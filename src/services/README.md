@@ -1,3 +1,5 @@
 # services
 
-API clients and external integrations (e.g. Firebase, HTTP clients) go here. Empty for now — introduced in a later step.
+API clients and external integrations.
+
+- `firebase.ts` — Firebase App initialization (config only; no Auth/Firestore/Storage yet).

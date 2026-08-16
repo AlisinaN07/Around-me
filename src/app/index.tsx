@@ -1,6 +1,7 @@
 import { StyleSheet, Text, View } from 'react-native';
 
 import { Colors, Spacing } from '@/constants/theme';
+import { isFirebaseConfigured } from '@/services/firebase';
 
 export default function Index() {
   return (
@@ -8,6 +9,11 @@ export default function Index() {
       <Text style={styles.title}>Around Me</Text>
       <Text style={styles.tagline}>See what&apos;s happening around you, right now.</Text>
       <Text style={styles.badge}>Development build</Text>
+      {__DEV__ && (
+        <Text style={styles.status}>
+          Firebase: {isFirebaseConfigured ? 'Connected' : 'Not configured'}
+        </Text>
+      )}
     </View>
   );
 }
@@ -40,5 +46,10 @@ const styles = StyleSheet.create({
     textTransform: 'uppercase',
     letterSpacing: 1,
     marginTop: Spacing.xl,
+  },
+  status: {
+    color: Colors.textSecondary,
+    fontSize: 12,
+    marginTop: Spacing.md,
   },
 });
