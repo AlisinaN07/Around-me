@@ -1,56 +1,45 @@
-# Welcome to your Expo app 👋
+# Around Me
 
-This is an [Expo](https://expo.dev) project created with [`create-expo-app`](https://www.npmjs.com/package/create-expo-app).
+Location-based social network organized around cities — "See what's happening around you, right now."
+
+This is the technical foundation only. No social features, authentication, or Firebase are implemented yet — those come in later steps.
+
+## Stack
+
+- React Native + Expo (SDK 57)
+- TypeScript (strict)
+- Expo Router (file-based routing)
+- npm
 
 ## Get started
 
-1. Install dependencies
-
-   ```bash
-   npm install
-   ```
-
-2. Start the app
-
-   ```bash
-   npx expo start
-   ```
-
-In the output, you'll find options to open the app in a
-
-- [development build](https://docs.expo.dev/develop/development-builds/introduction/)
-- [Android emulator](https://docs.expo.dev/workflow/android-studio-emulator/)
-- [iOS simulator](https://docs.expo.dev/workflow/ios-simulator/)
-- [Expo Go](https://expo.dev/go), a limited sandbox for trying out app development with Expo
-
-You can start developing by editing the files inside the **app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
-
-## Get a fresh project
-
-When you're ready, run:
-
 ```bash
-npm run reset-project
+npm install
+npx expo start
 ```
 
-This command will move the starter code to the **app-example** directory and create a blank **app** directory where you can start developing.
+Then press `i` for iOS simulator, `a` for Android emulator, or scan the QR code with Expo Go.
 
-### Other setup steps
+## Project structure
 
-- To set up ESLint for linting, run `npx expo lint`, or follow our guide on ["Using ESLint and Prettier"](https://docs.expo.dev/guides/using-eslint/)
-- If you'd like to set up unit testing, follow our guide on ["Unit Testing with Jest"](https://docs.expo.dev/develop/unit-testing/)
-- Learn more about the TypeScript setup in this template in our guide on ["Using TypeScript"](https://docs.expo.dev/guides/typescript/)
+```
+app.json              Expo app config (name, icon, splash, plugins)
+assets/                App icons, splash image, favicon
+src/
+  app/                 Screens and layouts (Expo Router file-based routing)
+  components/          Reusable UI components (empty — added as features are built)
+  constants/theme.ts   Centralized design tokens: colors, spacing, radius
+  hooks/               Custom React hooks (empty — added as features are built)
+  services/            API clients / external integrations, e.g. Firebase (empty — added later)
+  types/               Shared TypeScript types (empty — added as features are built)
+  utils/               Pure helper functions (empty — added as features are built)
+```
 
-## Learn more
+`@/*` is aliased to `src/*` (see `tsconfig.json`), so imports look like `import { Colors } from '@/constants/theme'`.
 
-To learn more about developing your project with Expo, look at the following resources:
+## Scripts
 
-- [Expo documentation](https://docs.expo.dev/): Learn fundamentals, or go into advanced topics with our [guides](https://docs.expo.dev/guides).
-- [Learn Expo tutorial](https://docs.expo.dev/tutorial/introduction/): Follow a step-by-step tutorial where you'll create a project that runs on Android, iOS, and the web.
-
-## Join the community
-
-Join our community of developers creating universal apps.
-
-- [Expo on GitHub](https://github.com/expo/expo): View our open source platform and contribute.
-- [Discord community](https://chat.expo.dev): Chat with Expo users and ask questions.
+- `npm start` — start the Metro dev server
+- `npm run ios` / `npm run android` / `npm run web` — start and open on a platform
+- `npm run lint` — run ESLint
+- `npx tsc --noEmit` — type-check
