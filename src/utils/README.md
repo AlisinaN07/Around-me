@@ -1,3 +1,6 @@
 # utils
 
-Small, pure helper functions (formatting, calculations, etc.) go here. Empty for now — introduced as features are built.
+Small, pure helper functions.
+
+- `username.ts` — canonical username normalization/validation (3–24 chars, lowercase/numbers/underscore).
+- `cityKey.ts` — builds the normalized `{countryCode}:{cityName}` key used for city-based filtering.

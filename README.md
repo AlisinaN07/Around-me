@@ -2,7 +2,7 @@
 
 Location-based social network organized around cities — "See what's happening around you, right now."
 
-Email/password authentication is implemented (sign up, log in, persisted sessions, log out). Firestore, profiles, and the rest of the social features are still to come.
+Email/password authentication is implemented (sign up, log in, persisted sessions, log out), and a Cloud Firestore data-layer foundation exists for user profiles. Onboarding UI and the rest of the social features are still to come.
 
 ## Stack
 
@@ -50,12 +50,33 @@ src/
   constants/theme.ts   Centralized design tokens: colors, spacing, radius
   hooks/useAuth.ts     Hook for auth session + sign-up/sign-in/sign-out
   providers/           AuthProvider — Firebase auth session as React Context
-  services/            firebase.ts (App) and auth.ts (Auth, AsyncStorage-persisted)
+  services/            firebase.ts (App), auth.ts (Auth), firestore.ts (Firestore), userProfile.ts (data layer)
   types/                Shared TypeScript types and type augmentations
-  utils/authErrors.ts  Maps Firebase error codes to friendly messages
+  utils/                authErrors.ts, username.ts, cityKey.ts
+firestore.rules         Firestore security rules (see Firestore section below)
+firebase.json           Firebase CLI config — Firestore rules only
+.firebaserc              Points the CLI at the around-me-6a437 project
 ```
 
 `@/*` is aliased to `src/*` (see `tsconfig.json`), so imports look like `import { Colors } from '@/constants/theme'`.
+
+## Firestore
+
+App data lives in Cloud Firestore, on the same Firebase project as Auth (`around-me-6a437`). Collections so far:
+
+- `users/{uid}` — the caller's own profile (`email`, `displayName`, `username`, `cityKey`, `interests`, etc.). Private to its owner — not yet publicly readable.
+- `usernames/{usernameLower}` — a uniqueness index reserving each username to one `uid`. Created atomically with the profile in a single transaction (see `src/services/userProfile.ts`).
+
+All access goes through `src/services/userProfile.ts` — UI code should never import `firebase/firestore` directly.
+
+**Security rules** (`firestore.rules`) enforce least privilege: an authenticated user may only read/create their own `users/{uid}` document, and may only reserve a username for their own uid. Everything else is denied by default. **Never switch production rules to `allow read, write: if true` — even temporarily.**
+
+To deploy rule changes:
+
+```bash
+npx firebase-tools login   # first time only — needs your Google account
+npx firebase-tools deploy --only firestore:rules
+```
 
 ## Scripts
 
