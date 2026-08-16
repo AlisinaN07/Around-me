@@ -2,7 +2,7 @@ import { router } from 'expo-router';
 import { useState } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 
-import { AuthScreenLayout } from '@/components/AuthScreenLayout';
+import { FormScreenLayout } from '@/components/FormScreenLayout';
 import { Button } from '@/components/Button';
 import { FormField } from '@/components/FormField';
 import { Colors, Spacing } from '@/constants/theme';
@@ -38,7 +38,7 @@ export default function LoginScreen() {
   };
 
   return (
-    <AuthScreenLayout>
+    <FormScreenLayout>
       <View style={styles.header}>
         <Text style={styles.title}>Log in</Text>
         <Text style={styles.subtitle}>Welcome back to Around Me.</Text>
@@ -84,7 +84,7 @@ export default function LoginScreen() {
           </Text>
         </Pressable>
       </View>
-    </AuthScreenLayout>
+    </FormScreenLayout>
   );
 }
 

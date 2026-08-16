@@ -2,25 +2,44 @@ import { StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { Button } from '@/components/Button';
-import { Colors, Spacing } from '@/constants/theme';
+import { INTERESTS } from '@/constants/interests';
+import { Colors, Radius, Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
+import { useProfile } from '@/hooks/useProfile';
 
 export default function HomeScreen() {
-  const { user, signOut } = useAuth();
+  const { signOut } = useAuth();
+  const { profile } = useProfile();
 
   const handleSignOut = () => {
     signOut().catch(() => {});
   };
 
+  const interestLabels = (profile?.interests ?? [])
+    .map((id) => INTERESTS.find((interest) => interest.id === id)?.label)
+    .filter((label): label is string => Boolean(label));
+
   return (
     <SafeAreaView style={styles.safeArea}>
       <View style={styles.content}>
-        <View style={styles.hero}>
-          <Text style={styles.title}>Around Me</Text>
-          <Text style={styles.subtitle}>You&apos;re in.</Text>
-          {user?.email ? <Text style={styles.email}>{user.email}</Text> : null}
+        <View style={styles.header}>
+          <Text style={styles.title}>Around {profile?.cityName ?? 'you'}</Text>
+          <Text style={styles.subtitle}>See what&apos;s happening around you, right now.</Text>
         </View>
-        <Button label="Log out" variant="secondary" onPress={handleSignOut} />
+
+        <View style={styles.card}>
+          <Text style={styles.cardText}>Your local feed is coming next.</Text>
+        </View>
+
+        {interestLabels.length > 0 ? (
+          <Text style={styles.meta} numberOfLines={2}>
+            Into {interestLabels.join(', ')}
+          </Text>
+        ) : null}
+
+        <View style={styles.footer}>
+          <Button label="Log out" variant="secondary" onPress={handleSignOut} />
+        </View>
       </View>
     </SafeAreaView>
   );
@@ -33,29 +52,43 @@ const styles = StyleSheet.create({
   },
   content: {
     flex: 1,
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    paddingHorizontal: Spacing.xl,
-    paddingVertical: Spacing.xl,
+    padding: Spacing.xl,
   },
-  hero: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-    gap: Spacing.sm,
+  header: {
+    gap: Spacing.xs,
+    marginTop: Spacing.lg,
   },
   title: {
     color: Colors.text,
-    fontSize: 32,
+    fontSize: 30,
     fontWeight: '800',
   },
   subtitle: {
     color: Colors.textSecondary,
-    fontSize: 18,
+    fontSize: 16,
+    lineHeight: 22,
   },
-  email: {
+  card: {
+    marginTop: Spacing.xl,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    borderRadius: Radius.lg,
+    backgroundColor: Colors.surface,
+    paddingVertical: Spacing.xxl,
+    paddingHorizontal: Spacing.lg,
+    alignItems: 'center',
+  },
+  cardText: {
+    color: Colors.textSecondary,
+    fontSize: 15,
+    textAlign: 'center',
+  },
+  meta: {
     color: Colors.textSecondary,
     fontSize: 13,
     marginTop: Spacing.md,
+  },
+  footer: {
+    marginTop: 'auto',
   },
 });

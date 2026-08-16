@@ -8,15 +8,18 @@ type FormFieldProps = TextInputProps & {
   error?: string;
   /** Renders a Show/Hide toggle and treats the field as a password field. */
   secureToggle?: boolean;
+  /** Static text rendered before the input, e.g. "@" for a username field. */
+  prefix?: string;
 };
 
-export function FormField({ label, error, secureToggle, style, ...rest }: FormFieldProps) {
+export function FormField({ label, error, secureToggle, prefix, style, ...rest }: FormFieldProps) {
   const [isRevealed, setIsRevealed] = useState(false);
 
   return (
     <View style={styles.container}>
       <Text style={styles.label}>{label}</Text>
       <View style={[styles.inputRow, error && styles.inputRowError]}>
+        {prefix ? <Text style={styles.prefix}>{prefix}</Text> : null}
         <TextInput
           style={[styles.input, style]}
           placeholderTextColor={Colors.textSecondary}
@@ -71,6 +74,11 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontWeight: '600',
     marginLeft: Spacing.sm,
+  },
+  prefix: {
+    color: Colors.textSecondary,
+    fontSize: 16,
+    marginRight: Spacing.xs,
   },
   errorText: {
     color: Colors.error,

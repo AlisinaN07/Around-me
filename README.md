@@ -2,7 +2,7 @@
 
 Location-based social network organized around cities — "See what's happening around you, right now."
 
-Email/password authentication is implemented (sign up, log in, persisted sessions, log out), and a Cloud Firestore data-layer foundation exists for user profiles. Onboarding UI and the rest of the social features are still to come.
+Email/password authentication, onboarding (name, username, city, interests), and a temporary Home foundation are implemented. The real feed, maps, and the rest of the social features are still to come.
 
 ## Stack
 
@@ -43,14 +43,16 @@ assets/                App icons, splash image, favicon
 .env.local              Your real Firebase config (git-ignored, not committed)
 src/
   app/
-    (auth)/            Welcome, log in, sign up — shown when logged out
-    (app)/             Authenticated home screen — shown when logged in
-    _layout.tsx        Routes to (auth) or (app) based on session state
-  components/          Button, FormField, AuthScreenLayout
-  constants/theme.ts   Centralized design tokens: colors, spacing, radius
-  hooks/useAuth.ts     Hook for auth session + sign-up/sign-in/sign-out
-  providers/           AuthProvider — Firebase auth session as React Context
-  services/            firebase.ts (App), auth.ts (Auth), firestore.ts (Firestore), userProfile.ts (data layer)
+    (auth)/            Welcome, log in, sign up — logged out
+    (onboarding)/      Name+username, city, interests — logged in, no profile yet
+    (app)/             Home — logged in, profile complete
+    _layout.tsx        Routes between the three groups based on auth + profile state
+  components/          Button, FormField, FormScreenLayout, OnboardingProgress, CountryPicker
+  constants/            theme.ts (design tokens), countries.ts, interests.ts
+  hooks/                useAuth.ts, useProfile.ts
+  providers/            AuthProvider, ProfileProvider, OnboardingDraftProvider
+  services/            firebase.ts (App), auth.ts (Auth), firestore.ts (Firestore),
+                       userProfile.ts (data layer), location.ts (one-time city lookup)
   types/                Shared TypeScript types and type augmentations
   utils/                authErrors.ts, username.ts, cityKey.ts
 firestore.rules         Firestore security rules (see Firestore section below)
@@ -85,6 +87,10 @@ To deploy rule changes:
 npx firebase-tools login   # first time only — needs your Google account
 npx firebase-tools deploy --only firestore:rules
 ```
+
+## Location
+
+Onboarding's city step can use `expo-location` for a one-time, foreground-only lookup ("when in use" permission only — no background location, no continuous tracking). It's used purely to derive a city + country, which get turned into a `cityKey` via `src/utils/cityKey.ts`. Raw coordinates only ever exist as local variables inside `src/services/location.ts` and are never sent to Firestore or persisted anywhere. Denying the permission doesn't block onboarding — manual city selection (country picker + city text field) always works.
 
 ## Scripts
 
