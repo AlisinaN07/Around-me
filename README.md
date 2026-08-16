@@ -71,6 +71,14 @@ All access goes through `src/services/userProfile.ts` — UI code should never i
 
 **Security rules** (`firestore.rules`) enforce least privilege: an authenticated user may only read/create their own `users/{uid}` document, and may only reserve a username for their own uid. Everything else is denied by default. **Never switch production rules to `allow read, write: if true` — even temporarily.**
 
+Before deploying a rules change, test it against the emulator:
+
+```bash
+npm run test:rules
+```
+
+This runs `tests/firestore.rules.test.mjs` against a local Firestore emulator using `@firebase/rules-unit-testing`, covering the ALLOW/DENY cases for both collections. (Note: on at least one sandboxed dev environment, the emulator's rules-management endpoint hung indefinitely for unrelated network reasons — if `npm run test:rules` hangs for you, verify the same scenarios directly against a real project instead, as was done manually to validate the rules deployed here.)
+
 To deploy rule changes:
 
 ```bash
