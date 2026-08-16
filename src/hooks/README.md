@@ -1,3 +1,5 @@
 # hooks
 
-Custom React hooks shared across screens go here. Empty for now — introduced as features are built.
+Custom React hooks shared across screens.
+
+- `useAuth.ts` — access the current auth session and sign-up/sign-in/sign-out actions (see `@/providers/AuthProvider`).

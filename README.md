@@ -2,7 +2,7 @@
 
 Location-based social network organized around cities — "See what's happening around you, right now."
 
-This is the technical foundation only. Firebase App is initialized, but no auth, Firestore, storage, or social features are implemented yet — those come in later steps.
+Email/password authentication is implemented (sign up, log in, persisted sessions, log out). Firestore, profiles, and the rest of the social features are still to come.
 
 ## Stack
 
@@ -42,13 +42,17 @@ assets/                App icons, splash image, favicon
 .env.example           Firebase config template (safe to commit)
 .env.local              Your real Firebase config (git-ignored, not committed)
 src/
-  app/                 Screens and layouts (Expo Router file-based routing)
-  components/          Reusable UI components (empty — added as features are built)
+  app/
+    (auth)/            Welcome, log in, sign up — shown when logged out
+    (app)/             Authenticated home screen — shown when logged in
+    _layout.tsx        Routes to (auth) or (app) based on session state
+  components/          Button, FormField, AuthScreenLayout
   constants/theme.ts   Centralized design tokens: colors, spacing, radius
-  hooks/               Custom React hooks (empty — added as features are built)
-  services/firebase.ts Firebase App initialization (config only, no Auth/Firestore/Storage yet)
-  types/               Shared TypeScript types (empty — added as features are built)
-  utils/               Pure helper functions (empty — added as features are built)
+  hooks/useAuth.ts     Hook for auth session + sign-up/sign-in/sign-out
+  providers/           AuthProvider — Firebase auth session as React Context
+  services/            firebase.ts (App) and auth.ts (Auth, AsyncStorage-persisted)
+  types/                Shared TypeScript types and type augmentations
+  utils/authErrors.ts  Maps Firebase error codes to friendly messages
 ```
 
 `@/*` is aliased to `src/*` (see `tsconfig.json`), so imports look like `import { Colors } from '@/constants/theme'`.

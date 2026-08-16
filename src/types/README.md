@@ -1,3 +1,5 @@
 # types
 
-Shared TypeScript types and interfaces used across the app go here. Empty for now — introduced as features are built.
+Shared TypeScript types and type augmentations.
+
+- `firebase-auth.d.ts` — restores the `getReactNativePersistence` type that `firebase/auth`'s published declarations omit (see file comment).

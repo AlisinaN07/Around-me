@@ -1,0 +1,79 @@
+import { useState } from 'react';
+import { Pressable, StyleSheet, Text, TextInput, View, type TextInputProps } from 'react-native';
+
+import { Colors, Radius, Spacing } from '@/constants/theme';
+
+type FormFieldProps = TextInputProps & {
+  label: string;
+  error?: string;
+  /** Renders a Show/Hide toggle and treats the field as a password field. */
+  secureToggle?: boolean;
+};
+
+export function FormField({ label, error, secureToggle, style, ...rest }: FormFieldProps) {
+  const [isRevealed, setIsRevealed] = useState(false);
+
+  return (
+    <View style={styles.container}>
+      <Text style={styles.label}>{label}</Text>
+      <View style={[styles.inputRow, error && styles.inputRowError]}>
+        <TextInput
+          style={[styles.input, style]}
+          placeholderTextColor={Colors.textSecondary}
+          secureTextEntry={secureToggle ? !isRevealed : rest.secureTextEntry}
+          {...rest}
+        />
+        {secureToggle && (
+          <Pressable
+            onPress={() => setIsRevealed((revealed) => !revealed)}
+            hitSlop={8}
+            accessibilityRole="button"
+            accessibilityLabel={isRevealed ? 'Hide password' : 'Show password'}
+          >
+            <Text style={styles.toggleLabel}>{isRevealed ? 'Hide' : 'Show'}</Text>
+          </Pressable>
+        )}
+      </View>
+      {error ? <Text style={styles.errorText}>{error}</Text> : null}
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    gap: Spacing.xs,
+  },
+  label: {
+    color: Colors.textSecondary,
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  inputRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: Colors.border,
+    borderRadius: Radius.md,
+    backgroundColor: Colors.surface,
+    paddingHorizontal: Spacing.md,
+  },
+  inputRowError: {
+    borderColor: Colors.error,
+  },
+  input: {
+    flex: 1,
+    color: Colors.text,
+    fontSize: 16,
+    paddingVertical: Spacing.md,
+  },
+  toggleLabel: {
+    color: Colors.accent,
+    fontSize: 13,
+    fontWeight: '600',
+    marginLeft: Spacing.sm,
+  },
+  errorText: {
+    color: Colors.error,
+    fontSize: 12,
+  },
+});
