@@ -1,4 +1,5 @@
 import { Ionicons } from '@expo/vector-icons';
+import { router } from 'expo-router';
 import { useState } from 'react';
 import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
@@ -21,7 +22,7 @@ const PROFILE_TABS: { id: ProfileTab; label: string; icon: keyof typeof Ionicons
 ];
 
 export default function ProfileScreen() {
-  const { signOut } = useAuth();
+  const { user, signOut } = useAuth();
   const { profile } = useProfile();
   const [activeTab, setActiveTab] = useState<ProfileTab>('posts');
 
@@ -71,6 +72,18 @@ export default function ProfileScreen() {
             <Button label="Edit profile" variant="secondary" onPress={() => {}} disabled />
             <Button label="Log out" variant="secondary" onPress={handleSignOut} />
           </View>
+
+          {user ? (
+            <Pressable
+              onPress={() => router.push(`/user/${user.uid}`)}
+              style={styles.publicProfileLink}
+              accessibilityRole="button"
+              accessibilityLabel="View public profile"
+            >
+              <Ionicons name="person-circle-outline" size={16} color={Colors.accent} />
+              <Text style={styles.publicProfileLinkText}>View public profile</Text>
+            </Pressable>
+          ) : null}
 
           <View style={styles.tabsRow}>
             {PROFILE_TABS.map((tab) => {
@@ -161,6 +174,18 @@ const styles = StyleSheet.create({
     gap: Spacing.sm,
     marginTop: Spacing.xl,
     marginHorizontal: Spacing.xl,
+  },
+  publicProfileLink: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+    marginTop: Spacing.md,
+  },
+  publicProfileLinkText: {
+    color: Colors.accent,
+    fontSize: 13,
+    fontWeight: '600',
   },
   tabsRow: {
     flexDirection: 'row',

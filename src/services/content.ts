@@ -29,12 +29,27 @@ import {
   TITLE_MAX_LENGTH,
 } from '@/types/content';
 
+import { fetchFollowingUids } from './following';
 import { firestore } from './firestore';
 import { fetchUserProfile } from './userProfile';
 
 const CONTENT_COLLECTION = 'content';
 const DEFAULT_FEED_LIMIT = 20;
 const VALID_CATEGORY_IDS = new Set(INTERESTS.map((interest) => interest.id));
+
+// MVP cap on how many followed creators a single Following feed page
+// considers (see fetchFollowingFeed below) — matches the limit already
+// used by fetchFollowingUids/fetchFollowing in following.ts, so a page
+// covers everyone in the caller's Following list before pagination is
+// needed. If usage shows people following more than this, the fix is
+// cursor-paginating fetchFollowingUids itself, not raising this number.
+const MAX_FOLLOWED_UIDS_PER_FEED_PAGE = 30;
+
+// Firestore's JS SDK allows up to 30 values in a single `in` query, but we
+// deliberately chunk much smaller (10) for headroom and predictability —
+// see fetchFollowingFeed.
+const FOLLOWING_UID_CHUNK_SIZE = 10;
+const DEFAULT_FOLLOWING_FEED_LIMIT = 20;
 
 export type CreateContentError = 'not-configured' | 'no-profile' | 'invalid-input' | 'unknown';
 
@@ -332,6 +347,29 @@ export async function fetchCityFeed(cityKey: string, limitCount = DEFAULT_FEED_L
   return snapshot.docs.map((docSnapshot) => docSnapshot.data() as Content);
 }
 
+/**
+ * A single user's own published content (posts, activities, events mixed),
+ * newest first — powers the "real content" section of their public
+ * profile. Only ever filters by authorUid + status; never reads any
+ * private users/{uid} document. UI can filter the returned list by
+ * `type` in-memory for the Posts/Activities/Events tabs rather than
+ * running three separate queries for one profile page.
+ */
+export async function fetchPublicUserContent(uid: string, limitCount = DEFAULT_FEED_LIMIT): Promise<Content[]> {
+  if (!firestore) {
+    return [];
+  }
+  const contentQuery = query(
+    collection(firestore, CONTENT_COLLECTION),
+    where('authorUid', '==', uid),
+    where('status', '==', 'published'),
+    orderBy('createdAt', 'desc'),
+    limit(limitCount)
+  );
+  const snapshot = await getDocs(contentQuery);
+  return snapshot.docs.map((docSnapshot) => docSnapshot.data() as Content);
+}
+
 async function fetchUpcomingByType<T extends ActivityContent | EventContent>(
   type: 'activity' | 'event',
   cityKey: string,
@@ -407,4 +445,94 @@ export async function fetchHappeningNow(
     fetchHappeningNowByType<ActivityContent>('activity', cityKey, limitCount),
   ]);
   return [...events, ...activities].sort((a, b) => a.startsAt.toMillis() - b.startsAt.toMillis());
+}
+
+function chunkArray<T>(items: T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let i = 0; i < items.length; i += size) {
+    chunks.push(items.slice(i, i + size));
+  }
+  return chunks;
+}
+
+export type FetchFollowingFeedInput = {
+  currentUid: string;
+  /**
+   * The city to scope the feed to — deliberately a parameter, not derived
+   * from the caller's own profile inside this function. Today the only
+   * caller passes the signed-in user's own cityKey, but a future
+   * city-switcher can pass any city without this function changing (see
+   * the "Critical city rule" in the Step 12 spec).
+   */
+  cityKey: string;
+  limit?: number;
+};
+
+/**
+ * Chronological Following feed: published content from people `currentUid`
+ * follows, in one specific city. Never queries the whole content
+ * collection and filters locally — always resolves followed uids first,
+ * then queries content directly by those uids.
+ *
+ * Firestore's `in` operator caps at 30 values per query on this SDK; we
+ * chunk into groups of FOLLOWING_UID_CHUNK_SIZE (10) for headroom rather
+ * than relying on that ceiling. Each chunk is its own
+ * (authorUid in [...], cityKey ==, status == 'published') query, ordered
+ * newest-first with its own limit — then all chunk results are merged,
+ * deduplicated by contentId (a piece of content could theoretically
+ * appear in results from more than one chunk if authorUid matching
+ * overlapped, though in practice each author only ever falls into one
+ * chunk), globally re-sorted by createdAt, and sliced to the requested
+ * limit. No realtime listeners — call again to refresh.
+ *
+ * MVP limit: only the first MAX_FOLLOWED_UIDS_PER_FEED_PAGE (30) followed
+ * uids are considered per feed page. Someone following more than that
+ * simply won't see the rest reflected in Following yet — this needs
+ * cursor pagination on the follow list itself to fix properly, which is
+ * out of scope here.
+ */
+export async function fetchFollowingFeed({
+  currentUid,
+  cityKey,
+  limit: limitCount = DEFAULT_FOLLOWING_FEED_LIMIT,
+}: FetchFollowingFeedInput): Promise<Content[]> {
+  if (!firestore) {
+    return [];
+  }
+  const db = firestore;
+
+  const followedUids = await fetchFollowingUids(currentUid, MAX_FOLLOWED_UIDS_PER_FEED_PAGE);
+  if (followedUids.length === 0) {
+    return [];
+  }
+
+  const chunks = chunkArray(followedUids, FOLLOWING_UID_CHUNK_SIZE);
+  const chunkResults = await Promise.all(
+    chunks.map((chunk) =>
+      getDocs(
+        query(
+          collection(db, CONTENT_COLLECTION),
+          where('authorUid', 'in', chunk),
+          where('cityKey', '==', cityKey),
+          where('status', '==', 'published'),
+          orderBy('createdAt', 'desc'),
+          limit(limitCount)
+        )
+      )
+    )
+  );
+
+  const seenContentIds = new Set<string>();
+  const merged: Content[] = [];
+  for (const snapshot of chunkResults) {
+    for (const docSnapshot of snapshot.docs) {
+      const item = docSnapshot.data() as Content;
+      if (seenContentIds.has(item.contentId)) continue;
+      seenContentIds.add(item.contentId);
+      merged.push(item);
+    }
+  }
+
+  merged.sort((a, b) => b.createdAt.toMillis() - a.createdAt.toMillis());
+  return merged.slice(0, limitCount);
 }

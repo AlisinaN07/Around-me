@@ -7,8 +7,10 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { Button } from '@/components/Button';
 import { CategoryChip } from '@/components/CategoryChip';
 import { ContentCard } from '@/components/ContentCard';
+import { FollowingFeed } from '@/components/FollowingFeed';
 import { HappeningNowCard } from '@/components/HappeningNowCard';
 import { SectionHeader } from '@/components/SectionHeader';
+import { SegmentedControl } from '@/components/SegmentedControl';
 import { CATEGORY_FILTERS } from '@/constants/categoryFilters';
 import { INTERESTS } from '@/constants/interests';
 import { Colors, Layout, Radius, Spacing } from '@/constants/theme';
@@ -21,9 +23,20 @@ import { formatEventTime } from '@/utils/timeFormat';
 
 type LoadStatus = 'loading' | 'loaded' | 'error';
 
+type HomeMode = 'around' | 'following';
+
+const HOME_MODE_OPTIONS: { id: HomeMode; label: string }[] = [
+  { id: 'around', label: 'Around' },
+  { id: 'following', label: 'Following' },
+];
+
 export default function HomeScreen() {
   const { user } = useAuth();
   const { profile } = useProfile();
+  // In-session only — not persisted to Firestore. Resets to "Around" (the
+  // default) every time this screen mounts fresh; trivially preserved for
+  // the rest of a session because it's just ordinary component state.
+  const [homeMode, setHomeMode] = useState<HomeMode>('around');
   const [selectedCategory, setSelectedCategory] = useState('all');
   const [feedItems, setFeedItems] = useState<Content[]>([]);
   const [happeningItems, setHappeningItems] = useState<(ActivityContent | EventContent)[]>([]);
@@ -84,16 +97,7 @@ export default function HomeScreen() {
 
   return (
     <SafeAreaView style={styles.safeArea} edges={['top']}>
-      <ScrollView
-        style={styles.scroll}
-        contentContainerStyle={styles.scrollContent}
-        showsVerticalScrollIndicator={false}
-        refreshControl={
-          Platform.OS === 'web' ? undefined : (
-            <RefreshControl refreshing={isRefreshing} onRefresh={() => loadFeed(true)} tintColor={Colors.accent} />
-          )
-        }
-      >
+      <View style={styles.topBar}>
         <View style={styles.page}>
           <View style={styles.header}>
             <View style={styles.headerTextGroup}>
@@ -104,7 +108,7 @@ export default function HomeScreen() {
               <Text style={styles.title}>Around {cityLabel}</Text>
             </View>
             <View style={styles.headerActions}>
-              {Platform.OS === 'web' && (
+              {Platform.OS === 'web' && homeMode === 'around' && (
                 <Pressable
                   onPress={() => loadFeed(true)}
                   hitSlop={8}
@@ -136,111 +140,139 @@ export default function HomeScreen() {
             </View>
           </View>
 
-          <ScrollView
-            horizontal
-            showsHorizontalScrollIndicator={false}
-            style={styles.horizontalScroll}
-            contentContainerStyle={styles.chipsRow}
-          >
-            {CATEGORY_FILTERS.map((category) => (
-              <CategoryChip
-                key={category.id}
-                label={category.label}
-                icon={category.icon}
-                selected={selectedCategory === category.id}
-                onPress={() => setSelectedCategory(category.id)}
-              />
-            ))}
-          </ScrollView>
-
-          {status === 'error' ? (
-            <View style={styles.errorState}>
-              <Ionicons name="cloud-offline-outline" size={32} color={Colors.textSecondary} />
-              <Text style={styles.errorTitle}>Couldn&apos;t load Around {cityLabel}.</Text>
-              <Button label="Try again" onPress={() => loadFeed()} />
-            </View>
-          ) : (
-            <>
-              <View style={styles.section}>
-                <SectionHeader title="Happening Now 🔥" />
-                {status === 'loading' && happeningItems.length === 0 ? (
-                  <ScrollView
-                    horizontal
-                    showsHorizontalScrollIndicator={false}
-                    style={styles.horizontalScroll}
-                    contentContainerStyle={styles.horizontalListContent}
-                  >
-                    <SkeletonBlock width={168} height={148} />
-                    <SkeletonBlock width={168} height={148} />
-                  </ScrollView>
-                ) : happeningItems.length === 0 ? (
-                  <View style={styles.emptyPanel}>
-                    <Text style={styles.emptyPanelTitle}>Nothing live right now</Text>
-                    <Text style={styles.emptyPanelBody}>
-                      Check upcoming events and activities around {cityLabel}.
-                    </Text>
-                  </View>
-                ) : (
-                  <ScrollView
-                    horizontal
-                    showsHorizontalScrollIndicator={false}
-                    style={styles.horizontalScroll}
-                    contentContainerStyle={styles.horizontalListContent}
-                  >
-                    {happeningItems.map((item) => {
-                      const category = INTERESTS.find((interest) => interest.id === item.categoryId);
-                      return (
-                        <HappeningNowCard
-                          key={item.contentId}
-                          category={category ? `${category.emoji} ${category.label}` : item.categoryId}
-                          title={item.title}
-                          place={item.placeName}
-                          timeLabel={formatEventTime(item.startsAt.toDate())}
-                          onPress={() => router.push(`/content/${item.contentId}`)}
-                        />
-                      );
-                    })}
-                  </ScrollView>
-                )}
-              </View>
-
-              <View style={styles.section}>
-                <SectionHeader title="Local Reels" />
-                <View style={styles.reelsEmptyPanel}>
-                  <Ionicons name="videocam-outline" size={22} color={Colors.textSecondary} />
-                  <Text style={styles.emptyPanelBody}>
-                    Local videos will appear here as people start sharing what&apos;s happening around the city.
-                  </Text>
-                </View>
-              </View>
-
-              <View style={styles.section}>
-                <SectionHeader title="Around You" />
-                {status === 'loading' && feedItems.length === 0 ? (
-                  <>
-                    <SkeletonBlock width="100%" height={110} style={styles.feedSkeleton} />
-                    <SkeletonBlock width="100%" height={110} style={styles.feedSkeleton} />
-                  </>
-                ) : feedItems.length === 0 ? (
-                  <View style={styles.emptyCityPanel}>
-                    <Text style={styles.emptyPanelTitle}>Nothing here yet.</Text>
-                    <Text style={styles.emptyPanelBody}>
-                      Be the first person to share what&apos;s happening in {cityLabel}.
-                    </Text>
-                    <Button label="Create something" onPress={() => router.push('/create')} />
-                  </View>
-                ) : visibleItems.length === 0 ? (
-                  <View style={styles.emptyCityPanel}>
-                    <Text style={styles.emptyPanelBody}>Nothing matches this filter yet.</Text>
-                  </View>
-                ) : (
-                  visibleItems.map((item) => <ContentCard key={item.contentId} item={item} currentUid={user?.uid ?? null} />)
-                )}
-              </View>
-            </>
-          )}
+          <View style={styles.modeSwitch}>
+            <SegmentedControl options={HOME_MODE_OPTIONS} value={homeMode} onChange={setHomeMode} />
+          </View>
         </View>
-      </ScrollView>
+      </View>
+
+      {homeMode === 'following' ? (
+        user && profile ? (
+          <FollowingFeed
+            currentUid={user.uid}
+            cityKey={profile.cityKey}
+            cityLabel={cityLabel}
+            onExploreAround={() => setHomeMode('around')}
+          />
+        ) : null
+      ) : (
+        <ScrollView
+          style={styles.scroll}
+          contentContainerStyle={styles.scrollContent}
+          showsVerticalScrollIndicator={false}
+          refreshControl={
+            Platform.OS === 'web' ? undefined : (
+              <RefreshControl refreshing={isRefreshing} onRefresh={() => loadFeed(true)} tintColor={Colors.accent} />
+            )
+          }
+        >
+          <View style={styles.page}>
+            <ScrollView
+              horizontal
+              showsHorizontalScrollIndicator={false}
+              style={styles.horizontalScroll}
+              contentContainerStyle={styles.chipsRow}
+            >
+              {CATEGORY_FILTERS.map((category) => (
+                <CategoryChip
+                  key={category.id}
+                  label={category.label}
+                  icon={category.icon}
+                  selected={selectedCategory === category.id}
+                  onPress={() => setSelectedCategory(category.id)}
+                />
+              ))}
+            </ScrollView>
+
+            {status === 'error' ? (
+              <View style={styles.errorState}>
+                <Ionicons name="cloud-offline-outline" size={32} color={Colors.textSecondary} />
+                <Text style={styles.errorTitle}>Couldn&apos;t load Around {cityLabel}.</Text>
+                <Button label="Try again" onPress={() => loadFeed()} />
+              </View>
+            ) : (
+              <>
+                <View style={styles.section}>
+                  <SectionHeader title="Happening Now 🔥" />
+                  {status === 'loading' && happeningItems.length === 0 ? (
+                    <ScrollView
+                      horizontal
+                      showsHorizontalScrollIndicator={false}
+                      style={styles.horizontalScroll}
+                      contentContainerStyle={styles.horizontalListContent}
+                    >
+                      <SkeletonBlock width={168} height={148} />
+                      <SkeletonBlock width={168} height={148} />
+                    </ScrollView>
+                  ) : happeningItems.length === 0 ? (
+                    <View style={styles.emptyPanel}>
+                      <Text style={styles.emptyPanelTitle}>Nothing live right now</Text>
+                      <Text style={styles.emptyPanelBody}>
+                        Check upcoming events and activities around {cityLabel}.
+                      </Text>
+                    </View>
+                  ) : (
+                    <ScrollView
+                      horizontal
+                      showsHorizontalScrollIndicator={false}
+                      style={styles.horizontalScroll}
+                      contentContainerStyle={styles.horizontalListContent}
+                    >
+                      {happeningItems.map((item) => {
+                        const category = INTERESTS.find((interest) => interest.id === item.categoryId);
+                        return (
+                          <HappeningNowCard
+                            key={item.contentId}
+                            category={category ? `${category.emoji} ${category.label}` : item.categoryId}
+                            title={item.title}
+                            place={item.placeName}
+                            timeLabel={formatEventTime(item.startsAt.toDate())}
+                            onPress={() => router.push(`/content/${item.contentId}`)}
+                          />
+                        );
+                      })}
+                    </ScrollView>
+                  )}
+                </View>
+
+                <View style={styles.section}>
+                  <SectionHeader title="Local Reels" />
+                  <View style={styles.reelsEmptyPanel}>
+                    <Ionicons name="videocam-outline" size={22} color={Colors.textSecondary} />
+                    <Text style={styles.emptyPanelBody}>
+                      Local videos will appear here as people start sharing what&apos;s happening around the city.
+                    </Text>
+                  </View>
+                </View>
+
+                <View style={styles.section}>
+                  <SectionHeader title="Around You" />
+                  {status === 'loading' && feedItems.length === 0 ? (
+                    <>
+                      <SkeletonBlock width="100%" height={110} style={styles.feedSkeleton} />
+                      <SkeletonBlock width="100%" height={110} style={styles.feedSkeleton} />
+                    </>
+                  ) : feedItems.length === 0 ? (
+                    <View style={styles.emptyCityPanel}>
+                      <Text style={styles.emptyPanelTitle}>Nothing here yet.</Text>
+                      <Text style={styles.emptyPanelBody}>
+                        Be the first person to share what&apos;s happening in {cityLabel}.
+                      </Text>
+                      <Button label="Create something" onPress={() => router.push('/create')} />
+                    </View>
+                  ) : visibleItems.length === 0 ? (
+                    <View style={styles.emptyCityPanel}>
+                      <Text style={styles.emptyPanelBody}>Nothing matches this filter yet.</Text>
+                    </View>
+                  ) : (
+                    visibleItems.map((item) => <ContentCard key={item.contentId} item={item} currentUid={user?.uid ?? null} />)
+                  )}
+                </View>
+              </>
+            )}
+          </View>
+        </ScrollView>
+      )}
     </SafeAreaView>
   );
 }
@@ -261,9 +293,16 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     paddingBottom: Spacing.xxl,
   },
+  topBar: {
+    alignItems: 'center',
+  },
   page: {
     width: '100%',
     maxWidth: Layout.maxContentWidth,
+  },
+  modeSwitch: {
+    paddingHorizontal: Spacing.lg,
+    paddingBottom: Spacing.md,
   },
   header: {
     flexDirection: 'row',
