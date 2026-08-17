@@ -2,7 +2,7 @@
 
 Location-based social network organized around cities — "See what's happening around you, right now."
 
-Email/password authentication, onboarding (name, username, city, interests), and a full tab-based application shell (Home, Reels, Create, Map, Profile) are implemented. Home's sections use local UI fixture data — the real feed/Reels/events backend is still to come.
+Email/password authentication, onboarding (name, username, city, interests), a full tab-based application shell (Home, Reels, Create, Map, Profile), and the real Firestore content backend (posts, activities, events) are implemented. Home's UI still shows fixture data — wiring the real content backend into it is the next step.
 
 ## Stack
 
@@ -55,11 +55,13 @@ src/
   hooks/                useAuth.ts, useProfile.ts
   providers/            AuthProvider, ProfileProvider, OnboardingDraftProvider
   services/            firebase.ts (App), auth.ts (Auth), firestore.ts (Firestore),
-                       userProfile.ts (data layer), location.ts (one-time city lookup)
+                       userProfile.ts (profile data layer), content.ts (posts/activities/events
+                       data layer), location.ts (one-time city lookup)
   types/                Shared TypeScript types and type augmentations
   utils/                authErrors.ts, username.ts, cityKey.ts, cityDisplay.ts
 firestore.rules         Firestore security rules (see Firestore section below)
-firebase.json           Firebase CLI config — Firestore rules only
+firestore.indexes.json  Composite indexes the content queries need
+firebase.json           Firebase CLI config — Firestore rules + indexes only
 .firebaserc              Points the CLI at the around-me-6a437 project
 ```
 
@@ -71,10 +73,18 @@ App data lives in Cloud Firestore, on the same Firebase project as Auth (`around
 
 - `users/{uid}` — the caller's own profile (`email`, `displayName`, `username`, `cityKey`, `interests`, etc.). Private to its owner — not yet publicly readable.
 - `usernames/{usernameLower}` — a uniqueness index reserving each username to one `uid`. Created atomically with the profile in a single transaction (see `src/services/userProfile.ts`).
+- `content/{contentId}` — one unified collection for `post` / `activity` / `event` (a discriminated union in `src/types/content.ts`), since Home will eventually be a mixed feed of all three. Reels get their own architecture in a later step — different media/storage concerns.
 
-All access goes through `src/services/userProfile.ts` — UI code should never import `firebase/firestore` directly.
+Every content document carries `authorUid`, `authorDisplayName`, `authorUsername`, `cityName`, `countryCode`, `cityKey` — a **public-safe snapshot** of the author's private profile, copied at write time so the feed never has to read another user's `users/{uid}` document. Firestore rules verify this snapshot exactly matches the author's own profile on create, so a modified client can't post as another user or claim another city. Reads are open to any signed-in user (not scoped to the reader's own city — browsing other cities is intentional); creates require a completed profile; only the author can delete their own content; updates are denied entirely for now (no edit UI exists yet, so there's nothing to validate "which fields are safely mutable" against).
 
-**Security rules** (`firestore.rules`) enforce least privilege: an authenticated user may only read/create their own `users/{uid}` document, and may only reserve a username for their own uid. Everything else is denied by default. **Never switch production rules to `allow read, write: if true` — even temporarily.**
+Content queries (`src/services/content.ts`) are one-shot reads with explicit limits — no realtime listeners, no unbounded queries:
+- `fetchCityFeed(cityKey)` — newest published content for a city, mixed types, `orderBy(createdAt desc)`.
+- `fetchUpcomingEvents` / `fetchUpcomingActivities(cityKey)` — `startsAt >= now`, `orderBy(startsAt asc)`.
+- `fetchHappeningNow(cityKey)` — Firestore can't filter two different fields with inequalities in one query, so `startsAt <= now AND endsAt >= now` isn't directly expressible. Instead it fetches already-started candidates (`startsAt <= now`) and filters client-side for ones that haven't ended — reusing the same index as the "upcoming" queries rather than a third one. Fine until real usage data says otherwise.
+
+All access goes through `src/services/userProfile.ts` and `src/services/content.ts` — UI code should never import `firebase/firestore` directly.
+
+**Security rules** (`firestore.rules`) enforce least privilege throughout. Everything unspecified is denied by default. **Never switch production rules to `allow read, write: if true` — even temporarily.**
 
 Before deploying a rules change, test it against the emulator:
 
@@ -82,14 +92,16 @@ Before deploying a rules change, test it against the emulator:
 npm run test:rules
 ```
 
-This runs `tests/firestore.rules.test.mjs` against a local Firestore emulator using `@firebase/rules-unit-testing`, covering the ALLOW/DENY cases for both collections. (Note: on at least one sandboxed dev environment, the emulator's rules-management endpoint hung indefinitely for unrelated network reasons — if `npm run test:rules` hangs for you, verify the same scenarios directly against a real project instead, as was done manually to validate the rules deployed here.)
+This runs `tests/firestore.rules.test.mjs` against a local Firestore emulator using `@firebase/rules-unit-testing`, covering the ALLOW/DENY cases for `users`, `usernames`, and `content`. (Note: on at least one sandboxed dev environment, the emulator's rules-management endpoint hung indefinitely for unrelated network reasons — if `npm run test:rules` hangs for you, verify the same scenarios directly against a real project instead, as was done manually to validate the rules deployed here.)
 
-To deploy rule changes:
+To deploy rules and indexes:
 
 ```bash
 npx firebase-tools login   # first time only — needs your Google account
-npx firebase-tools deploy --only firestore:rules
+npx firebase-tools deploy --only firestore
 ```
+
+New composite indexes take a little while to build after deploying — check status with `npx firebase-tools firestore:indexes`, or just try the query; Firestore returns a clear "index is currently building" error (with a console link) until it's ready.
 
 ## Location
 

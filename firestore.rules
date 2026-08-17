@@ -59,6 +59,99 @@ service cloud.firestore {
         && request.resource.data.keys().hasOnly(['uid', 'createdAt']);
     }
 
+    // content/{contentId} — the unified root collection for posts,
+    // activities, and events (see src/types/content.ts). Every document's
+    // author/city fields are validated against the author's own private
+    // users/{uid} profile below, so a modified client can never impersonate
+    // another user or another city — without making users/{uid} itself
+    // publicly readable.
+    match /content/{contentId} {
+      // Base field set shared by every content type.
+      function baseContentKeys() {
+        return [
+          'contentId', 'type', 'authorUid', 'authorDisplayName', 'authorUsername',
+          'cityName', 'countryCode', 'cityKey', 'categoryId',
+          'status', 'visibility', 'createdAt', 'updatedAt'
+        ];
+      }
+
+      function isValidPostShape(data) {
+        return data.type == 'post'
+          && data.body is string
+          && data.body.size() > 0
+          && data.body.size() <= 1000
+          && data.keys().hasAll(baseContentKeys().concat(['body']))
+          && data.keys().hasOnly(baseContentKeys().concat(['body', 'placeName']))
+          && (!('placeName' in data) || (data.placeName is string && data.placeName.size() <= 200));
+      }
+
+      function isValidActivityShape(data) {
+        return data.type == 'activity'
+          && data.title is string && data.title.size() > 0 && data.title.size() <= 120
+          && data.description is string && data.description.size() > 0 && data.description.size() <= 1000
+          && data.placeName is string && data.placeName.size() > 0 && data.placeName.size() <= 200
+          && data.startsAt is timestamp
+          && data.endsAt is timestamp
+          && data.startsAt < data.endsAt
+          && data.keys().hasAll(baseContentKeys().concat(['title', 'description', 'startsAt', 'endsAt', 'placeName']))
+          && data.keys().hasOnly(baseContentKeys().concat(['title', 'description', 'startsAt', 'endsAt', 'placeName', 'maxParticipants']))
+          && (!('maxParticipants' in data) || (data.maxParticipants is int && data.maxParticipants > 0 && data.maxParticipants <= 500));
+      }
+
+      function isValidEventShape(data) {
+        return data.type == 'event'
+          && data.title is string && data.title.size() > 0 && data.title.size() <= 120
+          && data.description is string && data.description.size() > 0 && data.description.size() <= 1000
+          && data.placeName is string && data.placeName.size() > 0 && data.placeName.size() <= 200
+          && data.startsAt is timestamp
+          && data.endsAt is timestamp
+          && data.startsAt < data.endsAt
+          && data.keys().hasAll(baseContentKeys().concat(['title', 'description', 'startsAt', 'endsAt', 'placeName']))
+          && data.keys().hasOnly(baseContentKeys().concat(['title', 'description', 'startsAt', 'endsAt', 'placeName']));
+      }
+
+      // Fetches the caller's own private profile once (Firestore rules
+      // cache repeated get()/exists() calls to the same path within one
+      // evaluation, so this costs a single read regardless of how many
+      // times `profile` is referenced below) and checks the full author +
+      // city snapshot on the incoming document against it.
+      function isValidContentCreate(data) {
+        let profile = get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+        return exists(/databases/$(database)/documents/users/$(request.auth.uid))
+          && profile.onboardingCompleted == true
+          && data.contentId == contentId
+          && data.authorUid == request.auth.uid
+          && data.authorDisplayName == profile.displayName
+          && data.authorUsername == profile.username
+          && data.cityName == profile.cityName
+          && data.countryCode == profile.countryCode
+          && data.cityKey == profile.cityKey
+          && data.status == 'published'
+          && data.visibility == 'city'
+          && data.categoryId is string
+          && data.categoryId.size() > 0
+          && isServerTimestamp(data.createdAt)
+          && isServerTimestamp(data.updatedAt)
+          && (isValidPostShape(data) || isValidActivityShape(data) || isValidEventShape(data));
+      }
+
+      // Published content is readable by any signed-in user (this also
+      // governs list/query results — Firestore evaluates this per matched
+      // document). Not scoped to the reader's own city: browsing other
+      // cities is part of the product.
+      allow read: if isSignedIn() && resource.data.status == 'published';
+
+      allow create: if isSignedIn() && isValidContentCreate(request.resource.data);
+
+      // No edit UI exists yet, so there's nothing to validate "which
+      // fields are safely mutable" against — deny entirely for now rather
+      // than design that validation speculatively. Revisit when an actual
+      // edit flow exists.
+      allow update: if false;
+
+      allow delete: if isOwner(resource.data.authorUid);
+    }
+
     // Everything else is denied by default.
     match /{document=**} {
       allow read, write: if false;
