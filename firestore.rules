@@ -136,6 +136,23 @@ service cloud.firestore {
         && data.keys().hasOnly(['followerUid', 'followingUid', 'createdAt']);
     }
 
+    // places/{placeId} — real public physical locations (see
+    // src/types/place.ts). Ordinary users can only READ active Places.
+    // Step 13 has no place-creation UI at all — Places are seeded only by
+    // trusted tooling using the same `firebase login` CLI session as the
+    // rest of this project's scripts (see scripts/delete-test-documents.cjs
+    // for the equivalent pattern), never by ordinary client writes. This is
+    // deliberate: unrestricted client writes would let anyone add fake
+    // restaurants/venues to the public map. Business accounts, place
+    // claiming, and user submissions are future steps, not this one.
+    match /places/{placeId} {
+      allow read: if isSignedIn() && resource.data.status == 'active';
+
+      allow create: if false;
+      allow update: if false;
+      allow delete: if false;
+    }
+
     // content/{contentId} — the unified root collection for posts,
     // activities, and events (see src/types/content.ts). Every document's
     // author/city fields are validated against the author's own private
@@ -143,11 +160,12 @@ service cloud.firestore {
     // another user or another city — without making users/{uid} itself
     // publicly readable.
     match /content/{contentId} {
-      // Base field set shared by every content type.
+      // Base field set shared by every content type. placeId is always
+      // present (a string places/{placeId} or null) — see isValidPlaceLink.
       function baseContentKeys() {
         return [
           'contentId', 'type', 'authorUid', 'authorDisplayName', 'authorUsername',
-          'cityName', 'countryCode', 'cityKey', 'categoryId',
+          'cityName', 'countryCode', 'cityKey', 'categoryId', 'placeId',
           'status', 'visibility', 'createdAt', 'updatedAt'
         ];
       }
@@ -187,6 +205,25 @@ service cloud.firestore {
           && data.keys().hasOnly(baseContentKeys().concat(['title', 'description', 'startsAt', 'endsAt', 'placeName']));
       }
 
+      // If placeId is set, the linked place must exist, be active, be in
+      // the SAME city as this content, and content.placeName must exactly
+      // match the place's real name — otherwise a modified client could
+      // link Karlstad content to a Stockholm place, or attach a spoofed
+      // placeName to a real place. exists() is checked before any get()
+      // on the same path, so a nonexistent/mistyped placeId is denied
+      // rather than causing get() to fail the whole rule evaluation.
+      function isValidPlaceLink(data) {
+        return data.placeId == null
+          || (
+            data.placeId is string
+            && data.placeId.size() > 0
+            && exists(/databases/$(database)/documents/places/$(data.placeId))
+            && get(/databases/$(database)/documents/places/$(data.placeId)).data.status == 'active'
+            && get(/databases/$(database)/documents/places/$(data.placeId)).data.cityKey == data.cityKey
+            && get(/databases/$(database)/documents/places/$(data.placeId)).data.name == data.placeName
+          );
+      }
+
       // Fetches the caller's own private profile once (Firestore rules
       // cache repeated get()/exists() calls to the same path within one
       // evaluation, so this costs a single read regardless of how many
@@ -207,6 +244,7 @@ service cloud.firestore {
           && data.visibility == 'city'
           && data.categoryId is string
           && data.categoryId.size() > 0
+          && isValidPlaceLink(data)
           && isServerTimestamp(data.createdAt)
           && isServerTimestamp(data.updatedAt)
           && (isValidPostShape(data) || isValidActivityShape(data) || isValidEventShape(data));

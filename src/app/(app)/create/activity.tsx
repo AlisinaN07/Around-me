@@ -7,10 +7,13 @@ import { CategorySelector } from '@/components/CategorySelector';
 import { HeaderScreenLayout } from '@/components/HeaderScreenLayout';
 import { DateTimeField } from '@/components/DateTimeField';
 import { FormField } from '@/components/FormField';
+import { PlaceSelector, type PlaceSelectorValue } from '@/components/PlaceSelector';
 import { Colors, Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
+import { useProfile } from '@/hooks/useProfile';
 import { createActivity } from '@/services/content';
 import { DESCRIPTION_MAX_LENGTH, MAX_PARTICIPANTS_LIMIT, PLACE_NAME_MAX_LENGTH, TITLE_MAX_LENGTH } from '@/types/content';
+import { formatCityDisplayName } from '@/utils/cityDisplay';
 import { addHours, roundUpToNextHalfHour } from '@/utils/timeFormat';
 
 const DEFAULT_START = roundUpToNextHalfHour(new Date());
@@ -18,10 +21,11 @@ const DEFAULT_END = addHours(DEFAULT_START, 1);
 
 export default function CreateActivityScreen() {
   const { user } = useAuth();
+  const { profile } = useProfile();
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
   const [categoryId, setCategoryId] = useState<string | null>(null);
-  const [placeName, setPlaceName] = useState('');
+  const [place, setPlace] = useState<PlaceSelectorValue>({ placeId: null, placeName: '' });
   const [startsAt, setStartsAt] = useState(DEFAULT_START);
   const [endsAt, setEndsAt] = useState(DEFAULT_END);
   const [maxParticipants, setMaxParticipants] = useState('');
@@ -40,7 +44,7 @@ export default function CreateActivityScreen() {
 
     const trimmedTitle = title.trim();
     const trimmedDescription = description.trim();
-    const trimmedPlace = placeName.trim();
+    const trimmedPlace = place.placeName.trim();
     let hasError = false;
 
     if (!trimmedTitle || trimmedTitle.length > TITLE_MAX_LENGTH) {
@@ -103,6 +107,7 @@ export default function CreateActivityScreen() {
       description: trimmedDescription,
       categoryId: categoryId!,
       placeName: trimmedPlace,
+      placeId: place.placeId,
       startsAt,
       endsAt,
       maxParticipants: parsedMaxParticipants,
@@ -158,16 +163,16 @@ export default function CreateActivityScreen() {
         error={categoryError ?? undefined}
       />
 
-      <FormField
+      <PlaceSelector
         label="Place"
-        placeholder="e.g. Tingvalla IP"
-        value={placeName}
-        onChangeText={(text) => {
-          setPlaceName(text);
+        cityKey={profile?.cityKey ?? ''}
+        cityLabel={profile?.cityName ? formatCityDisplayName(profile.cityName) : 'your city'}
+        value={place}
+        onChange={(next) => {
+          setPlace(next);
           if (placeError) setPlaceError(null);
         }}
         error={placeError ?? undefined}
-        maxLength={PLACE_NAME_MAX_LENGTH}
       />
 
       <DateTimeField

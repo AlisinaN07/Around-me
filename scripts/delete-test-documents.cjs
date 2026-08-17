@@ -19,6 +19,7 @@
 //     --users uid1,uid2 \
 //     --usernames someuser,otheruser \
 //     --content contentId1,contentId2 \
+//     --places placeId1,placeId2 \
 //     --paths content/activityId/participants/uid,content/activityId/stats/activity \
 //     --auth-uids uid1,uid2
 //
@@ -36,13 +37,13 @@ const apiv2 = require('firebase-tools/lib/apiv2');
 const auth = require('firebase-tools/lib/auth');
 
 const PROJECT = 'around-me-6a437';
-const COLLECTIONS = ['users', 'usernames', 'content'];
+const COLLECTIONS = ['users', 'usernames', 'content', 'places'];
 
 function parseArgs(argv) {
-  const ids = { users: [], usernames: [], content: [], paths: [], 'auth-uids': [] };
+  const ids = { users: [], usernames: [], content: [], places: [], paths: [], 'auth-uids': [] };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
-    const match = /^--(users|usernames|content|paths|auth-uids)$/.exec(arg);
+    const match = /^--(users|usernames|content|places|paths|auth-uids)$/.exec(arg);
     if (match) {
       const value = argv[i + 1];
       i += 1;
@@ -71,7 +72,7 @@ async function main() {
 
   if (totalDocIds === 0 && totalAuthIds === 0) {
     console.log('No IDs given — nothing to delete. Exiting.');
-    console.log('Pass --users, --usernames, --content, --paths, and/or --auth-uids with comma-separated IDs.');
+    console.log('Pass --users, --usernames, --content, --places, --paths, and/or --auth-uids with comma-separated IDs.');
     return;
   }
 

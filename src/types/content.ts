@@ -31,6 +31,16 @@ export type ContentBase = {
   categoryId: string;
   status: ContentStatus;
   visibility: ContentVisibility;
+  /**
+   * A known places/{placeId} this content is linked to, or null for a
+   * manually-typed place (see placeName below) or no place at all.
+   * Firestore rules independently verify — on create — that the place
+   * exists, is active, is in the same city as this content, and that
+   * placeName matches the place's real name (see firestore.rules); a
+   * modified client can't link Karlstad content to a Stockholm place, or
+   * attach a spoofed placeName to a real place.
+   */
+  placeId: string | null;
   createdAt: Timestamp;
   updatedAt: Timestamp;
 };

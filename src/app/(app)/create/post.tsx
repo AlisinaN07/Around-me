@@ -6,16 +6,20 @@ import { Button } from '@/components/Button';
 import { CategorySelector } from '@/components/CategorySelector';
 import { HeaderScreenLayout } from '@/components/HeaderScreenLayout';
 import { FormField } from '@/components/FormField';
+import { PlaceSelector, type PlaceSelectorValue } from '@/components/PlaceSelector';
 import { Colors, Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
+import { useProfile } from '@/hooks/useProfile';
 import { createPost } from '@/services/content';
-import { BODY_MAX_LENGTH, PLACE_NAME_MAX_LENGTH } from '@/types/content';
+import { BODY_MAX_LENGTH } from '@/types/content';
+import { formatCityDisplayName } from '@/utils/cityDisplay';
 
 export default function CreatePostScreen() {
   const { user } = useAuth();
+  const { profile } = useProfile();
   const [body, setBody] = useState('');
   const [categoryId, setCategoryId] = useState<string | null>(null);
-  const [placeName, setPlaceName] = useState('');
+  const [place, setPlace] = useState<PlaceSelectorValue>({ placeId: null, placeName: '' });
   const [bodyError, setBodyError] = useState<string | null>(null);
   const [categoryError, setCategoryError] = useState<string | null>(null);
   const [formError, setFormError] = useState<string | null>(null);
@@ -55,7 +59,8 @@ export default function CreatePostScreen() {
       uid: user.uid,
       body: trimmedBody,
       categoryId: categoryId!,
-      placeName: placeName.trim() || undefined,
+      placeName: place.placeName.trim() || undefined,
+      placeId: place.placeId,
     });
 
     setIsSubmitting(false);
@@ -101,12 +106,12 @@ export default function CreatePostScreen() {
         error={categoryError ?? undefined}
       />
 
-      <FormField
+      <PlaceSelector
         label="Place (optional)"
-        placeholder="e.g. Stora torget"
-        value={placeName}
-        onChangeText={setPlaceName}
-        maxLength={PLACE_NAME_MAX_LENGTH}
+        cityKey={profile?.cityKey ?? ''}
+        cityLabel={profile?.cityName ? formatCityDisplayName(profile.cityName) : 'your city'}
+        value={place}
+        onChange={setPlace}
       />
 
       {formError ? <Text style={styles.formError}>{formError}</Text> : null}

@@ -59,6 +59,29 @@ function isValidCategoryId(categoryId: string): boolean {
   return VALID_CATEGORY_IDS.has(categoryId);
 }
 
+/**
+ * Shared placeId validation for all three create functions. If a known
+ * Place was selected (placeId set), a matching placeName must also be
+ * present — Firestore rules independently re-verify that this placeId
+ * exists, is active, is in the same city, and that placeName matches the
+ * place's real name (see firestore.rules); this client-side check only
+ * catches the "picked a place but somehow cleared the name" edge case
+ * before hitting the network.
+ */
+function resolvePlaceId(
+  placeId: string | null | undefined,
+  placeName: string | undefined
+): { ok: true; placeId: string | null } | { ok: false; error: CreateContentError; message: string } {
+  const trimmed = placeId?.trim();
+  if (!trimmed) {
+    return { ok: true, placeId: null };
+  }
+  if (!placeName) {
+    return { ok: false, error: 'invalid-input', message: 'A selected place needs a place name.' };
+  }
+  return { ok: true, placeId: trimmed };
+}
+
 type TrustedAuthorFields = {
   authorUid: string;
   authorDisplayName: string;
@@ -113,6 +136,8 @@ export type CreatePostInput = {
   body: string;
   categoryId: string;
   placeName?: string;
+  /** A known places/{placeId}, or omitted/null for a manual place name (or no place at all). */
+  placeId?: string | null;
 };
 
 export async function createPost(input: CreatePostInput): Promise<CreateContentResult<PostContent>> {
@@ -136,6 +161,10 @@ export async function createPost(input: CreatePostInput): Promise<CreateContentR
   if (placeName && placeName.length > PLACE_NAME_MAX_LENGTH) {
     return { ok: false, error: 'invalid-input', message: 'Place name is too long.' };
   }
+  const placeLink = resolvePlaceId(input.placeId, placeName);
+  if (!placeLink.ok) {
+    return placeLink;
+  }
 
   const contentRef = doc(collection(firestore, CONTENT_COLLECTION));
   const data = {
@@ -146,6 +175,7 @@ export async function createPost(input: CreatePostInput): Promise<CreateContentR
     status: 'published',
     visibility: 'city',
     body,
+    placeId: placeLink.placeId,
     ...(placeName ? { placeName } : {}),
     createdAt: serverTimestamp(),
     updatedAt: serverTimestamp(),
@@ -211,6 +241,8 @@ export type CreateActivityInput = {
   startsAt: Date;
   endsAt: Date;
   placeName: string;
+  /** A known places/{placeId}, or omitted/null for a manually-typed place name. */
+  placeId?: string | null;
   maxParticipants?: number;
 };
 
@@ -227,6 +259,10 @@ export async function createActivity(input: CreateActivityInput): Promise<Create
   const validated = validateEventLikeFields(input);
   if (!validated.ok) {
     return validated;
+  }
+  const placeLink = resolvePlaceId(input.placeId, validated.placeName);
+  if (!placeLink.ok) {
+    return placeLink;
   }
 
   if (input.maxParticipants !== undefined) {
@@ -250,6 +286,7 @@ export async function createActivity(input: CreateActivityInput): Promise<Create
     title: validated.title,
     description: validated.description,
     placeName: validated.placeName,
+    placeId: placeLink.placeId,
     startsAt: Timestamp.fromDate(input.startsAt),
     endsAt: Timestamp.fromDate(input.endsAt),
     ...(input.maxParticipants !== undefined ? { maxParticipants: input.maxParticipants } : {}),
@@ -278,6 +315,8 @@ export type CreateEventInput = {
   startsAt: Date;
   endsAt: Date;
   placeName: string;
+  /** A known places/{placeId}, or omitted/null for a manually-typed place name. */
+  placeId?: string | null;
 };
 
 export async function createEvent(input: CreateEventInput): Promise<CreateContentResult<EventContent>> {
@@ -294,6 +333,10 @@ export async function createEvent(input: CreateEventInput): Promise<CreateConten
   if (!validated.ok) {
     return validated;
   }
+  const placeLink = resolvePlaceId(input.placeId, validated.placeName);
+  if (!placeLink.ok) {
+    return placeLink;
+  }
 
   const contentRef = doc(collection(firestore, CONTENT_COLLECTION));
   const data = {
@@ -306,6 +349,7 @@ export async function createEvent(input: CreateEventInput): Promise<CreateConten
     title: validated.title,
     description: validated.description,
     placeName: validated.placeName,
+    placeId: placeLink.placeId,
     startsAt: Timestamp.fromDate(input.startsAt),
     endsAt: Timestamp.fromDate(input.endsAt),
     createdAt: serverTimestamp(),
@@ -362,6 +406,27 @@ export async function fetchPublicUserContent(uid: string, limitCount = DEFAULT_F
   const contentQuery = query(
     collection(firestore, CONTENT_COLLECTION),
     where('authorUid', '==', uid),
+    where('status', '==', 'published'),
+    orderBy('createdAt', 'desc'),
+    limit(limitCount)
+  );
+  const snapshot = await getDocs(contentQuery);
+  return snapshot.docs.map((docSnapshot) => docSnapshot.data() as Content);
+}
+
+/**
+ * Published content linked to one known Place (posts, activities, events
+ * mixed), newest first — powers a Place page's "What's happening here".
+ * Only ever filters by placeId + status; manually-typed places (placeId
+ * null) never match this query.
+ */
+export async function fetchPlaceContent(placeId: string, limitCount = DEFAULT_FEED_LIMIT): Promise<Content[]> {
+  if (!firestore) {
+    return [];
+  }
+  const contentQuery = query(
+    collection(firestore, CONTENT_COLLECTION),
+    where('placeId', '==', placeId),
     where('status', '==', 'published'),
     orderBy('createdAt', 'desc'),
     limit(limitCount)

@@ -73,8 +73,29 @@ function contentBase(authorUid, authorDisplayName, authorUsername, contentId, ov
     countryCode: 'SE',
     cityKey: 'se:karlstad',
     categoryId: 'music',
+    placeId: null,
     status: 'published',
     visibility: 'city',
+    createdAt: serverTimestamp(),
+    updatedAt: serverTimestamp(),
+    ...overrides,
+  };
+}
+
+function validPlace(placeId, name, cityKey, overrides = {}) {
+  return {
+    placeId,
+    name,
+    nameLower: name.toLowerCase(),
+    categoryId: 'cafe',
+    cityName: cityKey === 'se:stockholm' ? 'Stockholm' : 'Karlstad',
+    countryCode: 'SE',
+    cityKey,
+    address: 'Test address 1',
+    latitude: 59.3,
+    longitude: 13.5,
+    geohash: 'u6sce',
+    status: 'active',
     createdAt: serverTimestamp(),
     updatedAt: serverTimestamp(),
     ...overrides,
@@ -1206,6 +1227,143 @@ async function main() {
       await assertFails(setDoc(doc(legacy, 'publicProfiles', 'legacy'), validPublicProfile('legacy', 'Legacy User', 'legacy_handle')));
       const snapshot = await getDoc(doc(legacy, 'publicProfiles', 'legacy'));
       assert.equal(snapshot.exists(), true);
+    });
+
+    // =========================================================================
+    // Places (Step 13) — places/{placeId} is read-only from any client.
+    // Seeded here with the security rules disabled (the same admin bypass
+    // seedProfile() uses above), mirroring how trusted tooling — never an
+    // ordinary client — creates real Places in production.
+    // =========================================================================
+    await testEnv.withSecurityRulesDisabled(async (adminContext) => {
+      const adminDb = adminContext.firestore();
+      await setDoc(doc(adminDb, 'places', 'place-karlstad-cafe'), validPlace('place-karlstad-cafe', 'Test Café Karlstad', 'se:karlstad'));
+      await setDoc(doc(adminDb, 'places', 'place-stockholm-venue'), validPlace('place-stockholm-venue', 'Test Venue Stockholm', 'se:stockholm'));
+      await setDoc(
+        doc(adminDb, 'places', 'place-inactive'),
+        validPlace('place-inactive', 'Test Inactive Place', 'se:karlstad', { status: 'pending' })
+      );
+    });
+
+    const aliceForPlaces = testEnv.authenticatedContext('alice').firestore();
+    const anonForPlaces = testEnv.unauthenticatedContext().firestore();
+
+    await check('ALLOW: authenticated user reads an active place', async () => {
+      const snapshot = await assertSucceeds(getDoc(doc(aliceForPlaces, 'places', 'place-karlstad-cafe')));
+      assert.equal(snapshot.data().name, 'Test Café Karlstad');
+    });
+
+    await check('ALLOW: authenticated city query reads active places (and excludes other cities)', async () => {
+      const cityPlacesQuery = query(
+        collection(aliceForPlaces, 'places'),
+        where('cityKey', '==', 'se:karlstad'),
+        where('status', '==', 'active')
+      );
+      const snapshot = await assertSucceeds(getDocs(cityPlacesQuery));
+      const ids = snapshot.docs.map((d) => d.id).sort();
+      assert.deepEqual(ids, ['place-karlstad-cafe']);
+    });
+
+    await check('DENY: unauthenticated read of a place', async () => {
+      await assertFails(getDoc(doc(anonForPlaces, 'places', 'place-karlstad-cafe')));
+    });
+
+    await check('DENY: ordinary client creates a place', async () => {
+      await assertFails(setDoc(doc(aliceForPlaces, 'places', 'place-fake'), validPlace('place-fake', 'Fake Place', 'se:karlstad')));
+    });
+
+    await check('DENY: ordinary client updates a place', async () => {
+      await assertFails(updateDoc(doc(aliceForPlaces, 'places', 'place-karlstad-cafe'), { name: 'Hijacked Name' }));
+    });
+
+    await check('DENY: ordinary client deletes a place', async () => {
+      await assertFails(deleteDoc(doc(aliceForPlaces, 'places', 'place-karlstad-cafe')));
+    });
+
+    // --- Content <-> Place linking ---------------------------------------
+
+    await check('ALLOW: content with an active same-city placeId + matching placeName', async () => {
+      await assertSucceeds(
+        setDoc(
+          doc(aliceForPlaces, 'content', 'post-known-place'),
+          validPost('alice', 'Test User', 'alice_handle', 'post-known-place', {
+            placeId: 'place-karlstad-cafe',
+            placeName: 'Test Café Karlstad',
+          })
+        )
+      );
+    });
+
+    await check('ALLOW: content with placeId null + a valid manual place name', async () => {
+      await assertSucceeds(
+        setDoc(
+          doc(aliceForPlaces, 'content', 'post-manual-place'),
+          validPost('alice', 'Test User', 'alice_handle', 'post-manual-place', {
+            placeId: null,
+            placeName: 'Some spot not in Around Me yet',
+          })
+        )
+      );
+    });
+
+    await check('DENY: content links to a nonexistent placeId', async () => {
+      await assertFails(
+        setDoc(
+          doc(aliceForPlaces, 'content', 'post-bad-place-1'),
+          validPost('alice', 'Test User', 'alice_handle', 'post-bad-place-1', {
+            placeId: 'place-does-not-exist',
+            placeName: 'Whatever',
+          })
+        )
+      );
+    });
+
+    await check('DENY: content links to an inactive place', async () => {
+      await assertFails(
+        setDoc(
+          doc(aliceForPlaces, 'content', 'post-bad-place-2'),
+          validPost('alice', 'Test User', 'alice_handle', 'post-bad-place-2', {
+            placeId: 'place-inactive',
+            placeName: 'Test Inactive Place',
+          })
+        )
+      );
+    });
+
+    await check('DENY: content links to a different-city place (Stockholm place on Karlstad content)', async () => {
+      await assertFails(
+        setDoc(
+          doc(aliceForPlaces, 'content', 'post-bad-place-3'),
+          validPost('alice', 'Test User', 'alice_handle', 'post-bad-place-3', {
+            placeId: 'place-stockholm-venue',
+            placeName: 'Test Venue Stockholm',
+          })
+        )
+      );
+    });
+
+    await check('DENY: content spoofs placeName for a real, same-city place', async () => {
+      await assertFails(
+        setDoc(
+          doc(aliceForPlaces, 'content', 'post-bad-place-4'),
+          validPost('alice', 'Test User', 'alice_handle', 'post-bad-place-4', {
+            placeId: 'place-karlstad-cafe',
+            placeName: 'Fake Casino',
+          })
+        )
+      );
+    });
+
+    await check('DENY: malformed placeId type (number instead of string)', async () => {
+      await assertFails(
+        setDoc(
+          doc(aliceForPlaces, 'content', 'post-bad-place-5'),
+          validPost('alice', 'Test User', 'alice_handle', 'post-bad-place-5', {
+            placeId: 12345,
+            placeName: 'Test Café Karlstad',
+          })
+        )
+      );
     });
 
     await testEnv.clearFirestore();
