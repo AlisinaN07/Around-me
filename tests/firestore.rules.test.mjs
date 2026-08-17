@@ -130,6 +130,23 @@ function validResponse(uid, displayName, username, status, overrides = {}) {
   return { uid, displayName, username, status, createdAt: serverTimestamp(), updatedAt: serverTimestamp(), ...overrides };
 }
 
+function validLike(uid, overrides = {}) {
+  return { uid, createdAt: serverTimestamp(), ...overrides };
+}
+
+function validComment(commentId, authorUid, authorDisplayName, authorUsername, body, overrides = {}) {
+  return {
+    commentId,
+    authorUid,
+    authorDisplayName,
+    authorUsername,
+    body,
+    createdAt: serverTimestamp(),
+    updatedAt: serverTimestamp(),
+    ...overrides,
+  };
+}
+
 /** Mirrors the real joinActivity transaction: participant create + stats increment, atomically. */
 function joinTransaction(db, activityId, uid, displayName, username, nextCount) {
   const participantRef = doc(db, 'content', activityId, 'participants', uid);
@@ -377,8 +394,13 @@ async function main() {
       await assertFails(deleteDoc(doc(anon, 'content', 'post-bob-1')));
     });
 
-    await check('ALLOW: author deletes their own content', async () => {
-      await assertSucceeds(deleteDoc(doc(alice, 'content', 'post-alice-1')));
+    // Step 10: root content delete is now disabled entirely (see
+    // firestore.rules) — content has five possible subcollections
+    // (participants/stats/responses/likes/comments) that Firestore never
+    // cascade-deletes, and there's no safe production cascade-delete
+    // workflow yet. This used to be an ALLOW case; it's a DENY case now.
+    await check('DENY: author can no longer delete their own content (cascade-delete safety)', async () => {
+      await assertFails(deleteDoc(doc(alice, 'content', 'post-alice-1')));
     });
 
     // =========================================================================
@@ -687,6 +709,232 @@ async function main() {
       await assertSucceeds(deleteDoc(doc(bob, 'content', 'event-agg-1', 'responses', 'bob')));
       const counts = await responseCounts(bob);
       assert.deepEqual(counts, { interestedCount: 0, goingCount: 1 });
+    });
+
+    // =========================================================================
+    // content/{contentId}/likes/{uid}
+    // Reuses post-alice-1, post-bob-1, activity-alice-1, event-alice-1 from
+    // earlier in the suite (all still exist — content delete is disabled).
+    // =========================================================================
+    await check('ALLOW: completed user Likes a published Post', async () => {
+      await assertSucceeds(setDoc(doc(bob, 'content', 'post-alice-1', 'likes', 'bob'), validLike('bob')));
+    });
+
+    await check('ALLOW: Likes a published Activity', async () => {
+      await assertSucceeds(setDoc(doc(bob, 'content', 'activity-alice-1', 'likes', 'bob'), validLike('bob')));
+    });
+
+    await check('ALLOW: Likes a published Event', async () => {
+      await assertSucceeds(setDoc(doc(bob, 'content', 'event-alice-1', 'likes', 'bob'), validLike('bob')));
+    });
+
+    await check('ALLOW: authenticated user reads Likes', async () => {
+      await assertSucceeds(getDocs(collection(carol, 'content', 'post-alice-1', 'likes')));
+    });
+
+    await check('DENY: duplicate Like does not create a second record', async () => {
+      // bob already liked activity-alice-1 above — re-creating the same
+      // uid-keyed doc is a write-to-existing-doc, i.e. an update, and
+      // updates are denied — this is what actually prevents double-liking.
+      await assertFails(setDoc(doc(bob, 'content', 'activity-alice-1', 'likes', 'bob'), validLike('bob')));
+    });
+
+    await check('ALLOW: user deletes their own Like', async () => {
+      await assertSucceeds(deleteDoc(doc(bob, 'content', 'post-alice-1', 'likes', 'bob')));
+    });
+
+    await check('DENY: unauthenticated Like', async () => {
+      await assertFails(setDoc(doc(anon, 'content', 'post-alice-1', 'likes', 'ghost'), validLike('ghost')));
+    });
+
+    await check('DENY: Like document created for another uid', async () => {
+      await assertFails(setDoc(doc(bob, 'content', 'post-alice-1', 'likes', 'carol'), validLike('carol')));
+    });
+
+    await check('DENY: mismatched uid field inside Like data', async () => {
+      await assertFails(setDoc(doc(carol, 'content', 'post-alice-1', 'likes', 'carol'), validLike('bob')));
+    });
+
+    await check('DENY: update an existing Like', async () => {
+      // bob's like on event-alice-1 is still there (never deleted above).
+      await assertFails(updateDoc(doc(bob, 'content', 'event-alice-1', 'likes', 'bob'), { createdAt: serverTimestamp() }));
+    });
+
+    await check('DENY: user deletes another user\'s Like', async () => {
+      await assertFails(deleteDoc(doc(alice, 'content', 'event-alice-1', 'likes', 'bob')));
+    });
+
+    await check('DENY: Like on nonexistent content', async () => {
+      await assertFails(setDoc(doc(bob, 'content', 'does-not-exist', 'likes', 'bob'), validLike('bob')));
+    });
+
+    await check('setup: seed an unpublished content doc (admin bypass — content create rules always force status=published)', async () => {
+      await testEnv.withSecurityRulesDisabled(async (adminContext) => {
+        await setDoc(doc(adminContext.firestore(), 'content', 'post-unpublished-1'), {
+          ...validPost('alice', 'Test User', 'alice_handle', 'post-unpublished-1'),
+          status: 'draft',
+        });
+      });
+    });
+
+    await check('DENY: Like on unpublished content', async () => {
+      await assertFails(setDoc(doc(bob, 'content', 'post-unpublished-1', 'likes', 'bob'), validLike('bob')));
+    });
+
+    async function likeCount(db, contentId) {
+      const snapshot = await getCountFromServer(collection(db, 'content', contentId, 'likes'));
+      return snapshot.data().count;
+    }
+
+    await check('setup: fresh Post for Like aggregation testing', async () => {
+      await assertSucceeds(setDoc(doc(alice, 'content', 'post-agg-1'), validPost('alice', 'Test User', 'alice_handle', 'post-agg-1')));
+    });
+
+    await check('AGGREGATION: Like count 0 -> 1 -> 2 -> 1', async () => {
+      assert.equal(await likeCount(bob, 'post-agg-1'), 0);
+      await assertSucceeds(setDoc(doc(bob, 'content', 'post-agg-1', 'likes', 'bob'), validLike('bob')));
+      assert.equal(await likeCount(bob, 'post-agg-1'), 1);
+      await assertSucceeds(setDoc(doc(carol, 'content', 'post-agg-1', 'likes', 'carol'), validLike('carol')));
+      assert.equal(await likeCount(bob, 'post-agg-1'), 2);
+      await assertSucceeds(deleteDoc(doc(bob, 'content', 'post-agg-1', 'likes', 'bob')));
+      assert.equal(await likeCount(bob, 'post-agg-1'), 1);
+    });
+
+    // =========================================================================
+    // content/{contentId}/comments/{commentId}
+    // =========================================================================
+    await check('ALLOW: completed User A comments on published content', async () => {
+      await assertSucceeds(
+        setDoc(
+          doc(alice, 'content', 'post-bob-1', 'comments', 'comment-1'),
+          validComment('comment-1', 'alice', 'Test User', 'alice_handle', 'Nice post!')
+        )
+      );
+    });
+
+    await check('ALLOW: authenticated user reads comments', async () => {
+      await assertSucceeds(getDocs(collection(carol, 'content', 'post-bob-1', 'comments')));
+    });
+
+    await check('ALLOW: User A deletes their own comment', async () => {
+      await assertSucceeds(deleteDoc(doc(alice, 'content', 'post-bob-1', 'comments', 'comment-1')));
+    });
+
+    await check('DENY: unauthenticated comment', async () => {
+      await assertFails(
+        setDoc(
+          doc(anon, 'content', 'post-bob-1', 'comments', 'comment-ghost'),
+          validComment('comment-ghost', 'ghost', 'Ghost', 'ghost_handle', 'hi')
+        )
+      );
+    });
+
+    await check('DENY: commenter with no completed profile', async () => {
+      const dave = testEnv.authenticatedContext('dave').firestore(); // dave has no seeded profile anywhere in this suite
+      await assertFails(
+        setDoc(doc(dave, 'content', 'post-bob-1', 'comments', 'comment-dave'), validComment('comment-dave', 'dave', 'Dave', 'dave_handle', 'hi'))
+      );
+    });
+
+    await check('DENY: spoofed authorUid', async () => {
+      await assertFails(
+        setDoc(
+          doc(bob, 'content', 'post-bob-1', 'comments', 'comment-spoof-uid'),
+          validComment('comment-spoof-uid', 'alice', 'Bob Bobsson', 'bob_handle', 'hi')
+        )
+      );
+    });
+
+    await check('DENY: spoofed authorUsername', async () => {
+      await assertFails(
+        setDoc(
+          doc(bob, 'content', 'post-bob-1', 'comments', 'comment-spoof-username'),
+          validComment('comment-spoof-username', 'bob', 'Bob Bobsson', 'alice_handle', 'hi')
+        )
+      );
+    });
+
+    await check('DENY: spoofed authorDisplayName', async () => {
+      await assertFails(
+        setDoc(
+          doc(bob, 'content', 'post-bob-1', 'comments', 'comment-spoof-name'),
+          validComment('comment-spoof-name', 'bob', 'Test User', 'bob_handle', 'hi')
+        )
+      );
+    });
+
+    await check('DENY: empty comment body', async () => {
+      await assertFails(
+        setDoc(doc(bob, 'content', 'post-bob-1', 'comments', 'comment-empty'), validComment('comment-empty', 'bob', 'Bob Bobsson', 'bob_handle', ''))
+      );
+    });
+
+    await check('DENY: comment body over 500 characters', async () => {
+      await assertFails(
+        setDoc(
+          doc(bob, 'content', 'post-bob-1', 'comments', 'comment-long'),
+          validComment('comment-long', 'bob', 'Bob Bobsson', 'bob_handle', 'x'.repeat(501))
+        )
+      );
+    });
+
+    await check('DENY: malformed comment shape (missing body)', async () => {
+      const malformed = validComment('comment-malformed', 'bob', 'Bob Bobsson', 'bob_handle', 'hi');
+      delete malformed.body;
+      await assertFails(setDoc(doc(bob, 'content', 'post-bob-1', 'comments', 'comment-malformed'), malformed));
+    });
+
+    await check('DENY: commentId field does not match document ID', async () => {
+      await assertFails(
+        setDoc(doc(bob, 'content', 'post-bob-1', 'comments', 'comment-mismatch'), validComment('wrong-id', 'bob', 'Bob Bobsson', 'bob_handle', 'hi'))
+      );
+    });
+
+    await check('DENY: update an existing comment', async () => {
+      await assertSucceeds(
+        setDoc(doc(bob, 'content', 'post-bob-1', 'comments', 'comment-2'), validComment('comment-2', 'bob', 'Bob Bobsson', 'bob_handle', 'Original'))
+      );
+      await assertFails(updateDoc(doc(bob, 'content', 'post-bob-1', 'comments', 'comment-2'), { body: 'Edited' }));
+    });
+
+    await check('DENY: User A deletes User B\'s comment', async () => {
+      await assertFails(deleteDoc(doc(alice, 'content', 'post-bob-1', 'comments', 'comment-2')));
+    });
+
+    await check('DENY: comment on nonexistent content', async () => {
+      await assertFails(
+        setDoc(doc(bob, 'content', 'does-not-exist', 'comments', 'comment-x'), validComment('comment-x', 'bob', 'Bob Bobsson', 'bob_handle', 'hi'))
+      );
+    });
+
+    await check('DENY: comment on unpublished content', async () => {
+      await assertFails(
+        setDoc(
+          doc(bob, 'content', 'post-unpublished-1', 'comments', 'comment-y'),
+          validComment('comment-y', 'bob', 'Bob Bobsson', 'bob_handle', 'hi')
+        )
+      );
+    });
+
+    async function commentCount(db, contentId) {
+      const snapshot = await getCountFromServer(collection(db, 'content', contentId, 'comments'));
+      return snapshot.data().count;
+    }
+
+    await check('setup: fresh Post for Comment aggregation testing', async () => {
+      await assertSucceeds(setDoc(doc(alice, 'content', 'post-agg-2'), validPost('alice', 'Test User', 'alice_handle', 'post-agg-2')));
+    });
+
+    await check('AGGREGATION: Comment count 0 -> 1 -> 2 -> 1', async () => {
+      assert.equal(await commentCount(bob, 'post-agg-2'), 0);
+      await assertSucceeds(setDoc(doc(bob, 'content', 'post-agg-2', 'comments', 'c-a'), validComment('c-a', 'bob', 'Bob Bobsson', 'bob_handle', 'First!')));
+      assert.equal(await commentCount(bob, 'post-agg-2'), 1);
+      await assertSucceeds(
+        setDoc(doc(carol, 'content', 'post-agg-2', 'comments', 'c-b'), validComment('c-b', 'carol', 'Carol Carlsson', 'carol_handle', 'Second!'))
+      );
+      assert.equal(await commentCount(bob, 'post-agg-2'), 2);
+      await assertSucceeds(deleteDoc(doc(bob, 'content', 'post-agg-2', 'comments', 'c-a')));
+      assert.equal(await commentCount(bob, 'post-agg-2'), 1);
     });
 
     await testEnv.clearFirestore();

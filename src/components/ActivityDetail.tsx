@@ -4,6 +4,7 @@ import { StyleSheet, Text, View } from 'react-native';
 
 import { Avatar } from '@/components/Avatar';
 import { Button } from '@/components/Button';
+import { EngagementSection } from '@/components/EngagementSection';
 import { INTERESTS } from '@/constants/interests';
 import { Colors, Radius, Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
@@ -155,6 +156,8 @@ export function ActivityDetail({ content }: { content: ActivityContent }) {
           </View>
         )}
       </View>
+
+      <EngagementSection contentId={content.contentId} />
     </View>
   );
 }

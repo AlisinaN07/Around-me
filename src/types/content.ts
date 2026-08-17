@@ -110,3 +110,33 @@ export type EventResponse = {
   createdAt: Timestamp;
   updatedAt: Timestamp;
 };
+
+/**
+ * content/{contentId}/likes/{uid} — one document per user who liked a Post,
+ * Activity, or Event. The document ID (the liker's own uid) is what
+ * guarantees at most one Like per user; there is nothing else to store, so
+ * unlike participants/responses this carries no public-safe profile
+ * snapshot at all — just enough to prove who liked and when.
+ */
+export type ContentLike = {
+  uid: string;
+  createdAt: Timestamp;
+};
+
+export const COMMENT_BODY_MAX_LENGTH = 500;
+
+/**
+ * content/{contentId}/comments/{commentId} — top-level comments only for
+ * Step 10, no replies/threads. authorDisplayName/authorUsername are a
+ * public-safe snapshot of the commenter's own profile, verified against it
+ * by Firestore rules on create — same pattern as content authorship itself.
+ */
+export type ContentComment = {
+  commentId: string;
+  authorUid: string;
+  authorDisplayName: string;
+  authorUsername: string;
+  body: string;
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+};

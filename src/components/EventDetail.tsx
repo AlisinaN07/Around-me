@@ -2,6 +2,7 @@ import { Ionicons } from '@expo/vector-icons';
 import { useCallback, useEffect, useState } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 
+import { EngagementSection } from '@/components/EngagementSection';
 import { INTERESTS } from '@/constants/interests';
 import { Colors, Radius, Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
@@ -128,6 +129,8 @@ export function EventDetail({ content }: { content: EventContent }) {
           </View>
         </>
       )}
+
+      <EngagementSection contentId={content.contentId} />
     </View>
   );
 }

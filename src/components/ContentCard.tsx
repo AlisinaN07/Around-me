@@ -26,7 +26,12 @@ export function ContentCard({ item, currentUid }: ContentCardProps) {
   const timeLabel = item.type === 'post' ? formatTimeAgo(item.createdAt.toDate()) : formatEventTime(item.startsAt.toDate());
 
   return (
-    <View style={styles.card}>
+    <Pressable
+      style={styles.card}
+      onPress={() => router.push(`/content/${item.contentId}`)}
+      accessibilityRole="button"
+      accessibilityLabel={`View ${item.type}`}
+    >
       <View style={styles.header}>
         <View style={styles.authorRow}>
           <Text style={styles.authorName} numberOfLines={1}>
@@ -80,16 +85,11 @@ export function ContentCard({ item, currentUid }: ContentCardProps) {
       ) : null}
 
       {item.type !== 'post' && (
-        <Pressable
-          style={styles.actionButton}
-          onPress={() => router.push(`/content/${item.contentId}`)}
-          accessibilityRole="button"
-          accessibilityLabel={`View ${item.type}`}
-        >
+        <View style={styles.actionButton}>
           <Text style={styles.actionText}>{item.type === 'activity' ? 'View activity' : 'View event'}</Text>
-        </Pressable>
+        </View>
       )}
-    </View>
+    </Pressable>
   );
 }
 

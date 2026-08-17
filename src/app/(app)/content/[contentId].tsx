@@ -7,6 +7,7 @@ import { ActivityDetail } from '@/components/ActivityDetail';
 import { Button } from '@/components/Button';
 import { EventDetail } from '@/components/EventDetail';
 import { HeaderScreenLayout } from '@/components/HeaderScreenLayout';
+import { PostDetail } from '@/components/PostDetail';
 import { Colors, Spacing } from '@/constants/theme';
 import { fetchContentById } from '@/services/content';
 import type { Content } from '@/types/content';
@@ -51,7 +52,7 @@ export default function ContentDetailScreen() {
         <View style={styles.centered}>
           <Ionicons name="alert-circle-outline" size={32} color={Colors.textSecondary} />
           <Text style={styles.errorTitle}>
-            {title === 'Event' ? "Couldn't load event." : "Couldn't load activity."}
+            {title === 'Event' ? "Couldn't load event." : title === 'Activity' ? "Couldn't load activity." : "Couldn't load post."}
           </Text>
           <Button label="Try again" onPress={load} />
         </View>
@@ -60,12 +61,7 @@ export default function ContentDetailScreen() {
       ) : content.type === 'event' ? (
         <EventDetail content={content} />
       ) : (
-        <View style={styles.postFallback}>
-          <Text style={styles.postAuthor}>
-            {content.authorDisplayName} · @{content.authorUsername}
-          </Text>
-          <Text style={styles.postBody}>{content.body}</Text>
-        </View>
+        <PostDetail content={content} />
       )}
     </HeaderScreenLayout>
   );
@@ -86,17 +82,5 @@ const styles = StyleSheet.create({
     fontSize: 15,
     fontWeight: '700',
     textAlign: 'center',
-  },
-  postFallback: {
-    gap: Spacing.sm,
-  },
-  postAuthor: {
-    color: Colors.textSecondary,
-    fontSize: 13,
-  },
-  postBody: {
-    color: Colors.text,
-    fontSize: 16,
-    lineHeight: 22,
   },
 });

@@ -149,7 +149,14 @@ service cloud.firestore {
       // edit flow exists.
       allow update: if false;
 
-      allow delete: if isOwner(resource.data.authorUid);
+      // Disabled as of Step 10: content now has five possible subcollections
+      // (participants, stats, responses, likes, comments) and Firestore
+      // never cascade-deletes them when the parent document is removed.
+      // There is no safe production cascade-delete workflow yet (and no
+      // client "delete content" UI), so allowing a client to delete the
+      // parent alone would leave those subcollections permanently orphaned.
+      // Revisit once a real delete flow (Cloud Function or equivalent) exists.
+      allow delete: if false;
 
       // content/{contentId}/participants/{uid} — one document per user who
       // joined an Activity. Paired 1:1 with a content/{contentId}/stats/activity
@@ -305,6 +312,72 @@ service cloud.firestore {
           && newData.createdAt == oldData.createdAt
           && isServerTimestamp(newData.updatedAt)
           && newData.keys().hasOnly(['uid', 'displayName', 'username', 'status', 'createdAt', 'updatedAt']);
+      }
+
+      // content/{contentId}/likes/{uid} — one document per user who liked
+      // this Post/Activity/Event, keyed by the liker's own uid (which is
+      // itself what guarantees at most one Like per user — no separate
+      // uniqueness check needed). No counter to keep paired: like counts
+      // come from a getCountFromServer() aggregation query instead (see
+      // src/services/socialEngagement.ts).
+      match /likes/{uid} {
+        function likeParentPublished() {
+          return get(/databases/$(database)/documents/content/$(contentId)).data.status == 'published';
+        }
+
+        allow read: if isSignedIn() && likeParentPublished();
+
+        allow create: if isSignedIn()
+          && uid == request.auth.uid
+          && likeParentPublished()
+          && request.resource.data.uid == request.auth.uid
+          && isServerTimestamp(request.resource.data.createdAt)
+          && request.resource.data.keys().hasOnly(['uid', 'createdAt']);
+
+        // Re-liking an existing Like doc is an update, not a create — denying
+        // update here is what actually prevents a duplicate/overwritten Like,
+        // not a separate "already exists" check on create.
+        allow update: if false;
+
+        allow delete: if isOwner(uid);
+      }
+
+      // content/{contentId}/comments/{commentId} — top-level comments only
+      // for Step 10 (no replies/threads). authorDisplayName/authorUsername
+      // are a public-safe snapshot of the commenter's own profile, verified
+      // against it below — same pattern as content authorship itself.
+      match /comments/{commentId} {
+        function commentParentPublished() {
+          return get(/databases/$(database)/documents/content/$(contentId)).data.status == 'published';
+        }
+
+        allow read: if isSignedIn() && commentParentPublished();
+
+        allow create: if isSignedIn() && isValidCommentCreate(contentId, commentId, request.resource.data);
+
+        // Comment editing is a later step.
+        allow update: if false;
+
+        // Only the author — not the content's author — can delete a
+        // comment for now. Moderation-by-content-author comes later.
+        allow delete: if isOwner(resource.data.authorUid);
+      }
+
+      function isValidCommentCreate(contentId, commentId, data) {
+        let profile = get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+        return exists(/databases/$(database)/documents/users/$(request.auth.uid))
+          && profile.onboardingCompleted == true
+          && get(/databases/$(database)/documents/content/$(contentId)).data.status == 'published'
+          && data.commentId == commentId
+          && data.authorUid == request.auth.uid
+          && data.authorDisplayName == profile.displayName
+          && data.authorUsername == profile.username
+          && data.body is string
+          && data.body.size() > 0
+          && data.body.size() <= 500
+          && isServerTimestamp(data.createdAt)
+          && isServerTimestamp(data.updatedAt)
+          && data.keys().hasOnly(['commentId', 'authorUid', 'authorDisplayName', 'authorUsername', 'body', 'createdAt', 'updatedAt']);
       }
     }
 

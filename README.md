@@ -2,7 +2,7 @@
 
 Location-based social network organized around cities — "See what's happening around you, right now."
 
-Email/password authentication, onboarding (name, username, city, interests), a full tab-based application shell (Home, Reels, Create, Map, Profile), and the real Firestore content backend (posts, activities, events) are implemented. Create → Post/Activity/Event → Publish is wired to that backend, and Home's Around You / Happening Now sections render the real city feed. Activity/Event cards open real detail screens with Join/Leave and Interested/Going participation, backed by Firestore transactions and security rules. Reels (both creation and the Local Reels feed) remain unimplemented placeholders — no media/Storage layer exists yet. Likes, comments, and other general social engagement are not implemented yet either.
+Email/password authentication, onboarding (name, username, city, interests), a full tab-based application shell (Home, Reels, Create, Map, Profile), and the real Firestore content backend (posts, activities, events) are implemented. Create → Post/Activity/Event → Publish is wired to that backend, and Home's Around You / Happening Now sections render the real city feed. Every content type has a real detail screen — Activity with Join/Leave, Event with Interested/Going, and all three with Likes and Comments — backed by Firestore transactions/writes and security rules. Reels (both creation and the Local Reels feed) remain unimplemented placeholders — no media/Storage layer exists yet. Replies, follows, saves, notifications, and moderation are not implemented yet either.
 
 ## Stack
 
@@ -54,14 +54,14 @@ src/
   components/          Button, FormField, FormScreenLayout, HeaderScreenLayout, OnboardingProgress,
                        CountryPicker, Avatar, SectionHeader, CategoryChip, CategorySelector,
                        DateTimeField (+ .web variant), ContentCard, HappeningNowCard,
-                       ActivityDetail, EventDetail
+                       PostDetail, ActivityDetail, EventDetail, EngagementSection
   constants/            theme.ts (design tokens), countries.ts, interests.ts, categoryFilters.ts
   hooks/                useAuth.ts, useProfile.ts
   providers/            AuthProvider, ProfileProvider, OnboardingDraftProvider
   services/            firebase.ts (App), auth.ts (Auth), firestore.ts (Firestore),
                        userProfile.ts (profile data layer), content.ts (posts/activities/events
                        data layer), engagement.ts (activity participation + event responses),
-                       location.ts (one-time city lookup)
+                       socialEngagement.ts (likes + comments), location.ts (one-time city lookup)
   types/                Shared TypeScript types and type augmentations
   utils/                authErrors.ts, username.ts, cityKey.ts, cityDisplay.ts, timeFormat.ts
 scripts/                delete-test-documents.cjs — explicit-ID-only disposable test cleanup
@@ -81,7 +81,7 @@ App data lives in Cloud Firestore, on the same Firebase project as Auth (`around
 - `usernames/{usernameLower}` — a uniqueness index reserving each username to one `uid`. Created atomically with the profile in a single transaction (see `src/services/userProfile.ts`).
 - `content/{contentId}` — one unified collection for `post` / `activity` / `event` (a discriminated union in `src/types/content.ts`), since Home will eventually be a mixed feed of all three. Reels get their own architecture in a later step — different media/storage concerns.
 
-Every content document carries `authorUid`, `authorDisplayName`, `authorUsername`, `cityName`, `countryCode`, `cityKey` — a **public-safe snapshot** of the author's private profile, copied at write time so the feed never has to read another user's `users/{uid}` document. Firestore rules verify this snapshot exactly matches the author's own profile on create, so a modified client can't post as another user or claim another city. Reads are open to any signed-in user (not scoped to the reader's own city — browsing other cities is intentional); creates require a completed profile; only the author can delete their own content; updates are denied entirely for now (no edit UI exists yet, so there's nothing to validate "which fields are safely mutable" against).
+Every content document carries `authorUid`, `authorDisplayName`, `authorUsername`, `cityName`, `countryCode`, `cityKey` — a **public-safe snapshot** of the author's private profile, copied at write time so the feed never has to read another user's `users/{uid}` document. Firestore rules verify this snapshot exactly matches the author's own profile on create, so a modified client can't post as another user or claim another city. Reads are open to any signed-in user (not scoped to the reader's own city — browsing other cities is intentional); creates require a completed profile; updates are denied entirely for now (no edit UI exists yet, so there's nothing to validate "which fields are safely mutable" against). **Root content delete is disabled** (`allow delete: if false`) as of Step 10 — content now has five possible subcollections (`participants`, `stats`, `responses`, `likes`, `comments`) that Firestore never cascade-deletes, and there's no safe production cascade-delete workflow or client "delete content" UI yet, so allowing a client to delete the parent alone would leave those subcollections permanently orphaned.
 
 Content queries (`src/services/content.ts`) are one-shot reads with explicit limits — no realtime listeners, no unbounded queries:
 - `fetchCityFeed(cityKey)` — newest published content for a city, mixed types, `orderBy(createdAt desc)`.
@@ -94,7 +94,12 @@ Two subcollections support participation, added under `content/{contentId}`:
 - `content/{activityId}/stats/activity` — a single `{ participantCount, updatedAt }` document, kept in sync with the participant subcollection by a Firestore transaction on every join/leave (see Engagement below) so `maxParticipants` can be enforced without reading every participant.
 - `content/{eventId}/responses/{uid}` — one document per user's Interested/Going response to an Event (`status: 'interested' | 'going'`, switched in place rather than creating a second document). No separate counter — Interested/Going counts come from `getCountFromServer` aggregation queries instead.
 
-All access goes through `src/services/userProfile.ts`, `src/services/content.ts`, and `src/services/engagement.ts` — UI code should never import `firebase/firestore` directly.
+Two more subcollections support general social engagement (Post/Activity/Event alike), added in Step 10:
+
+- `content/{contentId}/likes/{uid}` — one document per user who liked this content, keyed by the liker's own uid (which is itself what guarantees at most one Like per user). No public-safe snapshot needed — just `{ uid, createdAt }`. Like counts come from a `getCountFromServer` aggregation query, same as Event response counts — no counter to keep paired.
+- `content/{contentId}/comments/{commentId}` — top-level comments only for Step 10 (no replies/threads), same public-safe-snapshot pattern as content authorship (`authorDisplayName`/`authorUsername` verified against the commenter's own profile). Comment counts are also aggregation-based.
+
+All access goes through `src/services/userProfile.ts`, `src/services/content.ts`, `src/services/engagement.ts`, and `src/services/socialEngagement.ts` — UI code should never import `firebase/firestore` directly.
 
 **Security rules** (`firestore.rules`) enforce least privilege throughout. Everything unspecified is denied by default. **Never switch production rules to `allow read, write: if true` — even temporarily.**
 
@@ -104,7 +109,7 @@ Before deploying a rules change, test it against the emulator:
 npm run test:rules
 ```
 
-This runs `tests/firestore.rules.test.mjs` against a local Firestore emulator using `@firebase/rules-unit-testing`, covering the ALLOW/DENY cases for `users`, `usernames`, `content`, `content/{id}/participants`, `content/{id}/stats`, and `content/{id}/responses`. (Note: on at least one sandboxed dev environment, the emulator starts fine but pushing the ruleset to it fails with `ECONNRESET`/`fetch failed` for unrelated network reasons — if `npm run test:rules` fails that way for you, verify the same scenarios directly against a real project instead, as was done manually to validate the rules deployed here.)
+This runs `tests/firestore.rules.test.mjs` against a local Firestore emulator using `@firebase/rules-unit-testing`, covering the ALLOW/DENY cases for `users`, `usernames`, `content`, `content/{id}/participants`, `content/{id}/stats`, `content/{id}/responses`, `content/{id}/likes`, and `content/{id}/comments`. (Note: on at least one sandboxed dev environment, the emulator starts fine but pushing the ruleset to it fails with `ECONNRESET`/`fetch failed` for unrelated network reasons — if `npm run test:rules` fails that way for you, verify the same scenarios directly against a real project instead, as was done manually to validate the rules deployed here.)
 
 To deploy rules and indexes:
 
@@ -143,7 +148,18 @@ Date/time fields use `@react-native-community/datetimepicker` on iOS/Android (`s
 
 Firestore rules enforce all of this server-side too, independent of the client: a participant/response document's `uid`/`displayName`/`username` must match the caller's own profile, a participant or response can only be created for a published, not-yet-ended Activity/Event, and the `stats/activity` counter can only change by exactly ±1 in the same atomic write as the caller's own participant document appearing/disappearing (checked via `existsAfter()`/`getAfter()` on both sides of the pair) — a client can never write `participantCount` directly, exceed `maxParticipants`, or push the count negative.
 
-Activity/Event detail screens (`src/app/(app)/content/[contentId].tsx`, delegating to `ActivityDetail`/`EventDetail`) are reached by tapping "View activity"/"View event" on a `ContentCard` or a Happening Now card. Joining/leaving/responding disables the button, runs the write, then refetches — no realtime listeners, no optimistic counts.
+Content detail screens (`src/app/(app)/content/[contentId].tsx`, delegating to `PostDetail`/`ActivityDetail`/`EventDetail` by type) are reached by tapping anywhere on a `ContentCard` or a Happening Now card. Joining/leaving/responding disables the button, runs the write, then refetches — no realtime listeners, no optimistic counts.
+
+## Social engagement (Likes, Comments)
+
+`src/services/socialEngagement.ts`:
+
+- `likeContent` / `unlikeContent` / `fetchMyLike` / `fetchLikeCount` — plain reads/writes, no transaction (there's no counter to keep paired — `fetchLikeCount` is a `getCountFromServer` aggregation). Liking requires a completed profile and published parent content; liking twice returns `alreadyLiked` instead of writing again.
+- `createComment` / `deleteComment` / `fetchComments` / `fetchCommentCount` — comments are capped one-shot reads (`orderBy(createdAt desc)`, `limit(30)`), never an unbounded fetch. `fetchCommentCount` is also aggregation-based rather than loading every comment.
+
+Every detail screen renders one shared `<EngagementSection contentId={...} />` (heart + Like count, comment icon + Comment count, a composer, and the comment list with an empty state and per-comment delete for your own comments) — the Like/Comment implementation exists in exactly one place, not duplicated across Post/Activity/Event.
+
+Home intentionally does **not** run Like/Comment aggregation queries per card — that would be two extra reads per card × up to 20 cards on every Home load. Full engagement (counts, liking, commenting) is Content Detail only; Home cards stay exactly as they were.
 
 ## Location
 

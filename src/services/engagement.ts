@@ -36,6 +36,7 @@ export type EngagementError =
   | 'not-found'
   | 'ended'
   | 'full'
+  | 'invalid-input'
   | 'unknown';
 
 export type EngagementResult<T> = { ok: true } & T | { ok: false; error: EngagementError; message: string };
@@ -50,10 +51,15 @@ class TransactionAbort extends Error {
 }
 
 type TrustedParticipantFields = { displayName: string; username: string };
-type TrustedResult = { ok: true; fields: TrustedParticipantFields } | { ok: false; error: EngagementError; message: string };
+export type TrustedFieldsResult = { ok: true; fields: TrustedParticipantFields } | { ok: false; error: EngagementError; message: string };
 
-/** Public-safe snapshot always comes from the caller's own completed profile — never from UI input. */
-async function resolveTrustedFields(uid: string): Promise<TrustedResult> {
+/**
+ * Public-safe snapshot always comes from the caller's own completed profile
+ * — never from UI input. Exported so src/services/socialEngagement.ts (likes,
+ * comments) can reuse the exact same "does this uid have a completed
+ * profile" gate instead of duplicating it.
+ */
+export async function resolveTrustedFields(uid: string): Promise<TrustedFieldsResult> {
   const profile = await fetchUserProfile(uid);
   if (!profile || !profile.onboardingCompleted) {
     return { ok: false, error: 'no-profile', message: 'Complete your profile first.' };
@@ -61,7 +67,8 @@ async function resolveTrustedFields(uid: string): Promise<TrustedResult> {
   return { ok: true, fields: { displayName: profile.displayName, username: profile.username } };
 }
 
-function contentDocRef(contentId: string) {
+/** Exported so socialEngagement.ts can check the same content doc without a second constant. */
+export function contentDocRef(contentId: string) {
   return doc(firestore!, CONTENT_COLLECTION, contentId);
 }
 function participantRef(activityId: string, uid: string) {
