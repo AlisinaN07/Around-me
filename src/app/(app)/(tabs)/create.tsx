@@ -1,5 +1,6 @@
 import { Ionicons } from '@expo/vector-icons';
-import { StyleSheet, Text, View } from 'react-native';
+import { router, type Href } from 'expo-router';
+import { Pressable, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { Colors, Layout, Radius, Spacing } from '@/constants/theme';
@@ -9,6 +10,7 @@ type CreateOption = {
   icon: keyof typeof Ionicons.glyphMap;
   label: string;
   description: string;
+  href: Href | null;
 };
 
 const CREATE_OPTIONS: CreateOption[] = [
@@ -17,24 +19,28 @@ const CREATE_OPTIONS: CreateOption[] = [
     icon: 'people-outline',
     label: 'Activity',
     description: 'Find people nearby to do something together.',
+    href: '/create/activity',
   },
   {
     id: 'event',
     icon: 'calendar-outline',
     label: 'Event',
     description: 'Share something happening in the city.',
+    href: '/create/event',
   },
   {
     id: 'post',
     icon: 'create-outline',
     label: 'Post',
     description: 'Share with people around you.',
+    href: '/create/post',
   },
   {
     id: 'reel',
     icon: 'videocam-outline',
     label: 'Reel',
     description: 'Show what is happening right now.',
+    href: null,
   },
 ];
 
@@ -46,20 +52,31 @@ export default function CreateScreen() {
 
         <View style={styles.list}>
           {CREATE_OPTIONS.map((option) => (
-            <View key={option.id} style={styles.option}>
+            <Pressable
+              key={option.id}
+              style={({ pressed }) => [styles.option, pressed && option.href && styles.optionPressed]}
+              onPress={() => option.href && router.push(option.href)}
+              disabled={!option.href}
+              accessibilityRole="button"
+              accessibilityLabel={option.label}
+              accessibilityState={{ disabled: !option.href }}
+            >
               <View style={styles.iconWrap}>
                 <Ionicons name={option.icon} size={22} color={Colors.accent} />
               </View>
               <View style={styles.optionText}>
                 <View style={styles.optionHeaderRow}>
                   <Text style={styles.optionLabel}>{option.label}</Text>
-                  <View style={styles.comingSoonBadge}>
-                    <Text style={styles.comingSoonText}>Coming soon</Text>
-                  </View>
+                  {!option.href && (
+                    <View style={styles.comingSoonBadge}>
+                      <Text style={styles.comingSoonText}>Coming soon</Text>
+                    </View>
+                  )}
                 </View>
                 <Text style={styles.optionDescription}>{option.description}</Text>
               </View>
-            </View>
+              {option.href && <Ionicons name="chevron-forward" size={18} color={Colors.textSecondary} />}
+            </Pressable>
           ))}
         </View>
       </View>
@@ -91,12 +108,16 @@ const styles = StyleSheet.create({
   },
   option: {
     flexDirection: 'row',
+    alignItems: 'center',
     gap: Spacing.md,
     borderRadius: Radius.lg,
     backgroundColor: Colors.surface,
     borderWidth: 1,
     borderColor: Colors.border,
     padding: Spacing.md,
+  },
+  optionPressed: {
+    opacity: 0.85,
   },
   iconWrap: {
     width: 44,

@@ -1,23 +1,86 @@
 import { Ionicons } from '@expo/vector-icons';
-import { useState } from 'react';
-import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { router, useFocusEffect } from 'expo-router';
+import { useCallback, useMemo, useState } from 'react';
+import { Platform, Pressable, RefreshControl, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
+import { Button } from '@/components/Button';
 import { CategoryChip } from '@/components/CategoryChip';
-import { FeedCard } from '@/components/FeedCard';
+import { ContentCard } from '@/components/ContentCard';
 import { HappeningNowCard } from '@/components/HappeningNowCard';
-import { ReelPreviewCard } from '@/components/ReelPreviewCard';
 import { SectionHeader } from '@/components/SectionHeader';
-import { Colors, Layout, Spacing } from '@/constants/theme';
-import { AROUND_YOU_FIXTURES, CATEGORY_FILTERS, HAPPENING_NOW_FIXTURES, REEL_PREVIEW_FIXTURES } from '@/fixtures/homeFeed';
+import { CATEGORY_FILTERS } from '@/constants/categoryFilters';
+import { INTERESTS } from '@/constants/interests';
+import { Colors, Layout, Radius, Spacing } from '@/constants/theme';
+import { useAuth } from '@/hooks/useAuth';
 import { useProfile } from '@/hooks/useProfile';
+import { fetchCityFeed, fetchHappeningNow } from '@/services/content';
+import type { ActivityContent, Content, EventContent } from '@/types/content';
 import { formatCityDisplayName } from '@/utils/cityDisplay';
+import { formatEventTime } from '@/utils/timeFormat';
+
+type LoadStatus = 'loading' | 'loaded' | 'error';
 
 export default function HomeScreen() {
+  const { user } = useAuth();
   const { profile } = useProfile();
   const [selectedCategory, setSelectedCategory] = useState('all');
+  const [feedItems, setFeedItems] = useState<Content[]>([]);
+  const [happeningItems, setHappeningItems] = useState<(ActivityContent | EventContent)[]>([]);
+  const [status, setStatus] = useState<LoadStatus>('loading');
+  const [isRefreshing, setIsRefreshing] = useState(false);
 
   const cityLabel = profile?.cityName ? formatCityDisplayName(profile.cityName) : 'you';
+
+  const loadFeed = useCallback(
+    async (isRefresh = false) => {
+      if (!profile) return;
+      if (isRefresh) {
+        setIsRefreshing(true);
+      } else {
+        setStatus('loading');
+      }
+      try {
+        const [feed, happening] = await Promise.all([
+          fetchCityFeed(profile.cityKey),
+          fetchHappeningNow(profile.cityKey),
+        ]);
+        setFeedItems(feed);
+        setHappeningItems(happening);
+        setStatus('loaded');
+      } catch {
+        setStatus('error');
+      } finally {
+        setIsRefreshing(false);
+      }
+    },
+    [profile]
+  );
+
+  // Home refetches every time it regains focus — covers first mount, tab
+  // switches back to Home, and returning here after a successful publish
+  // from Create. No realtime listener: still a one-shot query per visit.
+  useFocusEffect(
+    useCallback(() => {
+      loadFeed();
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [profile?.cityKey])
+  );
+
+  const visibleItems = useMemo(() => {
+    switch (selectedCategory) {
+      case 'all':
+        return feedItems;
+      case 'happening-now':
+        return happeningItems;
+      case 'events':
+        return feedItems.filter((item) => item.type === 'event');
+      case 'activities':
+        return feedItems.filter((item) => item.type === 'activity');
+      default:
+        return feedItems.filter((item) => item.categoryId === selectedCategory);
+    }
+  }, [selectedCategory, feedItems, happeningItems]);
 
   return (
     <SafeAreaView style={styles.safeArea} edges={['top']}>
@@ -25,6 +88,11 @@ export default function HomeScreen() {
         style={styles.scroll}
         contentContainerStyle={styles.scrollContent}
         showsVerticalScrollIndicator={false}
+        refreshControl={
+          Platform.OS === 'web' ? undefined : (
+            <RefreshControl refreshing={isRefreshing} onRefresh={() => loadFeed(true)} tintColor={Colors.accent} />
+          )
+        }
       >
         <View style={styles.page}>
           <View style={styles.header}>
@@ -36,6 +104,17 @@ export default function HomeScreen() {
               <Text style={styles.title}>Around {cityLabel}</Text>
             </View>
             <View style={styles.headerActions}>
+              {Platform.OS === 'web' && (
+                <Pressable
+                  onPress={() => loadFeed(true)}
+                  hitSlop={8}
+                  accessibilityRole="button"
+                  accessibilityLabel="Refresh"
+                  style={styles.headerButton}
+                >
+                  <Ionicons name={isRefreshing ? 'sync' : 'refresh-outline'} size={20} color={Colors.text} />
+                </Pressable>
+              )}
               <Pressable
                 onPress={() => {}}
                 hitSlop={8}
@@ -74,44 +153,99 @@ export default function HomeScreen() {
             ))}
           </ScrollView>
 
-          <View style={styles.section}>
-            <SectionHeader title="Happening Now 🔥" actionLabel="See all" onActionPress={() => {}} />
-            <ScrollView
-              horizontal
-              showsHorizontalScrollIndicator={false}
-              style={styles.horizontalScroll}
-              contentContainerStyle={styles.horizontalListContent}
-            >
-              {HAPPENING_NOW_FIXTURES.map((item) => (
-                <HappeningNowCard key={item.id} item={item} />
-              ))}
-            </ScrollView>
-          </View>
+          {status === 'error' ? (
+            <View style={styles.errorState}>
+              <Ionicons name="cloud-offline-outline" size={32} color={Colors.textSecondary} />
+              <Text style={styles.errorTitle}>Couldn&apos;t load Around {cityLabel}.</Text>
+              <Button label="Try again" onPress={() => loadFeed()} />
+            </View>
+          ) : (
+            <>
+              <View style={styles.section}>
+                <SectionHeader title="Happening Now 🔥" />
+                {status === 'loading' && happeningItems.length === 0 ? (
+                  <ScrollView
+                    horizontal
+                    showsHorizontalScrollIndicator={false}
+                    style={styles.horizontalScroll}
+                    contentContainerStyle={styles.horizontalListContent}
+                  >
+                    <SkeletonBlock width={168} height={148} />
+                    <SkeletonBlock width={168} height={148} />
+                  </ScrollView>
+                ) : happeningItems.length === 0 ? (
+                  <View style={styles.emptyPanel}>
+                    <Text style={styles.emptyPanelTitle}>Nothing live right now</Text>
+                    <Text style={styles.emptyPanelBody}>
+                      Check upcoming events and activities around {cityLabel}.
+                    </Text>
+                  </View>
+                ) : (
+                  <ScrollView
+                    horizontal
+                    showsHorizontalScrollIndicator={false}
+                    style={styles.horizontalScroll}
+                    contentContainerStyle={styles.horizontalListContent}
+                  >
+                    {happeningItems.map((item) => {
+                      const category = INTERESTS.find((interest) => interest.id === item.categoryId);
+                      return (
+                        <HappeningNowCard
+                          key={item.contentId}
+                          category={category ? `${category.emoji} ${category.label}` : item.categoryId}
+                          title={item.title}
+                          place={item.placeName}
+                          timeLabel={formatEventTime(item.startsAt.toDate())}
+                        />
+                      );
+                    })}
+                  </ScrollView>
+                )}
+              </View>
 
-          <View style={styles.section}>
-            <SectionHeader title="Local Reels" actionLabel="See all" onActionPress={() => {}} />
-            <ScrollView
-              horizontal
-              showsHorizontalScrollIndicator={false}
-              style={styles.horizontalScroll}
-              contentContainerStyle={styles.horizontalListContent}
-            >
-              {REEL_PREVIEW_FIXTURES.map((item) => (
-                <ReelPreviewCard key={item.id} item={item} />
-              ))}
-            </ScrollView>
-          </View>
+              <View style={styles.section}>
+                <SectionHeader title="Local Reels" />
+                <View style={styles.reelsEmptyPanel}>
+                  <Ionicons name="videocam-outline" size={22} color={Colors.textSecondary} />
+                  <Text style={styles.emptyPanelBody}>
+                    Local videos will appear here as people start sharing what&apos;s happening around the city.
+                  </Text>
+                </View>
+              </View>
 
-          <View style={styles.section}>
-            <SectionHeader title="Around You" />
-            {AROUND_YOU_FIXTURES.map((item) => (
-              <FeedCard key={item.id} item={item} />
-            ))}
-          </View>
+              <View style={styles.section}>
+                <SectionHeader title="Around You" />
+                {status === 'loading' && feedItems.length === 0 ? (
+                  <>
+                    <SkeletonBlock width="100%" height={110} style={styles.feedSkeleton} />
+                    <SkeletonBlock width="100%" height={110} style={styles.feedSkeleton} />
+                  </>
+                ) : feedItems.length === 0 ? (
+                  <View style={styles.emptyCityPanel}>
+                    <Text style={styles.emptyPanelTitle}>Nothing here yet.</Text>
+                    <Text style={styles.emptyPanelBody}>
+                      Be the first person to share what&apos;s happening in {cityLabel}.
+                    </Text>
+                    <Button label="Create something" onPress={() => router.push('/create')} />
+                  </View>
+                ) : visibleItems.length === 0 ? (
+                  <View style={styles.emptyCityPanel}>
+                    <Text style={styles.emptyPanelBody}>Nothing matches this filter yet.</Text>
+                  </View>
+                ) : (
+                  visibleItems.map((item) => <ContentCard key={item.contentId} item={item} currentUid={user?.uid ?? null} />)
+                )}
+              </View>
+            </>
+          )}
         </View>
       </ScrollView>
     </SafeAreaView>
   );
+}
+
+function SkeletonBlock({ width, height, style }: { width: number | `${number}%`; height: number; style?: object }) {
+  return <View style={[styles.skeleton, { width, height }, style]} />;
 }
 
 const styles = StyleSheet.create({
@@ -187,5 +321,74 @@ const styles = StyleSheet.create({
   horizontalListContent: {
     gap: Spacing.md,
     paddingHorizontal: Spacing.lg,
+  },
+  emptyPanel: {
+    marginHorizontal: Spacing.lg,
+    borderRadius: Radius.lg,
+    backgroundColor: Colors.surface,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    padding: Spacing.lg,
+    gap: 4,
+  },
+  emptyPanelTitle: {
+    color: Colors.text,
+    fontSize: 15,
+    fontWeight: '700',
+  },
+  emptyPanelBody: {
+    color: Colors.textSecondary,
+    fontSize: 13,
+    lineHeight: 18,
+  },
+  reelsEmptyPanel: {
+    marginHorizontal: Spacing.lg,
+    borderRadius: Radius.lg,
+    backgroundColor: Colors.surface,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    borderStyle: 'dashed',
+    padding: Spacing.lg,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Spacing.sm,
+  },
+  emptyCityPanel: {
+    marginHorizontal: Spacing.lg,
+    borderRadius: Radius.lg,
+    backgroundColor: Colors.surface,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    padding: Spacing.xl,
+    alignItems: 'center',
+    gap: Spacing.sm,
+  },
+  errorState: {
+    marginHorizontal: Spacing.lg,
+    marginTop: Spacing.xl,
+    borderRadius: Radius.lg,
+    backgroundColor: Colors.surface,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    padding: Spacing.xl,
+    alignItems: 'center',
+    gap: Spacing.sm,
+  },
+  errorTitle: {
+    color: Colors.text,
+    fontSize: 15,
+    fontWeight: '700',
+    textAlign: 'center',
+  },
+  skeleton: {
+    borderRadius: Radius.lg,
+    backgroundColor: Colors.surface,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    opacity: 0.5,
+  },
+  feedSkeleton: {
+    marginHorizontal: Spacing.lg,
+    marginBottom: Spacing.md,
   },
 });

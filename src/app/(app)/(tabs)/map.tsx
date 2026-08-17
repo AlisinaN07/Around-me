@@ -4,8 +4,8 @@ import { ScrollView, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { CategoryChip } from '@/components/CategoryChip';
+import { CATEGORY_FILTERS } from '@/constants/categoryFilters';
 import { Colors, Layout, Radius, Spacing } from '@/constants/theme';
-import { CATEGORY_FILTERS } from '@/fixtures/homeFeed';
 import { useProfile } from '@/hooks/useProfile';
 import { formatCityDisplayName } from '@/utils/cityDisplay';
 

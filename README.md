@@ -2,7 +2,7 @@
 
 Location-based social network organized around cities — "See what's happening around you, right now."
 
-Email/password authentication, onboarding (name, username, city, interests), a full tab-based application shell (Home, Reels, Create, Map, Profile), and the real Firestore content backend (posts, activities, events) are implemented. Home's UI still shows fixture data — wiring the real content backend into it is the next step.
+Email/password authentication, onboarding (name, username, city, interests), a full tab-based application shell (Home, Reels, Create, Map, Profile), and the real Firestore content backend (posts, activities, events) are implemented. Create → Post/Activity/Event → Publish is wired to that backend, and Home's Around You / Happening Now sections render the real city feed. Reels (both creation and the Local Reels feed) remain unimplemented placeholders — no media/Storage layer exists yet.
 
 ## Stack
 
@@ -47,18 +47,20 @@ src/
     (onboarding)/      Name+username, city, interests — logged in, no profile yet
     (app)/
       (tabs)/           Home, Reels, Create, Map, Profile — logged in, profile complete
+      create/            Post/Activity/Event forms — stack screens above the tab bar, not tabs
     _layout.tsx        Routes between the three top-level groups based on auth + profile state
-  components/          Button, FormField, FormScreenLayout, OnboardingProgress, CountryPicker,
-                       Avatar, SectionHeader, CategoryChip, HappeningNowCard, ReelPreviewCard, FeedCard
-  constants/            theme.ts (design tokens), countries.ts, interests.ts
-  fixtures/             Local-only UI preview data for Home (never Firestore — see fixtures/README.md)
+  components/          Button, FormField, FormScreenLayout, CreateScreenLayout, OnboardingProgress,
+                       CountryPicker, Avatar, SectionHeader, CategoryChip, CategorySelector,
+                       DateTimeField (+ .web variant), ContentCard, HappeningNowCard
+  constants/            theme.ts (design tokens), countries.ts, interests.ts, categoryFilters.ts
   hooks/                useAuth.ts, useProfile.ts
   providers/            AuthProvider, ProfileProvider, OnboardingDraftProvider
   services/            firebase.ts (App), auth.ts (Auth), firestore.ts (Firestore),
                        userProfile.ts (profile data layer), content.ts (posts/activities/events
                        data layer), location.ts (one-time city lookup)
   types/                Shared TypeScript types and type augmentations
-  utils/                authErrors.ts, username.ts, cityKey.ts, cityDisplay.ts
+  utils/                authErrors.ts, username.ts, cityKey.ts, cityDisplay.ts, timeFormat.ts
+scripts/                delete-test-documents.cjs — explicit-ID-only disposable test cleanup
 firestore.rules         Firestore security rules (see Firestore section below)
 firestore.indexes.json  Composite indexes the content queries need
 firebase.json           Firebase CLI config — Firestore rules + indexes only
@@ -112,6 +114,12 @@ npm run cleanup:test-data -- --users uid1,uid2 --usernames someuser,otheruser --
 ```
 
 `scripts/delete-test-documents.cjs` deletes only the exact document IDs you pass it — it has no "delete everything" mode and running it with no flags is a no-op. **Never** run `firebase firestore:delete <collection> --recursive` against this project: that deletes the entire collection, real user data included, not just test documents.
+
+## Create flow
+
+Create → choose Post/Activity/Event → fill in the form → Publish calls the matching `create*` function in `src/services/content.ts` directly (screens never write to Firestore themselves). On success the app navigates back to Home; Home refetches on every focus (`useFocusEffect`, still a one-shot query, not a realtime listener), so newly-published content shows up without an app restart. Reel stays "Coming soon" — no upload UI or Storage integration exists yet.
+
+Date/time fields use `@react-native-community/datetimepicker` on iOS/Android (`src/components/DateTimeField.tsx`) and plain HTML `date`/`time` inputs on web (`DateTimeField.web.tsx`, picked automatically by Metro's platform file resolution) — the picker package has no web support of its own.
 
 ## Location
 

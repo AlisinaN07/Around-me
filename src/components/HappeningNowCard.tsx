@@ -2,24 +2,30 @@ import { Ionicons } from '@expo/vector-icons';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 
 import { Colors, Radius, Spacing } from '@/constants/theme';
-import type { HappeningNowItem } from '@/fixtures/homeFeed';
 
-export function HappeningNowCard({ item }: { item: HappeningNowItem }) {
+type HappeningNowCardProps = {
+  category: string;
+  title: string;
+  place: string;
+  timeLabel: string;
+};
+
+export function HappeningNowCard({ category, title, place, timeLabel }: HappeningNowCardProps) {
   return (
-    <Pressable style={styles.card} accessibilityRole="button" accessibilityLabel={`${item.title} at ${item.place}`}>
+    <Pressable style={styles.card} accessibilityRole="button" accessibilityLabel={`${title} at ${place}`}>
       <View style={styles.media}>
         <Ionicons name="image-outline" size={28} color={Colors.textSecondary} />
         <View style={styles.timeBadge}>
-          <Text style={styles.timeBadgeText}>{item.time}</Text>
+          <Text style={styles.timeBadgeText}>{timeLabel}</Text>
         </View>
       </View>
       <View style={styles.body}>
-        <Text style={styles.category}>{item.category}</Text>
+        <Text style={styles.category}>{category}</Text>
         <Text style={styles.title} numberOfLines={1}>
-          {item.title}
+          {title}
         </Text>
         <Text style={styles.place} numberOfLines={1}>
-          {item.place}
+          {place}
         </Text>
       </View>
     </Pressable>
