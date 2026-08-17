@@ -18,10 +18,14 @@
 //   node scripts/delete-test-documents.cjs \
 //     --users uid1,uid2 \
 //     --usernames someuser,otheruser \
-//     --content contentId1,contentId2
+//     --content contentId1,contentId2 \
+//     --auth-uids uid1,uid2
 //
-// Any of the three flags may be omitted. Running with no flags at all does
-// nothing (and says so) rather than deleting anything by default.
+// Any of the flags may be omitted. Running with none of them does nothing
+// (and says so) rather than deleting anything by default. --auth-uids
+// deletes the Firebase Auth account itself (via the Identity Toolkit REST
+// API, same reused CLI session) — use it for disposable test accounts only,
+// never for a real user's account.
 
 const apiv2 = require('firebase-tools/lib/apiv2');
 const auth = require('firebase-tools/lib/auth');
@@ -30,15 +34,15 @@ const PROJECT = 'around-me-6a437';
 const COLLECTIONS = ['users', 'usernames', 'content'];
 
 function parseArgs(argv) {
-  const ids = { users: [], usernames: [], content: [] };
+  const ids = { users: [], usernames: [], content: [], 'auth-uids': [] };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
-    const match = /^--(users|usernames|content)$/.exec(arg);
+    const match = /^--(users|usernames|content|auth-uids)$/.exec(arg);
     if (match) {
       const value = argv[i + 1];
       i += 1;
       if (!value) {
-        throw new Error(`${arg} requires a comma-separated list of document IDs`);
+        throw new Error(`${arg} requires a comma-separated list of IDs`);
       }
       ids[match[1]] = value
         .split(',')
@@ -51,11 +55,12 @@ function parseArgs(argv) {
 
 async function main() {
   const ids = parseArgs(process.argv.slice(2));
-  const totalIds = COLLECTIONS.reduce((sum, c) => sum + ids[c].length, 0);
+  const totalDocIds = COLLECTIONS.reduce((sum, c) => sum + ids[c].length, 0);
+  const totalAuthIds = ids['auth-uids'].length;
 
-  if (totalIds === 0) {
-    console.log('No document IDs given for any collection — nothing to delete. Exiting.');
-    console.log('Pass --users, --usernames, and/or --content with comma-separated IDs.');
+  if (totalDocIds === 0 && totalAuthIds === 0) {
+    console.log('No IDs given — nothing to delete. Exiting.');
+    console.log('Pass --users, --usernames, --content, and/or --auth-uids with comma-separated IDs.');
     return;
   }
 
@@ -67,7 +72,7 @@ async function main() {
   }
   auth.setRefreshToken(account.tokens.refresh_token);
 
-  const client = new apiv2.Client({
+  const firestoreClient = new apiv2.Client({
     auth: true,
     apiVersion: 'v1',
     urlPrefix: 'https://firestore.googleapis.com',
@@ -79,7 +84,7 @@ async function main() {
     for (const id of ids[collectionId]) {
       const path = `${root}/${collectionId}/${id}`;
       try {
-        await client.delete(path);
+        await firestoreClient.delete(path);
         console.log(`Deleted ${collectionId}/${id}`);
       } catch (error) {
         if (error?.status === 404 || /NOT_FOUND/i.test(String(error?.message))) {
@@ -91,7 +96,27 @@ async function main() {
     }
   }
 
-  console.log(`\nDone. Deleted only the ${totalIds} explicit document(s) listed above.`);
+  if (totalAuthIds > 0) {
+    const identityClient = new apiv2.Client({
+      auth: true,
+      apiVersion: 'v1',
+      urlPrefix: 'https://identitytoolkit.googleapis.com',
+    });
+    for (const uid of ids['auth-uids']) {
+      try {
+        await identityClient.post(`/projects/${PROJECT}/accounts:delete`, { localId: uid });
+        console.log(`Deleted Auth account ${uid}`);
+      } catch (error) {
+        if (error?.status === 400 && /USER_NOT_FOUND/i.test(String(error?.message))) {
+          console.log(`Auth account ${uid} already absent — skipping`);
+        } else {
+          throw error;
+        }
+      }
+    }
+  }
+
+  console.log(`\nDone. Deleted only the ${totalDocIds + totalAuthIds} explicit ID(s) listed above.`);
 }
 
 main().catch((error) => {
