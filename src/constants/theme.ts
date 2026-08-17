@@ -38,3 +38,8 @@ export const Radius = {
 } as const;
 
 export type RadiusToken = keyof typeof Radius;
+
+export const Layout = {
+  /** Caps content width on wide web viewports so mobile-first screens don't stretch awkwardly. */
+  maxContentWidth: 480,
+} as const;

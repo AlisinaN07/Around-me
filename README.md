@@ -2,7 +2,7 @@
 
 Location-based social network organized around cities — "See what's happening around you, right now."
 
-Email/password authentication, onboarding (name, username, city, interests), and a temporary Home foundation are implemented. The real feed, maps, and the rest of the social features are still to come.
+Email/password authentication, onboarding (name, username, city, interests), and a full tab-based application shell (Home, Reels, Create, Map, Profile) are implemented. Home's sections use local UI fixture data — the real feed/Reels/events backend is still to come.
 
 ## Stack
 
@@ -45,16 +45,19 @@ src/
   app/
     (auth)/            Welcome, log in, sign up — logged out
     (onboarding)/      Name+username, city, interests — logged in, no profile yet
-    (app)/             Home — logged in, profile complete
-    _layout.tsx        Routes between the three groups based on auth + profile state
-  components/          Button, FormField, FormScreenLayout, OnboardingProgress, CountryPicker
+    (app)/
+      (tabs)/           Home, Reels, Create, Map, Profile — logged in, profile complete
+    _layout.tsx        Routes between the three top-level groups based on auth + profile state
+  components/          Button, FormField, FormScreenLayout, OnboardingProgress, CountryPicker,
+                       Avatar, SectionHeader, CategoryChip, HappeningNowCard, ReelPreviewCard, FeedCard
   constants/            theme.ts (design tokens), countries.ts, interests.ts
+  fixtures/             Local-only UI preview data for Home (never Firestore — see fixtures/README.md)
   hooks/                useAuth.ts, useProfile.ts
   providers/            AuthProvider, ProfileProvider, OnboardingDraftProvider
   services/            firebase.ts (App), auth.ts (Auth), firestore.ts (Firestore),
                        userProfile.ts (data layer), location.ts (one-time city lookup)
   types/                Shared TypeScript types and type augmentations
-  utils/                authErrors.ts, username.ts, cityKey.ts
+  utils/                authErrors.ts, username.ts, cityKey.ts, cityDisplay.ts
 firestore.rules         Firestore security rules (see Firestore section below)
 firebase.json           Firebase CLI config — Firestore rules only
 .firebaserc              Points the CLI at the around-me-6a437 project
