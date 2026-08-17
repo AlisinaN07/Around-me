@@ -2,7 +2,7 @@
 
 Location-based social network organized around cities — "See what's happening around you, right now."
 
-Email/password authentication, onboarding (name, username, city, interests), a full tab-based application shell (Home, Reels, Create, Map, Profile), and the real Firestore content backend (posts, activities, events) are implemented. Create → Post/Activity/Event → Publish is wired to that backend, and Home's Around You / Happening Now sections render the real city feed. Every content type has a real detail screen — Activity with Join/Leave, Event with Interested/Going, and all three with Likes and Comments — backed by Firestore transactions/writes and security rules. Reels (both creation and the Local Reels feed) remain unimplemented placeholders — no media/Storage layer exists yet. Replies, follows, saves, notifications, and moderation are not implemented yet either.
+Email/password authentication, onboarding (name, username, city, interests), a full tab-based application shell (Home, Reels, Create, Map, Profile), and the real Firestore content backend (posts, activities, events) are implemented. Create → Post/Activity/Event → Publish is wired to that backend, and Home's Around You / Happening Now sections render the real city feed. Every content type has a real detail screen — Activity with Join/Leave, Event with Interested/Going, and all three with Likes and Comments — backed by Firestore transactions/writes and security rules. Every user also has a public social profile (separate from their private account data) with real Follow/Unfollow and follower/following lists, reachable by tapping any author, commenter, or `@username` in the app. Reels (both creation and the Local Reels feed) remain unimplemented placeholders — no media/Storage layer exists yet. Direct messaging, notifications, saves, and a personalized Following feed are not implemented yet either.
 
 ## Stack
 
@@ -50,19 +50,25 @@ src/
       create/            Post/Activity/Event forms — stack screens above the tab bar, not tabs
       content/           [contentId] detail screen (Activity/Event participation) — also a stack
                         screen above the tab bar
+      user/              [uid]/index (public profile), [uid]/followers, [uid]/following —
+                        also stack screens above the tab bar
     _layout.tsx        Routes between the three top-level groups based on auth + profile state
   components/          Button, FormField, FormScreenLayout, HeaderScreenLayout, OnboardingProgress,
                        CountryPicker, Avatar, SectionHeader, CategoryChip, CategorySelector,
                        DateTimeField (+ .web variant), ContentCard, HappeningNowCard,
-                       PostDetail, ActivityDetail, EventDetail, EngagementSection
+                       PostDetail, ActivityDetail, EventDetail, EngagementSection,
+                       AuthorLink, UserList
   constants/            theme.ts (design tokens), countries.ts, interests.ts, categoryFilters.ts
   hooks/                useAuth.ts, useProfile.ts
   providers/            AuthProvider, ProfileProvider, OnboardingDraftProvider
   services/            firebase.ts (App), auth.ts (Auth), firestore.ts (Firestore),
-                       userProfile.ts (profile data layer), content.ts (posts/activities/events
-                       data layer), engagement.ts (activity participation + event responses),
-                       socialEngagement.ts (likes + comments), location.ts (one-time city lookup)
-  types/                Shared TypeScript types and type augmentations
+                       userProfile.ts (private profile data layer), content.ts (posts/activities/
+                       events data layer), engagement.ts (activity participation + event
+                       responses), socialEngagement.ts (likes + comments), publicProfile.ts
+                       (public social profiles), following.ts (follow graph), location.ts
+                       (one-time city lookup)
+  types/                Shared TypeScript types and type augmentations (user.ts = private,
+                       social.ts = public profile + follow)
   utils/                authErrors.ts, username.ts, cityKey.ts, cityDisplay.ts, timeFormat.ts
 scripts/                delete-test-documents.cjs — explicit-ID-only disposable test cleanup
 firestore.rules         Firestore security rules (see Firestore section below)
@@ -77,8 +83,10 @@ firebase.json           Firebase CLI config — Firestore rules + indexes only
 
 App data lives in Cloud Firestore, on the same Firebase project as Auth (`around-me-6a437`). Collections so far:
 
-- `users/{uid}` — the caller's own profile (`email`, `displayName`, `username`, `cityKey`, `interests`, etc.). Private to its owner — not yet publicly readable.
+- `users/{uid}` — the caller's own profile (`email`, `displayName`, `username`, `cityKey`, `interests`, etc.). **Private to its owner, always** — never made publicly readable, including after Step 11. Anything social-facing lives in `publicProfiles/{uid}` instead (see below), which is the entire reason that collection exists.
 - `usernames/{usernameLower}` — a uniqueness index reserving each username to one `uid`. Created atomically with the profile in a single transaction (see `src/services/userProfile.ts`).
+- `publicProfiles/{uid}` — the social-facing counterpart to `users/{uid}`, containing only what's safe to show any signed-in user: `displayName`, `username`, `usernameLower`, `cityName`, `countryCode`, `cityKey`, `interests`, `accountType`, `createdAt`, `updatedAt`. No email, GPS, tokens, or other private fields — enforced by Firestore rules requiring every field to exactly match the caller's own `users/{uid}` document on create. Created atomically alongside `users`/`usernames` during onboarding; accounts that completed onboarding before Step 11 get one lazily via `ensureMyPublicProfile()` (see Social graph below).
+- `follows/{followerUid}_{followingUid}` — a directed edge in the social graph (`src/services/following.ts`), with a deterministic ID so at most one follow document can ever exist per (follower, following) pair. No copied profile data, just `followerUid`, `followingUid`, `createdAt` — resolve to `publicProfiles/{uid}` for display.
 - `content/{contentId}` — one unified collection for `post` / `activity` / `event` (a discriminated union in `src/types/content.ts`), since Home will eventually be a mixed feed of all three. Reels get their own architecture in a later step — different media/storage concerns.
 
 Every content document carries `authorUid`, `authorDisplayName`, `authorUsername`, `cityName`, `countryCode`, `cityKey` — a **public-safe snapshot** of the author's private profile, copied at write time so the feed never has to read another user's `users/{uid}` document. Firestore rules verify this snapshot exactly matches the author's own profile on create, so a modified client can't post as another user or claim another city. Reads are open to any signed-in user (not scoped to the reader's own city — browsing other cities is intentional); creates require a completed profile; updates are denied entirely for now (no edit UI exists yet, so there's nothing to validate "which fields are safely mutable" against). **Root content delete is disabled** (`allow delete: if false`) as of Step 10 — content now has five possible subcollections (`participants`, `stats`, `responses`, `likes`, `comments`) that Firestore never cascade-deletes, and there's no safe production cascade-delete workflow or client "delete content" UI yet, so allowing a client to delete the parent alone would leave those subcollections permanently orphaned.
@@ -109,7 +117,7 @@ Before deploying a rules change, test it against the emulator:
 npm run test:rules
 ```
 
-This runs `tests/firestore.rules.test.mjs` against a local Firestore emulator using `@firebase/rules-unit-testing`, covering the ALLOW/DENY cases for `users`, `usernames`, `content`, `content/{id}/participants`, `content/{id}/stats`, `content/{id}/responses`, `content/{id}/likes`, and `content/{id}/comments`. (Note: on at least one sandboxed dev environment, the emulator starts fine but pushing the ruleset to it fails with `ECONNRESET`/`fetch failed` for unrelated network reasons — if `npm run test:rules` fails that way for you, verify the same scenarios directly against a real project instead, as was done manually to validate the rules deployed here.)
+This runs `tests/firestore.rules.test.mjs` against a local Firestore emulator using `@firebase/rules-unit-testing`, covering the ALLOW/DENY cases for `users`, `usernames`, `publicProfiles`, `follows`, `content`, `content/{id}/participants`, `content/{id}/stats`, `content/{id}/responses`, `content/{id}/likes`, and `content/{id}/comments`. (Note: on at least one sandboxed dev environment, the emulator starts fine but pushing the ruleset to it fails with `ECONNRESET`/`fetch failed` for unrelated network reasons — if `npm run test:rules` fails that way for you, verify the same scenarios directly against a real project instead, as was done manually to validate the rules deployed here.)
 
 To deploy rules and indexes:
 
@@ -160,6 +168,24 @@ Content detail screens (`src/app/(app)/content/[contentId].tsx`, delegating to `
 Every detail screen renders one shared `<EngagementSection contentId={...} />` (heart + Like count, comment icon + Comment count, a composer, and the comment list with an empty state and per-comment delete for your own comments) — the Like/Comment implementation exists in exactly one place, not duplicated across Post/Activity/Event.
 
 Home intentionally does **not** run Like/Comment aggregation queries per card — that would be two extra reads per card × up to 20 cards on every Home load. Full engagement (counts, liking, commenting) is Content Detail only; Home cards stay exactly as they were.
+
+## Social graph (public profiles, Follow)
+
+`src/services/publicProfile.ts`:
+
+- `fetchPublicProfile(uid)` / `fetchPublicProfileByUsername(username)` — the latter resolves username → uid via the existing `usernames/{usernameLower}` reservation, then reads `publicProfiles/{uid}`; it never scans `publicProfiles` itself.
+- `ensureMyPublicProfile(uid)` — owner-only lazy migration for accounts that completed onboarding before Step 11. Returns the existing profile untouched if one's already there; only creates one (from the caller's own private profile) if missing. `ProfileProvider` calls this automatically, fire-and-forget, right after loading a completed profile, so it's transparent — no explicit user action required.
+
+`src/services/following.ts`:
+
+- `followUser` / `unfollowUser` / `isFollowing` — plain reads/writes on the deterministic `follows/{followerUid}_{followingUid}` document; no transaction needed since there's no counter to keep paired.
+- `fetchFollowerCount` / `fetchFollowingCount` — `getCountFromServer` aggregation, never loads every follow edge just to count them.
+- `fetchFollowers` / `fetchFollowing` — capped (`limit(30)`), no `orderBy` (a single equality filter needs no composite index this way; ordering isn't a Step 11 requirement), each edge resolved to a `publicProfiles/{uid}` read.
+- `fetchFollowingUids` — same shape as `fetchFollowing` but returns bare uids instead of resolved profiles. This exists purely as a **foundation for a future personalized Following feed** — it's not wired to any UI. Around Me stays city-first (Home is unchanged); a real feed will eventually need to batch these into chunked Firestore `in` queries (30-value limit per query) or a different fan-out strategy once someone follows more people than fit on one page — intentionally not attempted here.
+
+A subtlety worth knowing if you touch `firestore.rules`: the onboarding transaction creates `users/{uid}` and `publicProfiles/{uid}` in the **same** transaction, so the public-profile create rule can't validate against `get(users/{uid})` — that only sees the pre-transaction snapshot, and for a brand-new user the document doesn't exist there yet, which would make every signup fail. It uses `getAfter()`/`existsAfter()` instead (same pairing pattern as the participants/stats rules from Step 9), which correctly sees same-transaction writes.
+
+`/user/{uid}` (public profile), `/user/{uid}/followers`, `/user/{uid}/following` are reachable by tapping any author, commenter, participant name, or `@username` throughout the app (`src/components/AuthorLink.tsx`) — including from inside a `ContentCard`, where it's nested inside that card's own tap-to-open-detail `Pressable` and calls `stopPropagation()` so only one of the two navigations fires.
 
 ## Location
 

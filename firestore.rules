@@ -59,6 +59,83 @@ service cloud.firestore {
         && request.resource.data.keys().hasOnly(['uid', 'createdAt']);
     }
 
+    // publicProfiles/{uid} — the social-facing counterpart to the private
+    // users/{uid} document (see src/types/social.ts). Only public-safe
+    // fields, never email/GPS/tokens/private settings. Every field is
+    // validated server-side against the caller's own private profile on
+    // create, so a modified client can never publish someone else's name,
+    // a different city, or a fabricated identity. users/{uid} itself stays
+    // fully private — this collection exists specifically so we never have
+    // to make it publicly readable.
+    match /publicProfiles/{uid} {
+      allow read: if isSignedIn();
+
+      allow create: if isSignedIn()
+        && request.auth.uid == uid
+        && isValidPublicProfileCreate(uid, request.resource.data);
+
+      // Profile editing is a later step — nothing to validate yet.
+      allow update: if false;
+
+      // Social identity documents aren't independently erasable from
+      // account lifecycle yet.
+      allow delete: if false;
+    }
+
+    function isValidPublicProfileCreate(uid, data) {
+      // getAfter()/existsAfter(), not get()/exists(): the atomic onboarding
+      // transaction creates users/{uid} and publicProfiles/{uid} together in
+      // one transaction, so a plain get() here would only see the
+      // pre-transaction snapshot — users/{uid} wouldn't exist yet from that
+      // vantage point for a brand-new user, and this would always fail. This
+      // is the exact same pairing pattern as the participants/stats rules.
+      let profile = getAfter(/databases/$(database)/documents/users/$(uid)).data;
+      return existsAfter(/databases/$(database)/documents/users/$(uid))
+        && profile.onboardingCompleted == true
+        && data.uid == uid
+        && data.displayName == profile.displayName
+        && data.username == profile.username
+        && data.usernameLower == profile.usernameLower
+        && data.cityName == profile.cityName
+        && data.countryCode == profile.countryCode
+        && data.cityKey == profile.cityKey
+        && data.interests == profile.interests
+        && data.accountType == profile.accountType
+        && isServerTimestamp(data.createdAt)
+        && isServerTimestamp(data.updatedAt)
+        && data.keys().hasOnly([
+          'uid', 'displayName', 'username', 'usernameLower', 'cityName',
+          'countryCode', 'cityKey', 'interests', 'accountType', 'createdAt', 'updatedAt'
+        ]);
+    }
+
+    // follows/{followerUid}_{followingUid} — a directed edge in the social
+    // graph (see src/services/following.ts). The deterministic ID is what
+    // guarantees at most one follow per (follower, following) pair: a
+    // second create attempt for the same pair lands on the same document,
+    // which is a rules "update" (denied below), not a second "create".
+    match /follows/{followId} {
+      allow read: if isSignedIn();
+
+      allow create: if isSignedIn() && isValidFollowCreate(followId, request.resource.data);
+
+      allow update: if false;
+
+      // Only the follower can remove their own follow — a followed user
+      // can't unilaterally strip someone else's follow edge in Step 11.
+      allow delete: if isSignedIn() && resource.data.followerUid == request.auth.uid;
+    }
+
+    function isValidFollowCreate(followId, data) {
+      return data.followerUid == request.auth.uid
+        && data.followingUid != request.auth.uid
+        && followId == data.followerUid + '_' + data.followingUid
+        && exists(/databases/$(database)/documents/publicProfiles/$(data.followingUid))
+        && exists(/databases/$(database)/documents/publicProfiles/$(request.auth.uid))
+        && isServerTimestamp(data.createdAt)
+        && data.keys().hasOnly(['followerUid', 'followingUid', 'createdAt']);
+    }
+
     // content/{contentId} — the unified root collection for posts,
     // activities, and events (see src/types/content.ts). Every document's
     // author/city fields are validated against the author's own private

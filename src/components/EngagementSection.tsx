@@ -3,6 +3,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { ActivityIndicator, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
 
 import { Avatar } from '@/components/Avatar';
+import { AuthorLink } from '@/components/AuthorLink';
 import { Colors, Radius, Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
 import {
@@ -188,15 +189,19 @@ export function EngagementSection({ contentId }: { contentId: string }) {
         <View style={styles.commentsList}>
           {comments.map((comment) => (
             <View key={comment.commentId} style={styles.commentRow}>
-              <Avatar name={comment.authorDisplayName} size={32} />
+              <AuthorLink uid={comment.authorUid}>
+                <Avatar name={comment.authorDisplayName} size={32} />
+              </AuthorLink>
               <View style={styles.commentBody}>
                 <View style={styles.commentHeaderRow}>
-                  <Text style={styles.commentAuthor} numberOfLines={1}>
-                    {comment.authorDisplayName}
-                  </Text>
-                  <Text style={styles.commentUsername} numberOfLines={1}>
-                    @{comment.authorUsername}
-                  </Text>
+                  <AuthorLink uid={comment.authorUid} style={styles.commentAuthorLink}>
+                    <Text style={styles.commentAuthor} numberOfLines={1}>
+                      {comment.authorDisplayName}
+                    </Text>
+                    <Text style={styles.commentUsername} numberOfLines={1}>
+                      @{comment.authorUsername}
+                    </Text>
+                  </AuthorLink>
                   {user?.uid === comment.authorUid && (
                     <View style={styles.youBadge}>
                       <Text style={styles.youText}>You</Text>
@@ -346,6 +351,12 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: 6,
     flexWrap: 'wrap',
+  },
+  commentAuthorLink: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    flexShrink: 1,
   },
   commentAuthor: {
     color: Colors.text,

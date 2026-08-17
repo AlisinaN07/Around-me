@@ -5,6 +5,7 @@
 
 import { doc, getDoc, runTransaction, serverTimestamp, type WithFieldValue } from 'firebase/firestore';
 
+import type { PublicProfile } from '@/types/social';
 import type { UserProfile, UsernameReservation } from '@/types/user';
 import { buildCityKey } from '@/utils/cityKey';
 import { normalizeUsername } from '@/utils/username';
@@ -13,6 +14,7 @@ import { firestore } from './firestore';
 
 const USERS_COLLECTION = 'users';
 const USERNAMES_COLLECTION = 'usernames';
+const PUBLIC_PROFILES_COLLECTION = 'publicProfiles';
 
 export type UsernameAvailabilityResult =
   | { available: true; usernameLower: string }
@@ -99,6 +101,7 @@ export async function createInitialUserProfile(
 
   const userRef = doc(firestore, USERS_COLLECTION, input.uid);
   const usernameRef = doc(firestore, USERNAMES_COLLECTION, normalizedUsername.usernameLower);
+  const publicProfileRef = doc(firestore, PUBLIC_PROFILES_COLLECTION, input.uid);
 
   try {
     await runTransaction(firestore, async (transaction) => {
@@ -114,6 +117,8 @@ export async function createInitialUserProfile(
         throw new ProfileTransactionError('username-taken');
       }
 
+      const displayName = input.displayName.trim();
+
       transaction.set(usernameRef, {
         uid: input.uid,
         createdAt: serverTimestamp(),
@@ -122,7 +127,7 @@ export async function createInitialUserProfile(
       transaction.set(userRef, {
         uid: input.uid,
         email: input.email,
-        displayName: input.displayName.trim(),
+        displayName,
         username: normalizedUsername.username,
         usernameLower: normalizedUsername.usernameLower,
         cityName,
@@ -134,6 +139,24 @@ export async function createInitialUserProfile(
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       } satisfies WithFieldValue<UserProfile>);
+
+      // Public-safe snapshot of the same profile, created atomically with it
+      // — see src/types/social.ts. Never partially committed: this is the
+      // same transaction as the private profile + username reservation
+      // above, so either all three documents exist or none do.
+      transaction.set(publicProfileRef, {
+        uid: input.uid,
+        displayName,
+        username: normalizedUsername.username,
+        usernameLower: normalizedUsername.usernameLower,
+        cityName,
+        countryCode,
+        cityKey,
+        interests: input.interests,
+        accountType: 'personal',
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      } satisfies WithFieldValue<PublicProfile>);
     });
   } catch (error) {
     if (error instanceof ProfileTransactionError) {

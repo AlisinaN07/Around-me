@@ -2,6 +2,7 @@ import { Ionicons } from '@expo/vector-icons';
 import { router } from 'expo-router';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 
+import { AuthorLink } from '@/components/AuthorLink';
 import { INTERESTS } from '@/constants/interests';
 import { Colors, Radius, Spacing } from '@/constants/theme';
 import type { Content } from '@/types/content';
@@ -34,12 +35,14 @@ export function ContentCard({ item, currentUid }: ContentCardProps) {
     >
       <View style={styles.header}>
         <View style={styles.authorRow}>
-          <Text style={styles.authorName} numberOfLines={1}>
-            {item.authorDisplayName}
-          </Text>
-          <Text style={styles.username} numberOfLines={1}>
-            @{item.authorUsername}
-          </Text>
+          <AuthorLink uid={item.authorUid} style={styles.authorLink}>
+            <Text style={styles.authorName} numberOfLines={1}>
+              {item.authorDisplayName}
+            </Text>
+            <Text style={styles.username} numberOfLines={1}>
+              @{item.authorUsername}
+            </Text>
+          </AuthorLink>
           {isOwn && (
             <View style={styles.youBadge}>
               <Text style={styles.youText}>You</Text>
@@ -111,6 +114,12 @@ const styles = StyleSheet.create({
     gap: Spacing.sm,
   },
   authorRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    flexShrink: 1,
+  },
+  authorLink: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 6,

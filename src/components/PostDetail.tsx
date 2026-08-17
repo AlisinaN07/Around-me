@@ -1,6 +1,7 @@
 import { Ionicons } from '@expo/vector-icons';
 import { StyleSheet, Text, View } from 'react-native';
 
+import { AuthorLink } from '@/components/AuthorLink';
 import { EngagementSection } from '@/components/EngagementSection';
 import { INTERESTS } from '@/constants/interests';
 import { Colors, Radius, Spacing } from '@/constants/theme';
@@ -22,10 +23,10 @@ export function PostDetail({ content }: { content: PostContent }) {
         </View>
       )}
 
-      <View style={styles.authorRow}>
+      <AuthorLink uid={content.authorUid} style={styles.authorRow}>
         <Text style={styles.authorName}>{content.authorDisplayName}</Text>
         <Text style={styles.username}>@{content.authorUsername}</Text>
-      </View>
+      </AuthorLink>
 
       <Text style={styles.body}>{content.body}</Text>
 

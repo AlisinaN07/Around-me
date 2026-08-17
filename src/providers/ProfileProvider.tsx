@@ -1,6 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react';
 
 import { useAuth } from '@/hooks/useAuth';
+import { ensureMyPublicProfile } from '@/services/publicProfile';
 import { fetchUserProfile } from '@/services/userProfile';
 import type { UserProfile } from '@/types/user';
 
@@ -32,6 +33,13 @@ export function ProfileProvider({ children }: { children: ReactNode }) {
     try {
       const profile = await fetchUserProfile(uid);
       setResult({ uid, profile, error: null });
+      if (profile?.onboardingCompleted) {
+        // Lazy migration for accounts that completed onboarding before
+        // Step 11 (new profiles already get a publicProfiles/{uid} in the
+        // same onboarding transaction) — fire-and-forget, never blocks or
+        // fails the profile-load flow above.
+        ensureMyPublicProfile(uid).catch(() => {});
+      }
     } catch (error) {
       setResult({ uid, profile: null, error: error instanceof Error ? error.message : 'Could not load your profile.' });
     }

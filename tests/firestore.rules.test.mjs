@@ -134,6 +134,27 @@ function validLike(uid, overrides = {}) {
   return { uid, createdAt: serverTimestamp(), ...overrides };
 }
 
+function validPublicProfile(uid, displayName, username, overrides = {}) {
+  return {
+    uid,
+    displayName,
+    username,
+    usernameLower: username,
+    cityName: 'Karlstad',
+    countryCode: 'SE',
+    cityKey: 'se:karlstad',
+    interests: ['music'],
+    accountType: 'personal',
+    createdAt: serverTimestamp(),
+    updatedAt: serverTimestamp(),
+    ...overrides,
+  };
+}
+
+function validFollow(followerUid, followingUid, overrides = {}) {
+  return { followerUid, followingUid, createdAt: serverTimestamp(), ...overrides };
+}
+
 function validComment(commentId, authorUid, authorDisplayName, authorUsername, body, overrides = {}) {
   return {
     commentId,
@@ -935,6 +956,256 @@ async function main() {
       assert.equal(await commentCount(bob, 'post-agg-2'), 2);
       await assertSucceeds(deleteDoc(doc(bob, 'content', 'post-agg-2', 'comments', 'c-a')));
       assert.equal(await commentCount(bob, 'post-agg-2'), 1);
+    });
+
+    // =========================================================================
+    // publicProfiles/{uid}
+    // =========================================================================
+    await check('ALLOW: completed user creates own matching public profile', async () => {
+      await assertSucceeds(setDoc(doc(alice, 'publicProfiles', 'alice'), validPublicProfile('alice', 'Test User', 'alice_handle')));
+    });
+
+    await check('ALLOW: authenticated user reads a public profile', async () => {
+      await assertSucceeds(getDoc(doc(bob, 'publicProfiles', 'alice')));
+    });
+
+    await check('DENY: unauthenticated read', async () => {
+      await assertFails(getDoc(doc(anon, 'publicProfiles', 'alice')));
+    });
+
+    await check('DENY: user A creates a public profile at user B\'s UID', async () => {
+      await assertFails(setDoc(doc(alice, 'publicProfiles', 'bob'), validPublicProfile('bob', 'Bob Bobsson', 'bob_handle')));
+    });
+
+    await check('DENY: spoofed displayName on public profile', async () => {
+      await assertFails(setDoc(doc(bob, 'publicProfiles', 'bob'), validPublicProfile('bob', 'Someone Else', 'bob_handle')));
+    });
+
+    await check('DENY: spoofed username on public profile', async () => {
+      await assertFails(setDoc(doc(bob, 'publicProfiles', 'bob'), validPublicProfile('bob', 'Bob Bobsson', 'alice_handle')));
+    });
+
+    await check('DENY: spoofed city on public profile', async () => {
+      await assertFails(
+        setDoc(doc(bob, 'publicProfiles', 'bob'), validPublicProfile('bob', 'Bob Bobsson', 'bob_handle', { cityName: 'Stockholm', cityKey: 'se:stockholm' }))
+      );
+    });
+
+    await check('DENY: public profile includes an email field', async () => {
+      await assertFails(
+        setDoc(doc(bob, 'publicProfiles', 'bob'), { ...validPublicProfile('bob', 'Bob Bobsson', 'bob_handle'), email: 'bob@example.com' })
+      );
+    });
+
+    await check('DENY: public profile includes an arbitrary extra field', async () => {
+      await assertFails(setDoc(doc(bob, 'publicProfiles', 'bob'), { ...validPublicProfile('bob', 'Bob Bobsson', 'bob_handle'), bio: 'hello' }));
+    });
+
+    await check('ALLOW: second user creates own matching public profile (setup for follows)', async () => {
+      await assertSucceeds(setDoc(doc(bob, 'publicProfiles', 'bob'), validPublicProfile('bob', 'Bob Bobsson', 'bob_handle')));
+    });
+
+    await check('ALLOW: third user creates own matching public profile (setup for follows)', async () => {
+      await assertSucceeds(setDoc(doc(carol, 'publicProfiles', 'carol'), validPublicProfile('carol', 'Carol Carlsson', 'carol_handle')));
+    });
+
+    await check('DENY: update a public profile', async () => {
+      await assertFails(updateDoc(doc(alice, 'publicProfiles', 'alice'), { displayName: 'Changed' }));
+    });
+
+    await check('DENY: delete a public profile', async () => {
+      await assertFails(deleteDoc(doc(alice, 'publicProfiles', 'alice')));
+    });
+
+    // =========================================================================
+    // follows/{followerUid}_{followingUid}
+    // =========================================================================
+    await check('ALLOW: user A follows user B', async () => {
+      await assertSucceeds(setDoc(doc(alice, 'follows', 'alice_bob'), validFollow('alice', 'bob')));
+    });
+
+    await check('ALLOW: authenticated user reads follow edges', async () => {
+      await assertSucceeds(getDoc(doc(carol, 'follows', 'alice_bob')));
+    });
+
+    await check('DENY: duplicate follow does not create a second edge', async () => {
+      // Same deterministic ID as the existing follow above => a rules
+      // "update" (the doc already exists), which is denied — that's what
+      // actually prevents a duplicate edge, not a separate exists() check.
+      await assertFails(setDoc(doc(alice, 'follows', 'alice_bob'), validFollow('alice', 'bob')));
+    });
+
+    await check('ALLOW: user A unfollows user B', async () => {
+      await assertSucceeds(deleteDoc(doc(alice, 'follows', 'alice_bob')));
+    });
+
+    await check('DENY: unauthenticated follow', async () => {
+      await assertFails(setDoc(doc(anon, 'follows', 'ghost_bob'), validFollow('ghost', 'bob')));
+    });
+
+    await check('DENY: user A creates a follow with followerUid = user C', async () => {
+      await assertFails(setDoc(doc(alice, 'follows', 'carol_bob'), validFollow('carol', 'bob')));
+    });
+
+    await check('DENY: self-follow', async () => {
+      await assertFails(setDoc(doc(alice, 'follows', 'alice_alice'), validFollow('alice', 'alice')));
+    });
+
+    await check('DENY: follow a nonexistent public profile', async () => {
+      await assertFails(setDoc(doc(alice, 'follows', 'alice_dave'), validFollow('alice', 'dave')));
+    });
+
+    await check('DENY: wrong deterministic follow document ID', async () => {
+      await assertFails(setDoc(doc(alice, 'follows', 'wrong-id'), validFollow('alice', 'bob')));
+    });
+
+    await check('DENY: follow document with extra fields', async () => {
+      await assertFails(setDoc(doc(alice, 'follows', 'alice_carol'), { ...validFollow('alice', 'carol'), note: 'hi' }));
+    });
+
+    await check('DENY: update a follow document', async () => {
+      await assertSucceeds(setDoc(doc(alice, 'follows', 'alice_carol'), validFollow('alice', 'carol')));
+      await assertFails(updateDoc(doc(alice, 'follows', 'alice_carol'), { createdAt: serverTimestamp() }));
+    });
+
+    await check('DENY: user A deletes user C\'s follow edge', async () => {
+      await assertSucceeds(setDoc(doc(bob, 'follows', 'bob_carol'), validFollow('bob', 'carol')));
+      await assertFails(deleteDoc(doc(alice, 'follows', 'bob_carol')));
+    });
+
+    // =========================================================================
+    // Counts + list verification — fresh users so counts start at a known
+    // zero, independent of the follow edges created above.
+    // =========================================================================
+    await seedProfile(testEnv, 'usera', 'usera_handle', { displayName: 'User A' });
+    await seedProfile(testEnv, 'userb', 'userb_handle', { displayName: 'User B' });
+    await seedProfile(testEnv, 'userc', 'userc_handle', { displayName: 'User C' });
+    const userA = testEnv.authenticatedContext('usera').firestore();
+    const userB = testEnv.authenticatedContext('userb').firestore();
+    const userC = testEnv.authenticatedContext('userc').firestore();
+
+    await check('setup: fresh users create their own public profiles', async () => {
+      await assertSucceeds(setDoc(doc(userA, 'publicProfiles', 'usera'), validPublicProfile('usera', 'User A', 'usera_handle')));
+      await assertSucceeds(setDoc(doc(userB, 'publicProfiles', 'userb'), validPublicProfile('userb', 'User B', 'userb_handle')));
+      await assertSucceeds(setDoc(doc(userC, 'publicProfiles', 'userc'), validPublicProfile('userc', 'User C', 'userc_handle')));
+    });
+
+    async function followerCount(db, uid) {
+      const snapshot = await getCountFromServer(query(collection(db, 'follows'), where('followingUid', '==', uid)));
+      return snapshot.data().count;
+    }
+    async function followingCount(db, uid) {
+      const snapshot = await getCountFromServer(query(collection(db, 'follows'), where('followerUid', '==', uid)));
+      return snapshot.data().count;
+    }
+
+    await check('AGGREGATION: follower count 0 -> 1 (A follows B) -> 2 (C follows B) -> 1 (A unfollows B)', async () => {
+      assert.equal(await followerCount(userB, 'userb'), 0);
+      await assertSucceeds(setDoc(doc(userA, 'follows', 'usera_userb'), validFollow('usera', 'userb')));
+      assert.equal(await followerCount(userB, 'userb'), 1);
+      await assertSucceeds(setDoc(doc(userC, 'follows', 'userc_userb'), validFollow('userc', 'userb')));
+      assert.equal(await followerCount(userB, 'userb'), 2);
+      await assertSucceeds(deleteDoc(doc(userA, 'follows', 'usera_userb')));
+      assert.equal(await followerCount(userB, 'userb'), 1);
+    });
+
+    await check('AGGREGATION: following count 0 -> 1 (A follows B) -> 0 (A unfollows B)', async () => {
+      assert.equal(await followingCount(userA, 'usera'), 0);
+      await assertSucceeds(setDoc(doc(userA, 'follows', 'usera_userb'), validFollow('usera', 'userb')));
+      assert.equal(await followingCount(userA, 'usera'), 1);
+      await assertSucceeds(deleteDoc(doc(userA, 'follows', 'usera_userb')));
+      assert.equal(await followingCount(userA, 'usera'), 0);
+    });
+
+    await check('setup: A follows B, A follows C (C already follows B from aggregation tests above)', async () => {
+      await assertSucceeds(setDoc(doc(userA, 'follows', 'usera_userb'), validFollow('usera', 'userb')));
+      await assertSucceeds(setDoc(doc(userA, 'follows', 'usera_userc'), validFollow('usera', 'userc')));
+    });
+
+    async function followingUidsOf(db, uid) {
+      const snapshot = await getDocs(query(collection(db, 'follows'), where('followerUid', '==', uid)));
+      return snapshot.docs.map((docSnapshot) => docSnapshot.data().followingUid).sort();
+    }
+    async function followerUidsOf(db, uid) {
+      const snapshot = await getDocs(query(collection(db, 'follows'), where('followingUid', '==', uid)));
+      return snapshot.docs.map((docSnapshot) => docSnapshot.data().followerUid).sort();
+    }
+
+    await check('LIST: fetchFollowing(A) contains exactly B and C, nothing else', async () => {
+      assert.deepEqual(await followingUidsOf(userA, 'usera'), ['userb', 'userc']);
+    });
+
+    await check('LIST: fetchFollowers(B) contains exactly A and C, nothing else', async () => {
+      assert.deepEqual(await followerUidsOf(userB, 'userb'), ['usera', 'userc']);
+    });
+
+    // =========================================================================
+    // Onboarding regression — the exact 3-document transaction shape used by
+    // createInitialUserProfile (users + usernames + publicProfiles), proving
+    // Firestore transactions are genuinely atomic against these rules: if
+    // any one write would be denied, NONE of the three documents land.
+    // =========================================================================
+    await check('ALLOW: onboarding transaction creates users + usernames + publicProfiles atomically', async () => {
+      const frank = testEnv.authenticatedContext('frank').firestore();
+      const userRef = doc(frank, 'users', 'frank');
+      const usernameRef = doc(frank, 'usernames', 'frank_handle');
+      const publicRef = doc(frank, 'publicProfiles', 'frank');
+
+      await assertSucceeds(
+        runTransaction(frank, async (tx) => {
+          await Promise.all([tx.get(userRef), tx.get(usernameRef)]);
+          tx.set(usernameRef, usernameReservation('frank'));
+          tx.set(userRef, validUserProfile('frank', 'frank_handle'));
+          tx.set(publicRef, validPublicProfile('frank', 'Test User', 'frank_handle'));
+        })
+      );
+
+      const [userSnap, usernameSnap, publicSnap] = await Promise.all([getDoc(userRef), getDoc(usernameRef), getDoc(publicRef)]);
+      assert.equal(userSnap.exists(), true);
+      assert.equal(usernameSnap.exists(), true);
+      assert.equal(publicSnap.exists(), true);
+      assert.equal('email' in publicSnap.data(), false);
+    });
+
+    await check('DENY: onboarding transaction with a spoofed publicProfile fails atomically (no partial documents)', async () => {
+      const gina = testEnv.authenticatedContext('gina').firestore();
+      const userRef = doc(gina, 'users', 'gina');
+      const usernameRef = doc(gina, 'usernames', 'gina_handle');
+      const publicRef = doc(gina, 'publicProfiles', 'gina');
+
+      await assertFails(
+        runTransaction(gina, async (tx) => {
+          await Promise.all([tx.get(userRef), tx.get(usernameRef)]);
+          tx.set(usernameRef, usernameReservation('gina'));
+          tx.set(userRef, validUserProfile('gina', 'gina_handle'));
+          // Doesn't match the private profile's displayName ('Test User') —
+          // this single bad write should roll back the entire transaction.
+          tx.set(publicRef, validPublicProfile('gina', 'SPOOFED NAME', 'gina_handle'));
+        })
+      );
+
+      const [userSnap, usernameSnap, publicSnap] = await Promise.all([getDoc(userRef), getDoc(usernameRef), getDoc(publicRef)]);
+      assert.equal(userSnap.exists(), false);
+      assert.equal(usernameSnap.exists(), false);
+      assert.equal(publicSnap.exists(), false);
+    });
+
+    // =========================================================================
+    // Existing-user lazy migration (ensureMyPublicProfile) — a legacy user
+    // has a private profile + username but no public profile yet, matching
+    // an account that completed onboarding before Step 11.
+    // =========================================================================
+    await seedProfile(testEnv, 'legacy', 'legacy_handle', { displayName: 'Legacy User' });
+    const legacy = testEnv.authenticatedContext('legacy').firestore();
+
+    await check('ALLOW: ensureMyPublicProfile creates a matching public profile for a legacy user', async () => {
+      await assertSucceeds(setDoc(doc(legacy, 'publicProfiles', 'legacy'), validPublicProfile('legacy', 'Legacy User', 'legacy_handle')));
+    });
+
+    await check('DENY+IDEMPOTENT: calling it again does not overwrite — a second create is denied, the original document is untouched', async () => {
+      await assertFails(setDoc(doc(legacy, 'publicProfiles', 'legacy'), validPublicProfile('legacy', 'Legacy User', 'legacy_handle')));
+      const snapshot = await getDoc(doc(legacy, 'publicProfiles', 'legacy'));
+      assert.equal(snapshot.exists(), true);
     });
 
     await testEnv.clearFirestore();

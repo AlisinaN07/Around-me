@@ -2,6 +2,7 @@ import { Ionicons } from '@expo/vector-icons';
 import { useCallback, useEffect, useState } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 
+import { AuthorLink } from '@/components/AuthorLink';
 import { EngagementSection } from '@/components/EngagementSection';
 import { INTERESTS } from '@/constants/interests';
 import { Colors, Radius, Spacing } from '@/constants/theme';
@@ -80,10 +81,10 @@ export function EventDetail({ content }: { content: EventContent }) {
 
       <Text style={styles.title}>{content.title}</Text>
 
-      <View style={styles.authorRow}>
+      <AuthorLink uid={content.authorUid} style={styles.authorRow}>
         <Text style={styles.authorName}>{content.authorDisplayName}</Text>
         <Text style={styles.username}>@{content.authorUsername}</Text>
-      </View>
+      </AuthorLink>
 
       <Text style={styles.description}>{content.description}</Text>
 

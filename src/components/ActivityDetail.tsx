@@ -3,6 +3,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { StyleSheet, Text, View } from 'react-native';
 
 import { Avatar } from '@/components/Avatar';
+import { AuthorLink } from '@/components/AuthorLink';
 import { Button } from '@/components/Button';
 import { EngagementSection } from '@/components/EngagementSection';
 import { INTERESTS } from '@/constants/interests';
@@ -90,10 +91,10 @@ export function ActivityDetail({ content }: { content: ActivityContent }) {
 
       <Text style={styles.title}>{content.title}</Text>
 
-      <View style={styles.authorRow}>
+      <AuthorLink uid={content.authorUid} style={styles.authorRow}>
         <Text style={styles.authorName}>{content.authorDisplayName}</Text>
         <Text style={styles.username}>@{content.authorUsername}</Text>
-      </View>
+      </AuthorLink>
 
       <Text style={styles.description}>{content.description}</Text>
 
