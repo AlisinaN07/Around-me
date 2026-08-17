@@ -68,3 +68,45 @@ export const TITLE_MAX_LENGTH = 120;
 export const DESCRIPTION_MAX_LENGTH = 1000;
 export const PLACE_NAME_MAX_LENGTH = 200;
 export const MAX_PARTICIPANTS_LIMIT = 500;
+
+/**
+ * content/{activityId}/participants/{uid} — one document per joined user.
+ * displayName/username are a public-safe snapshot of the participant's own
+ * profile, verified against it by Firestore rules on create. Never store
+ * email, location, or other private profile fields here.
+ */
+export type ActivityParticipant = {
+  uid: string;
+  displayName: string;
+  username: string;
+  joinedAt: Timestamp;
+};
+
+/**
+ * content/{activityId}/stats/activity — a single document holding the
+ * participant count, so `maxParticipants` can be enforced without reading
+ * every participant document. Kept separate from the root content document
+ * so the existing content schema stays stable (see src/services/content.ts).
+ */
+export type ActivityStats = {
+  participantCount: number;
+  updatedAt: Timestamp;
+};
+
+export type EventResponseStatus = 'interested' | 'going';
+
+/**
+ * content/{eventId}/responses/{uid} — one document per user, holding their
+ * current status. Switching between "interested" and "going" updates this
+ * same document rather than creating a second one. displayName/username are
+ * a public-safe snapshot, verified against the responder's own profile by
+ * Firestore rules.
+ */
+export type EventResponse = {
+  uid: string;
+  displayName: string;
+  username: string;
+  status: EventResponseStatus;
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+};

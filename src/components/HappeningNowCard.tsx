@@ -8,11 +8,12 @@ type HappeningNowCardProps = {
   title: string;
   place: string;
   timeLabel: string;
+  onPress?: () => void;
 };
 
-export function HappeningNowCard({ category, title, place, timeLabel }: HappeningNowCardProps) {
+export function HappeningNowCard({ category, title, place, timeLabel, onPress }: HappeningNowCardProps) {
   return (
-    <Pressable style={styles.card} accessibilityRole="button" accessibilityLabel={`${title} at ${place}`}>
+    <Pressable style={styles.card} onPress={onPress} accessibilityRole="button" accessibilityLabel={`${title} at ${place}`}>
       <View style={styles.media}>
         <Ionicons name="image-outline" size={28} color={Colors.textSecondary} />
         <View style={styles.timeBadge}>

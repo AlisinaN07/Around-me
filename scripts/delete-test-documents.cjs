@@ -19,13 +19,18 @@
 //     --users uid1,uid2 \
 //     --usernames someuser,otheruser \
 //     --content contentId1,contentId2 \
+//     --paths content/activityId/participants/uid,content/activityId/stats/activity \
 //     --auth-uids uid1,uid2
 //
 // Any of the flags may be omitted. Running with none of them does nothing
 // (and says so) rather than deleting anything by default. --auth-uids
 // deletes the Firebase Auth account itself (via the Identity Toolkit REST
 // API, same reused CLI session) — use it for disposable test accounts only,
-// never for a real user's account.
+// never for a real user's account. --paths deletes exact subcollection
+// documents (e.g. content/{id}/participants/{uid}) that --content doesn't
+// reach, since Firestore never cascade-deletes subcollections — each path
+// must resolve to one document (an even number of segments), so a bare
+// collection path is rejected rather than silently doing something wider.
 
 const apiv2 = require('firebase-tools/lib/apiv2');
 const auth = require('firebase-tools/lib/auth');
@@ -34,10 +39,10 @@ const PROJECT = 'around-me-6a437';
 const COLLECTIONS = ['users', 'usernames', 'content'];
 
 function parseArgs(argv) {
-  const ids = { users: [], usernames: [], content: [], 'auth-uids': [] };
+  const ids = { users: [], usernames: [], content: [], paths: [], 'auth-uids': [] };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
-    const match = /^--(users|usernames|content|auth-uids)$/.exec(arg);
+    const match = /^--(users|usernames|content|paths|auth-uids)$/.exec(arg);
     if (match) {
       const value = argv[i + 1];
       i += 1;
@@ -50,17 +55,23 @@ function parseArgs(argv) {
         .filter(Boolean);
     }
   }
+  for (const path of ids.paths) {
+    const segments = path.split('/').filter(Boolean);
+    if (segments.length % 2 !== 0) {
+      throw new Error(`--paths entry "${path}" has an odd number of segments — it names a collection, not a document. Refusing.`);
+    }
+  }
   return ids;
 }
 
 async function main() {
   const ids = parseArgs(process.argv.slice(2));
-  const totalDocIds = COLLECTIONS.reduce((sum, c) => sum + ids[c].length, 0);
+  const totalDocIds = COLLECTIONS.reduce((sum, c) => sum + ids[c].length, 0) + ids.paths.length;
   const totalAuthIds = ids['auth-uids'].length;
 
   if (totalDocIds === 0 && totalAuthIds === 0) {
     console.log('No IDs given — nothing to delete. Exiting.');
-    console.log('Pass --users, --usernames, --content, and/or --auth-uids with comma-separated IDs.');
+    console.log('Pass --users, --usernames, --content, --paths, and/or --auth-uids with comma-separated IDs.');
     return;
   }
 
@@ -92,6 +103,20 @@ async function main() {
         } else {
           throw error;
         }
+      }
+    }
+  }
+
+  for (const relativePath of ids.paths) {
+    const path = `${root}/${relativePath}`;
+    try {
+      await firestoreClient.delete(path);
+      console.log(`Deleted ${relativePath}`);
+    } catch (error) {
+      if (error?.status === 404 || /NOT_FOUND/i.test(String(error?.message))) {
+        console.log(`${relativePath} already absent — skipping`);
+      } else {
+        throw error;
       }
     }
   }

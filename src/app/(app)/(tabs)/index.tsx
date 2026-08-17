@@ -196,6 +196,7 @@ export default function HomeScreen() {
                           title={item.title}
                           place={item.placeName}
                           timeLabel={formatEventTime(item.startsAt.toDate())}
+                          onPress={() => router.push(`/content/${item.contentId}`)}
                         />
                       );
                     })}

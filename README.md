@@ -2,7 +2,7 @@
 
 Location-based social network organized around cities — "See what's happening around you, right now."
 
-Email/password authentication, onboarding (name, username, city, interests), a full tab-based application shell (Home, Reels, Create, Map, Profile), and the real Firestore content backend (posts, activities, events) are implemented. Create → Post/Activity/Event → Publish is wired to that backend, and Home's Around You / Happening Now sections render the real city feed. Reels (both creation and the Local Reels feed) remain unimplemented placeholders — no media/Storage layer exists yet.
+Email/password authentication, onboarding (name, username, city, interests), a full tab-based application shell (Home, Reels, Create, Map, Profile), and the real Firestore content backend (posts, activities, events) are implemented. Create → Post/Activity/Event → Publish is wired to that backend, and Home's Around You / Happening Now sections render the real city feed. Activity/Event cards open real detail screens with Join/Leave and Interested/Going participation, backed by Firestore transactions and security rules. Reels (both creation and the Local Reels feed) remain unimplemented placeholders — no media/Storage layer exists yet. Likes, comments, and other general social engagement are not implemented yet either.
 
 ## Stack
 
@@ -48,16 +48,20 @@ src/
     (app)/
       (tabs)/           Home, Reels, Create, Map, Profile — logged in, profile complete
       create/            Post/Activity/Event forms — stack screens above the tab bar, not tabs
+      content/           [contentId] detail screen (Activity/Event participation) — also a stack
+                        screen above the tab bar
     _layout.tsx        Routes between the three top-level groups based on auth + profile state
-  components/          Button, FormField, FormScreenLayout, CreateScreenLayout, OnboardingProgress,
+  components/          Button, FormField, FormScreenLayout, HeaderScreenLayout, OnboardingProgress,
                        CountryPicker, Avatar, SectionHeader, CategoryChip, CategorySelector,
-                       DateTimeField (+ .web variant), ContentCard, HappeningNowCard
+                       DateTimeField (+ .web variant), ContentCard, HappeningNowCard,
+                       ActivityDetail, EventDetail
   constants/            theme.ts (design tokens), countries.ts, interests.ts, categoryFilters.ts
   hooks/                useAuth.ts, useProfile.ts
   providers/            AuthProvider, ProfileProvider, OnboardingDraftProvider
   services/            firebase.ts (App), auth.ts (Auth), firestore.ts (Firestore),
                        userProfile.ts (profile data layer), content.ts (posts/activities/events
-                       data layer), location.ts (one-time city lookup)
+                       data layer), engagement.ts (activity participation + event responses),
+                       location.ts (one-time city lookup)
   types/                Shared TypeScript types and type augmentations
   utils/                authErrors.ts, username.ts, cityKey.ts, cityDisplay.ts, timeFormat.ts
 scripts/                delete-test-documents.cjs — explicit-ID-only disposable test cleanup
@@ -84,7 +88,13 @@ Content queries (`src/services/content.ts`) are one-shot reads with explicit lim
 - `fetchUpcomingEvents` / `fetchUpcomingActivities(cityKey)` — `startsAt >= now`, `orderBy(startsAt asc)`.
 - `fetchHappeningNow(cityKey)` — Firestore can't filter two different fields with inequalities in one query, so `startsAt <= now AND endsAt >= now` isn't directly expressible. Instead it fetches already-started candidates (`startsAt <= now`) and filters client-side for ones that haven't ended — reusing the same index as the "upcoming" queries rather than a third one. Fine until real usage data says otherwise.
 
-All access goes through `src/services/userProfile.ts` and `src/services/content.ts` — UI code should never import `firebase/firestore` directly.
+Two subcollections support participation, added under `content/{contentId}`:
+
+- `content/{activityId}/participants/{uid}` — one document per user who joined an Activity (`uid`, `displayName`, `username`, `joinedAt` — same public-safe-snapshot pattern as content itself, verified against the joiner's own profile by Firestore rules).
+- `content/{activityId}/stats/activity` — a single `{ participantCount, updatedAt }` document, kept in sync with the participant subcollection by a Firestore transaction on every join/leave (see Engagement below) so `maxParticipants` can be enforced without reading every participant.
+- `content/{eventId}/responses/{uid}` — one document per user's Interested/Going response to an Event (`status: 'interested' | 'going'`, switched in place rather than creating a second document). No separate counter — Interested/Going counts come from `getCountFromServer` aggregation queries instead.
+
+All access goes through `src/services/userProfile.ts`, `src/services/content.ts`, and `src/services/engagement.ts` — UI code should never import `firebase/firestore` directly.
 
 **Security rules** (`firestore.rules`) enforce least privilege throughout. Everything unspecified is denied by default. **Never switch production rules to `allow read, write: if true` — even temporarily.**
 
@@ -94,7 +104,7 @@ Before deploying a rules change, test it against the emulator:
 npm run test:rules
 ```
 
-This runs `tests/firestore.rules.test.mjs` against a local Firestore emulator using `@firebase/rules-unit-testing`, covering the ALLOW/DENY cases for `users`, `usernames`, and `content`. (Note: on at least one sandboxed dev environment, the emulator's rules-management endpoint hung indefinitely for unrelated network reasons — if `npm run test:rules` hangs for you, verify the same scenarios directly against a real project instead, as was done manually to validate the rules deployed here.)
+This runs `tests/firestore.rules.test.mjs` against a local Firestore emulator using `@firebase/rules-unit-testing`, covering the ALLOW/DENY cases for `users`, `usernames`, `content`, `content/{id}/participants`, `content/{id}/stats`, and `content/{id}/responses`. (Note: on at least one sandboxed dev environment, the emulator starts fine but pushing the ruleset to it fails with `ECONNRESET`/`fetch failed` for unrelated network reasons — if `npm run test:rules` fails that way for you, verify the same scenarios directly against a real project instead, as was done manually to validate the rules deployed here.)
 
 To deploy rules and indexes:
 
@@ -122,6 +132,18 @@ npm run cleanup:test-data -- --users uid1,uid2 --usernames someuser,otheruser --
 Create → choose Post/Activity/Event → fill in the form → Publish calls the matching `create*` function in `src/services/content.ts` directly (screens never write to Firestore themselves). On success the app navigates back to Home; Home refetches on every focus (`useFocusEffect`, still a one-shot query, not a realtime listener), so newly-published content shows up without an app restart. Reel stays "Coming soon" — no upload UI or Storage integration exists yet.
 
 Date/time fields use `@react-native-community/datetimepicker` on iOS/Android (`src/components/DateTimeField.tsx`) and plain HTML `date`/`time` inputs on web (`DateTimeField.web.tsx`, picked automatically by Metro's platform file resolution) — the picker package has no web support of its own.
+
+## Engagement (Activity join/leave, Event Interested/Going)
+
+`src/services/engagement.ts`:
+
+- `joinActivity` / `leaveActivity` — each a single Firestore transaction that reads the Activity + the caller's own participant doc + the stats doc, then writes the participant doc and the stats counter together atomically. Rejects joining a non-Activity, an unpublished Activity, an ended Activity, or a full one (`maxParticipants`); a repeat join returns `alreadyJoined` instead of incrementing twice; a repeat leave is a safe no-op instead of going negative.
+- `getActivityParticipation` / `fetchActivityParticipants` — one-shot reads for the detail screen's own join state + a capped (`limit`) participant preview list.
+- `setEventResponse` / `removeEventResponse` / `fetchMyEventResponse` / `fetchEventResponseCounts` — plain reads/writes (no transaction needed, since there's no counter to keep paired) that create-or-update the caller's own response document and read real Interested/Going counts via aggregation queries.
+
+Firestore rules enforce all of this server-side too, independent of the client: a participant/response document's `uid`/`displayName`/`username` must match the caller's own profile, a participant or response can only be created for a published, not-yet-ended Activity/Event, and the `stats/activity` counter can only change by exactly ±1 in the same atomic write as the caller's own participant document appearing/disappearing (checked via `existsAfter()`/`getAfter()` on both sides of the pair) — a client can never write `participantCount` directly, exceed `maxParticipants`, or push the count negative.
+
+Activity/Event detail screens (`src/app/(app)/content/[contentId].tsx`, delegating to `ActivityDetail`/`EventDetail`) are reached by tapping "View activity"/"View event" on a `ContentCard` or a Happening Now card. Joining/leaving/responding disables the button, runs the write, then refetches — no realtime listeners, no optimistic counts.
 
 ## Location
 

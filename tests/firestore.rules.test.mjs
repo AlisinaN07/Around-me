@@ -15,6 +15,7 @@ import {
   collection,
   deleteDoc,
   doc,
+  getCountFromServer,
   getDoc,
   getDocs,
   query,
@@ -22,6 +23,7 @@ import {
   serverTimestamp,
   setDoc,
   Timestamp,
+  updateDoc,
   where,
 } from 'firebase/firestore';
 
@@ -114,6 +116,29 @@ function validEvent(authorUid, authorDisplayName, authorUsername, contentId, ove
     endsAt: Timestamp.fromMillis(now + 3 * 60 * 60 * 1000),
     ...overrides,
   };
+}
+
+function validParticipant(uid, displayName, username, overrides = {}) {
+  return { uid, displayName, username, joinedAt: serverTimestamp(), ...overrides };
+}
+
+function statsDoc(count) {
+  return { participantCount: count, updatedAt: serverTimestamp() };
+}
+
+function validResponse(uid, displayName, username, status, overrides = {}) {
+  return { uid, displayName, username, status, createdAt: serverTimestamp(), updatedAt: serverTimestamp(), ...overrides };
+}
+
+/** Mirrors the real joinActivity transaction: participant create + stats increment, atomically. */
+function joinTransaction(db, activityId, uid, displayName, username, nextCount) {
+  const participantRef = doc(db, 'content', activityId, 'participants', uid);
+  const statsRef = doc(db, 'content', activityId, 'stats', 'activity');
+  return runTransaction(db, async (tx) => {
+    await Promise.all([tx.get(participantRef), tx.get(statsRef)]);
+    tx.set(participantRef, validParticipant(uid, displayName, username));
+    tx.set(statsRef, statsDoc(nextCount));
+  });
 }
 
 /** Seeds a users/{uid} profile directly, bypassing rules (already tested above). */
@@ -354,6 +379,314 @@ async function main() {
 
     await check('ALLOW: author deletes their own content', async () => {
       await assertSucceeds(deleteDoc(doc(alice, 'content', 'post-alice-1')));
+    });
+
+    // =========================================================================
+    // content/{activityId}/participants/{uid} + stats/activity
+    // Reuses 'activity-alice-1' (created above, future start/end, no cap) for
+    // the main join/read/leave flow. Dedicated fresh activities are used for
+    // tests that need a specific, uncontaminated participant count.
+    // =========================================================================
+    await seedProfile(testEnv, 'carol', 'carol_handle', { displayName: 'Carol Carlsson' });
+    const carol = testEnv.authenticatedContext('carol').firestore();
+
+    await check('ALLOW: completed user joins a valid Activity (participant + stats paired write)', async () => {
+      await assertSucceeds(joinTransaction(alice, 'activity-alice-1', 'alice', 'Test User', 'alice_handle', 1));
+      const stats = await getDoc(doc(alice, 'content', 'activity-alice-1', 'stats', 'activity'));
+      assert.equal(stats.data().participantCount, 1);
+    });
+
+    await check('DENY: duplicate join does not double-increment (second paired write for same user rejected)', async () => {
+      // alice is already joined; a second create attempt for the same
+      // participant doc is a create-on-existing-doc, which Firestore itself
+      // rejects (the real joinActivity() service returns "alreadyJoined"
+      // instead of ever attempting this) — confirms no double count is possible.
+      await assertFails(joinTransaction(alice, 'activity-alice-1', 'alice', 'Test User', 'alice_handle', 2));
+      const stats = await getDoc(doc(alice, 'content', 'activity-alice-1', 'stats', 'activity'));
+      assert.equal(stats.data().participantCount, 1);
+    });
+
+    await check('ALLOW: authenticated user reads the participant list', async () => {
+      await assertSucceeds(getDocs(collection(bob, 'content', 'activity-alice-1', 'participants')));
+    });
+
+    await check('DENY: unauthenticated join', async () => {
+      const participantRef = doc(anon, 'content', 'activity-alice-1', 'participants', 'ghost');
+      const statsRef = doc(anon, 'content', 'activity-alice-1', 'stats', 'activity');
+      await assertFails(
+        runTransaction(testEnv.unauthenticatedContext().firestore(), async (tx) => {
+          await Promise.all([tx.get(participantRef), tx.get(statsRef)]);
+          tx.set(participantRef, validParticipant('ghost', 'Ghost', 'ghost_handle'));
+          tx.set(statsRef, statsDoc(2));
+        })
+      );
+    });
+
+    await check('DENY: user A creates a participant doc for user B', async () => {
+      await assertFails(
+        setDoc(doc(bob, 'content', 'activity-alice-1', 'participants', 'carol'), validParticipant('carol', 'Carol Carlsson', 'carol_handle'))
+      );
+    });
+
+    await check('DENY: user spoofs username on participant doc', async () => {
+      await assertFails(
+        setDoc(doc(bob, 'content', 'activity-alice-1', 'participants', 'bob'), validParticipant('bob', 'Bob Bobsson', 'alice_handle'))
+      );
+    });
+
+    await check('DENY: user spoofs displayName on participant doc', async () => {
+      await assertFails(
+        setDoc(doc(bob, 'content', 'activity-alice-1', 'participants', 'bob'), validParticipant('bob', 'Test User', 'bob_handle'))
+      );
+    });
+
+    await check('DENY: join non-Activity content (a Post)', async () => {
+      await assertFails(
+        setDoc(doc(bob, 'content', 'post-bob-1', 'participants', 'bob'), validParticipant('bob', 'Bob Bobsson', 'bob_handle'))
+      );
+    });
+
+    await check('setup: create an already-ended Activity', async () => {
+      await assertSucceeds(
+        setDoc(
+          doc(alice, 'content', 'activity-ended-1'),
+          validActivity('alice', 'Test User', 'alice_handle', 'activity-ended-1', {
+            startsAt: Timestamp.fromMillis(Date.now() - 2 * 60 * 60 * 1000),
+            endsAt: Timestamp.fromMillis(Date.now() - 60 * 60 * 1000),
+          })
+        )
+      );
+    });
+
+    await check('DENY: join an ended Activity', async () => {
+      await assertFails(joinTransaction(bob, 'activity-ended-1', 'bob', 'Bob Bobsson', 'bob_handle', 1));
+    });
+
+    await check('DENY: stats increment without a paired participant creation', async () => {
+      await assertFails(setDoc(doc(bob, 'content', 'activity-alice-1', 'stats', 'activity'), statsDoc(2)));
+    });
+
+    await check('DENY: stats increments by more than 1', async () => {
+      const participantRef = doc(bob, 'content', 'activity-alice-1', 'participants', 'bob');
+      const statsRef = doc(bob, 'content', 'activity-alice-1', 'stats', 'activity');
+      await assertFails(
+        runTransaction(bob, async (tx) => {
+          await Promise.all([tx.get(participantRef), tx.get(statsRef)]);
+          tx.set(participantRef, validParticipant('bob', 'Bob Bobsson', 'bob_handle'));
+          tx.set(statsRef, statsDoc(5));
+        })
+      );
+    });
+
+    await check('DENY: participant deletion without a paired stats decrement', async () => {
+      // bob has no participant doc on activity-alice-1 yet in this suite, so
+      // delete alice's instead to prove a lone delete (no stats pairing) fails —
+      // confirms via a fresh doc rather than reusing alice's real membership.
+      await assertFails(deleteDoc(doc(alice, 'content', 'activity-alice-1', 'participants', 'alice')));
+    });
+
+    await check('DENY: direct participant document update', async () => {
+      await assertFails(updateDoc(doc(alice, 'content', 'activity-alice-1', 'participants', 'alice'), { displayName: 'Changed' }));
+    });
+
+    await check('setup: activity with maxParticipants = 1', async () => {
+      await assertSucceeds(
+        setDoc(
+          doc(alice, 'content', 'activity-full-1'),
+          validActivity('alice', 'Test User', 'alice_handle', 'activity-full-1', { maxParticipants: 1 })
+        )
+      );
+    });
+
+    await check('ALLOW: first user joins a maxParticipants=1 Activity', async () => {
+      await assertSucceeds(joinTransaction(bob, 'activity-full-1', 'bob', 'Bob Bobsson', 'bob_handle', 1));
+    });
+
+    await check('DENY: second user joins when maxParticipants is already full', async () => {
+      await assertFails(joinTransaction(carol, 'activity-full-1', 'carol', 'Carol Carlsson', 'carol_handle', 2));
+    });
+
+    await check('DENY: negative participant count', async () => {
+      const participantRef = doc(bob, 'content', 'activity-full-1', 'participants', 'bob');
+      const statsRef = doc(bob, 'content', 'activity-full-1', 'stats', 'activity');
+      await assertFails(
+        runTransaction(bob, async (tx) => {
+          await tx.get(statsRef);
+          tx.delete(participantRef);
+          tx.set(statsRef, statsDoc(-1));
+        })
+      );
+    });
+
+    await check('ALLOW: user leaves an Activity (paired delete + decrement)', async () => {
+      const participantRef = doc(alice, 'content', 'activity-alice-1', 'participants', 'alice');
+      const statsRef = doc(alice, 'content', 'activity-alice-1', 'stats', 'activity');
+      await assertSucceeds(
+        runTransaction(alice, async (tx) => {
+          await tx.get(statsRef);
+          tx.delete(participantRef);
+          tx.set(statsRef, statsDoc(0));
+        })
+      );
+    });
+
+    await check('DENY: user A deletes user B\'s participant document', async () => {
+      // bob is still joined on activity-full-1 from the capacity test above.
+      const participantRef = doc(alice, 'content', 'activity-full-1', 'participants', 'bob');
+      const statsRef = doc(alice, 'content', 'activity-full-1', 'stats', 'activity');
+      await assertFails(
+        runTransaction(alice, async (tx) => {
+          await tx.get(statsRef);
+          tx.delete(participantRef);
+          tx.set(statsRef, statsDoc(0));
+        })
+      );
+    });
+
+    // =========================================================================
+    // content/{eventId}/responses/{uid}
+    // =========================================================================
+    await check('ALLOW: completed user marks Interested on an Event', async () => {
+      await assertSucceeds(
+        setDoc(doc(alice, 'content', 'event-alice-1', 'responses', 'alice'), validResponse('alice', 'Test User', 'alice_handle', 'interested'))
+      );
+    });
+
+    await check('ALLOW: user switches their response from Interested to Going', async () => {
+      await assertSucceeds(
+        updateDoc(doc(alice, 'content', 'event-alice-1', 'responses', 'alice'), { status: 'going', updatedAt: serverTimestamp() })
+      );
+      const saved = await getDoc(doc(alice, 'content', 'event-alice-1', 'responses', 'alice'));
+      assert.equal(saved.data().status, 'going');
+    });
+
+    await check('ALLOW: authenticated user reads Event responses', async () => {
+      await assertSucceeds(getDocs(collection(bob, 'content', 'event-alice-1', 'responses')));
+    });
+
+    await check('DENY: unauthenticated response', async () => {
+      await assertFails(
+        setDoc(doc(anon, 'content', 'event-alice-1', 'responses', 'ghost'), validResponse('ghost', 'Ghost', 'ghost_handle', 'interested'))
+      );
+    });
+
+    await check('DENY: response on non-Event content (an Activity)', async () => {
+      await assertFails(
+        setDoc(doc(bob, 'content', 'activity-alice-1', 'responses', 'bob'), validResponse('bob', 'Bob Bobsson', 'bob_handle', 'interested'))
+      );
+    });
+
+    await check('DENY: user A writes a response for user B', async () => {
+      await assertFails(
+        setDoc(doc(bob, 'content', 'event-alice-1', 'responses', 'carol'), validResponse('carol', 'Carol Carlsson', 'carol_handle', 'interested'))
+      );
+    });
+
+    await check('DENY: spoofed username on response', async () => {
+      await assertFails(
+        setDoc(doc(bob, 'content', 'event-alice-1', 'responses', 'bob'), validResponse('bob', 'Bob Bobsson', 'alice_handle', 'interested'))
+      );
+    });
+
+    await check('DENY: spoofed displayName on response', async () => {
+      await assertFails(
+        setDoc(doc(bob, 'content', 'event-alice-1', 'responses', 'bob'), validResponse('bob', 'Test User', 'bob_handle', 'interested'))
+      );
+    });
+
+    await check('DENY: invalid response status', async () => {
+      await assertFails(
+        setDoc(doc(bob, 'content', 'event-alice-1', 'responses', 'bob'), validResponse('bob', 'Bob Bobsson', 'bob_handle', 'maybe'))
+      );
+    });
+
+    await check('DENY: changing immutable uid on response update', async () => {
+      await assertFails(updateDoc(doc(alice, 'content', 'event-alice-1', 'responses', 'alice'), { uid: 'bob', updatedAt: serverTimestamp() }));
+    });
+
+    await check('DENY: changing immutable createdAt on response update', async () => {
+      await assertFails(
+        updateDoc(doc(alice, 'content', 'event-alice-1', 'responses', 'alice'), { createdAt: Timestamp.now(), updatedAt: serverTimestamp() })
+      );
+    });
+
+    await check('setup: create an already-ended Event', async () => {
+      await assertSucceeds(
+        setDoc(
+          doc(alice, 'content', 'event-ended-1'),
+          validEvent('alice', 'Test User', 'alice_handle', 'event-ended-1', {
+            startsAt: Timestamp.fromMillis(Date.now() - 2 * 60 * 60 * 1000),
+            endsAt: Timestamp.fromMillis(Date.now() - 60 * 60 * 1000),
+          })
+        )
+      );
+    });
+
+    await check('DENY: response after Event has ended', async () => {
+      await assertFails(
+        setDoc(doc(bob, 'content', 'event-ended-1', 'responses', 'bob'), validResponse('bob', 'Bob Bobsson', 'bob_handle', 'going'))
+      );
+    });
+
+    await check('ALLOW: user removes their own response', async () => {
+      await assertSucceeds(deleteDoc(doc(alice, 'content', 'event-alice-1', 'responses', 'alice')));
+    });
+
+    await check('DENY: user A deletes user B\'s response', async () => {
+      await assertSucceeds(
+        setDoc(doc(bob, 'content', 'event-alice-1', 'responses', 'bob'), validResponse('bob', 'Bob Bobsson', 'bob_handle', 'going'))
+      );
+      await assertFails(deleteDoc(doc(alice, 'content', 'event-alice-1', 'responses', 'bob')));
+    });
+
+    // =========================================================================
+    // Aggregation counts (getCountFromServer) — a fresh Event so the counts
+    // start at a known zero, independent of the response tests above.
+    // =========================================================================
+    await check('setup: create a fresh Event for aggregation-count testing', async () => {
+      await assertSucceeds(setDoc(doc(alice, 'content', 'event-agg-1'), validEvent('alice', 'Test User', 'alice_handle', 'event-agg-1')));
+    });
+
+    async function responseCounts(db) {
+      const responsesRef = collection(db, 'content', 'event-agg-1', 'responses');
+      const [interested, going] = await Promise.all([
+        getCountFromServer(query(responsesRef, where('status', '==', 'interested'))),
+        getCountFromServer(query(responsesRef, where('status', '==', 'going'))),
+      ]);
+      return { interestedCount: interested.data().count, goingCount: going.data().count };
+    }
+
+    await check('AGGREGATION: counts are 0/0 with no responses', async () => {
+      const counts = await responseCounts(bob);
+      assert.deepEqual(counts, { interestedCount: 0, goingCount: 0 });
+    });
+
+    await check('AGGREGATION: counts after one Interested response', async () => {
+      await assertSucceeds(
+        setDoc(doc(bob, 'content', 'event-agg-1', 'responses', 'bob'), validResponse('bob', 'Bob Bobsson', 'bob_handle', 'interested'))
+      );
+      const counts = await responseCounts(bob);
+      assert.deepEqual(counts, { interestedCount: 1, goingCount: 0 });
+    });
+
+    await check('AGGREGATION: counts after a second user marks Going', async () => {
+      await assertSucceeds(
+        setDoc(doc(carol, 'content', 'event-agg-1', 'responses', 'carol'), validResponse('carol', 'Carol Carlsson', 'carol_handle', 'going'))
+      );
+      const counts = await responseCounts(bob);
+      assert.deepEqual(counts, { interestedCount: 1, goingCount: 1 });
+    });
+
+    await check('AGGREGATION: counts after Interested user switches to Going', async () => {
+      await assertSucceeds(updateDoc(doc(bob, 'content', 'event-agg-1', 'responses', 'bob'), { status: 'going', updatedAt: serverTimestamp() }));
+      const counts = await responseCounts(bob);
+      assert.deepEqual(counts, { interestedCount: 0, goingCount: 2 });
+    });
+
+    await check('AGGREGATION: counts after a response is removed', async () => {
+      await assertSucceeds(deleteDoc(doc(bob, 'content', 'event-agg-1', 'responses', 'bob')));
+      const counts = await responseCounts(bob);
+      assert.deepEqual(counts, { interestedCount: 0, goingCount: 1 });
     });
 
     await testEnv.clearFirestore();

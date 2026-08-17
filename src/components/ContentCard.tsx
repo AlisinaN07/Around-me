@@ -1,4 +1,5 @@
 import { Ionicons } from '@expo/vector-icons';
+import { router } from 'expo-router';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 
 import { INTERESTS } from '@/constants/interests';
@@ -79,7 +80,12 @@ export function ContentCard({ item, currentUid }: ContentCardProps) {
       ) : null}
 
       {item.type !== 'post' && (
-        <Pressable style={styles.actionButton} accessibilityRole="button" accessibilityLabel={`View ${item.type}`}>
+        <Pressable
+          style={styles.actionButton}
+          onPress={() => router.push(`/content/${item.contentId}`)}
+          accessibilityRole="button"
+          accessibilityLabel={`View ${item.type}`}
+        >
           <Text style={styles.actionText}>{item.type === 'activity' ? 'View activity' : 'View event'}</Text>
         </Pressable>
       )}

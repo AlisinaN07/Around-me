@@ -4,7 +4,7 @@ import { StyleSheet, Text } from 'react-native';
 
 import { Button } from '@/components/Button';
 import { CategorySelector } from '@/components/CategorySelector';
-import { CreateScreenLayout } from '@/components/CreateScreenLayout';
+import { HeaderScreenLayout } from '@/components/HeaderScreenLayout';
 import { DateTimeField } from '@/components/DateTimeField';
 import { FormField } from '@/components/FormField';
 import { Colors, Spacing } from '@/constants/theme';
@@ -103,7 +103,7 @@ export default function CreateEventScreen() {
   };
 
   return (
-    <CreateScreenLayout title="Create event">
+    <HeaderScreenLayout title="Create event">
       <Text style={styles.subtitle}>Share something happening in the city.</Text>
 
       <FormField
@@ -178,7 +178,7 @@ export default function CreateEventScreen() {
       {formError ? <Text style={styles.formError}>{formError}</Text> : null}
 
       <Button label="Publish event" onPress={handlePublish} loading={isSubmitting} />
-    </CreateScreenLayout>
+    </HeaderScreenLayout>
   );
 }
 

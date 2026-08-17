@@ -4,7 +4,7 @@ import { StyleSheet, Text, View } from 'react-native';
 
 import { Button } from '@/components/Button';
 import { CategorySelector } from '@/components/CategorySelector';
-import { CreateScreenLayout } from '@/components/CreateScreenLayout';
+import { HeaderScreenLayout } from '@/components/HeaderScreenLayout';
 import { FormField } from '@/components/FormField';
 import { Colors, Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
@@ -69,7 +69,7 @@ export default function CreatePostScreen() {
   };
 
   return (
-    <CreateScreenLayout title="Create post">
+    <HeaderScreenLayout title="Create post">
       <Text style={styles.subtitle}>Share something with people in your city.</Text>
 
       <View>
@@ -112,7 +112,7 @@ export default function CreatePostScreen() {
       {formError ? <Text style={styles.formError}>{formError}</Text> : null}
 
       <Button label="Publish post" onPress={handlePublish} loading={isSubmitting} />
-    </CreateScreenLayout>
+    </HeaderScreenLayout>
   );
 }
 

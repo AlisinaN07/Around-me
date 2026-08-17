@@ -6,13 +6,13 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { Colors, Layout, Spacing } from '@/constants/theme';
 
-type CreateScreenLayoutProps = {
+type HeaderScreenLayoutProps = {
   title: string;
   children: ReactNode;
 };
 
 /** Shared chrome for the Post/Activity/Event creation screens: back button, title, keyboard-avoiding scroll body. */
-export function CreateScreenLayout({ title, children }: CreateScreenLayoutProps) {
+export function HeaderScreenLayout({ title, children }: HeaderScreenLayoutProps) {
   return (
     <SafeAreaView style={styles.safeArea} edges={['top', 'bottom']}>
       <View style={styles.header}>

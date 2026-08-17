@@ -4,7 +4,7 @@ import { StyleSheet, Text } from 'react-native';
 
 import { Button } from '@/components/Button';
 import { CategorySelector } from '@/components/CategorySelector';
-import { CreateScreenLayout } from '@/components/CreateScreenLayout';
+import { HeaderScreenLayout } from '@/components/HeaderScreenLayout';
 import { DateTimeField } from '@/components/DateTimeField';
 import { FormField } from '@/components/FormField';
 import { Colors, Spacing } from '@/constants/theme';
@@ -119,7 +119,7 @@ export default function CreateActivityScreen() {
   };
 
   return (
-    <CreateScreenLayout title="Create activity">
+    <HeaderScreenLayout title="Create activity">
       <Text style={styles.subtitle}>Find people nearby to do something together.</Text>
 
       <FormField
@@ -206,7 +206,7 @@ export default function CreateActivityScreen() {
       {formError ? <Text style={styles.formError}>{formError}</Text> : null}
 
       <Button label="Publish activity" onPress={handlePublish} loading={isSubmitting} />
-    </CreateScreenLayout>
+    </HeaderScreenLayout>
   );
 }
 

@@ -150,6 +150,162 @@ service cloud.firestore {
       allow update: if false;
 
       allow delete: if isOwner(resource.data.authorUid);
+
+      // content/{contentId}/participants/{uid} — one document per user who
+      // joined an Activity. Paired 1:1 with a content/{contentId}/stats/activity
+      // increment/decrement in the same atomic write (see below): a
+      // participant document can never be created or deleted without the
+      // matching counter change actually landing, and vice versa.
+      match /participants/{uid} {
+        function participantParent() {
+          return get(/databases/$(database)/documents/content/$(contentId)).data;
+        }
+
+        allow read: if isSignedIn()
+          && participantParent().type == 'activity'
+          && participantParent().status == 'published';
+
+        allow create: if isSignedIn()
+          && uid == request.auth.uid
+          && isValidParticipantCreate(contentId, request.resource.data);
+
+        // No edit surface for participation — you're either joined or not.
+        allow update: if false;
+
+        // A lone delete (no paired stats write in the same batch) would
+        // otherwise pass an "existsAfter" check trivially — the stats doc is
+        // untouched, so it still exists. We must verify its VALUE actually
+        // decremented by exactly 1, which forces the client to include a
+        // correctly-computed stats write in the same transaction.
+        allow delete: if isOwner(uid)
+          && existsAfter(/databases/$(database)/documents/content/$(contentId)/stats/activity)
+          && getAfter(/databases/$(database)/documents/content/$(contentId)/stats/activity).data.participantCount
+             == get(/databases/$(database)/documents/content/$(contentId)/stats/activity).data.participantCount - 1;
+      }
+
+      function isValidParticipantCreate(contentId, data) {
+        let activity = get(/databases/$(database)/documents/content/$(contentId)).data;
+        let profile = get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+        let statsPath = /databases/$(database)/documents/content/$(contentId)/stats/activity;
+        return activity.type == 'activity'
+          && activity.status == 'published'
+          && activity.endsAt > request.time
+          && data.uid == request.auth.uid
+          && data.displayName == profile.displayName
+          && data.username == profile.username
+          && isServerTimestamp(data.joinedAt)
+          && data.keys().hasOnly(['uid', 'displayName', 'username', 'joinedAt'])
+          // The paired counter write must land in the same batch/transaction,
+          // and must be exactly the correctly-incremented value — same
+          // reasoning as the delete rule above (existence alone isn't enough).
+          && existsAfter(statsPath)
+          && getAfter(statsPath).data.participantCount == (exists(statsPath) ? get(statsPath).data.participantCount + 1 : 1);
+      }
+
+      // content/{contentId}/stats/activity — a single document holding the
+      // live participant count, since maxParticipants needs a value that's
+      // safe under concurrent joins without reading every participant.
+      // Every increment/decrement must be exactly 1 and paired with the
+      // caller's own participant document actually appearing/disappearing —
+      // a client can never simply write participantCount directly.
+      match /stats/activity {
+        function statsParent() {
+          return get(/databases/$(database)/documents/content/$(contentId)).data;
+        }
+
+        function isValidStatsShape(data) {
+          return data.participantCount is int
+            && data.participantCount >= 0
+            && isServerTimestamp(data.updatedAt)
+            && data.keys().hasOnly(['participantCount', 'updatedAt']);
+        }
+
+        function participantPath() {
+          return /databases/$(database)/documents/content/$(contentId)/participants/$(request.auth.uid);
+        }
+
+        allow read: if isSignedIn()
+          && statsParent().type == 'activity'
+          && statsParent().status == 'published';
+
+        // First join ever for this Activity — the stats doc doesn't exist yet.
+        allow create: if isSignedIn()
+          && isValidStatsShape(request.resource.data)
+          && request.resource.data.participantCount == 1
+          && !exists(participantPath())
+          && existsAfter(participantPath())
+          && (!('maxParticipants' in statsParent()) || 1 <= statsParent().maxParticipants);
+
+        // Every later join (+1) or leave (-1) for this Activity.
+        allow update: if isSignedIn()
+          && isValidStatsShape(request.resource.data)
+          && (
+            (
+              !exists(participantPath())
+              && existsAfter(participantPath())
+              && request.resource.data.participantCount == resource.data.participantCount + 1
+              && (!('maxParticipants' in statsParent()) || request.resource.data.participantCount <= statsParent().maxParticipants)
+            )
+            || (
+              exists(participantPath())
+              && !existsAfter(participantPath())
+              && request.resource.data.participantCount == resource.data.participantCount - 1
+            )
+          );
+
+        allow delete: if false;
+      }
+
+      // content/{contentId}/responses/{uid} — one document per user's
+      // Interested/Going response to an Event. Switching state updates this
+      // same document; there is deliberately no separate counter here (Step
+      // 9 uses aggregation count queries instead — see src/services/engagement.ts).
+      match /responses/{uid} {
+        function responseParent() {
+          return get(/databases/$(database)/documents/content/$(contentId)).data;
+        }
+
+        allow read: if isSignedIn()
+          && responseParent().type == 'event'
+          && responseParent().status == 'published';
+
+        allow create: if isSignedIn()
+          && uid == request.auth.uid
+          && isValidResponseCreate(contentId, request.resource.data);
+
+        allow update: if isOwner(uid)
+          && isValidResponseUpdate(contentId, request.resource.data, resource.data);
+
+        allow delete: if isOwner(uid);
+      }
+
+      function isValidResponseCreate(contentId, data) {
+        let event = get(/databases/$(database)/documents/content/$(contentId)).data;
+        let profile = get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+        return event.type == 'event'
+          && event.status == 'published'
+          && event.endsAt > request.time
+          && data.uid == request.auth.uid
+          && data.displayName == profile.displayName
+          && data.username == profile.username
+          && (data.status == 'interested' || data.status == 'going')
+          && isServerTimestamp(data.createdAt)
+          && isServerTimestamp(data.updatedAt)
+          && data.keys().hasOnly(['uid', 'displayName', 'username', 'status', 'createdAt', 'updatedAt']);
+      }
+
+      function isValidResponseUpdate(contentId, newData, oldData) {
+        let event = get(/databases/$(database)/documents/content/$(contentId)).data;
+        return event.type == 'event'
+          && event.endsAt > request.time
+          && (newData.status == 'interested' || newData.status == 'going')
+          && newData.uid == oldData.uid
+          && newData.displayName == oldData.displayName
+          && newData.username == oldData.username
+          && newData.createdAt == oldData.createdAt
+          && isServerTimestamp(newData.updatedAt)
+          && newData.keys().hasOnly(['uid', 'displayName', 'username', 'status', 'createdAt', 'updatedAt']);
+      }
     }
 
     // Everything else is denied by default.
