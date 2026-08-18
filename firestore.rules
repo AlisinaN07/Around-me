@@ -496,6 +496,147 @@ service cloud.firestore {
       }
     }
 
+    // notifications/{notificationId} — one social notification per Like,
+    // Comment, or Follow (see src/types/notification.ts). These are always
+    // written atomically with their underlying action (writeBatch, in
+    // src/services/socialEngagement.ts and src/services/following.ts), and
+    // every create here is independently re-validated against that action —
+    // a client can never fabricate a notification ("X followed you" with no
+    // real follow edge) no matter what it sends.
+    match /notifications/{notificationId} {
+      allow read: if isSignedIn() && resource.data.recipientUid == request.auth.uid;
+
+      allow create: if isSignedIn()
+        && isValidNotificationActor(request.resource.data)
+        && isValidNotificationBase(notificationId, request.resource.data)
+        && (
+          isValidLikeNotification(notificationId, request.resource.data)
+          || isValidCommentNotification(notificationId, request.resource.data)
+          || isValidFollowNotification(notificationId, request.resource.data)
+        );
+
+      allow update: if isSignedIn() && isValidNotificationUpdate(request.resource.data, resource.data);
+
+      allow delete: if isSignedIn() && isValidNotificationDelete(resource.data);
+    }
+
+    // The actor snapshot (actorDisplayName/actorUsername) must match the
+    // caller's OWN public profile, and a notification can never target
+    // yourself — self-like/self-comment/self-follow never produce one (see
+    // the service layer, which already skips the write; this is the
+    // server-side backstop).
+    function isValidNotificationActor(data) {
+      let profile = get(/databases/$(database)/documents/publicProfiles/$(request.auth.uid)).data;
+      return data.actorUid == request.auth.uid
+        && data.recipientUid != request.auth.uid
+        && exists(/databases/$(database)/documents/publicProfiles/$(request.auth.uid))
+        && data.actorDisplayName == profile.displayName
+        && data.actorUsername == profile.username;
+    }
+
+    function isValidNotificationBase(notificationId, data) {
+      return data.notificationId == notificationId
+        && data.read == false
+        && isServerTimestamp(data.createdAt)
+        && isServerTimestamp(data.updatedAt)
+        && data.keys().hasOnly([
+          'notificationId', 'recipientUid', 'actorUid', 'actorDisplayName', 'actorUsername',
+          'type', 'contentId', 'commentId', 'previewText', 'read', 'createdAt', 'updatedAt'
+        ]);
+    }
+
+    // The deterministic ID ties this doc to one exact (content, actor) pair,
+    // and existsAfter() on the Like doc proves a real Like landed in the
+    // same batch — not just a claim that one exists.
+    function isValidLikeNotification(notificationId, data) {
+      let contentPath = /databases/$(database)/documents/content/$(data.contentId);
+      return data.type == 'like'
+        && data.contentId is string
+        && data.commentId == null
+        && data.previewText == null
+        && notificationId == 'like_' + data.contentId + '_' + data.actorUid
+        && exists(contentPath)
+        && get(contentPath).data.status == 'published'
+        && get(contentPath).data.authorUid == data.recipientUid
+        && existsAfter(/databases/$(database)/documents/content/$(data.contentId)/likes/$(data.actorUid));
+    }
+
+    // Same idea for comments: the ID is tied to one exact comment, and the
+    // comment must actually exist (in the same batch) and be authored by
+    // the notification's claimed actor.
+    function isValidCommentNotification(notificationId, data) {
+      let contentPath = /databases/$(database)/documents/content/$(data.contentId);
+      let commentPath = /databases/$(database)/documents/content/$(data.contentId)/comments/$(data.commentId);
+      return data.type == 'comment'
+        && data.contentId is string
+        && data.commentId is string
+        && notificationId == 'comment_' + data.commentId
+        && (data.previewText == null || (data.previewText is string && data.previewText.size() <= 500))
+        && exists(contentPath)
+        && get(contentPath).data.status == 'published'
+        && get(contentPath).data.authorUid == data.recipientUid
+        && existsAfter(commentPath)
+        && getAfter(commentPath).data.authorUid == data.actorUid;
+    }
+
+    // And for follows: the ID is tied to one exact (actor, recipient) edge,
+    // and that edge must actually exist (in the same batch) with matching
+    // follower/following uids.
+    function isValidFollowNotification(notificationId, data) {
+      let followPath = /databases/$(database)/documents/follows/$(data.actorUid + '_' + data.recipientUid);
+      return data.type == 'follow'
+        && data.contentId == null
+        && data.commentId == null
+        && data.previewText == null
+        && notificationId == 'follow_' + data.actorUid + '_' + data.recipientUid
+        && exists(/databases/$(database)/documents/publicProfiles/$(data.recipientUid))
+        && existsAfter(followPath)
+        && getAfter(followPath).data.followerUid == data.actorUid
+        && getAfter(followPath).data.followingUid == data.recipientUid;
+    }
+
+    // Only the recipient, and only to toggle read state — every other
+    // field, including actorUid/recipientUid/type, must stay byte-identical
+    // to what create validated. Nobody can "retarget" or "relabel" an
+    // existing notification via update.
+    function isValidNotificationUpdate(newData, oldData) {
+      return oldData.recipientUid == request.auth.uid
+        && newData.notificationId == oldData.notificationId
+        && newData.recipientUid == oldData.recipientUid
+        && newData.actorUid == oldData.actorUid
+        && newData.actorDisplayName == oldData.actorDisplayName
+        && newData.actorUsername == oldData.actorUsername
+        && newData.type == oldData.type
+        && newData.contentId == oldData.contentId
+        && newData.commentId == oldData.commentId
+        && newData.previewText == oldData.previewText
+        && newData.createdAt == oldData.createdAt
+        && newData.read is bool
+        && isServerTimestamp(newData.updatedAt)
+        && newData.keys().hasOnly([
+          'notificationId', 'recipientUid', 'actorUid', 'actorDisplayName', 'actorUsername',
+          'type', 'contentId', 'commentId', 'previewText', 'read', 'createdAt', 'updatedAt'
+        ]);
+    }
+
+    // Recipients can always clear their own inbox. Actors may only delete a
+    // notification they generated as part of genuinely undoing the same
+    // action (unlike/delete-comment/unfollow) in the same batch — this
+    // keeps "notification exists iff the action exists" true from the
+    // actor's side too, instead of letting an actor delete a notification
+    // while leaving the Like/Comment/Follow it came from intact.
+    function isValidNotificationDelete(data) {
+      return data.recipientUid == request.auth.uid
+        || (
+          data.actorUid == request.auth.uid
+          && (
+            (data.type == 'like' && !existsAfter(/databases/$(database)/documents/content/$(data.contentId)/likes/$(data.actorUid)))
+            || (data.type == 'comment' && !existsAfter(/databases/$(database)/documents/content/$(data.contentId)/comments/$(data.commentId)))
+            || (data.type == 'follow' && !existsAfter(/databases/$(database)/documents/follows/$(data.actorUid + '_' + data.recipientUid)))
+          )
+        );
+    }
+
     // Everything else is denied by default.
     match /{document=**} {
       allow read, write: if false;

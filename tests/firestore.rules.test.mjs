@@ -25,6 +25,7 @@ import {
   Timestamp,
   updateDoc,
   where,
+  writeBatch,
 } from 'firebase/firestore';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -183,6 +184,36 @@ function validComment(commentId, authorUid, authorDisplayName, authorUsername, b
     authorDisplayName,
     authorUsername,
     body,
+    createdAt: serverTimestamp(),
+    updatedAt: serverTimestamp(),
+    ...overrides,
+  };
+}
+
+// Same deterministic ID scheme as buildNotificationId in
+// src/services/notifications.ts.
+function likeNotificationId(contentId, actorUid) {
+  return `like_${contentId}_${actorUid}`;
+}
+function commentNotificationId(commentId) {
+  return `comment_${commentId}`;
+}
+function followNotificationId(actorUid, recipientUid) {
+  return `follow_${actorUid}_${recipientUid}`;
+}
+
+function validNotification(notificationId, recipientUid, actorUid, actorDisplayName, actorUsername, type, overrides = {}) {
+  return {
+    notificationId,
+    recipientUid,
+    actorUid,
+    actorDisplayName,
+    actorUsername,
+    type,
+    contentId: null,
+    commentId: null,
+    previewText: null,
+    read: false,
     createdAt: serverTimestamp(),
     updatedAt: serverTimestamp(),
     ...overrides,
@@ -1364,6 +1395,319 @@ async function main() {
           })
         )
       );
+    });
+
+    // =========================================================================
+    // notifications/{notificationId}
+    // Fresh users + fresh content, independent of every mutated document
+    // above, so these assertions never depend on earlier sections' state.
+    // =========================================================================
+    await seedProfile(testEnv, 'notifa', 'notifa_handle', { displayName: 'Notif Alpha' });
+    await seedProfile(testEnv, 'notifb', 'notifb_handle', { displayName: 'Notif Bravo' });
+    await seedProfile(testEnv, 'notifc', 'notifc_handle', { displayName: 'Notif Charlie' });
+
+    const notifA = testEnv.authenticatedContext('notifa').firestore();
+    const notifB = testEnv.authenticatedContext('notifb').firestore();
+    const notifC = testEnv.authenticatedContext('notifc').firestore();
+
+    await check('setup: notification test users create matching public profiles', async () => {
+      await assertSucceeds(setDoc(doc(notifA, 'publicProfiles', 'notifa'), validPublicProfile('notifa', 'Notif Alpha', 'notifa_handle')));
+      await assertSucceeds(setDoc(doc(notifB, 'publicProfiles', 'notifb'), validPublicProfile('notifb', 'Notif Bravo', 'notifb_handle')));
+      await assertSucceeds(setDoc(doc(notifC, 'publicProfiles', 'notifc'), validPublicProfile('notifc', 'Notif Charlie', 'notifc_handle')));
+    });
+
+    await check('setup: notifa creates a Post for notification testing', async () => {
+      await assertSucceeds(
+        setDoc(doc(notifA, 'content', 'post-notif-1'), validPost('notifa', 'Notif Alpha', 'notifa_handle', 'post-notif-1'))
+      );
+    });
+
+    // --- LIKE notifications ---
+    await check('ALLOW: B likes A\'s post + notification created atomically', async () => {
+      const notificationId = likeNotificationId('post-notif-1', 'notifb');
+      const batch = writeBatch(notifB);
+      batch.set(doc(notifB, 'content', 'post-notif-1', 'likes', 'notifb'), validLike('notifb'));
+      batch.set(
+        doc(notifB, 'notifications', notificationId),
+        validNotification(notificationId, 'notifa', 'notifb', 'Notif Bravo', 'notifb_handle', 'like', { contentId: 'post-notif-1' })
+      );
+      await assertSucceeds(batch.commit());
+
+      const snapshot = await getDoc(doc(notifA, 'notifications', notificationId));
+      assert.equal(snapshot.exists(), true);
+      assert.equal(snapshot.data().read, false);
+      assert.equal(snapshot.data().recipientUid, 'notifa');
+    });
+
+    await check('DENY: self notification (A likes own post, notification targets self)', async () => {
+      const notificationId = likeNotificationId('post-notif-1', 'notifa');
+      const batch = writeBatch(notifA);
+      batch.set(doc(notifA, 'content', 'post-notif-1', 'likes', 'notifa'), validLike('notifa'));
+      batch.set(
+        doc(notifA, 'notifications', notificationId),
+        validNotification(notificationId, 'notifa', 'notifa', 'Notif Alpha', 'notifa_handle', 'like', { contentId: 'post-notif-1' })
+      );
+      await assertFails(batch.commit());
+    });
+
+    await check('DENY: B creates a notification pretending actorUid = C', async () => {
+      const notificationId = likeNotificationId('post-notif-1', 'notifc');
+      const batch = writeBatch(notifB);
+      batch.set(
+        doc(notifB, 'notifications', notificationId),
+        validNotification(notificationId, 'notifa', 'notifc', 'Notif Charlie', 'notifc_handle', 'like', { contentId: 'post-notif-1' })
+      );
+      await assertFails(batch.commit());
+    });
+
+    await check('DENY: notification sent to an arbitrary recipient with no matching Like', async () => {
+      // post-notif-1 is authored by notifa, not notifc — the content-author
+      // check fails regardless of the (nonexistent) Like.
+      const batch = writeBatch(notifB);
+      batch.set(
+        doc(notifB, 'notifications', 'like_post-notif-1_spoofed'),
+        validNotification('like_post-notif-1_spoofed', 'notifc', 'notifb', 'Notif Bravo', 'notifb_handle', 'like', {
+          contentId: 'post-notif-1',
+        })
+      );
+      await assertFails(batch.commit());
+    });
+
+    await check('DENY: fake Comment notification with no matching Comment', async () => {
+      const notificationId = commentNotificationId('comment-fake-1');
+      const batch = writeBatch(notifB);
+      batch.set(
+        doc(notifB, 'notifications', notificationId),
+        validNotification(notificationId, 'notifa', 'notifb', 'Notif Bravo', 'notifb_handle', 'comment', {
+          contentId: 'post-notif-1',
+          commentId: 'comment-fake-1',
+        })
+      );
+      await assertFails(batch.commit());
+    });
+
+    await check('DENY: fake Follow notification with no matching follow edge', async () => {
+      const notificationId = followNotificationId('notifb', 'notifa');
+      await assertFails(
+        setDoc(
+          doc(notifB, 'notifications', notificationId),
+          validNotification(notificationId, 'notifa', 'notifb', 'Notif Bravo', 'notifb_handle', 'follow')
+        )
+      );
+    });
+
+    await check('DENY: wrong deterministic notification ID for a real Like', async () => {
+      // The Like write itself is perfectly valid — only the notification's
+      // document ID doesn't match contentId+actorUid. Atomicity means the
+      // whole batch (including the otherwise-valid Like) is rejected.
+      const batch = writeBatch(notifC);
+      batch.set(doc(notifC, 'content', 'post-notif-1', 'likes', 'notifc'), validLike('notifc'));
+      batch.set(
+        doc(notifC, 'notifications', 'wrong-id'),
+        validNotification('wrong-id', 'notifa', 'notifc', 'Notif Charlie', 'notifc_handle', 'like', { contentId: 'post-notif-1' })
+      );
+      await assertFails(batch.commit());
+    });
+
+    await check('DENY: notification create with an extra unexpected field', async () => {
+      const notificationId = likeNotificationId('post-notif-1', 'notifc');
+      const batch = writeBatch(notifC);
+      batch.set(doc(notifC, 'content', 'post-notif-1', 'likes', 'notifc'), validLike('notifc'));
+      batch.set(doc(notifC, 'notifications', notificationId), {
+        ...validNotification(notificationId, 'notifa', 'notifc', 'Notif Charlie', 'notifc_handle', 'like', { contentId: 'post-notif-1' }),
+        extra: 'nope',
+      });
+      await assertFails(batch.commit());
+    });
+
+    await check('ALLOW: authenticated recipient reads their own notification', async () => {
+      const notificationId = likeNotificationId('post-notif-1', 'notifb');
+      await assertSucceeds(getDoc(doc(notifA, 'notifications', notificationId)));
+    });
+
+    await check('ALLOW: A queries their own notifications, newest first', async () => {
+      const notificationsQuery = query(collection(notifA, 'notifications'), where('recipientUid', '==', 'notifa'));
+      const snapshot = await assertSucceeds(getDocs(notificationsQuery));
+      assert.ok(snapshot.size >= 1);
+    });
+
+    await check('DENY: unauthenticated read of a notification', async () => {
+      const anonCtx = testEnv.unauthenticatedContext().firestore();
+      const notificationId = likeNotificationId('post-notif-1', 'notifb');
+      await assertFails(getDoc(doc(anonCtx, 'notifications', notificationId)));
+    });
+
+    await check('DENY: another authenticated user reads A\'s notification', async () => {
+      const notificationId = likeNotificationId('post-notif-1', 'notifb');
+      await assertFails(getDoc(doc(notifC, 'notifications', notificationId)));
+    });
+
+    await check('ALLOW: A marks their own notification read', async () => {
+      const notificationId = likeNotificationId('post-notif-1', 'notifb');
+      await assertSucceeds(updateDoc(doc(notifA, 'notifications', notificationId), { read: true, updatedAt: serverTimestamp() }));
+      const snapshot = await getDoc(doc(notifA, 'notifications', notificationId));
+      assert.equal(snapshot.data().read, true);
+    });
+
+    await check('DENY: B marks A\'s notification read', async () => {
+      const notificationId = likeNotificationId('post-notif-1', 'notifb');
+      await assertFails(updateDoc(doc(notifB, 'notifications', notificationId), { read: true, updatedAt: serverTimestamp() }));
+    });
+
+    await check('DENY: A modifies recipientUid on their own notification', async () => {
+      const notificationId = likeNotificationId('post-notif-1', 'notifb');
+      await assertFails(updateDoc(doc(notifA, 'notifications', notificationId), { recipientUid: 'notifc' }));
+    });
+
+    await check('DENY: A modifies actorDisplayName on their own notification', async () => {
+      const notificationId = likeNotificationId('post-notif-1', 'notifb');
+      await assertFails(updateDoc(doc(notifA, 'notifications', notificationId), { actorDisplayName: 'Someone Else' }));
+    });
+
+    await check('DENY: B deletes their own notification without removing the underlying Like', async () => {
+      const notificationId = likeNotificationId('post-notif-1', 'notifb');
+      // The Like from the first test is still there — deleting only the
+      // notification would break "notification exists iff the action does".
+      await assertFails(deleteDoc(doc(notifB, 'notifications', notificationId)));
+    });
+
+    await check('ALLOW: B unlikes + notification removed atomically', async () => {
+      const notificationId = likeNotificationId('post-notif-1', 'notifb');
+      const batch = writeBatch(notifB);
+      batch.delete(doc(notifB, 'content', 'post-notif-1', 'likes', 'notifb'));
+      batch.delete(doc(notifB, 'notifications', notificationId));
+      await assertSucceeds(batch.commit());
+
+      await testEnv.withSecurityRulesDisabled(async (adminContext) => {
+        const snapshot = await getDoc(doc(adminContext.firestore(), 'notifications', notificationId));
+        assert.equal(snapshot.exists(), false);
+      });
+    });
+
+    // --- COMMENT notifications ---
+    await check('ALLOW: B comments on A\'s post + notification created atomically', async () => {
+      const notificationId = commentNotificationId('comment-notif-1');
+      const batch = writeBatch(notifB);
+      batch.set(
+        doc(notifB, 'content', 'post-notif-1', 'comments', 'comment-notif-1'),
+        validComment('comment-notif-1', 'notifb', 'Notif Bravo', 'notifb_handle', 'Are you coming tonight?')
+      );
+      batch.set(
+        doc(notifB, 'notifications', notificationId),
+        validNotification(notificationId, 'notifa', 'notifb', 'Notif Bravo', 'notifb_handle', 'comment', {
+          contentId: 'post-notif-1',
+          commentId: 'comment-notif-1',
+          previewText: 'Are you coming tonight?',
+        })
+      );
+      await assertSucceeds(batch.commit());
+
+      const snapshot = await getDoc(doc(notifA, 'notifications', notificationId));
+      assert.equal(snapshot.data().previewText, 'Are you coming tonight?');
+      assert.equal(snapshot.data().commentId, 'comment-notif-1');
+    });
+
+    await check('DENY: comment notification previewText far exceeds the safe preview bound', async () => {
+      const notificationId = commentNotificationId('comment-notif-2');
+      const batch = writeBatch(notifB);
+      batch.set(
+        doc(notifB, 'content', 'post-notif-1', 'comments', 'comment-notif-2'),
+        validComment('comment-notif-2', 'notifb', 'Notif Bravo', 'notifb_handle', 'x'.repeat(300))
+      );
+      batch.set(
+        doc(notifB, 'notifications', notificationId),
+        validNotification(notificationId, 'notifa', 'notifb', 'Notif Bravo', 'notifb_handle', 'comment', {
+          contentId: 'post-notif-1',
+          commentId: 'comment-notif-2',
+          previewText: 'y'.repeat(600),
+        })
+      );
+      await assertFails(batch.commit());
+    });
+
+    await check('ALLOW: B deletes their own comment + notification removed atomically', async () => {
+      const notificationId = commentNotificationId('comment-notif-1');
+      const batch = writeBatch(notifB);
+      batch.delete(doc(notifB, 'content', 'post-notif-1', 'comments', 'comment-notif-1'));
+      batch.delete(doc(notifB, 'notifications', notificationId));
+      await assertSucceeds(batch.commit());
+
+      await testEnv.withSecurityRulesDisabled(async (adminContext) => {
+        const snapshot = await getDoc(doc(adminContext.firestore(), 'notifications', notificationId));
+        assert.equal(snapshot.exists(), false);
+      });
+    });
+
+    // --- FOLLOW notifications ---
+    await check('ALLOW: B follows A + notification created atomically', async () => {
+      const notificationId = followNotificationId('notifb', 'notifa');
+      const batch = writeBatch(notifB);
+      batch.set(doc(notifB, 'follows', 'notifb_notifa'), validFollow('notifb', 'notifa'));
+      batch.set(
+        doc(notifB, 'notifications', notificationId),
+        validNotification(notificationId, 'notifa', 'notifb', 'Notif Bravo', 'notifb_handle', 'follow')
+      );
+      await assertSucceeds(batch.commit());
+
+      const snapshot = await getDoc(doc(notifA, 'notifications', notificationId));
+      assert.equal(snapshot.data().type, 'follow');
+      assert.equal(snapshot.data().contentId, null);
+    });
+
+    await check('ALLOW: recipient deletes their own notification directly (Inbox cleanup)', async () => {
+      const notificationId = followNotificationId('notifb', 'notifa');
+      await assertSucceeds(deleteDoc(doc(notifA, 'notifications', notificationId)));
+      // Recreate it for the unfollow test below, since self-cleanup doesn't
+      // touch the underlying follow edge.
+      await testEnv.withSecurityRulesDisabled(async (adminContext) => {
+        await setDoc(
+          doc(adminContext.firestore(), 'notifications', notificationId),
+          validNotification(notificationId, 'notifa', 'notifb', 'Notif Bravo', 'notifb_handle', 'follow')
+        );
+      });
+    });
+
+    await check('ALLOW: B unfollows + notification removed atomically', async () => {
+      const notificationId = followNotificationId('notifb', 'notifa');
+      const batch = writeBatch(notifB);
+      batch.delete(doc(notifB, 'follows', 'notifb_notifa'));
+      batch.delete(doc(notifB, 'notifications', notificationId));
+      await assertSucceeds(batch.commit());
+
+      await testEnv.withSecurityRulesDisabled(async (adminContext) => {
+        const snapshot = await getDoc(doc(adminContext.firestore(), 'notifications', notificationId));
+        assert.equal(snapshot.exists(), false);
+      });
+    });
+
+    // --- Mark-all-as-read (bounded batch over an already-fetched list) ---
+    await check('setup: two fresh notifications for A (from B and C)', async () => {
+      await testEnv.withSecurityRulesDisabled(async (adminContext) => {
+        const db = adminContext.firestore();
+        await setDoc(
+          doc(db, 'notifications', likeNotificationId('post-notif-1', 'notifb')),
+          validNotification(likeNotificationId('post-notif-1', 'notifb'), 'notifa', 'notifb', 'Notif Bravo', 'notifb_handle', 'like', {
+            contentId: 'post-notif-1',
+          })
+        );
+        await setDoc(
+          doc(db, 'notifications', followNotificationId('notifc', 'notifa')),
+          validNotification(followNotificationId('notifc', 'notifa'), 'notifa', 'notifc', 'Notif Charlie', 'notifc_handle', 'follow')
+        );
+      });
+    });
+
+    await check('ALLOW: A marks all their own notifications read in one batch', async () => {
+      const batch = writeBatch(notifA);
+      batch.update(doc(notifA, 'notifications', likeNotificationId('post-notif-1', 'notifb')), { read: true, updatedAt: serverTimestamp() });
+      batch.update(doc(notifA, 'notifications', followNotificationId('notifc', 'notifa')), { read: true, updatedAt: serverTimestamp() });
+      await assertSucceeds(batch.commit());
+    });
+
+    await check('DENY: B batch-updates A\'s notification (not B\'s to mark read)', async () => {
+      const batch = writeBatch(notifB);
+      batch.update(doc(notifB, 'notifications', likeNotificationId('post-notif-1', 'notifb')), { read: true, updatedAt: serverTimestamp() });
+      await assertFails(batch.commit());
     });
 
     await testEnv.clearFirestore();

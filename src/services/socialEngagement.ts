@@ -6,7 +6,6 @@
 
 import {
   collection,
-  deleteDoc,
   doc,
   getCountFromServer,
   getDoc,
@@ -15,15 +14,18 @@ import {
   orderBy,
   query,
   serverTimestamp,
-  setDoc,
+  writeBatch,
   type WithFieldValue,
 } from 'firebase/firestore';
 
-import type { ContentComment, ContentLike } from '@/types/content';
+import type { Content, ContentComment, ContentLike } from '@/types/content';
 import { COMMENT_BODY_MAX_LENGTH } from '@/types/content';
+import type { Notification } from '@/types/notification';
+import { NOTIFICATION_PREVIEW_MAX_LENGTH } from '@/types/notification';
 
 import { contentDocRef, resolveTrustedFields, type EngagementError, type EngagementResult } from './engagement';
 import { firestore } from './firestore';
+import { buildNotificationId, notificationRef } from './notifications';
 
 const CONTENT_COLLECTION = 'content';
 const DEFAULT_COMMENT_LIMIT = 30;
@@ -38,12 +40,16 @@ function commentRef(contentId: string, commentId: string) {
   return doc(firestore!, CONTENT_COLLECTION, contentId, 'comments', commentId);
 }
 
-async function assertPublishedContent(contentId: string): Promise<{ ok: true } | { ok: false; error: EngagementError; message: string }> {
+type AssertPublishedContentResult =
+  | { ok: true; content: Content }
+  | { ok: false; error: EngagementError; message: string };
+
+async function assertPublishedContent(contentId: string): Promise<AssertPublishedContentResult> {
   const snapshot = await getDoc(contentDocRef(contentId));
   if (!snapshot.exists() || snapshot.data().status !== 'published') {
     return { ok: false, error: 'not-found', message: "Couldn't find that." };
   }
-  return { ok: true };
+  return { ok: true, content: snapshot.data() as Content };
 }
 
 // ---------------------------------------------------------------------------
@@ -67,10 +73,34 @@ export async function likeContent(contentId: string, uid: string): Promise<LikeC
   }
 
   try {
-    await setDoc(likeRef(contentId, uid), {
+    // Like + notification land atomically — see firestore.rules, which
+    // requires the like doc to exist (existsAfter) for the notification
+    // create to be valid. Never notify yourself for your own like.
+    const batch = writeBatch(firestore);
+    batch.set(likeRef(contentId, uid), {
       uid,
       createdAt: serverTimestamp(),
     } satisfies WithFieldValue<ContentLike>);
+
+    if (parent.content.authorUid !== uid) {
+      const notificationId = buildNotificationId('like', { contentId, actorUid: uid });
+      batch.set(notificationRef(notificationId), {
+        notificationId,
+        recipientUid: parent.content.authorUid,
+        actorUid: uid,
+        actorDisplayName: trusted.fields.displayName,
+        actorUsername: trusted.fields.username,
+        type: 'like',
+        contentId,
+        commentId: null,
+        previewText: null,
+        read: false,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      } satisfies WithFieldValue<Notification>);
+    }
+
+    await batch.commit();
   } catch {
     return { ok: false, error: 'unknown', message: "Couldn't like this." };
   }
@@ -81,7 +111,16 @@ export async function likeContent(contentId: string, uid: string): Promise<LikeC
 export async function unlikeContent(contentId: string, uid: string): Promise<{ ok: true } | { ok: false; error: EngagementError; message: string }> {
   if (!firestore) return { ok: false, error: 'not-configured', message: 'Firestore is not available.' };
   try {
-    await deleteDoc(likeRef(contentId, uid));
+    // Removing the like and its notification (if any — self-likes never
+    // had one) land in the same batch, so a notification can never outlive
+    // the like it was for.
+    const contentSnapshot = await getDoc(contentDocRef(contentId));
+    const batch = writeBatch(firestore);
+    batch.delete(likeRef(contentId, uid));
+    if (contentSnapshot.exists() && contentSnapshot.data().authorUid !== uid) {
+      batch.delete(notificationRef(buildNotificationId('like', { contentId, actorUid: uid })));
+    }
+    await batch.commit();
   } catch {
     return { ok: false, error: 'unknown', message: "Couldn't remove your like." };
   }
@@ -133,7 +172,32 @@ export async function createComment(contentId: string, uid: string, body: string
   } satisfies WithFieldValue<ContentComment>;
 
   try {
-    await setDoc(ref, data);
+    // Comment + notification land atomically — see firestore.rules, which
+    // requires the comment doc to exist (existsAfter) for the notification
+    // create to be valid. Never notify yourself for your own comment.
+    const batch = writeBatch(firestore);
+    batch.set(ref, data);
+
+    if (parent.content.authorUid !== uid) {
+      const notificationId = buildNotificationId('comment', { commentId: ref.id });
+      const previewText = trimmed.length > NOTIFICATION_PREVIEW_MAX_LENGTH ? `${trimmed.slice(0, NOTIFICATION_PREVIEW_MAX_LENGTH)}…` : trimmed;
+      batch.set(notificationRef(notificationId), {
+        notificationId,
+        recipientUid: parent.content.authorUid,
+        actorUid: uid,
+        actorDisplayName: trusted.fields.displayName,
+        actorUsername: trusted.fields.username,
+        type: 'comment',
+        contentId,
+        commentId: ref.id,
+        previewText,
+        read: false,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      } satisfies WithFieldValue<Notification>);
+    }
+
+    await batch.commit();
   } catch {
     return { ok: false, error: 'unknown', message: "Couldn't post your comment." };
   }
@@ -152,7 +216,16 @@ export async function deleteComment(
 ): Promise<{ ok: true } | { ok: false; error: EngagementError; message: string }> {
   if (!firestore) return { ok: false, error: 'not-configured', message: 'Firestore is not available.' };
   try {
-    await deleteDoc(commentRef(contentId, commentId));
+    // Removing the comment and its notification (if any — self-comments
+    // never had one) land in the same batch, so a notification can never
+    // outlive the comment it was for.
+    const contentSnapshot = await getDoc(contentDocRef(contentId));
+    const batch = writeBatch(firestore);
+    batch.delete(commentRef(contentId, commentId));
+    if (contentSnapshot.exists() && contentSnapshot.data().authorUid !== uid) {
+      batch.delete(notificationRef(buildNotificationId('comment', { commentId })));
+    }
+    await batch.commit();
   } catch {
     return { ok: false, error: 'unknown', message: "Couldn't delete your comment." };
   }

@@ -6,7 +6,6 @@
 
 import {
   collection,
-  deleteDoc,
   doc,
   getCountFromServer,
   getDoc,
@@ -14,15 +13,17 @@ import {
   limit,
   query,
   serverTimestamp,
-  setDoc,
   where,
+  writeBatch,
   type WithFieldValue,
 } from 'firebase/firestore';
 
 import { fetchPublicProfile } from '@/services/publicProfile';
 import type { Follow, PublicProfile } from '@/types/social';
+import type { Notification } from '@/types/notification';
 
 import { firestore } from './firestore';
+import { buildNotificationId, notificationRef } from './notifications';
 
 const FOLLOWS_COLLECTION = 'follows';
 const DEFAULT_LIST_LIMIT = 30;
@@ -49,12 +50,40 @@ export async function followUser(followerUid: string, targetUid: string): Promis
     return { ok: true };
   }
 
+  // The notification's actor snapshot comes from the follower's own PUBLIC
+  // profile — exactly the public-safe info a notification should show,
+  // and consistent with how the follow edge itself is validated.
+  const actorProfile = await fetchPublicProfile(followerUid);
+  if (!actorProfile) {
+    return { ok: false, error: 'unknown', message: "Couldn't follow this user." };
+  }
+
   try {
-    await setDoc(followRef(followerUid, targetUid), {
+    // Follow + notification land atomically — see firestore.rules, which
+    // requires the follow edge to exist (existsAfter) for the notification
+    // create to be valid. Self-follow is already impossible (checked above).
+    const notificationId = buildNotificationId('follow', { actorUid: followerUid, recipientUid: targetUid });
+    const batch = writeBatch(firestore);
+    batch.set(followRef(followerUid, targetUid), {
       followerUid,
       followingUid: targetUid,
       createdAt: serverTimestamp(),
     } satisfies WithFieldValue<Follow>);
+    batch.set(notificationRef(notificationId), {
+      notificationId,
+      recipientUid: targetUid,
+      actorUid: followerUid,
+      actorDisplayName: actorProfile.displayName,
+      actorUsername: actorProfile.username,
+      type: 'follow',
+      contentId: null,
+      commentId: null,
+      previewText: null,
+      read: false,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    } satisfies WithFieldValue<Notification>);
+    await batch.commit();
   } catch {
     return { ok: false, error: 'unknown', message: "Couldn't follow this user." };
   }
@@ -64,7 +93,13 @@ export async function followUser(followerUid: string, targetUid: string): Promis
 export async function unfollowUser(followerUid: string, targetUid: string): Promise<FollowActionResult> {
   if (!firestore) return { ok: false, error: 'not-configured', message: 'Firestore is not available.' };
   try {
-    await deleteDoc(followRef(followerUid, targetUid));
+    // Removing the follow edge and its notification land in the same
+    // batch, so a follow notification can never outlive the follow it was
+    // for.
+    const batch = writeBatch(firestore);
+    batch.delete(followRef(followerUid, targetUid));
+    batch.delete(notificationRef(buildNotificationId('follow', { actorUid: followerUid, recipientUid: targetUid })));
+    await batch.commit();
   } catch {
     return { ok: false, error: 'unknown', message: "Couldn't unfollow this user." };
   }
