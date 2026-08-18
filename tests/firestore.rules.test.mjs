@@ -18,6 +18,7 @@ import {
   getCountFromServer,
   getDoc,
   getDocs,
+  orderBy,
   query,
   runTransaction,
   serverTimestamp,
@@ -218,6 +219,38 @@ function validNotification(notificationId, recipientUid, actorUid, actorDisplayN
     updatedAt: serverTimestamp(),
     ...overrides,
   };
+}
+
+// Same deterministic ID scheme as getConversationId in
+// src/services/messages.ts — lexicographic string ordering, verified here
+// against Firestore Rules' own `<` string comparison via the tests below.
+function conversationId(uidA, uidB) {
+  return uidA < uidB ? `${uidA}_${uidB}` : `${uidB}_${uidA}`;
+}
+
+function sortedPair(uidA, uidB) {
+  return uidA < uidB ? [uidA, uidB] : [uidB, uidA];
+}
+
+function validConversation(uidA, uidB, senderUid, messageId, messageText, overrides = {}) {
+  const [uidLow, uidHigh] = sortedPair(uidA, uidB);
+  const otherUid = senderUid === uidLow ? uidHigh : uidLow;
+  return {
+    conversationId: conversationId(uidA, uidB),
+    participantUids: [uidLow, uidHigh],
+    lastMessageId: messageId,
+    lastMessageText: messageText,
+    lastMessageSenderUid: senderUid,
+    lastMessageAt: serverTimestamp(),
+    unreadCounts: { [senderUid]: 0, [otherUid]: 1 },
+    createdAt: serverTimestamp(),
+    updatedAt: serverTimestamp(),
+    ...overrides,
+  };
+}
+
+function validMessage(messageId, senderUid, body, overrides = {}) {
+  return { messageId, senderUid, body, createdAt: serverTimestamp(), ...overrides };
 }
 
 /** Mirrors the real joinActivity transaction: participant create + stats increment, atomically. */
@@ -1708,6 +1741,388 @@ async function main() {
       const batch = writeBatch(notifB);
       batch.update(doc(notifB, 'notifications', likeNotificationId('post-notif-1', 'notifb')), { read: true, updatedAt: serverTimestamp() });
       await assertFails(batch.commit());
+    });
+
+    // =========================================================================
+    // conversations/{conversationId} and conversations/{conversationId}/messages/{messageId}
+    // Fresh users, independent of everything above.
+    // =========================================================================
+    await seedProfile(testEnv, 'msga', 'msga_handle', { displayName: 'Msg Alpha' });
+    await seedProfile(testEnv, 'msgb', 'msgb_handle', { displayName: 'Msg Bravo' });
+    await seedProfile(testEnv, 'msgc', 'msgc_handle', { displayName: 'Msg Charlie' });
+
+    const msgA = testEnv.authenticatedContext('msga').firestore();
+    const msgB = testEnv.authenticatedContext('msgb').firestore();
+    const msgC = testEnv.authenticatedContext('msgc').firestore();
+
+    await check('setup: message test users create matching public profiles', async () => {
+      await assertSucceeds(setDoc(doc(msgA, 'publicProfiles', 'msga'), validPublicProfile('msga', 'Msg Alpha', 'msga_handle')));
+      await assertSucceeds(setDoc(doc(msgB, 'publicProfiles', 'msgb'), validPublicProfile('msgb', 'Msg Bravo', 'msgb_handle')));
+      await assertSucceeds(setDoc(doc(msgC, 'publicProfiles', 'msgc'), validPublicProfile('msgc', 'Msg Charlie', 'msgc_handle')));
+    });
+
+    // Regression: sendMessage's own "does this pair already have a
+    // conversation?" pre-check reads a conversation that may not exist yet
+    // — that read must succeed (returning "not found"), not error, or a
+    // first message could never be sent. Reading a nonexistent document
+    // reveals no data (there is none), so this is safe for any signed-in
+    // user, not just the two eventual participants.
+    await check('ALLOW: checking a nonexistent conversation for existence does not error', async () => {
+      const snapshot = await assertSucceeds(getDoc(doc(msgA, 'conversations', conversationId('msga', 'msgb'))));
+      assert.equal(snapshot.exists(), false);
+    });
+
+    await check('DENY: unauthenticated user checking a nonexistent conversation', async () => {
+      await assertFails(getDoc(doc(anon, 'conversations', conversationId('msga', 'msgb'))));
+    });
+
+    // Regression: the Chat screen's realtime listener queries this
+    // subcollection immediately on open, before any message (and
+    // therefore before the Conversation itself) exists — that query must
+    // return empty, not error.
+    await check('ALLOW: listing Messages of a not-yet-existing conversation returns empty, not an error', async () => {
+      const snapshot = await assertSucceeds(getDocs(collection(msgA, 'conversations', conversationId('msga', 'msgb'), 'messages')));
+      assert.equal(snapshot.size, 0);
+    });
+
+    await check('DENY: unauthenticated user listing Messages of a not-yet-existing conversation', async () => {
+      await assertFails(getDocs(collection(anon, 'conversations', conversationId('msga', 'msgb'), 'messages')));
+    });
+
+    await check('ALLOW: A creates conversation with B atomically with first message', async () => {
+      const convId = conversationId('msga', 'msgb');
+      const batch = writeBatch(msgA);
+      batch.set(doc(msgA, 'conversations', convId, 'messages', 'msg-1'), validMessage('msg-1', 'msga', 'Hey there'));
+      batch.set(doc(msgA, 'conversations', convId), validConversation('msga', 'msgb', 'msga', 'msg-1', 'Hey there'));
+      await assertSucceeds(batch.commit());
+
+      const snapshot = await getDoc(doc(msgA, 'conversations', convId));
+      assert.equal(snapshot.exists(), true);
+      assert.deepEqual(snapshot.data().unreadCounts, { msga: 0, msgb: 1 });
+      assert.deepEqual(snapshot.data().participantUids, ['msga', 'msgb']);
+    });
+
+    await check('ALLOW: A reads own conversation', async () => {
+      await assertSucceeds(getDoc(doc(msgA, 'conversations', conversationId('msga', 'msgb'))));
+    });
+
+    await check('ALLOW: B reads same conversation', async () => {
+      await assertSucceeds(getDoc(doc(msgB, 'conversations', conversationId('msga', 'msgb'))));
+    });
+
+    await check('DENY: C reads A<->B conversation (privacy)', async () => {
+      await assertFails(getDoc(doc(msgC, 'conversations', conversationId('msga', 'msgb'))));
+    });
+
+    await check('DENY: unauthenticated conversation read', async () => {
+      await assertFails(getDoc(doc(anon, 'conversations', conversationId('msga', 'msgb'))));
+    });
+
+    await check('DENY: self-conversation', async () => {
+      const selfId = conversationId('msga', 'msga');
+      const batch = writeBatch(msgA);
+      batch.set(doc(msgA, 'conversations', selfId, 'messages', 'msg-self'), validMessage('msg-self', 'msga', 'hi'));
+      batch.set(doc(msgA, 'conversations', selfId), validConversation('msga', 'msga', 'msga', 'msg-self', 'hi'));
+      await assertFails(batch.commit());
+    });
+
+    await check('DENY: wrong deterministic conversation ID', async () => {
+      const batch = writeBatch(msgA);
+      batch.set(doc(msgA, 'conversations', 'wrong-id', 'messages', 'msg-wrong'), validMessage('msg-wrong', 'msga', 'hi'));
+      batch.set(doc(msgA, 'conversations', 'wrong-id'), validConversation('msga', 'msgc', 'msga', 'msg-wrong', 'hi'));
+      await assertFails(batch.commit());
+    });
+
+    await check('DENY: conversation with nonexistent public profile', async () => {
+      const convId = conversationId('msga', 'msgghost');
+      const batch = writeBatch(msgA);
+      batch.set(doc(msgA, 'conversations', convId, 'messages', 'msg-ghost'), validMessage('msg-ghost', 'msga', 'hi'));
+      batch.set(doc(msgA, 'conversations', convId), validConversation('msga', 'msgghost', 'msga', 'msg-ghost', 'hi'));
+      await assertFails(batch.commit());
+    });
+
+    await check('DENY: conversation create without a matching first Message', async () => {
+      const convId = conversationId('msga', 'msgc');
+      await assertFails(setDoc(doc(msgA, 'conversations', convId), validConversation('msga', 'msgc', 'msga', 'msg-missing', 'hi')));
+    });
+
+    await check('DENY: arbitrary participantUids not matching the actual sender', async () => {
+      const convId = conversationId('msga', 'msgc');
+      const batch = writeBatch(msgA);
+      batch.set(doc(msgA, 'conversations', convId, 'messages', 'msg-arb'), validMessage('msg-arb', 'msga', 'hi'));
+      batch.set(doc(msgA, 'conversations', convId), {
+        ...validConversation('msga', 'msgc', 'msga', 'msg-arb', 'hi'),
+        participantUids: ['msgb', 'msgc'], // doesn't include msga, the real caller
+      });
+      await assertFails(batch.commit());
+    });
+
+    await check('DENY: change participantUids after creation', async () => {
+      await assertFails(updateDoc(doc(msgA, 'conversations', conversationId('msga', 'msgb')), { participantUids: ['msga', 'msgc'] }));
+    });
+
+    await check('DENY: direct unreadCount manipulation (arbitrary large value)', async () => {
+      await assertFails(updateDoc(doc(msgA, 'conversations', conversationId('msga', 'msgb')), { 'unreadCounts.msgb': 999 }));
+    });
+
+    await check('DENY: A resets B unread count to 0', async () => {
+      await assertFails(updateDoc(doc(msgA, 'conversations', conversationId('msga', 'msgb')), { 'unreadCounts.msgb': 0 }));
+    });
+
+    await check('DENY: negative unread count', async () => {
+      await assertFails(updateDoc(doc(msgA, 'conversations', conversationId('msga', 'msgb')), { 'unreadCounts.msga': -1 }));
+    });
+
+    await check('DENY: conversation delete', async () => {
+      await assertFails(deleteDoc(doc(msgA, 'conversations', conversationId('msga', 'msgb'))));
+    });
+
+    // --- messages/{messageId} ---
+    await check('ALLOW: A sends a second message on existing conversation', async () => {
+      const convId = conversationId('msga', 'msgb');
+      const batch = writeBatch(msgA);
+      batch.set(doc(msgA, 'conversations', convId, 'messages', 'msg-2'), validMessage('msg-2', 'msga', 'Second message'));
+      batch.update(doc(msgA, 'conversations', convId), {
+        lastMessageId: 'msg-2',
+        lastMessageText: 'Second message',
+        lastMessageSenderUid: 'msga',
+        lastMessageAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+        'unreadCounts.msga': 0,
+        'unreadCounts.msgb': 2,
+      });
+      await assertSucceeds(batch.commit());
+    });
+
+    await check('ALLOW: B sends a reply', async () => {
+      const convId = conversationId('msga', 'msgb');
+      const batch = writeBatch(msgB);
+      batch.set(doc(msgB, 'conversations', convId, 'messages', 'msg-3'), validMessage('msg-3', 'msgb', 'Reply!'));
+      batch.update(doc(msgB, 'conversations', convId), {
+        lastMessageId: 'msg-3',
+        lastMessageText: 'Reply!',
+        lastMessageSenderUid: 'msgb',
+        lastMessageAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+        'unreadCounts.msgb': 0,
+        'unreadCounts.msga': 1,
+      });
+      await assertSucceeds(batch.commit());
+    });
+
+    await check('ALLOW: A reads Messages', async () => {
+      await assertSucceeds(getDocs(collection(msgA, 'conversations', conversationId('msga', 'msgb'), 'messages')));
+    });
+
+    await check('ALLOW: B reads Messages', async () => {
+      await assertSucceeds(getDocs(collection(msgB, 'conversations', conversationId('msga', 'msgb'), 'messages')));
+    });
+
+    await check('DENY: unauthenticated message read', async () => {
+      await assertFails(getDocs(collection(anon, 'conversations', conversationId('msga', 'msgb'), 'messages')));
+    });
+
+    await check('DENY: C reads A<->B messages', async () => {
+      await assertFails(getDocs(collection(msgC, 'conversations', conversationId('msga', 'msgb'), 'messages')));
+    });
+
+    await check('DENY: C creates a message in A<->B conversation', async () => {
+      await assertFails(
+        setDoc(doc(msgC, 'conversations', conversationId('msga', 'msgb'), 'messages', 'msg-intrude'), validMessage('msg-intrude', 'msgc', 'sneaky'))
+      );
+    });
+
+    await check('DENY: senderUid spoofing on message create', async () => {
+      const convId = conversationId('msga', 'msgb');
+      const batch = writeBatch(msgA);
+      batch.set(doc(msgA, 'conversations', convId, 'messages', 'msg-spoof'), validMessage('msg-spoof', 'msgb', 'pretend to be B'));
+      batch.update(doc(msgA, 'conversations', convId), {
+        lastMessageId: 'msg-spoof',
+        lastMessageText: 'pretend to be B',
+        lastMessageSenderUid: 'msga',
+        lastMessageAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+        'unreadCounts.msga': 0,
+        'unreadCounts.msgb': 2,
+      });
+      await assertFails(batch.commit());
+    });
+
+    await check('DENY: empty message body', async () => {
+      const convId = conversationId('msga', 'msgb');
+      const batch = writeBatch(msgA);
+      batch.set(doc(msgA, 'conversations', convId, 'messages', 'msg-empty'), validMessage('msg-empty', 'msga', ''));
+      batch.update(doc(msgA, 'conversations', convId), {
+        lastMessageId: 'msg-empty',
+        lastMessageText: '',
+        lastMessageSenderUid: 'msga',
+        lastMessageAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+        'unreadCounts.msga': 0,
+        'unreadCounts.msgb': 2,
+      });
+      await assertFails(batch.commit());
+    });
+
+    await check('DENY: message body over 1000 characters', async () => {
+      const convId = conversationId('msga', 'msgb');
+      const longBody = 'x'.repeat(1001);
+      const batch = writeBatch(msgA);
+      batch.set(doc(msgA, 'conversations', convId, 'messages', 'msg-long'), validMessage('msg-long', 'msga', longBody));
+      batch.update(doc(msgA, 'conversations', convId), {
+        lastMessageId: 'msg-long',
+        lastMessageText: longBody,
+        lastMessageSenderUid: 'msga',
+        lastMessageAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+        'unreadCounts.msga': 0,
+        'unreadCounts.msgb': 2,
+      });
+      await assertFails(batch.commit());
+    });
+
+    await check('DENY: messageId field does not match document ID', async () => {
+      const convId = conversationId('msga', 'msgb');
+      const batch = writeBatch(msgA);
+      batch.set(doc(msgA, 'conversations', convId, 'messages', 'msg-real-id'), validMessage('different-id', 'msga', 'hi'));
+      batch.update(doc(msgA, 'conversations', convId), {
+        lastMessageId: 'msg-real-id',
+        lastMessageText: 'hi',
+        lastMessageSenderUid: 'msga',
+        lastMessageAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+        'unreadCounts.msga': 0,
+        'unreadCounts.msgb': 2,
+      });
+      await assertFails(batch.commit());
+    });
+
+    await check('DENY: message create without a paired Conversation update', async () => {
+      await assertFails(
+        setDoc(doc(msgA, 'conversations', conversationId('msga', 'msgb'), 'messages', 'msg-orphan'), validMessage('msg-orphan', 'msga', 'orphan'))
+      );
+    });
+
+    await check('DENY: Message body differs from Conversation.lastMessageText', async () => {
+      const convId = conversationId('msga', 'msgb');
+      const batch = writeBatch(msgA);
+      batch.set(doc(msgA, 'conversations', convId, 'messages', 'msg-mismatch'), validMessage('msg-mismatch', 'msga', 'real body'));
+      batch.update(doc(msgA, 'conversations', convId), {
+        lastMessageId: 'msg-mismatch',
+        lastMessageText: 'DIFFERENT claimed text',
+        lastMessageSenderUid: 'msga',
+        lastMessageAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+        'unreadCounts.msga': 0,
+        'unreadCounts.msgb': 2,
+      });
+      await assertFails(batch.commit());
+    });
+
+    await check('DENY: message update', async () => {
+      await assertFails(updateDoc(doc(msgA, 'conversations', conversationId('msga', 'msgb'), 'messages', 'msg-3'), { body: 'edited' }));
+    });
+
+    await check('DENY: message delete', async () => {
+      await assertFails(deleteDoc(doc(msgA, 'conversations', conversationId('msga', 'msgb'), 'messages', 'msg-3')));
+    });
+
+    // =========================================================================
+    // Unread flow — exact sequence verification (fresh A<->C pair).
+    // 0/1 -> 0/2 -> 0/0 -> 1/0 -> 0/0
+    // =========================================================================
+    await check('UNREAD FLOW: exact sequence verified at every step', async () => {
+      const convId = conversationId('msga', 'msgc');
+
+      let batch = writeBatch(msgA);
+      batch.set(doc(msgA, 'conversations', convId, 'messages', 'flow-1'), validMessage('flow-1', 'msga', 'one'));
+      batch.set(doc(msgA, 'conversations', convId), validConversation('msga', 'msgc', 'msga', 'flow-1', 'one'));
+      await assertSucceeds(batch.commit());
+      let snapshot = await getDoc(doc(msgA, 'conversations', convId));
+      assert.deepEqual(snapshot.data().unreadCounts, { msga: 0, msgc: 1 });
+
+      batch = writeBatch(msgA);
+      batch.set(doc(msgA, 'conversations', convId, 'messages', 'flow-2'), validMessage('flow-2', 'msga', 'two'));
+      batch.update(doc(msgA, 'conversations', convId), {
+        lastMessageId: 'flow-2',
+        lastMessageText: 'two',
+        lastMessageSenderUid: 'msga',
+        lastMessageAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+        'unreadCounts.msga': 0,
+        'unreadCounts.msgc': 2,
+      });
+      await assertSucceeds(batch.commit());
+      snapshot = await getDoc(doc(msgA, 'conversations', convId));
+      assert.deepEqual(snapshot.data().unreadCounts, { msga: 0, msgc: 2 });
+
+      await assertSucceeds(updateDoc(doc(msgC, 'conversations', convId), { 'unreadCounts.msgc': 0 }));
+      snapshot = await getDoc(doc(msgC, 'conversations', convId));
+      assert.deepEqual(snapshot.data().unreadCounts, { msga: 0, msgc: 0 });
+
+      batch = writeBatch(msgC);
+      batch.set(doc(msgC, 'conversations', convId, 'messages', 'flow-3'), validMessage('flow-3', 'msgc', 'three'));
+      batch.update(doc(msgC, 'conversations', convId), {
+        lastMessageId: 'flow-3',
+        lastMessageText: 'three',
+        lastMessageSenderUid: 'msgc',
+        lastMessageAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+        'unreadCounts.msgc': 0,
+        'unreadCounts.msga': 1,
+      });
+      await assertSucceeds(batch.commit());
+      snapshot = await getDoc(doc(msgC, 'conversations', convId));
+      assert.deepEqual(snapshot.data().unreadCounts, { msga: 1, msgc: 0 });
+
+      await assertSucceeds(updateDoc(doc(msgA, 'conversations', convId), { 'unreadCounts.msga': 0 }));
+      snapshot = await getDoc(doc(msgA, 'conversations', convId));
+      assert.deepEqual(snapshot.data().unreadCounts, { msga: 0, msgc: 0 });
+    });
+
+    // =========================================================================
+    // Conversation uniqueness — B "starting" with A resolves to the exact
+    // same document A already created with B; a naive re-create is denied.
+    // =========================================================================
+    await check('UNIQUENESS: B\'s canonical ID for the pair equals A\'s, and re-creating it is denied', async () => {
+      const convId = conversationId('msga', 'msgb');
+      assert.equal(conversationId('msgb', 'msga'), convId);
+
+      await assertFails(
+        setDoc(doc(msgB, 'conversations', convId), validConversation('msgb', 'msga', 'msgb', 'fake-recreate', 'hijack'))
+      );
+    });
+
+    // =========================================================================
+    // Ordering — Inbox's fetchConversations-equivalent query orders by
+    // lastMessageAt DESC, using real send-triggered timestamps.
+    // =========================================================================
+    await check('ORDERING: more-recently-active conversation sorts first', async () => {
+      const convIdAC = conversationId('msga', 'msgc');
+      const batch = writeBatch(msgA);
+      batch.set(doc(msgA, 'conversations', convIdAC, 'messages', 'flow-4'), validMessage('flow-4', 'msga', 'newest'));
+      batch.update(doc(msgA, 'conversations', convIdAC), {
+        lastMessageId: 'flow-4',
+        lastMessageText: 'newest',
+        lastMessageSenderUid: 'msga',
+        lastMessageAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+        'unreadCounts.msga': 0,
+        'unreadCounts.msgc': 1,
+      });
+      await assertSucceeds(batch.commit());
+
+      const conversationsQuery = query(
+        collection(msgA, 'conversations'),
+        where('participantUids', 'array-contains', 'msga'),
+        orderBy('lastMessageAt', 'desc')
+      );
+      const snapshot = await assertSucceeds(getDocs(conversationsQuery));
+      const ids = snapshot.docs.map((docSnapshot) => docSnapshot.id);
+      const acIndex = ids.indexOf(convIdAC);
+      const abIndex = ids.indexOf(conversationId('msga', 'msgb'));
+      assert.ok(acIndex !== -1 && abIndex !== -1);
+      assert.ok(acIndex < abIndex, 'A<->C (just updated) should sort before A<->B (older)');
     });
 
     await testEnv.clearFirestore();

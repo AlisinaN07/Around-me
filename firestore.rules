@@ -637,6 +637,187 @@ service cloud.firestore {
         );
     }
 
+    // conversations/{conversationId} — a private 1:1 direct-message thread
+    // between exactly two users (see src/services/messages.ts and
+    // src/types/message.ts). conversationId is the canonical
+    // `{lowerUid}_{higherUid}` pairing — Firestore Rules support the same
+    // lexicographic `<` ordering on strings that JavaScript's `<` uses for
+    // ASCII uids, so the client and these rules always agree on which uid
+    // sorts first. This is what guarantees at most one 1:1 conversation
+    // per user pair, no matter who starts it — verified explicitly by the
+    // rules test suite's "conversation uniqueness" checks, not assumed.
+    match /conversations/{conversationId} {
+      // resource == null (the conversation doesn't exist yet) is allowed
+      // here on purpose: a nonexistent document has no data to protect, and
+      // sendMessage's own existence pre-check (does this pair already have
+      // a conversation?) needs to be able to ask that question for a
+      // conversation that legitimately might not exist yet — without this,
+      // that pre-check read itself would be denied (resource.data would be
+      // null.data, an evaluation error) before a first message could ever
+      // be sent.
+      allow read: if isSignedIn() && (resource == null || request.auth.uid in resource.data.participantUids);
+
+      allow create: if isSignedIn() && isValidConversationCreate(conversationId, request.resource.data);
+
+      allow update: if isSignedIn()
+        && request.auth.uid in resource.data.participantUids
+        && (isValidConversationSend(request.resource.data, resource.data) || isValidMarkRead(request.resource.data, resource.data));
+
+      // Firestore never cascade-deletes the messages subcollection, and
+      // there's no delete UI yet — same reasoning as content delete above.
+      allow delete: if false;
+
+      // conversations/{conversationId}/messages/{messageId} — text-only,
+      // create + read only (no edit/delete in Step 16 — see
+      // isValidMessageCreate). Always paired with a Conversation
+      // create/update in the same transaction (src/services/messages.ts),
+      // and independently re-validated against it below so a modified
+      // client can never write a message the Conversation doesn't
+      // reference as its latest.
+      match /messages/{messageId} {
+        function conversationPath() {
+          return /databases/$(database)/documents/conversations/$(conversationId);
+        }
+
+        // Same reasoning as the conversations read rule above: the Chat
+        // screen queries this subcollection immediately on open, before
+        // any message (and therefore before the Conversation itself) may
+        // exist yet. A plain get() on a nonexistent Conversation throws in
+        // rules, so that query must be allowed to return "nothing" rather
+        // than error — there's no data to protect when the conversation
+        // doesn't exist. Once it exists, only real participants may read.
+        allow read: if isSignedIn()
+          && (!exists(conversationPath()) || request.auth.uid in get(conversationPath()).data.participantUids);
+
+        allow create: if isSignedIn() && isValidMessageCreate(conversationId, messageId, request.resource.data);
+
+        allow update: if false;
+        allow delete: if false;
+      }
+    }
+
+    function otherParticipant(participantUids, uid) {
+      return participantUids[0] == uid ? participantUids[1] : participantUids[0];
+    }
+
+    function conversationBaseKeys() {
+      return [
+        'conversationId', 'participantUids', 'lastMessageId', 'lastMessageText',
+        'lastMessageSenderUid', 'lastMessageAt', 'unreadCounts', 'createdAt', 'updatedAt'
+      ];
+    }
+
+    // Requires the two-uid array to be stored in the exact SAME sorted
+    // order the ID is derived from — one canonical representation per
+    // pair, not two, and self-conversations are impossible since a value
+    // can never be strictly less than itself.
+    function isValidParticipantPair(participantUids) {
+      return participantUids is list
+        && participantUids.size() == 2
+        && participantUids[0] is string
+        && participantUids[1] is string
+        && participantUids[0] < participantUids[1];
+    }
+
+    function isValidConversationCreate(conversationId, data) {
+      let messagePath = /databases/$(database)/documents/conversations/$(conversationId)/messages/$(data.lastMessageId);
+      return isValidParticipantPair(data.participantUids)
+        && conversationId == data.participantUids[0] + '_' + data.participantUids[1]
+        && request.auth.uid in data.participantUids
+        && exists(/databases/$(database)/documents/publicProfiles/$(data.participantUids[0]))
+        && exists(/databases/$(database)/documents/publicProfiles/$(data.participantUids[1]))
+        && data.conversationId == conversationId
+        && data.lastMessageSenderUid == request.auth.uid
+        && data.lastMessageText is string
+        && isServerTimestamp(data.lastMessageAt)
+        && isServerTimestamp(data.createdAt)
+        && isServerTimestamp(data.updatedAt)
+        && data.unreadCounts.size() == 2
+        && data.unreadCounts[request.auth.uid] == 0
+        && data.unreadCounts[otherParticipant(data.participantUids, request.auth.uid)] == 1
+        && data.keys().hasOnly(conversationBaseKeys())
+        // The paired first Message must exist (in this same transaction)
+        // and match the Conversation's claimed last-message fields exactly
+        // — a client can never point lastMessage* at a message that isn't
+        // really there, or that says something different.
+        && existsAfter(messagePath)
+        && getAfter(messagePath).data.senderUid == request.auth.uid
+        && getAfter(messagePath).data.body == data.lastMessageText
+        && getAfter(messagePath).data.createdAt == data.lastMessageAt;
+    }
+
+    // A normal send on an ALREADY-EXISTING conversation: identity fields
+    // are immutable, and the last-message snapshot + unread counts can
+    // only move in the one direction a real send actually moves them.
+    function isValidConversationSend(newData, oldData) {
+      let sender = request.auth.uid;
+      let other = otherParticipant(oldData.participantUids, sender);
+      let messagePath = /databases/$(database)/documents/conversations/$(oldData.conversationId)/messages/$(newData.lastMessageId);
+      return newData.conversationId == oldData.conversationId
+        && newData.participantUids == oldData.participantUids
+        && newData.createdAt == oldData.createdAt
+        && newData.lastMessageId != oldData.lastMessageId
+        && newData.lastMessageSenderUid == sender
+        && newData.lastMessageText is string
+        && isServerTimestamp(newData.lastMessageAt)
+        && isServerTimestamp(newData.updatedAt)
+        && newData.unreadCounts.size() == 2
+        && newData.unreadCounts[sender] == 0
+        && newData.unreadCounts[other] == oldData.unreadCounts[other] + 1
+        && newData.keys().hasOnly(conversationBaseKeys())
+        // The paired new Message must exist (in this same transaction)
+        // and match exactly — same pairing guarantee as create.
+        && existsAfter(messagePath)
+        && getAfter(messagePath).data.senderUid == sender
+        && getAfter(messagePath).data.body == newData.lastMessageText
+        && getAfter(messagePath).data.createdAt == newData.lastMessageAt;
+    }
+
+    // markConversationRead: the ONLY thing allowed to change is the
+    // caller's own unreadCounts entry, and only down to 0. Every other
+    // field — including the other participant's unread count — must stay
+    // byte-identical to what was there before.
+    function isValidMarkRead(newData, oldData) {
+      let uid = request.auth.uid;
+      let other = otherParticipant(oldData.participantUids, uid);
+      return newData.conversationId == oldData.conversationId
+        && newData.participantUids == oldData.participantUids
+        && newData.createdAt == oldData.createdAt
+        && newData.updatedAt == oldData.updatedAt
+        && newData.lastMessageId == oldData.lastMessageId
+        && newData.lastMessageText == oldData.lastMessageText
+        && newData.lastMessageSenderUid == oldData.lastMessageSenderUid
+        && newData.lastMessageAt == oldData.lastMessageAt
+        && newData.unreadCounts.size() == 2
+        && newData.unreadCounts[uid] == 0
+        && newData.unreadCounts[other] == oldData.unreadCounts[other]
+        && newData.keys().hasOnly(conversationBaseKeys());
+    }
+
+    function isValidMessageCreate(conversationId, messageId, data) {
+      let convPath = /databases/$(database)/documents/conversations/$(conversationId);
+      let convAfter = getAfter(convPath).data;
+      return existsAfter(convPath)
+        && request.auth.uid in convAfter.participantUids
+        && data.messageId == messageId
+        && data.senderUid == request.auth.uid
+        && data.body is string
+        && data.body.size() > 0
+        && data.body.size() <= 1000
+        && isServerTimestamp(data.createdAt)
+        && data.keys().hasOnly(['messageId', 'senderUid', 'body', 'createdAt'])
+        // The paired Conversation write (whether this message is the
+        // FIRST one — creating the Conversation in the same transaction —
+        // or a later one on an existing Conversation) must reference this
+        // exact message as its latest. Checking the POST-write state
+        // (getAfter) rather than the pre-write state is what makes this
+        // one check correct for both cases.
+        && convAfter.lastMessageId == messageId
+        && convAfter.lastMessageSenderUid == request.auth.uid
+        && convAfter.lastMessageText == data.body
+        && convAfter.lastMessageAt == data.createdAt;
+    }
+
     // Everything else is denied by default.
     match /{document=**} {
       allow read, write: if false;

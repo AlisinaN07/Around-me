@@ -157,12 +157,19 @@ export default function PublicProfileScreen() {
               <Text style={styles.selfBadgeText}>This is you</Text>
             </View>
           ) : (
-            <Button
-              label={amFollowing ? 'Following' : 'Follow'}
-              variant={amFollowing ? 'secondary' : 'primary'}
-              onPress={handleToggleFollow}
-              loading={isFollowSubmitting}
-            />
+            <View style={styles.actionsRow}>
+              <View style={styles.actionButton}>
+                <Button
+                  label={amFollowing ? 'Following' : 'Follow'}
+                  variant={amFollowing ? 'secondary' : 'primary'}
+                  onPress={handleToggleFollow}
+                  loading={isFollowSubmitting}
+                />
+              </View>
+              <View style={styles.actionButton}>
+                <Button label="Message" variant="secondary" onPress={() => router.push(`/chat/${uid}`)} />
+              </View>
+            </View>
           )}
 
           {interestLabels.length > 0 && (
@@ -262,6 +269,13 @@ const styles = StyleSheet.create({
     color: Colors.error,
     fontSize: 13,
     textAlign: 'center',
+  },
+  actionsRow: {
+    flexDirection: 'row',
+    gap: Spacing.sm,
+  },
+  actionButton: {
+    flex: 1,
   },
   selfBadge: {
     alignSelf: 'center',
