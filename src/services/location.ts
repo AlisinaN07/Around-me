@@ -41,3 +41,34 @@ export async function detectCurrentCity(): Promise<DetectCityResult> {
     return { ok: false, reason: 'unknown', message: 'Something went wrong finding your location.' };
   }
 }
+
+export type DetectedCoordinates = { latitude: number; longitude: number };
+
+export type GetCurrentCoordinatesResult =
+  | { ok: true; coordinates: DetectedCoordinates }
+  | { ok: false; reason: 'permission-denied' | 'unavailable' | 'unknown'; message: string };
+
+/**
+ * One-time coordinate lookup for the "My location" map control — only
+ * called when the user explicitly taps it. The returned coordinate is
+ * used purely as ephemeral UI state to move the map camera; it is never
+ * written to Firestore, never persisted, and no location history is kept.
+ */
+export async function getCurrentCoordinates(): Promise<GetCurrentCoordinatesResult> {
+  try {
+    const { status } = await Location.requestForegroundPermissionsAsync();
+    if (status !== 'granted') {
+      return { ok: false, reason: 'permission-denied', message: 'Location permission was not granted.' };
+    }
+
+    const servicesEnabled = await Location.hasServicesEnabledAsync();
+    if (!servicesEnabled) {
+      return { ok: false, reason: 'unavailable', message: 'Location services are turned off.' };
+    }
+
+    const position = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
+    return { ok: true, coordinates: { latitude: position.coords.latitude, longitude: position.coords.longitude } };
+  } catch {
+    return { ok: false, reason: 'unknown', message: 'Something went wrong finding your location.' };
+  }
+}

@@ -1,6 +1,6 @@
 {
   "expo": {
-    "name": "around-me",
+    "name": "Around Me",
     "slug": "around-me",
     "version": "1.0.0",
     "orientation": "portrait",
@@ -8,9 +8,11 @@
     "scheme": "aroundme",
     "userInterfaceStyle": "dark",
     "ios": {
-      "icon": "./assets/expo.icon"
+      "icon": "./assets/expo.icon",
+      "bundleIdentifier": "com.alinabi.aroundme"
     },
     "android": {
+      "package": "com.alinabi.aroundme",
       "adaptiveIcon": {
         "backgroundColor": "#0B0B0F",
         "foregroundImage": "./assets/images/android-icon-foreground.png",
@@ -36,7 +38,7 @@
       [
         "expo-location",
         {
-          "locationWhenInUsePermission": "Around Me uses your location to show what's happening in your city.",
+          "locationWhenInUsePermission": "Around Me uses your location only when you ask to detect your city or center the map — never in the background.",
           "locationAlwaysAndWhenInUsePermission": false,
           "locationAlwaysPermission": false,
           "isIosBackgroundLocationEnabled": false,
@@ -44,7 +46,8 @@
         }
       ],
       "expo-font",
-      "@react-native-community/datetimepicker"
+      "@react-native-community/datetimepicker",
+      "expo-maps"
     ],
     "experiments": {
       "typedRoutes": true,

@@ -1,16 +1,20 @@
-import { ScrollView, StyleSheet, Text, View } from 'react-native';
+import { Platform, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { MapPlaceExplorer } from '@/components/MapPlaceExplorer';
+import { NativeMapScreen } from '@/components/NativeMapScreen';
 import { Colors, Layout, Spacing } from '@/constants/theme';
 import { useProfile } from '@/hooks/useProfile';
 import { formatCityDisplayName } from '@/utils/cityDisplay';
 
 /**
- * The map/data foundation for Places (Step 13) — a real Firestore-backed
- * city Places discovery screen. No native map rendering yet; MapPlaceExplorer
- * is deliberately the boundary a future native map (Step 14) can occupy
- * without changing how Places are fetched or filtered.
+ * The Map tab. iOS (Step 14) gets a real native Apple Map (NativeMapScreen)
+ * using the real Place coordinates built in Step 13; web and Android keep
+ * the Step 13 Place explorer/list (MapPlaceExplorer) — Android map support
+ * is a deliberate later step (Google Maps credentials), and `expo-maps`
+ * must never be imported outside NativeCityMap.ios.tsx or it would break
+ * bundling on those platforms. Both surfaces share the exact same
+ * fetch/filter logic (see useCityPlaces) — only the presentation differs.
  */
 export default function MapScreen() {
   const { profile } = useProfile();
@@ -26,7 +30,11 @@ export default function MapScreen() {
           </View>
 
           {profile ? (
-            <MapPlaceExplorer cityKey={profile.cityKey} cityLabel={cityLabel} />
+            Platform.OS === 'ios' ? (
+              <NativeMapScreen cityKey={profile.cityKey} cityLabel={cityLabel} />
+            ) : (
+              <MapPlaceExplorer cityKey={profile.cityKey} cityLabel={cityLabel} />
+            )
           ) : null}
         </View>
       </ScrollView>

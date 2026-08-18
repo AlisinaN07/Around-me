@@ -7,14 +7,29 @@ import { Colors, Radius, Spacing } from '@/constants/theme';
 import type { Place } from '@/types/place';
 import { formatCityDisplayName } from '@/utils/cityDisplay';
 
+type PlaceCardProps = {
+  place: Place;
+  /** Highlights the card — used when this Place is selected on the map (Step 14). */
+  selected?: boolean;
+  /**
+   * Overrides the default tap behavior. When provided (e.g. the native map
+   * screen), tapping the card body selects the Place instead of navigating
+   * — the chevron on the right always still opens the Place detail
+   * directly, so "open detail" is never lost. When omitted (the plain
+   * Places list), the whole card navigates on tap, unchanged from Step 13.
+   */
+  onPress?: () => void;
+};
+
 /** Renders a real places/{placeId} document — no fake ratings, distances, or review counts. */
-export function PlaceCard({ place }: { place: Place }) {
+export function PlaceCard({ place, selected, onPress }: PlaceCardProps) {
   const category = getPlaceCategory(place.categoryId);
+  const openDetail = () => router.push(`/place/${place.placeId}`);
 
   return (
     <Pressable
-      style={styles.card}
-      onPress={() => router.push(`/place/${place.placeId}`)}
+      style={[styles.card, selected && styles.cardSelected]}
+      onPress={onPress ?? openDetail}
       accessibilityRole="button"
       accessibilityLabel={`View ${place.name}`}
     >
@@ -33,7 +48,17 @@ export function PlaceCard({ place }: { place: Place }) {
           </Text>
         </View>
       </View>
-      <Ionicons name="chevron-forward" size={18} color={Colors.textSecondary} />
+      <Pressable
+        onPress={(event) => {
+          event.stopPropagation();
+          openDetail();
+        }}
+        hitSlop={8}
+        accessibilityRole="link"
+        accessibilityLabel="View place"
+      >
+        <Ionicons name="chevron-forward" size={18} color={Colors.textSecondary} />
+      </Pressable>
     </Pressable>
   );
 }
@@ -50,6 +75,9 @@ const styles = StyleSheet.create({
     padding: Spacing.md,
     marginHorizontal: Spacing.lg,
     marginBottom: Spacing.md,
+  },
+  cardSelected: {
+    borderColor: Colors.accent,
   },
   iconCircle: {
     width: 44,

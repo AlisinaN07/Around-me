@@ -13,6 +13,9 @@ type PlaceListProps = {
   status: PlaceListStatus;
   emptyText: string;
   onRetry: () => void;
+  /** When provided (Step 14's native map screen), tapping a card selects it instead of navigating — see PlaceCard. */
+  selectedPlaceId?: string | null;
+  onSelectPlace?: (placeId: string) => void;
 };
 
 /**
@@ -22,7 +25,7 @@ type PlaceListProps = {
  * Place[] this list already renders, without coupling map rendering to
  * data fetching.
  */
-export function PlaceList({ places, status, emptyText, onRetry }: PlaceListProps) {
+export function PlaceList({ places, status, emptyText, onRetry, selectedPlaceId, onSelectPlace }: PlaceListProps) {
   if (status === 'loading' && places.length === 0) {
     return (
       <View style={styles.container}>
@@ -55,7 +58,12 @@ export function PlaceList({ places, status, emptyText, onRetry }: PlaceListProps
   return (
     <View style={styles.container}>
       {places.map((place) => (
-        <PlaceCard key={place.placeId} place={place} />
+        <PlaceCard
+          key={place.placeId}
+          place={place}
+          selected={selectedPlaceId === place.placeId}
+          onPress={onSelectPlace ? () => onSelectPlace(place.placeId) : undefined}
+        />
       ))}
     </View>
   );
