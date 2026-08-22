@@ -6,8 +6,12 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { Avatar } from '@/components/Avatar';
 import { Button } from '@/components/Button';
+import { ConfirmDialog } from '@/components/ConfirmDialog';
+import { OptionsMenu, type OptionsMenuOption } from '@/components/OptionsMenu';
+import { ReportModal } from '@/components/ReportModal';
 import { Colors, Radius, Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
+import { blockUser, isUserBlocked, unblockUser } from '@/services/blocks';
 import { getConversationId, markConversationRead, sendMessage, subscribeToMessages } from '@/services/messages';
 import { fetchPublicProfile } from '@/services/publicProfile';
 import { MESSAGE_BODY_MAX_LENGTH, type Message } from '@/types/message';
@@ -29,12 +33,30 @@ export default function ChatScreen() {
   const [isSending, setIsSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
 
+  // Safety state — see src/services/blocks.ts. Only ever reflects the
+  // CURRENT user's own outgoing block (readable); whether the other
+  // person has blocked ME is never exposed to this client — a failed
+  // send just surfaces the generic "Messaging is unavailable." below.
+  const [amIBlockingThem, setAmIBlockingThem] = useState(false);
+  const [isBlockSubmitting, setIsBlockSubmitting] = useState(false);
+  const [isOptionsMenuOpen, setIsOptionsMenuOpen] = useState(false);
+  const [isBlockConfirmOpen, setIsBlockConfirmOpen] = useState(false);
+  const [reportTarget, setReportTarget] = useState<{ type: 'user' } | { type: 'message'; conversationId: string; messageId: string } | null>(
+    null
+  );
+
   const scrollRef = useRef<ScrollView>(null);
 
   const conversationId = useMemo(
     () => (currentUid ? getConversationId(currentUid, otherUid) : null),
     [currentUid, otherUid]
   );
+
+  const loadSafetyState = useCallback(async () => {
+    if (!currentUid) return;
+    const blocked = await isUserBlocked(currentUid, otherUid);
+    setAmIBlockingThem(blocked);
+  }, [currentUid, otherUid]);
 
   useEffect(() => {
     let cancelled = false;
@@ -45,10 +67,11 @@ export default function ChatScreen() {
       setOtherProfile(profile);
       setProfileStatus(profile ? 'loaded' : 'error');
     });
+    loadSafetyState();
     return () => {
       cancelled = true;
     };
-  }, [otherUid]);
+  }, [otherUid, loadSafetyState]);
 
   // The one realtime listener in this app — scoped to this single
   // conversation's latest messages, mounted only while this screen is on
@@ -90,7 +113,35 @@ export default function ChatScreen() {
     setComposerText('');
   }, [currentUid, otherUid, composerText, isSending]);
 
-  const canSend = composerText.trim().length > 0 && composerText.length <= MESSAGE_BODY_MAX_LENGTH && !isSending;
+  const handleConfirmBlock = async () => {
+    if (!currentUid || isBlockSubmitting) return;
+    setIsBlockSubmitting(true);
+    const result = await blockUser(currentUid, otherUid);
+    setIsBlockSubmitting(false);
+    setIsBlockConfirmOpen(false);
+    if (result.ok) {
+      setAmIBlockingThem(true);
+    }
+  };
+
+  const handleUnblock = async () => {
+    if (!currentUid || isBlockSubmitting) return;
+    setIsBlockSubmitting(true);
+    const result = await unblockUser(currentUid, otherUid);
+    setIsBlockSubmitting(false);
+    if (result.ok) {
+      setAmIBlockingThem(false);
+    }
+  };
+
+  const canSend = !amIBlockingThem && composerText.trim().length > 0 && composerText.length <= MESSAGE_BODY_MAX_LENGTH && !isSending;
+
+  const optionsMenuOptions: OptionsMenuOption[] = amIBlockingThem
+    ? [{ label: `Unblock ${otherProfile?.displayName ?? 'this user'}`, onPress: handleUnblock }]
+    : [
+        { label: `Block ${otherProfile?.displayName ?? 'this user'}`, onPress: () => setIsBlockConfirmOpen(true), destructive: true },
+        { label: 'Report user', onPress: () => setReportTarget({ type: 'user' }) },
+      ];
 
   return (
     <SafeAreaView style={styles.safeArea} edges={['top', 'bottom']}>
@@ -120,7 +171,15 @@ export default function ChatScreen() {
             <Text style={styles.headerName}>{profileStatus === 'error' ? "Couldn't load profile" : 'Loading…'}</Text>
           </View>
         )}
-        <View style={styles.headerSpacer} />
+        <Pressable
+          onPress={() => setIsOptionsMenuOpen(true)}
+          hitSlop={8}
+          accessibilityRole="button"
+          accessibilityLabel="More options"
+          style={styles.overflowButton}
+        >
+          <Ionicons name="ellipsis-horizontal" size={20} color={Colors.textSecondary} />
+        </Pressable>
       </View>
 
       <KeyboardAvoidingView style={styles.flex} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
@@ -143,6 +202,19 @@ export default function ChatScreen() {
               const isMine = message.senderUid === currentUid;
               return (
                 <View key={message.messageId} style={[styles.messageRow, isMine && styles.messageRowMine]}>
+                  {!isMine ? (
+                    <Pressable
+                      onPress={() =>
+                        conversationId && setReportTarget({ type: 'message', conversationId, messageId: message.messageId })
+                      }
+                      hitSlop={8}
+                      style={styles.reportButton}
+                      accessibilityRole="button"
+                      accessibilityLabel="Message options"
+                    >
+                      <Ionicons name="ellipsis-vertical" size={14} color={Colors.textSecondary} />
+                    </Pressable>
+                  ) : null}
                   <View style={[styles.bubble, isMine ? styles.bubbleMine : styles.bubbleTheirs]}>
                     <Text style={[styles.bubbleText, isMine && styles.bubbleTextMine]}>{message.body}</Text>
                     <Text style={[styles.bubbleTime, isMine && styles.bubbleTimeMine]}>
@@ -157,21 +229,49 @@ export default function ChatScreen() {
 
         {sendError ? <Text style={styles.sendError}>{sendError}</Text> : null}
 
-        <View style={styles.composerRow}>
-          <TextInput
-            style={styles.composerInput}
-            value={composerText}
-            onChangeText={setComposerText}
-            placeholder="Message…"
-            placeholderTextColor={Colors.textSecondary}
-            multiline
-            maxLength={MESSAGE_BODY_MAX_LENGTH}
-          />
-          <View style={styles.sendButtonWrap}>
-            <Button label="Send" onPress={handleSend} disabled={!canSend} loading={isSending} />
+        {amIBlockingThem ? (
+          <View style={styles.blockedBar}>
+            <Text style={styles.blockedBarText}>You blocked this user.</Text>
+            <Button label="Unblock" variant="secondary" onPress={handleUnblock} loading={isBlockSubmitting} />
           </View>
-        </View>
+        ) : (
+          <View style={styles.composerRow}>
+            <TextInput
+              style={styles.composerInput}
+              value={composerText}
+              onChangeText={setComposerText}
+              placeholder="Message…"
+              placeholderTextColor={Colors.textSecondary}
+              multiline
+              maxLength={MESSAGE_BODY_MAX_LENGTH}
+            />
+            <View style={styles.sendButtonWrap}>
+              <Button label="Send" onPress={handleSend} disabled={!canSend} loading={isSending} />
+            </View>
+          </View>
+        )}
       </KeyboardAvoidingView>
+
+      <OptionsMenu visible={isOptionsMenuOpen} onClose={() => setIsOptionsMenuOpen(false)} options={optionsMenuOptions} />
+
+      <ConfirmDialog
+        visible={isBlockConfirmOpen}
+        title={`Block ${otherProfile?.displayName ?? 'this user'}?`}
+        message="They won't be able to follow, like or comment on your content, or message you while blocked."
+        confirmLabel="Block"
+        isSubmitting={isBlockSubmitting}
+        onConfirm={handleConfirmBlock}
+        onCancel={() => setIsBlockConfirmOpen(false)}
+      />
+
+      {currentUid && reportTarget ? (
+        <ReportModal
+          visible={!!reportTarget}
+          onClose={() => setReportTarget(null)}
+          reporterUid={currentUid}
+          target={reportTarget.type === 'user' ? { type: 'user', targetUid: otherUid } : reportTarget}
+        />
+      ) : null}
     </SafeAreaView>
   );
 }
@@ -213,8 +313,11 @@ const styles = StyleSheet.create({
     color: Colors.textSecondary,
     fontSize: 12,
   },
-  headerSpacer: {
+  overflowButton: {
     width: 40,
+    height: 40,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   messagesContent: {
     flexGrow: 1,
@@ -237,10 +340,15 @@ const styles = StyleSheet.create({
   },
   messageRow: {
     flexDirection: 'row',
+    alignItems: 'flex-end',
+    gap: 4,
     justifyContent: 'flex-start',
   },
   messageRowMine: {
     justifyContent: 'flex-end',
+  },
+  reportButton: {
+    padding: 4,
   },
   bubble: {
     maxWidth: '78%',
@@ -305,5 +413,20 @@ const styles = StyleSheet.create({
   },
   sendButtonWrap: {
     width: 84,
+  },
+  blockedBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: Spacing.sm,
+    paddingHorizontal: Spacing.lg,
+    paddingVertical: Spacing.sm,
+    borderTopWidth: 1,
+    borderTopColor: Colors.border,
+  },
+  blockedBarText: {
+    flex: 1,
+    color: Colors.textSecondary,
+    fontSize: 13,
   },
 });

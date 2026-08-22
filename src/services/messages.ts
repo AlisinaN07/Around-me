@@ -110,7 +110,7 @@ export function subscribeToMessages(
   });
 }
 
-export type SendMessageError = 'not-configured' | 'invalid-input' | 'no-profile' | 'unknown';
+export type SendMessageError = 'not-configured' | 'invalid-input' | 'no-profile' | 'blocked' | 'unknown';
 export type SendMessageResult = { ok: true; conversationId: string } | { ok: false; error: SendMessageError; message: string };
 
 /**
@@ -180,10 +180,24 @@ export async function sendMessage(currentUid: string, targetUid: string, rawBody
         });
       }
     });
-  } catch {
+  } catch (error) {
+    // A permission-denied at this point — after every client-side check
+    // above has already passed — overwhelmingly means a Block exists in
+    // one direction (or, for a brand-new conversation, the recipient's
+    // message privacy setting). Never confirm WHICH: "Messaging is
+    // unavailable" reveals nothing about who blocked whom, or whether the
+    // other person even knows this conversation was attempted — see the
+    // Step 17 no-information-leak rule.
+    if (isPermissionDeniedError(error)) {
+      return { ok: false, error: 'blocked', message: 'Messaging is unavailable.' };
+    }
     return { ok: false, error: 'unknown', message: "Couldn't send that message." };
   }
   return { ok: true, conversationId };
+}
+
+function isPermissionDeniedError(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && 'code' in error && (error as { code?: unknown }).code === 'permission-denied';
 }
 
 /**

@@ -32,7 +32,8 @@ function followDocId(followerUid: string, followingUid: string): string {
   return `${followerUid}_${followingUid}`;
 }
 
-function followRef(followerUid: string, followingUid: string) {
+/** Exported for src/services/blocks.ts, which needs to remove both possible follow edges when a block is created. */
+export function followRef(followerUid: string, followingUid: string) {
   return doc(firestore!, FOLLOWS_COLLECTION, followDocId(followerUid, followingUid));
 }
 

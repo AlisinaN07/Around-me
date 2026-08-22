@@ -9,10 +9,12 @@ import { Colors, Layout, Spacing } from '@/constants/theme';
 type HeaderScreenLayoutProps = {
   title: string;
   children: ReactNode;
+  /** Replaces the default right-side spacer — e.g. a small overflow/options button. Falls back to a plain spacer (keeping the title centered) when omitted. */
+  headerRight?: ReactNode;
 };
 
 /** Shared chrome for the Post/Activity/Event creation screens: back button, title, keyboard-avoiding scroll body. */
-export function HeaderScreenLayout({ title, children }: HeaderScreenLayoutProps) {
+export function HeaderScreenLayout({ title, children, headerRight }: HeaderScreenLayoutProps) {
   return (
     <SafeAreaView style={styles.safeArea} edges={['top', 'bottom']}>
       <View style={styles.header}>
@@ -26,7 +28,7 @@ export function HeaderScreenLayout({ title, children }: HeaderScreenLayoutProps)
           <Ionicons name="chevron-back" size={24} color={Colors.text} />
         </Pressable>
         <Text style={styles.title}>{title}</Text>
-        <View style={styles.headerSpacer} />
+        {headerRight ?? <View style={styles.headerSpacer} />}
       </View>
       <KeyboardAvoidingView style={styles.flex} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
         <ScrollView

@@ -6,6 +6,7 @@ import { Platform, RefreshControl, ScrollView, StyleSheet, Text, View } from 're
 import { Button } from '@/components/Button';
 import { ContentCard } from '@/components/ContentCard';
 import { Colors, Layout, Radius, Spacing } from '@/constants/theme';
+import { fetchMyBlockedUserIds } from '@/services/blocks';
 import { fetchFollowingFeed } from '@/services/content';
 import { fetchFollowingCount } from '@/services/following';
 import type { Content } from '@/types/content';
@@ -40,12 +41,18 @@ export function FollowingFeed({ currentUid, cityKey, cityLabel, onExploreAround 
         setStatus('loading');
       }
       try {
-        const [count, feedItems] = await Promise.all([
+        const [count, feedItems, blockedUids] = await Promise.all([
           fetchFollowingCount(currentUid),
           fetchFollowingFeed({ currentUid, cityKey }),
+          fetchMyBlockedUserIds(currentUid),
         ]);
         setFollowingCount(count);
-        setItems(feedItems);
+        // Defensive only — blocking already removes the underlying follow
+        // edge (see src/services/blocks.ts), so a blocked author's content
+        // shouldn't reach this feed in the first place. This just covers
+        // any gap between "no longer followed" and "already fetched."
+        const blockedSet = new Set(blockedUids);
+        setItems(blockedSet.size > 0 ? feedItems.filter((item) => !blockedSet.has(item.authorUid)) : feedItems);
         setStatus('loaded');
       } catch {
         setStatus('error');

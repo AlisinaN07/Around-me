@@ -16,6 +16,7 @@ import { INTERESTS } from '@/constants/interests';
 import { Colors, Layout, Radius, Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
 import { useProfile } from '@/hooks/useProfile';
+import { fetchMyBlockedUserIds } from '@/services/blocks';
 import { fetchCityFeed, fetchHappeningNow } from '@/services/content';
 import type { ActivityContent, Content, EventContent } from '@/types/content';
 import { formatCityDisplayName } from '@/utils/cityDisplay';
@@ -54,12 +55,19 @@ export default function HomeScreen() {
         setStatus('loading');
       }
       try {
-        const [feed, happening] = await Promise.all([
+        const [feed, happening, blockedUids] = await Promise.all([
           fetchCityFeed(profile.cityKey),
           fetchHappeningNow(profile.cityKey),
+          // Client-side only: this does NOT make blocked users' published
+          // content inaccessible (see the Step 17 MVP boundary in
+          // firestore.rules) — it just keeps them out of MY OWN Around/
+          // Happening Now view. A single one-shot fetch per load, not a
+          // query per blocked user.
+          user ? fetchMyBlockedUserIds(user.uid) : Promise.resolve<string[]>([]),
         ]);
-        setFeedItems(feed);
-        setHappeningItems(happening);
+        const blockedSet = new Set(blockedUids);
+        setFeedItems(blockedSet.size > 0 ? feed.filter((item) => !blockedSet.has(item.authorUid)) : feed);
+        setHappeningItems(blockedSet.size > 0 ? happening.filter((item) => !blockedSet.has(item.authorUid)) : happening);
         setStatus('loaded');
       } catch {
         setStatus('error');
@@ -67,7 +75,7 @@ export default function HomeScreen() {
         setIsRefreshing(false);
       }
     },
-    [profile]
+    [profile, user]
   );
 
   // Home refetches every time it regains focus — covers first mount, tab

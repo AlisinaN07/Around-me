@@ -253,6 +253,45 @@ function validMessage(messageId, senderUid, body, overrides = {}) {
   return { messageId, senderUid, body, createdAt: serverTimestamp(), ...overrides };
 }
 
+// Same deterministic ID scheme as blockDocId in src/services/blocks.ts —
+// directional, like follows/{followerUid}_{followingUid}.
+function blockId(blockerUid, blockedUid) {
+  return `${blockerUid}_${blockedUid}`;
+}
+function validBlock(blockerUid, blockedUid, overrides = {}) {
+  return { blockId: blockId(blockerUid, blockedUid), blockerUid, blockedUid, createdAt: serverTimestamp(), ...overrides };
+}
+
+function validPrivacySettings(uid, newMessagesFrom, overrides = {}) {
+  return { uid, newMessagesFrom, createdAt: serverTimestamp(), updatedAt: serverTimestamp(), ...overrides };
+}
+
+// Same deterministic ID schemes as src/services/reports.ts.
+function userReportId(reporterUid, targetUid) {
+  return `user_${reporterUid}_${targetUid}`;
+}
+function contentReportId(reporterUid, contentId) {
+  return `content_${reporterUid}_${contentId}`;
+}
+function messageReportId(reporterUid, messageId) {
+  return `message_${reporterUid}_${messageId}`;
+}
+function validReport(reportId, reporterUid, targetType, overrides = {}) {
+  return {
+    reportId,
+    reporterUid,
+    targetType,
+    targetUid: null,
+    contentId: null,
+    conversationId: null,
+    messageId: null,
+    reason: 'spam',
+    details: null,
+    createdAt: serverTimestamp(),
+    ...overrides,
+  };
+}
+
 /** Mirrors the real joinActivity transaction: participant create + stats increment, atomically. */
 function joinTransaction(db, activityId, uid, displayName, username, nextCount) {
   const participantRef = doc(db, 'content', activityId, 'participants', uid);
@@ -2123,6 +2162,518 @@ async function main() {
       const abIndex = ids.indexOf(conversationId('msga', 'msgb'));
       assert.ok(acIndex !== -1 && abIndex !== -1);
       assert.ok(acIndex < abIndex, 'A<->C (just updated) should sort before A<->B (older)');
+    });
+
+    // =========================================================================
+    // Step 17 — blocks, block-aware follow/like/comment/messaging,
+    // message privacy, reports. Fresh users, independent of everything above.
+    // =========================================================================
+    await seedProfile(testEnv, 's17a', 's17a_handle', { displayName: 'Step17 Alpha' });
+    await seedProfile(testEnv, 's17b', 's17b_handle', { displayName: 'Step17 Bravo' });
+    await seedProfile(testEnv, 's17c', 's17c_handle', { displayName: 'Step17 Charlie' });
+    await seedProfile(testEnv, 's17d', 's17d_handle', { displayName: 'Step17 Delta' });
+
+    const s17a = testEnv.authenticatedContext('s17a').firestore();
+    const s17b = testEnv.authenticatedContext('s17b').firestore();
+    const s17c = testEnv.authenticatedContext('s17c').firestore();
+    const s17d = testEnv.authenticatedContext('s17d').firestore();
+
+    await check('setup: Step 17 users create matching public profiles', async () => {
+      await assertSucceeds(setDoc(doc(s17a, 'publicProfiles', 's17a'), validPublicProfile('s17a', 'Step17 Alpha', 's17a_handle')));
+      await assertSucceeds(setDoc(doc(s17b, 'publicProfiles', 's17b'), validPublicProfile('s17b', 'Step17 Bravo', 's17b_handle')));
+      await assertSucceeds(setDoc(doc(s17c, 'publicProfiles', 's17c'), validPublicProfile('s17c', 'Step17 Charlie', 's17c_handle')));
+      await assertSucceeds(setDoc(doc(s17d, 'publicProfiles', 's17d'), validPublicProfile('s17d', 'Step17 Delta', 's17d_handle')));
+    });
+
+    await check('setup: Step17 Alpha and Bravo each create a Post', async () => {
+      await assertSucceeds(setDoc(doc(s17a, 'content', 'post-s17a-1'), validPost('s17a', 'Step17 Alpha', 's17a_handle', 'post-s17a-1')));
+      await assertSucceeds(setDoc(doc(s17b, 'content', 'post-s17b-1'), validPost('s17b', 'Step17 Bravo', 's17b_handle', 'post-s17b-1')));
+    });
+
+    // --- blocks/{blockerUid}_{blockedUid} — attack tests ---
+    await check('DENY: unauthenticated block create', async () => {
+      await assertFails(setDoc(doc(anon, 'blocks', blockId('s17a', 's17b')), validBlock('s17a', 's17b')));
+    });
+
+    await check('DENY: block create with spoofed blockerUid', async () => {
+      await assertFails(setDoc(doc(s17a, 'blocks', blockId('s17b', 's17c')), validBlock('s17b', 's17c')));
+    });
+
+    await check('DENY: self block', async () => {
+      await assertFails(setDoc(doc(s17a, 'blocks', blockId('s17a', 's17a')), validBlock('s17a', 's17a')));
+    });
+
+    await check('DENY: block a nonexistent public profile', async () => {
+      await assertFails(setDoc(doc(s17a, 'blocks', blockId('s17a', 'ghost-user')), validBlock('s17a', 'ghost-user')));
+    });
+
+    await check('DENY: wrong deterministic block ID', async () => {
+      await assertFails(setDoc(doc(s17a, 'blocks', 'wrong-id'), validBlock('s17a', 's17b')));
+    });
+
+    // Regression: blockUser()'s own "is this already blocked?" pre-check
+    // reads a block that, for a first-time block (the common case),
+    // legitimately doesn't exist yet — that read must succeed (return
+    // "not found"), not error.
+    await check('ALLOW: checking a nonexistent block for existence does not error', async () => {
+      const snapshot = await assertSucceeds(getDoc(doc(s17a, 'blocks', blockId('s17a', 's17b'))));
+      assert.equal(snapshot.exists(), false);
+    });
+
+    await check('ALLOW: A blocks B', async () => {
+      await assertSucceeds(setDoc(doc(s17a, 'blocks', blockId('s17a', 's17b')), validBlock('s17a', 's17b')));
+    });
+
+    await check('ALLOW: A reads own Block', async () => {
+      await assertSucceeds(getDoc(doc(s17a, 'blocks', blockId('s17a', 's17b'))));
+    });
+
+    await check('DENY: B (the blocked user) reads A\'s block doc about them', async () => {
+      await assertFails(getDoc(doc(s17b, 'blocks', blockId('s17a', 's17b'))));
+    });
+
+    await check('DENY: update a block', async () => {
+      await assertFails(updateDoc(doc(s17a, 'blocks', blockId('s17a', 's17b')), { blockedUid: 's17c' }));
+    });
+
+    await check('DENY: B deletes A\'s block record', async () => {
+      await assertFails(deleteDoc(doc(s17b, 'blocks', blockId('s17a', 's17b'))));
+    });
+
+    // --- block-aware follow/like/comment (A still blocking B) ---
+    await check('DENY: B follows A while blocked', async () => {
+      await assertFails(setDoc(doc(s17b, 'follows', 's17b_s17a'), validFollow('s17b', 's17a')));
+    });
+
+    await check('DENY: A follows B while blocking B', async () => {
+      await assertFails(setDoc(doc(s17a, 'follows', 's17a_s17b'), validFollow('s17a', 's17b')));
+    });
+
+    await check('DENY: B likes A\'s post while blocked', async () => {
+      await assertFails(setDoc(doc(s17b, 'content', 'post-s17a-1', 'likes', 's17b'), validLike('s17b')));
+    });
+
+    await check('DENY: A likes B\'s post while blocking B', async () => {
+      await assertFails(setDoc(doc(s17a, 'content', 'post-s17b-1', 'likes', 's17a'), validLike('s17a')));
+    });
+
+    await check('DENY: B comments on A\'s post while blocked', async () => {
+      await assertFails(
+        setDoc(
+          doc(s17b, 'content', 'post-s17a-1', 'comments', 'comment-blocked-1'),
+          validComment('comment-blocked-1', 's17b', 'Step17 Bravo', 's17b_handle', 'hi')
+        )
+      );
+    });
+
+    await check('DENY: A comments on B\'s post while blocking B', async () => {
+      await assertFails(
+        setDoc(
+          doc(s17a, 'content', 'post-s17b-1', 'comments', 'comment-blocked-2'),
+          validComment('comment-blocked-2', 's17a', 'Step17 Alpha', 's17a_handle', 'hi')
+        )
+      );
+    });
+
+    // --- ALLOW: A unblocks B, ordinary interaction works again ---
+    await check('ALLOW: A unblocks B', async () => {
+      await assertSucceeds(deleteDoc(doc(s17a, 'blocks', blockId('s17a', 's17b'))));
+    });
+
+    await check('ALLOW: B can like A\'s post after being unblocked', async () => {
+      await assertSucceeds(setDoc(doc(s17b, 'content', 'post-s17a-1', 'likes', 's17b'), validLike('s17b')));
+    });
+
+    // --- BLOCK TEST — FOLLOW: pre-existing edges removed, counts correct ---
+    await check('setup: D follows A, A follows D (pre-existing follow edges for block-removal test)', async () => {
+      await assertSucceeds(setDoc(doc(s17d, 'follows', 's17d_s17a'), validFollow('s17d', 's17a')));
+      await assertSucceeds(setDoc(doc(s17a, 'follows', 's17a_s17d'), validFollow('s17a', 's17d')));
+    });
+
+    // Regression: these follow edges were seeded directly above (no paired
+    // notification, unlike the real followUser() flow) — deliberately
+    // mirroring a follow edge that predates the notifications feature (or
+    // one created by any other means without its notification). blockUser()
+    // needs to check "does a notification exist for this edge?" for edges
+    // exactly like this, and that check must succeed (return "not found"),
+    // not error.
+    await check('ALLOW: checking a nonexistent notification for existence does not error', async () => {
+      const snapshot = await assertSucceeds(getDoc(doc(s17a, 'notifications', 'follow_s17d_s17a')));
+      assert.equal(snapshot.exists(), false);
+    });
+
+    await check('ALLOW: A blocks D, atomically removing BOTH pre-existing follow edges', async () => {
+      const batch = writeBatch(s17a);
+      batch.set(doc(s17a, 'blocks', blockId('s17a', 's17d')), validBlock('s17a', 's17d'));
+      batch.delete(doc(s17a, 'follows', 's17a_s17d')); // A's own follow of D
+      batch.delete(doc(s17a, 'follows', 's17d_s17a')); // D's inbound follow of A — needs the block-aware branch
+      await assertSucceeds(batch.commit());
+
+      const followerCount = await getCountFromServer(query(collection(s17a, 'follows'), where('followingUid', '==', 's17a')));
+      const followingCount = await getCountFromServer(query(collection(s17a, 'follows'), where('followerUid', '==', 's17a')));
+      assert.equal(followerCount.data().count, 0);
+      assert.equal(followingCount.data().count, 0);
+    });
+
+    await check('DENY: A deletes an inbound follow with no accompanying block ("block must be the reason")', async () => {
+      await assertSucceeds(setDoc(doc(s17c, 'follows', 's17c_s17a'), validFollow('s17c', 's17a')));
+      await assertFails(deleteDoc(doc(s17a, 'follows', 's17c_s17a')));
+      // cleanup this one properly (as the real follower) so it doesn't
+      // pollute the ordering/aggregation assumptions of any later check.
+      await assertSucceeds(deleteDoc(doc(s17c, 'follows', 's17c_s17a')));
+    });
+
+    // --- BLOCK TEST — FIRST MESSAGE: neither side can start a conversation ---
+    await check('DENY: B cannot create a first conversation with A while blocked', async () => {
+      await assertSucceeds(setDoc(doc(s17a, 'blocks', blockId('s17a', 's17b')), validBlock('s17a', 's17b'))); // re-block for this test
+      const convId = conversationId('s17a', 's17b');
+      const batch = writeBatch(s17b);
+      batch.set(doc(s17b, 'conversations', convId, 'messages', 'msg-blocked-1'), validMessage('msg-blocked-1', 's17b', 'hi'));
+      batch.set(doc(s17b, 'conversations', convId), validConversation('s17a', 's17b', 's17b', 'msg-blocked-1', 'hi'));
+      await assertFails(batch.commit());
+    });
+
+    await check('DENY: A cannot create a first conversation with B while blocking B', async () => {
+      const convId = conversationId('s17a', 's17b');
+      const batch = writeBatch(s17a);
+      batch.set(doc(s17a, 'conversations', convId, 'messages', 'msg-blocked-2'), validMessage('msg-blocked-2', 's17a', 'hi'));
+      batch.set(doc(s17a, 'conversations', convId), validConversation('s17a', 's17b', 's17a', 'msg-blocked-2', 'hi'));
+      await assertFails(batch.commit());
+    });
+
+    // --- BLOCK TEST — EXISTING CONVERSATION: blocked mid-thread, then unblocked ---
+    await check('setup: A creates a conversation with D (existing-conversation block test)', async () => {
+      const convId = conversationId('s17a', 's17d');
+      const batch = writeBatch(s17a);
+      batch.set(doc(s17a, 'conversations', convId, 'messages', 'msg-ad-1'), validMessage('msg-ad-1', 's17a', 'Hi D'));
+      batch.set(doc(s17a, 'conversations', convId), validConversation('s17a', 's17d', 's17a', 'msg-ad-1', 'Hi D'));
+      await assertSucceeds(batch.commit());
+    });
+
+    await check('DENY: A sends to D after blocking D (A already blocks D from the follow-removal test above)', async () => {
+      const convId = conversationId('s17a', 's17d');
+      const batch = writeBatch(s17a);
+      batch.set(doc(s17a, 'conversations', convId, 'messages', 'msg-ad-2'), validMessage('msg-ad-2', 's17a', 'still there?'));
+      batch.update(doc(s17a, 'conversations', convId), {
+        lastMessageId: 'msg-ad-2',
+        lastMessageText: 'still there?',
+        lastMessageSenderUid: 's17a',
+        lastMessageAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+        'unreadCounts.s17a': 0,
+        'unreadCounts.s17d': 1,
+      });
+      await assertFails(batch.commit());
+    });
+
+    await check('DENY: D sends to A while blocked', async () => {
+      const convId = conversationId('s17a', 's17d');
+      const batch = writeBatch(s17d);
+      batch.set(doc(s17d, 'conversations', convId, 'messages', 'msg-ad-3'), validMessage('msg-ad-3', 's17d', 'hello?'));
+      batch.update(doc(s17d, 'conversations', convId), {
+        lastMessageId: 'msg-ad-3',
+        lastMessageText: 'hello?',
+        lastMessageSenderUid: 's17d',
+        lastMessageAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+        'unreadCounts.s17d': 0,
+        'unreadCounts.s17a': 1,
+      });
+      await assertFails(batch.commit());
+    });
+
+    await check('ALLOW: both A and D can still read the existing conversation history while blocked', async () => {
+      const convId = conversationId('s17a', 's17d');
+      await assertSucceeds(getDoc(doc(s17a, 'conversations', convId)));
+      await assertSucceeds(getDoc(doc(s17d, 'conversations', convId)));
+      await assertSucceeds(getDocs(collection(s17a, 'conversations', convId, 'messages')));
+      await assertSucceeds(getDocs(collection(s17d, 'conversations', convId, 'messages')));
+    });
+
+    await check('ALLOW: A unblocks D', async () => {
+      await assertSucceeds(deleteDoc(doc(s17a, 'blocks', blockId('s17a', 's17d'))));
+    });
+
+    await check('ALLOW: A can send to D again after unblocking', async () => {
+      const convId = conversationId('s17a', 's17d');
+      const batch = writeBatch(s17a);
+      batch.set(doc(s17a, 'conversations', convId, 'messages', 'msg-ad-4'), validMessage('msg-ad-4', 's17a', 'back now'));
+      batch.update(doc(s17a, 'conversations', convId), {
+        lastMessageId: 'msg-ad-4',
+        lastMessageText: 'back now',
+        lastMessageSenderUid: 's17a',
+        lastMessageAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+        'unreadCounts.s17a': 0,
+        'unreadCounts.s17d': 1,
+      });
+      await assertSucceeds(batch.commit());
+    });
+
+    // =========================================================================
+    // Message privacy — fresh pairs per scenario so the "existing
+    // conversation exception" from one test never leaks into another.
+    // =========================================================================
+    await seedProfile(testEnv, 'prva', 'prva_handle', { displayName: 'Privacy Alpha' });
+    await seedProfile(testEnv, 'prvb', 'prvb_handle', { displayName: 'Privacy Bravo' });
+    await seedProfile(testEnv, 'prvc', 'prvc_handle', { displayName: 'Privacy Charlie' });
+    await seedProfile(testEnv, 'prvd', 'prvd_handle', { displayName: 'Privacy Delta' });
+    await seedProfile(testEnv, 'prve', 'prve_handle', { displayName: 'Privacy Echo' });
+    await seedProfile(testEnv, 'prvf', 'prvf_handle', { displayName: 'Privacy Foxtrot' });
+    await seedProfile(testEnv, 'prvg', 'prvg_handle', { displayName: 'Privacy Golf' });
+
+    const prvA = testEnv.authenticatedContext('prva').firestore();
+    const prvB = testEnv.authenticatedContext('prvb').firestore();
+    const prvC = testEnv.authenticatedContext('prvc').firestore();
+    const prvD = testEnv.authenticatedContext('prvd').firestore();
+    const prvE = testEnv.authenticatedContext('prve').firestore();
+    const prvF = testEnv.authenticatedContext('prvf').firestore();
+    const prvG = testEnv.authenticatedContext('prvg').firestore();
+
+    await check('setup: privacy test users create matching public profiles', async () => {
+      await assertSucceeds(setDoc(doc(prvA, 'publicProfiles', 'prva'), validPublicProfile('prva', 'Privacy Alpha', 'prva_handle')));
+      await assertSucceeds(setDoc(doc(prvB, 'publicProfiles', 'prvb'), validPublicProfile('prvb', 'Privacy Bravo', 'prvb_handle')));
+      await assertSucceeds(setDoc(doc(prvC, 'publicProfiles', 'prvc'), validPublicProfile('prvc', 'Privacy Charlie', 'prvc_handle')));
+      await assertSucceeds(setDoc(doc(prvD, 'publicProfiles', 'prvd'), validPublicProfile('prvd', 'Privacy Delta', 'prvd_handle')));
+      await assertSucceeds(setDoc(doc(prvE, 'publicProfiles', 'prve'), validPublicProfile('prve', 'Privacy Echo', 'prve_handle')));
+      await assertSucceeds(setDoc(doc(prvF, 'publicProfiles', 'prvf'), validPublicProfile('prvf', 'Privacy Foxtrot', 'prvf_handle')));
+      await assertSucceeds(setDoc(doc(prvG, 'publicProfiles', 'prvg'), validPublicProfile('prvg', 'Privacy Golf', 'prvg_handle')));
+    });
+
+    // --- PRIVACY TEST — everyone (no doc / default) ---
+    await check('ALLOW: B starts a conversation with A, who has no privacy doc (defaults to everyone)', async () => {
+      const convId = conversationId('prva', 'prvb');
+      const batch = writeBatch(prvB);
+      batch.set(doc(prvB, 'conversations', convId, 'messages', 'msg-priv-1'), validMessage('msg-priv-1', 'prvb', 'hi A'));
+      batch.set(doc(prvB, 'conversations', convId), validConversation('prva', 'prvb', 'prvb', 'msg-priv-1', 'hi A'));
+      await assertSucceeds(batch.commit());
+    });
+
+    // --- PRIVACY TEST — people_i_follow ---
+    await check('ALLOW: C sets message privacy to people_i_follow', async () => {
+      await assertSucceeds(setDoc(doc(prvC, 'privacySettings', 'prvc'), validPrivacySettings('prvc', 'people_i_follow')));
+    });
+
+    await check('DENY: D cannot start a conversation with C (C does not follow D)', async () => {
+      const convId = conversationId('prvc', 'prvd');
+      const batch = writeBatch(prvD);
+      batch.set(doc(prvD, 'conversations', convId, 'messages', 'msg-priv-2'), validMessage('msg-priv-2', 'prvd', 'hi C'));
+      batch.set(doc(prvD, 'conversations', convId), validConversation('prvc', 'prvd', 'prvd', 'msg-priv-2', 'hi C'));
+      await assertFails(batch.commit());
+    });
+
+    await check('setup: C follows D', async () => {
+      await assertSucceeds(setDoc(doc(prvC, 'follows', 'prvc_prvd'), validFollow('prvc', 'prvd')));
+    });
+
+    await check('ALLOW: D can now start a conversation with C (C follows D)', async () => {
+      const convId = conversationId('prvc', 'prvd');
+      const batch = writeBatch(prvD);
+      batch.set(doc(prvD, 'conversations', convId, 'messages', 'msg-priv-3'), validMessage('msg-priv-3', 'prvd', 'hi C, take 2'));
+      batch.set(doc(prvD, 'conversations', convId), validConversation('prvc', 'prvd', 'prvd', 'msg-priv-3', 'hi C, take 2'));
+      await assertSucceeds(batch.commit());
+    });
+
+    // --- PRIVACY TEST — nobody, with the existing-conversation exception ---
+    await check('setup: E and F start a conversation while E has no privacy doc yet', async () => {
+      const convId = conversationId('prve', 'prvf');
+      const batch = writeBatch(prvF);
+      batch.set(doc(prvF, 'conversations', convId, 'messages', 'msg-priv-4'), validMessage('msg-priv-4', 'prvf', 'hi E'));
+      batch.set(doc(prvF, 'conversations', convId), validConversation('prve', 'prvf', 'prvf', 'msg-priv-4', 'hi E'));
+      await assertSucceeds(batch.commit());
+    });
+
+    await check('ALLOW: E sets message privacy to nobody', async () => {
+      await assertSucceeds(setDoc(doc(prvE, 'privacySettings', 'prve'), validPrivacySettings('prve', 'nobody')));
+    });
+
+    await check('DENY: a brand-new conversation cannot be started with E now that E is set to nobody', async () => {
+      const convId = conversationId('prve', 'prvg');
+      const batch = writeBatch(prvG);
+      batch.set(doc(prvG, 'conversations', convId, 'messages', 'msg-priv-5'), validMessage('msg-priv-5', 'prvg', 'hi E'));
+      batch.set(doc(prvG, 'conversations', convId), validConversation('prve', 'prvg', 'prvg', 'msg-priv-5', 'hi E'));
+      await assertFails(batch.commit());
+    });
+
+    await check('ALLOW: the EXISTING E<->F conversation still works after E sets nobody', async () => {
+      const convId = conversationId('prve', 'prvf');
+      const batch = writeBatch(prvF);
+      batch.set(doc(prvF, 'conversations', convId, 'messages', 'msg-priv-6'), validMessage('msg-priv-6', 'prvf', 'still there?'));
+      batch.update(doc(prvF, 'conversations', convId), {
+        lastMessageId: 'msg-priv-6',
+        lastMessageText: 'still there?',
+        lastMessageSenderUid: 'prvf',
+        lastMessageAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+        'unreadCounts.prvf': 0,
+        'unreadCounts.prve': 2,
+      });
+      await assertSucceeds(batch.commit());
+    });
+
+    // --- privacySettings/{uid} rules ---
+    await check('ALLOW: owner creates privacySettings', async () => {
+      await assertSucceeds(setDoc(doc(prvA, 'privacySettings', 'prva'), validPrivacySettings('prva', 'everyone')));
+    });
+
+    await check('ALLOW: owner reads own privacySettings', async () => {
+      await assertSucceeds(getDoc(doc(prvA, 'privacySettings', 'prva')));
+    });
+
+    await check('ALLOW: owner changes everyone -> people_i_follow -> nobody', async () => {
+      await assertSucceeds(updateDoc(doc(prvA, 'privacySettings', 'prva'), { newMessagesFrom: 'people_i_follow', updatedAt: serverTimestamp() }));
+      await assertSucceeds(updateDoc(doc(prvA, 'privacySettings', 'prva'), { newMessagesFrom: 'nobody', updatedAt: serverTimestamp() }));
+    });
+
+    await check('DENY: another user writes someone else\'s privacySettings', async () => {
+      await assertFails(setDoc(doc(prvB, 'privacySettings', 'prva'), validPrivacySettings('prva', 'nobody')));
+      await assertFails(updateDoc(doc(prvB, 'privacySettings', 'prva'), { newMessagesFrom: 'everyone' }));
+    });
+
+    await check('DENY: invalid newMessagesFrom enum value', async () => {
+      await assertFails(setDoc(doc(prvB, 'privacySettings', 'prvb'), validPrivacySettings('prvb', 'literally_anyone')));
+    });
+
+    await check('DENY: changing uid on update', async () => {
+      await assertFails(updateDoc(doc(prvA, 'privacySettings', 'prva'), { uid: 'prvb', updatedAt: serverTimestamp() }));
+    });
+
+    await check('DENY: changing createdAt on update', async () => {
+      await assertFails(updateDoc(doc(prvA, 'privacySettings', 'prva'), { createdAt: serverTimestamp(), updatedAt: serverTimestamp() }));
+    });
+
+    await check('DENY: extra field on privacySettings create', async () => {
+      await assertFails(setDoc(doc(prvB, 'privacySettings', 'prvb'), { ...validPrivacySettings('prvb', 'everyone'), note: 'x' }));
+    });
+
+    await check('DENY: delete privacySettings', async () => {
+      await assertFails(deleteDoc(doc(prvA, 'privacySettings', 'prva')));
+    });
+
+    // =========================================================================
+    // Reports — reusing the Step 17 block-test users/content/conversation
+    // (s17a/s17b/s17c/s17d, post-s17a-1, and the A<->D conversation).
+    // =========================================================================
+
+    // Regression: reportUser/reportContent/reportMessage's own
+    // duplicate-report pre-check reads a report that, for a first-time
+    // report (the common case), legitimately doesn't exist yet — that
+    // read must succeed (return "not found"), not error.
+    await check('ALLOW: checking a nonexistent report for existence does not error', async () => {
+      const snapshot = await assertSucceeds(getDoc(doc(s17c, 'reports', userReportId('s17c', 's17a'))));
+      assert.equal(snapshot.exists(), false);
+    });
+
+    await check('ALLOW: valid user report', async () => {
+      const reportId = userReportId('s17c', 's17a');
+      await assertSucceeds(setDoc(doc(s17c, 'reports', reportId), validReport(reportId, 's17c', 'user', { targetUid: 's17a' })));
+    });
+
+    await check('ALLOW: valid published-content report', async () => {
+      const reportId = contentReportId('s17c', 'post-s17a-1');
+      await assertSucceeds(
+        setDoc(doc(s17c, 'reports', reportId), validReport(reportId, 's17c', 'content', { contentId: 'post-s17a-1', targetUid: 's17a' }))
+      );
+    });
+
+    await check('ALLOW: valid received-message report', async () => {
+      const convId = conversationId('s17a', 's17d');
+      const reportId = messageReportId('s17d', 'msg-ad-1');
+      await assertSucceeds(
+        setDoc(
+          doc(s17d, 'reports', reportId),
+          validReport(reportId, 's17d', 'message', { conversationId: convId, messageId: 'msg-ad-1', targetUid: 's17a' })
+        )
+      );
+    });
+
+    await check('DENY: unauthenticated report', async () => {
+      const reportId = userReportId('ghost', 's17a');
+      await assertFails(setDoc(doc(anon, 'reports', reportId), validReport(reportId, 'ghost', 'user', { targetUid: 's17a' })));
+    });
+
+    await check('DENY: reporterUid spoofing', async () => {
+      const reportId = userReportId('s17b', 's17c');
+      await assertFails(setDoc(doc(s17b, 'reports', reportId), validReport(reportId, 's17c', 'user', { targetUid: 's17c' })));
+    });
+
+    await check('DENY: report a nonexistent user', async () => {
+      const reportId = userReportId('s17b', 'ghost-user');
+      await assertFails(setDoc(doc(s17b, 'reports', reportId), validReport(reportId, 's17b', 'user', { targetUid: 'ghost-user' })));
+    });
+
+    await check('DENY: self user report', async () => {
+      const reportId = userReportId('s17b', 's17b');
+      await assertFails(setDoc(doc(s17b, 'reports', reportId), validReport(reportId, 's17b', 'user', { targetUid: 's17b' })));
+    });
+
+    await check('DENY: report nonexistent content', async () => {
+      const reportId = contentReportId('s17b', 'does-not-exist');
+      await assertFails(
+        setDoc(doc(s17b, 'reports', reportId), validReport(reportId, 's17b', 'content', { contentId: 'does-not-exist', targetUid: 's17a' }))
+      );
+    });
+
+    await check('DENY: report content with spoofed targetUid', async () => {
+      const reportId = contentReportId('s17b', 'post-s17a-1');
+      await assertFails(
+        setDoc(doc(s17b, 'reports', reportId), validReport(reportId, 's17b', 'content', { contentId: 'post-s17a-1', targetUid: 's17b' }))
+      );
+    });
+
+    await check('DENY: third user reports a private message they cannot access', async () => {
+      const convId = conversationId('s17a', 's17d');
+      const reportId = messageReportId('s17c', 'msg-ad-1');
+      await assertFails(
+        setDoc(
+          doc(s17c, 'reports', reportId),
+          validReport(reportId, 's17c', 'message', { conversationId: convId, messageId: 'msg-ad-1', targetUid: 's17a' })
+        )
+      );
+    });
+
+    await check('DENY: report own message', async () => {
+      const convId = conversationId('s17a', 's17d');
+      const reportId = messageReportId('s17a', 'msg-ad-1');
+      await assertFails(
+        setDoc(
+          doc(s17a, 'reports', reportId),
+          validReport(reportId, 's17a', 'message', { conversationId: convId, messageId: 'msg-ad-1', targetUid: 's17a' })
+        )
+      );
+    });
+
+    await check('DENY: invalid report reason', async () => {
+      const reportId = userReportId('s17b', 's17a');
+      await assertFails(setDoc(doc(s17b, 'reports', reportId), validReport(reportId, 's17b', 'user', { targetUid: 's17a', reason: 'not-a-reason' })));
+    });
+
+    await check('DENY: oversized report details', async () => {
+      const reportId = userReportId('s17b', 's17a');
+      await assertFails(
+        setDoc(doc(s17b, 'reports', reportId), validReport(reportId, 's17b', 'user', { targetUid: 's17a', details: 'x'.repeat(1001) }))
+      );
+    });
+
+    await check('DENY: arbitrary extra field on report', async () => {
+      const reportId = userReportId('s17b', 's17a');
+      await assertFails(setDoc(doc(s17b, 'reports', reportId), { ...validReport(reportId, 's17b', 'user', { targetUid: 's17a' }), extra: 'nope' }));
+    });
+
+    await check('DENY: update a report', async () => {
+      await assertFails(updateDoc(doc(s17c, 'reports', userReportId('s17c', 's17a')), { reason: 'other' }));
+    });
+
+    await check('DENY: delete a report', async () => {
+      await assertFails(deleteDoc(doc(s17c, 'reports', userReportId('s17c', 's17a'))));
+    });
+
+    await check('DENY: reported user reads the report about them', async () => {
+      await assertFails(getDoc(doc(s17a, 'reports', userReportId('s17c', 's17a'))));
+    });
+
+    await check('DENY: unrelated authenticated user reads someone else\'s report', async () => {
+      await assertFails(getDoc(doc(s17b, 'reports', userReportId('s17c', 's17a'))));
     });
 
     await testEnv.clearFirestore();

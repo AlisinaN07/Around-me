@@ -85,6 +85,19 @@ export default function ProfileScreen() {
             </Pressable>
           ) : null}
 
+          <Pressable
+            onPress={() => router.push('/settings/privacy')}
+            style={styles.settingsRow}
+            accessibilityRole="button"
+            accessibilityLabel="Privacy & safety"
+          >
+            <View style={styles.settingsRowLeft}>
+              <Ionicons name="shield-checkmark-outline" size={18} color={Colors.text} />
+              <Text style={styles.settingsRowText}>Privacy & safety</Text>
+            </View>
+            <Ionicons name="chevron-forward" size={18} color={Colors.textSecondary} />
+          </Pressable>
+
           <View style={styles.tabsRow}>
             {PROFILE_TABS.map((tab) => {
               const isActive = tab.id === activeTab;
@@ -185,6 +198,29 @@ const styles = StyleSheet.create({
   publicProfileLinkText: {
     color: Colors.accent,
     fontSize: 13,
+    fontWeight: '600',
+  },
+  settingsRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginTop: Spacing.xl,
+    marginHorizontal: Spacing.xl,
+    borderRadius: Radius.md,
+    backgroundColor: Colors.surface,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    paddingHorizontal: Spacing.md,
+    paddingVertical: Spacing.md,
+  },
+  settingsRowLeft: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Spacing.sm,
+  },
+  settingsRowText: {
+    color: Colors.text,
+    fontSize: 14,
     fontWeight: '600',
   },
   tabsRow: {

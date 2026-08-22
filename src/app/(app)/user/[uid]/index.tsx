@@ -5,15 +5,21 @@ import { Pressable, StyleSheet, Text, View } from 'react-native';
 
 import { Avatar } from '@/components/Avatar';
 import { Button } from '@/components/Button';
+import { ConfirmDialog } from '@/components/ConfirmDialog';
 import { ContentCard } from '@/components/ContentCard';
 import { HeaderScreenLayout } from '@/components/HeaderScreenLayout';
+import { OptionsMenu, type OptionsMenuOption } from '@/components/OptionsMenu';
+import { ReportModal } from '@/components/ReportModal';
 import { SegmentedControl } from '@/components/SegmentedControl';
 import { COUNTRIES } from '@/constants/countries';
 import { INTERESTS } from '@/constants/interests';
 import { Colors, Radius, Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
+import { blockUser, isUserBlocked, unblockUser } from '@/services/blocks';
 import { fetchPublicUserContent } from '@/services/content';
 import { fetchFollowerCount, fetchFollowingCount, followUser, isFollowing, unfollowUser } from '@/services/following';
+import { fetchConversation, getConversationId } from '@/services/messages';
+import { fetchMyNewMessagesFrom } from '@/services/privacySettings';
 import { fetchPublicProfile } from '@/services/publicProfile';
 import type { Content, ContentType } from '@/types/content';
 import type { PublicProfile } from '@/types/social';
@@ -42,11 +48,22 @@ export default function PublicProfileScreen() {
   const [content, setContent] = useState<Content[]>([]);
   const [contentTab, setContentTab] = useState<ContentType>('post');
 
+  // Safety state — see src/services/blocks.ts / privacySettings.ts.
+  // canMessage is only ever used to proactively enable/disable the
+  // Message button before a Conversation exists; Firestore rules
+  // independently re-enforce all of this on the actual write.
+  const [amIBlockingThem, setAmIBlockingThem] = useState(false);
+  const [canMessage, setCanMessage] = useState(true);
+  const [isBlockSubmitting, setIsBlockSubmitting] = useState(false);
+  const [isOptionsMenuOpen, setIsOptionsMenuOpen] = useState(false);
+  const [isBlockConfirmOpen, setIsBlockConfirmOpen] = useState(false);
+  const [isReportOpen, setIsReportOpen] = useState(false);
+
   // load() never calls setState before its first await, so nothing runs
   // synchronously during the effect body below.
   const load = useCallback(async () => {
     try {
-      const [publicProfile, followers, following, followingState, userContent] = await Promise.all([
+      const [publicProfile, followers, following, followingState, userContent, blockedByMe] = await Promise.all([
         fetchPublicProfile(uid),
         fetchFollowerCount(uid),
         fetchFollowingCount(uid),
@@ -55,6 +72,7 @@ export default function PublicProfileScreen() {
         // tabs in-memory below, rather than running three separate queries
         // for a single profile page.
         fetchPublicUserContent(uid),
+        !isOwnProfile && user ? isUserBlocked(user.uid, uid) : Promise.resolve(false),
       ]);
       if (!publicProfile) {
         setStatus('error');
@@ -65,6 +83,26 @@ export default function PublicProfileScreen() {
       setFollowingCount(following);
       setAmFollowing(followingState);
       setContent(userContent);
+      setAmIBlockingThem(blockedByMe);
+
+      if (!isOwnProfile && user && !blockedByMe) {
+        // Before an existing Conversation exists, the Message button must
+        // respect the target's message privacy setting (see
+        // src/types/privacy.ts) — but an ALREADY-existing conversation is
+        // always continuable regardless of that setting (only a Block
+        // stops it — see firestore.rules' isValidConversationSend).
+        const [existingConversation, targetPrivacy, targetFollowsMe] = await Promise.all([
+          fetchConversation(getConversationId(user.uid, uid)),
+          fetchMyNewMessagesFrom(uid),
+          isFollowing(uid, user.uid),
+        ]);
+        setCanMessage(
+          existingConversation !== null || targetPrivacy === 'everyone' || (targetPrivacy === 'people_i_follow' && targetFollowsMe)
+        );
+      } else {
+        setCanMessage(true);
+      }
+
       setStatus('loaded');
     } catch {
       setStatus('error');
@@ -91,6 +129,31 @@ export default function PublicProfileScreen() {
     setAmFollowing(followingState);
   };
 
+  const handleConfirmBlock = async () => {
+    if (!user || isBlockSubmitting) return;
+    setIsBlockSubmitting(true);
+    const result = await blockUser(user.uid, uid);
+    setIsBlockSubmitting(false);
+    setIsBlockConfirmOpen(false);
+    if (!result.ok) {
+      setFollowError(result.message);
+      return;
+    }
+    await load();
+  };
+
+  const handleUnblock = async () => {
+    if (!user || isBlockSubmitting) return;
+    setIsBlockSubmitting(true);
+    const result = await unblockUser(user.uid, uid);
+    setIsBlockSubmitting(false);
+    if (!result.ok) {
+      setFollowError(result.message);
+      return;
+    }
+    await load();
+  };
+
   const cityLabel = profile?.cityName ? formatCityDisplayName(profile.cityName) : '';
   const countryLabel = COUNTRIES.find((country) => country.code === profile?.countryCode)?.name ?? '';
   const interestLabels = (profile?.interests ?? [])
@@ -99,6 +162,16 @@ export default function PublicProfileScreen() {
 
   const visibleContent = useMemo(() => content.filter((item) => item.type === contentTab), [content, contentTab]);
   const activeTabInfo = CONTENT_TABS.find((tab) => tab.id === contentTab) ?? CONTENT_TABS[0];
+
+  const optionsMenuOptions: OptionsMenuOption[] = amIBlockingThem
+    ? [
+        { label: `Unblock ${profile?.displayName ?? 'this user'}`, onPress: handleUnblock },
+        { label: 'Report user', onPress: () => setIsReportOpen(true) },
+      ]
+    : [
+        { label: `Block ${profile?.displayName ?? 'this user'}`, onPress: () => setIsBlockConfirmOpen(true), destructive: true },
+        { label: 'Report user', onPress: () => setIsReportOpen(true) },
+      ];
 
   return (
     <HeaderScreenLayout title={profile ? `@${profile.username}` : 'Profile'}>
@@ -115,6 +188,17 @@ export default function PublicProfileScreen() {
       ) : (
         <View style={styles.container}>
           <View style={styles.header}>
+            {!isOwnProfile ? (
+              <Pressable
+                onPress={() => setIsOptionsMenuOpen(true)}
+                style={styles.overflowButton}
+                hitSlop={8}
+                accessibilityRole="button"
+                accessibilityLabel="More options"
+              >
+                <Ionicons name="ellipsis-horizontal" size={20} color={Colors.textSecondary} />
+              </Pressable>
+            ) : null}
             <Avatar name={profile.displayName} size={80} />
             <Text style={styles.displayName}>{profile.displayName}</Text>
             <Text style={styles.username}>@{profile.username}</Text>
@@ -156,19 +240,31 @@ export default function PublicProfileScreen() {
             <View style={styles.selfBadge}>
               <Text style={styles.selfBadgeText}>This is you</Text>
             </View>
+          ) : amIBlockingThem ? (
+            <View style={styles.blockedRow}>
+              <View style={styles.blockedBadge}>
+                <Text style={styles.blockedBadgeText}>Blocked</Text>
+              </View>
+              <View style={styles.actionButton}>
+                <Button label="Unblock" variant="secondary" onPress={handleUnblock} loading={isBlockSubmitting} />
+              </View>
+            </View>
           ) : (
-            <View style={styles.actionsRow}>
-              <View style={styles.actionButton}>
-                <Button
-                  label={amFollowing ? 'Following' : 'Follow'}
-                  variant={amFollowing ? 'secondary' : 'primary'}
-                  onPress={handleToggleFollow}
-                  loading={isFollowSubmitting}
-                />
+            <View style={styles.actionsColumn}>
+              <View style={styles.actionsRow}>
+                <View style={styles.actionButton}>
+                  <Button
+                    label={amFollowing ? 'Following' : 'Follow'}
+                    variant={amFollowing ? 'secondary' : 'primary'}
+                    onPress={handleToggleFollow}
+                    loading={isFollowSubmitting}
+                  />
+                </View>
+                <View style={styles.actionButton}>
+                  <Button label="Message" variant="secondary" onPress={() => router.push(`/chat/${uid}`)} disabled={!canMessage} />
+                </View>
               </View>
-              <View style={styles.actionButton}>
-                <Button label="Message" variant="secondary" onPress={() => router.push(`/chat/${uid}`)} />
-              </View>
+              {!canMessage ? <Text style={styles.messageHint}>This person isn&apos;t accepting new conversations right now.</Text> : null}
             </View>
           )}
 
@@ -199,6 +295,27 @@ export default function PublicProfileScreen() {
           </View>
         </View>
       )}
+
+      <OptionsMenu visible={isOptionsMenuOpen} onClose={() => setIsOptionsMenuOpen(false)} options={optionsMenuOptions} />
+
+      <ConfirmDialog
+        visible={isBlockConfirmOpen}
+        title={`Block ${profile?.displayName ?? 'this user'}?`}
+        message="They won't be able to follow, like or comment on your content, or message you while blocked."
+        confirmLabel="Block"
+        isSubmitting={isBlockSubmitting}
+        onConfirm={handleConfirmBlock}
+        onCancel={() => setIsBlockConfirmOpen(false)}
+      />
+
+      {user ? (
+        <ReportModal
+          visible={isReportOpen}
+          onClose={() => setIsReportOpen(false)}
+          reporterUid={user.uid}
+          target={{ type: 'user', targetUid: uid }}
+        />
+      ) : null}
     </HeaderScreenLayout>
   );
 }
@@ -225,6 +342,15 @@ const styles = StyleSheet.create({
   header: {
     alignItems: 'center',
     gap: 4,
+  },
+  overflowButton: {
+    position: 'absolute',
+    top: 0,
+    right: 0,
+    width: 36,
+    height: 36,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   displayName: {
     color: Colors.text,
@@ -270,12 +396,39 @@ const styles = StyleSheet.create({
     fontSize: 13,
     textAlign: 'center',
   },
+  actionsColumn: {
+    gap: Spacing.xs,
+  },
   actionsRow: {
     flexDirection: 'row',
     gap: Spacing.sm,
   },
   actionButton: {
     flex: 1,
+  },
+  messageHint: {
+    color: Colors.textSecondary,
+    fontSize: 12,
+    textAlign: 'center',
+  },
+  blockedRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: Spacing.sm,
+  },
+  blockedBadge: {
+    borderRadius: Radius.full,
+    backgroundColor: Colors.background,
+    borderWidth: 1,
+    borderColor: Colors.error,
+    paddingHorizontal: Spacing.md,
+    paddingVertical: Spacing.sm,
+  },
+  blockedBadgeText: {
+    color: Colors.error,
+    fontSize: 13,
+    fontWeight: '700',
   },
   selfBadge: {
     alignSelf: 'center',

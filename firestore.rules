@@ -122,8 +122,28 @@ service cloud.firestore {
       allow update: if false;
 
       // Only the follower can remove their own follow — a followed user
-      // can't unilaterally strip someone else's follow edge in Step 11.
-      allow delete: if isSignedIn() && resource.data.followerUid == request.auth.uid;
+      // can't unilaterally strip someone else's follow edge, UNLESS
+      // they're the one being followed and are blocking the follower in
+      // the very same atomic write (see src/services/blocks.ts): the
+      // block must exist AFTER the write for this to be valid, so a bare
+      // "delete someone's inbound follow" attempt with no accompanying
+      // block is still denied. Block must be the reason.
+      allow delete: if isSignedIn()
+        && (
+          resource.data.followerUid == request.auth.uid
+          || (
+            resource.data.followingUid == request.auth.uid
+            && existsAfter(/databases/$(database)/documents/blocks/$(request.auth.uid + '_' + resource.data.followerUid))
+          )
+        );
+    }
+
+    // Shared by follow/like/comment/conversation creation below — a block
+    // in EITHER direction between two uids blocks new interaction both
+    // ways (see src/types/block.ts).
+    function isNotBlockedEitherWay(uidA, uidB) {
+      return !exists(/databases/$(database)/documents/blocks/$(uidA + '_' + uidB))
+        && !exists(/databases/$(database)/documents/blocks/$(uidB + '_' + uidA));
     }
 
     function isValidFollowCreate(followId, data) {
@@ -132,6 +152,7 @@ service cloud.firestore {
         && followId == data.followerUid + '_' + data.followingUid
         && exists(/databases/$(database)/documents/publicProfiles/$(data.followingUid))
         && exists(/databases/$(database)/documents/publicProfiles/$(request.auth.uid))
+        && isNotBlockedEitherWay(data.followerUid, data.followingUid)
         && isServerTimestamp(data.createdAt)
         && data.keys().hasOnly(['followerUid', 'followingUid', 'createdAt']);
     }
@@ -436,15 +457,16 @@ service cloud.firestore {
       // come from a getCountFromServer() aggregation query instead (see
       // src/services/socialEngagement.ts).
       match /likes/{uid} {
-        function likeParentPublished() {
-          return get(/databases/$(database)/documents/content/$(contentId)).data.status == 'published';
+        function likeParent() {
+          return get(/databases/$(database)/documents/content/$(contentId)).data;
         }
 
-        allow read: if isSignedIn() && likeParentPublished();
+        allow read: if isSignedIn() && likeParent().status == 'published';
 
         allow create: if isSignedIn()
           && uid == request.auth.uid
-          && likeParentPublished()
+          && likeParent().status == 'published'
+          && isNotBlockedEitherWay(request.auth.uid, likeParent().authorUid)
           && request.resource.data.uid == request.auth.uid
           && isServerTimestamp(request.resource.data.createdAt)
           && request.resource.data.keys().hasOnly(['uid', 'createdAt']);
@@ -480,9 +502,11 @@ service cloud.firestore {
 
       function isValidCommentCreate(contentId, commentId, data) {
         let profile = get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+        let contentAuthorUid = get(/databases/$(database)/documents/content/$(contentId)).data.authorUid;
         return exists(/databases/$(database)/documents/users/$(request.auth.uid))
           && profile.onboardingCompleted == true
           && get(/databases/$(database)/documents/content/$(contentId)).data.status == 'published'
+          && isNotBlockedEitherWay(request.auth.uid, contentAuthorUid)
           && data.commentId == commentId
           && data.authorUid == request.auth.uid
           && data.authorDisplayName == profile.displayName
@@ -504,7 +528,14 @@ service cloud.firestore {
     // a client can never fabricate a notification ("X followed you" with no
     // real follow edge) no matter what it sends.
     match /notifications/{notificationId} {
-      allow read: if isSignedIn() && resource.data.recipientUid == request.auth.uid;
+      // resource == null (no such notification) is allowed here on purpose
+      // — same reasoning as the conversations read rule below: reading a
+      // nonexistent document reveals no data, and src/services/blocks.ts
+      // needs to check "does a notification exist for this follow edge?"
+      // for follow edges that may predate this notifications feature
+      // (created before Step 15) and therefore have no paired notification
+      // — without this, that existence check would itself be denied.
+      allow read: if isSignedIn() && (resource == null || resource.data.recipientUid == request.auth.uid);
 
       allow create: if isSignedIn()
         && isValidNotificationActor(request.resource.data)
@@ -719,6 +750,23 @@ service cloud.firestore {
         && participantUids[0] < participantUids[1];
     }
 
+    // "everyone"/no doc: any signed-in sender may start a conversation.
+    // "people_i_follow": the RECIPIENT must already follow the SENDER —
+    // i.e. follows/{recipientUid}_{senderUid} — this is "people I follow
+    // may message me," not "people who follow me" (those are opposite
+    // directions and easy to swap by accident). "nobody": no new
+    // conversation, full stop. This only ever gates conversation CREATE —
+    // see isValidConversationSend, which never re-checks it.
+    function isNewConversationAllowedByPrivacy(senderUid, recipientUid) {
+      let settingsPath = /databases/$(database)/documents/privacySettings/$(recipientUid);
+      return !exists(settingsPath)
+        || get(settingsPath).data.newMessagesFrom == 'everyone'
+        || (
+          get(settingsPath).data.newMessagesFrom == 'people_i_follow'
+          && exists(/databases/$(database)/documents/follows/$(recipientUid + '_' + senderUid))
+        );
+    }
+
     function isValidConversationCreate(conversationId, data) {
       let messagePath = /databases/$(database)/documents/conversations/$(conversationId)/messages/$(data.lastMessageId);
       return isValidParticipantPair(data.participantUids)
@@ -726,6 +774,8 @@ service cloud.firestore {
         && request.auth.uid in data.participantUids
         && exists(/databases/$(database)/documents/publicProfiles/$(data.participantUids[0]))
         && exists(/databases/$(database)/documents/publicProfiles/$(data.participantUids[1]))
+        && isNotBlockedEitherWay(data.participantUids[0], data.participantUids[1])
+        && isNewConversationAllowedByPrivacy(request.auth.uid, otherParticipant(data.participantUids, request.auth.uid))
         && data.conversationId == conversationId
         && data.lastMessageSenderUid == request.auth.uid
         && data.lastMessageText is string
@@ -759,6 +809,11 @@ service cloud.firestore {
         && newData.lastMessageId != oldData.lastMessageId
         && newData.lastMessageSenderUid == sender
         && newData.lastMessageText is string
+        // Blocks stop an EXISTING conversation from continuing; message
+        // privacy (isNewConversationAllowedByPrivacy) deliberately does
+        // NOT apply here — see isValidConversationCreate for where it
+        // does apply (starting a brand new conversation only).
+        && isNotBlockedEitherWay(sender, other)
         && isServerTimestamp(newData.lastMessageAt)
         && isServerTimestamp(newData.updatedAt)
         && newData.unreadCounts.size() == 2
@@ -816,6 +871,157 @@ service cloud.firestore {
         && convAfter.lastMessageSenderUid == request.auth.uid
         && convAfter.lastMessageText == data.body
         && convAfter.lastMessageAt == data.createdAt;
+    }
+
+    // blocks/{blockerUid}_{blockedUid} — a directed "A blocks B" edge (see
+    // src/services/blocks.ts and src/types/block.ts). Prevents NEW follow/
+    // like/comment/message interaction in both directions (see
+    // isNotBlockedEitherWay above and its call sites) without erasing any
+    // existing history. Only the blocker may ever read their own block
+    // doc — the blocked user is never told they were blocked, by design.
+    match /blocks/{blockId} {
+      // resource == null (no such block) is allowed here on purpose, for
+      // two real client call sites: blockUser()'s own "is this already
+      // blocked?" pre-check — the common case for a FIRST-time block,
+      // where the answer is legitimately "no" — and unblockUser()'s
+      // delete, which must be a harmless no-op (not an error) if the
+      // block was already removed. Reading/deleting nothing reveals and
+      // changes nothing.
+      allow read: if isSignedIn() && (resource == null || resource.data.blockerUid == request.auth.uid);
+
+      allow create: if isSignedIn() && isValidBlockCreate(blockId, request.resource.data);
+
+      allow update: if false;
+
+      allow delete: if isSignedIn() && (resource == null || resource.data.blockerUid == request.auth.uid);
+    }
+
+    function isValidBlockCreate(blockId, data) {
+      return data.blockerUid == request.auth.uid
+        && data.blockedUid != request.auth.uid
+        && blockId == data.blockerUid + '_' + data.blockedUid
+        && exists(/databases/$(database)/documents/publicProfiles/$(data.blockerUid))
+        && exists(/databases/$(database)/documents/publicProfiles/$(data.blockedUid))
+        && isServerTimestamp(data.createdAt)
+        && data.keys().hasOnly(['blockId', 'blockerUid', 'blockedUid', 'createdAt']);
+    }
+
+    // privacySettings/{uid} — who may START a new DM conversation with
+    // this user (see src/types/privacy.ts and isNewConversationAllowedByPrivacy
+    // above). Readable by any signed-in user: a prospective sender's own
+    // conversation-create write needs this doc to exist-check against,
+    // and it contains no sensitive data beyond this one public-safe
+    // preference. Never affects an existing conversation — only Blocks do.
+    match /privacySettings/{uid} {
+      allow read: if isSignedIn();
+
+      allow create: if isOwner(uid) && isValidPrivacySettingsCreate(uid, request.resource.data);
+
+      allow update: if isOwner(uid) && isValidPrivacySettingsUpdate(request.resource.data, resource.data);
+
+      allow delete: if false;
+    }
+
+    function isValidNewMessagesFromEnum(value) {
+      return value == 'everyone' || value == 'people_i_follow' || value == 'nobody';
+    }
+
+    function isValidPrivacySettingsCreate(uid, data) {
+      return data.uid == uid
+        && isValidNewMessagesFromEnum(data.newMessagesFrom)
+        && isServerTimestamp(data.createdAt)
+        && isServerTimestamp(data.updatedAt)
+        && data.keys().hasOnly(['uid', 'newMessagesFrom', 'createdAt', 'updatedAt']);
+    }
+
+    function isValidPrivacySettingsUpdate(newData, oldData) {
+      return newData.uid == oldData.uid
+        && newData.createdAt == oldData.createdAt
+        && isValidNewMessagesFromEnum(newData.newMessagesFrom)
+        && isServerTimestamp(newData.updatedAt)
+        && newData.keys().hasOnly(['uid', 'newMessagesFrom', 'createdAt', 'updatedAt']);
+    }
+
+    // reports/{reportId} — private moderation records (see
+    // src/types/report.ts and src/services/reports.ts). Create-only from
+    // the client; there is no moderation UI yet, so nothing is ever
+    // updated or deleted client-side. Only the reporter may ever read
+    // their own submitted report — never the reported user, never anyone
+    // else. reportId is deterministic per (reporter, target) so a second
+    // create for the same target is evaluated as an "update" (denied),
+    // which is what actually stops duplicate-report spam.
+    match /reports/{reportId} {
+      // resource == null (no such report) is allowed here on purpose —
+      // src/services/reports.ts's own duplicate-report pre-check needs to
+      // ask "does a report already exist for this target?" for a FIRST-time
+      // report, the common case, where the honest answer is "no." Reading
+      // nothing reveals nothing.
+      allow read: if isSignedIn() && (resource == null || resource.data.reporterUid == request.auth.uid);
+
+      allow create: if isSignedIn() && isValidReportCreate(reportId, request.resource.data);
+
+      allow update: if false;
+
+      allow delete: if false;
+    }
+
+    function isValidReportReasonEnum(reason) {
+      return reason in ['spam', 'harassment', 'hate', 'sexual', 'violence', 'scam', 'other'];
+    }
+
+    function reportBaseKeys() {
+      return ['reportId', 'reporterUid', 'targetType', 'targetUid', 'contentId', 'conversationId', 'messageId', 'reason', 'details', 'createdAt'];
+    }
+
+    function isValidReportBase(data) {
+      return data.reporterUid == request.auth.uid
+        && isValidReportReasonEnum(data.reason)
+        && (data.details == null || (data.details is string && data.details.size() <= 1000))
+        && isServerTimestamp(data.createdAt)
+        && data.keys().hasOnly(reportBaseKeys());
+    }
+
+    function isValidUserReport(reportId, data) {
+      return data.targetType == 'user'
+        && data.targetUid is string
+        && data.targetUid != request.auth.uid
+        && data.contentId == null
+        && data.conversationId == null
+        && data.messageId == null
+        && reportId == 'user_' + request.auth.uid + '_' + data.targetUid
+        && exists(/databases/$(database)/documents/publicProfiles/$(data.targetUid));
+    }
+
+    function isValidContentReport(reportId, data) {
+      let contentPath = /databases/$(database)/documents/content/$(data.contentId);
+      return data.targetType == 'content'
+        && data.contentId is string
+        && data.conversationId == null
+        && data.messageId == null
+        && reportId == 'content_' + request.auth.uid + '_' + data.contentId
+        && exists(contentPath)
+        && get(contentPath).data.status == 'published'
+        && data.targetUid == get(contentPath).data.authorUid;
+    }
+
+    function isValidMessageReport(reportId, data) {
+      let convPath = /databases/$(database)/documents/conversations/$(data.conversationId);
+      let msgPath = /databases/$(database)/documents/conversations/$(data.conversationId)/messages/$(data.messageId);
+      return data.targetType == 'message'
+        && data.conversationId is string
+        && data.messageId is string
+        && data.contentId == null
+        && exists(convPath)
+        && request.auth.uid in get(convPath).data.participantUids
+        && exists(msgPath)
+        && get(msgPath).data.senderUid != request.auth.uid
+        && data.targetUid == get(msgPath).data.senderUid
+        && reportId == 'message_' + request.auth.uid + '_' + data.messageId;
+    }
+
+    function isValidReportCreate(reportId, data) {
+      return isValidReportBase(data)
+        && (isValidUserReport(reportId, data) || isValidContentReport(reportId, data) || isValidMessageReport(reportId, data));
     }
 
     // Everything else is denied by default.
