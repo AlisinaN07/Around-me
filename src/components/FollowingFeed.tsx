@@ -101,9 +101,7 @@ export function FollowingFeed({ currentUid, cityKey, cityLabel, onExploreAround 
           <View style={styles.emptyPanel}>
             <Ionicons name="people-outline" size={32} color={Colors.textSecondary} />
             <Text style={styles.emptyTitle}>Your Following feed is empty</Text>
-            <Text style={styles.emptyBody}>
-              Follow people around your city to see their posts, activities and events here.
-            </Text>
+            <Text style={styles.emptyBody}>Follow people around {cityLabel} to see them here.</Text>
             <Button label="Explore Around" onPress={onExploreAround} />
           </View>
         ) : items.length === 0 ? (

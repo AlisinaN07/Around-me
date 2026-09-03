@@ -11,6 +11,7 @@ import { Colors, Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
 import { useProfile } from '@/hooks/useProfile';
 import { AuthProvider } from '@/providers/AuthProvider';
+import { CityProvider } from '@/providers/CityProvider';
 import { ProfileProvider } from '@/providers/ProfileProvider';
 
 SystemUI.setBackgroundColorAsync(Colors.background);
@@ -20,8 +21,10 @@ export default function RootLayout() {
   return (
     <AuthProvider>
       <ProfileProvider>
-        <StatusBar style="light" />
-        <RootNavigator />
+        <CityProvider>
+          <StatusBar style="light" />
+          <RootNavigator />
+        </CityProvider>
       </ProfileProvider>
     </AuthProvider>
   );

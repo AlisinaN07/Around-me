@@ -4,6 +4,7 @@ import { Pressable, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { Colors, Layout, Radius, Spacing } from '@/constants/theme';
+import { useCity } from '@/providers/CityProvider';
 
 type CreateOption = {
   id: string;
@@ -45,10 +46,21 @@ const CREATE_OPTIONS: CreateOption[] = [
 ];
 
 export default function CreateScreen() {
+  const { homeCity, activeCity, isExploringAnotherCity } = useCity();
+
   return (
     <SafeAreaView style={styles.safeArea}>
       <View style={styles.content}>
         <Text style={styles.title}>Create</Text>
+
+        {isExploringAnotherCity && homeCity && activeCity ? (
+          <View style={styles.exploringBanner}>
+            <Ionicons name="information-circle-outline" size={18} color={Colors.textSecondary} />
+            <Text style={styles.exploringBannerText}>
+              You&apos;re exploring {activeCity.cityName}. Your posts are published to your home city, {homeCity.cityName}.
+            </Text>
+          </View>
+        ) : null}
 
         <View style={styles.list}>
           {CREATE_OPTIONS.map((option) => (
@@ -102,6 +114,24 @@ const styles = StyleSheet.create({
     fontWeight: '800',
     marginTop: Spacing.lg,
     marginBottom: Spacing.xl,
+  },
+  exploringBanner: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: Spacing.sm,
+    borderRadius: Radius.lg,
+    backgroundColor: Colors.surface,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    padding: Spacing.md,
+    marginTop: -Spacing.md,
+    marginBottom: Spacing.lg,
+  },
+  exploringBannerText: {
+    flex: 1,
+    color: Colors.textSecondary,
+    fontSize: 13,
+    lineHeight: 18,
   },
   list: {
     gap: Spacing.md,

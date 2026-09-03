@@ -15,11 +15,10 @@ import { CATEGORY_FILTERS } from '@/constants/categoryFilters';
 import { INTERESTS } from '@/constants/interests';
 import { Colors, Layout, Radius, Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
-import { useProfile } from '@/hooks/useProfile';
+import { useCity } from '@/providers/CityProvider';
 import { fetchMyBlockedUserIds } from '@/services/blocks';
 import { fetchCityFeed, fetchHappeningNow } from '@/services/content';
 import type { ActivityContent, Content, EventContent } from '@/types/content';
-import { formatCityDisplayName } from '@/utils/cityDisplay';
 import { formatEventTime } from '@/utils/timeFormat';
 
 type LoadStatus = 'loading' | 'loaded' | 'error';
@@ -33,7 +32,7 @@ const HOME_MODE_OPTIONS: { id: HomeMode; label: string }[] = [
 
 export default function HomeScreen() {
   const { user } = useAuth();
-  const { profile } = useProfile();
+  const { activeCity, isExploringAnotherCity, isReady: isCityReady } = useCity();
   // In-session only — not persisted to Firestore. Resets to "Around" (the
   // default) every time this screen mounts fresh; trivially preserved for
   // the rest of a session because it's just ordinary component state.
@@ -44,20 +43,27 @@ export default function HomeScreen() {
   const [status, setStatus] = useState<LoadStatus>('loading');
   const [isRefreshing, setIsRefreshing] = useState(false);
 
-  const cityLabel = profile?.cityName ? formatCityDisplayName(profile.cityName) : 'you';
+  const cityLabel = activeCity?.cityName ?? 'you';
 
   const loadFeed = useCallback(
     async (isRefresh = false) => {
-      if (!profile) return;
+      if (!activeCity) return;
       if (isRefresh) {
         setIsRefreshing(true);
       } else {
         setStatus('loading');
+        // Clears any previous city's results immediately, before the new
+        // city's fetch even starts — otherwise the loading-skeleton branch
+        // below (which only triggers when the list is empty) would be
+        // skipped and stale content from the prior city would render
+        // under the new city's header for the duration of the fetch.
+        setFeedItems([]);
+        setHappeningItems([]);
       }
       try {
         const [feed, happening, blockedUids] = await Promise.all([
-          fetchCityFeed(profile.cityKey),
-          fetchHappeningNow(profile.cityKey),
+          fetchCityFeed(activeCity.cityKey),
+          fetchHappeningNow(activeCity.cityKey),
           // Client-side only: this does NOT make blocked users' published
           // content inaccessible (see the Step 17 MVP boundary in
           // firestore.rules) — it just keeps them out of MY OWN Around/
@@ -75,17 +81,20 @@ export default function HomeScreen() {
         setIsRefreshing(false);
       }
     },
-    [profile, user]
+    [activeCity, user]
   );
 
-  // Home refetches every time it regains focus — covers first mount, tab
+  // Home refetches every time it regains focus (covers first mount, tab
   // switches back to Home, and returning here after a successful publish
-  // from Create. No realtime listener: still a one-shot query per visit.
+  // from Create — no realtime listener, still a one-shot query per visit)
+  // AND every time Active City changes, so switching cities in the
+  // explorer refreshes this screen without a manual pull-to-refresh.
   useFocusEffect(
     useCallback(() => {
+      if (!isCityReady) return;
       loadFeed();
       // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [profile?.cityKey])
+    }, [activeCity?.cityKey, isCityReady])
   );
 
   const visibleItems = useMemo(() => {
@@ -108,13 +117,13 @@ export default function HomeScreen() {
       <View style={styles.topBar}>
         <View style={styles.page}>
           <View style={styles.header}>
-            <View style={styles.headerTextGroup}>
+            <Pressable onPress={() => router.push('/cities')} style={styles.headerTextGroup} accessibilityRole="button" accessibilityLabel="Change city">
               <View style={styles.cityRow}>
-                <Ionicons name="location" size={14} color={Colors.accent} />
-                <Text style={styles.cityLabel}>Current city</Text>
+                <Text style={styles.title}>Around {cityLabel}</Text>
+                <Ionicons name="chevron-down" size={18} color={Colors.text} />
               </View>
-              <Text style={styles.title}>Around {cityLabel}</Text>
-            </View>
+              {isExploringAnotherCity ? <Text style={styles.exploringLabel}>Exploring {cityLabel}</Text> : null}
+            </Pressable>
             <View style={styles.headerActions}>
               {Platform.OS === 'web' && homeMode === 'around' && (
                 <Pressable
@@ -155,10 +164,10 @@ export default function HomeScreen() {
       </View>
 
       {homeMode === 'following' ? (
-        user && profile ? (
+        user && activeCity ? (
           <FollowingFeed
             currentUid={user.uid}
-            cityKey={profile.cityKey}
+            cityKey={activeCity.cityKey}
             cityLabel={cityLabel}
             onExploreAround={() => setHomeMode('around')}
           />
@@ -195,7 +204,7 @@ export default function HomeScreen() {
             {status === 'error' ? (
               <View style={styles.errorState}>
                 <Ionicons name="cloud-offline-outline" size={32} color={Colors.textSecondary} />
-                <Text style={styles.errorTitle}>Couldn&apos;t load Around {cityLabel}.</Text>
+                <Text style={styles.errorTitle}>Couldn&apos;t load what&apos;s happening in {cityLabel}.</Text>
                 <Button label="Try again" onPress={() => loadFeed()} />
               </View>
             ) : (
@@ -214,10 +223,8 @@ export default function HomeScreen() {
                     </ScrollView>
                   ) : happeningItems.length === 0 ? (
                     <View style={styles.emptyPanel}>
-                      <Text style={styles.emptyPanelTitle}>Nothing live right now</Text>
-                      <Text style={styles.emptyPanelBody}>
-                        Check upcoming events and activities around {cityLabel}.
-                      </Text>
+                      <Text style={styles.emptyPanelTitle}>Nothing happening right now in {cityLabel}</Text>
+                      <Text style={styles.emptyPanelBody}>Check Activities and Events coming up soon.</Text>
                     </View>
                   ) : (
                     <ScrollView
@@ -262,11 +269,19 @@ export default function HomeScreen() {
                     </>
                   ) : feedItems.length === 0 ? (
                     <View style={styles.emptyCityPanel}>
-                      <Text style={styles.emptyPanelTitle}>Nothing here yet.</Text>
-                      <Text style={styles.emptyPanelBody}>
-                        Be the first person to share what&apos;s happening in {cityLabel}.
-                      </Text>
-                      <Button label="Create something" onPress={() => router.push('/create')} />
+                      {isExploringAnotherCity ? (
+                        <>
+                          <Text style={styles.emptyPanelTitle}>Not much happening in {cityLabel} yet.</Text>
+                          <Text style={styles.emptyPanelBody}>Explore another city or check back later.</Text>
+                          <Button label="Explore another city" variant="secondary" onPress={() => router.push('/cities')} />
+                        </>
+                      ) : (
+                        <>
+                          <Text style={styles.emptyPanelTitle}>Nothing happening here yet.</Text>
+                          <Text style={styles.emptyPanelBody}>Be one of the first people to post in {cityLabel}.</Text>
+                          <Button label="Create something" onPress={() => router.push('/create')} />
+                        </>
+                      )}
                     </View>
                   ) : visibleItems.length === 0 ? (
                     <View style={styles.emptyCityPanel}>
@@ -327,13 +342,12 @@ const styles = StyleSheet.create({
   cityRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 4,
+    gap: 2,
   },
-  cityLabel: {
-    color: Colors.textSecondary,
+  exploringLabel: {
+    color: Colors.accent,
     fontSize: 12,
     fontWeight: '600',
-    textTransform: 'uppercase',
   },
   title: {
     color: Colors.text,

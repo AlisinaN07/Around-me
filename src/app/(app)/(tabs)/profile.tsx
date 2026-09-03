@@ -78,6 +78,14 @@ export default function ProfileScreen() {
                 </Text>
               </View>
             ) : null}
+            <Pressable
+              onPress={() => router.push('/cities')}
+              style={styles.exploreCityLink}
+              accessibilityRole="button"
+              accessibilityLabel="Explore another city"
+            >
+              <Text style={styles.exploreCityLinkText}>Explore another city</Text>
+            </Pressable>
           </View>
 
           {interestLabels.length > 0 && (
@@ -203,6 +211,15 @@ const styles = StyleSheet.create({
   locationText: {
     color: Colors.textSecondary,
     fontSize: 13,
+  },
+  exploreCityLink: {
+    marginTop: Spacing.xs,
+    paddingVertical: 2,
+  },
+  exploreCityLinkText: {
+    color: Colors.accent,
+    fontSize: 13,
+    fontWeight: '600',
   },
   interestsSection: {
     marginTop: Spacing.lg,

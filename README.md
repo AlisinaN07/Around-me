@@ -201,6 +201,43 @@ A subtlety worth knowing if you touch `firestore.rules`: the onboarding transact
 
 `/user/{uid}` (public profile), `/user/{uid}/followers`, `/user/{uid}/following` are reachable by tapping any author, commenter, participant name, or `@username` throughout the app (`src/components/AuthorLink.tsx`) — including from inside a `ContentCard`, where it's nested inside that card's own tap-to-open-detail `Pressable` and calls `stopPropagation()` so only one of the two navigations fires.
 
+## City discovery: Home City vs Active City (Step 21)
+
+Around Me is launching city-by-city (Karlstad first), and Step 21 introduces two distinct city concepts:
+
+- **Home City** — the user's permanent social identity, read-only-derived from their completed profile (`users/{uid}.cityKey`/`cityName`/`countryCode`). Nothing in this step ever writes to `users/{uid}` or `publicProfiles/{uid}` just because someone browses a different city.
+- **Active City** — a temporary, local-only browsing context that discovery surfaces query against. Starts equal to Home City; changed via the city switcher (`/cities`). Never sent to Firestore.
+
+`src/providers/CityProvider.tsx` (`useCity()`) is the single source for both — `homeCity`, `activeCity`, `isExploringAnotherCity`, `setActiveCity(city)`, `resetToHomeCity()`. It's mounted once in the root layout (`src/app/_layout.tsx`), inside `ProfileProvider` (it needs the profile to compute Home City) and around the whole navigator, so deep-linked routes like `/reel/{id}` or `/user/{uid}` always have it available without any extra gating — Active City is discovery state, not an authorization gate, so its (brief, async) initial resolution never blocks or delays rendering those routes.
+
+### Supported-city catalog
+
+`src/constants/cities.ts` is the one shared source of truth — the city switcher, and the lightweight unit tests (`npm run test:cities`, via `tsx`), all read from `CITIES`, never a duplicated list. Sweden-focused for the initial launch, ten cities: Karlstad, Stockholm, Göteborg, Malmö, Uppsala, Västerås, Örebro, Linköping, Helsingborg, Jönköping. Each entry's `cityKey` is built with the exact same `buildCityKey(countryCode, cityName)` onboarding uses (`src/utils/cityKey.ts`), so a catalog entry and a real user's profile for the same city always produce an identical key with no separate mapping to keep in sync. No third-party city database (Google Places, GeoNames, Mapbox) — a small static list is sufficient for a city-by-city launch and avoids a new cost/API dependency. `searchCities(query)` is case-insensitive and diacritic-normalized (same stripping approach as `buildCityKey`), so typing "Goteborg" finds "Göteborg" without a fuzzy-search library.
+
+### Persistence — per signed-in user
+
+Active City is persisted in AsyncStorage under `aroundme.activeCity.{uid}` — **keyed by uid**, specifically so a shared device/browser can't leak one account's browsing city into another account's session (confirmed structurally: the key format itself makes cross-account leakage impossible, since each uid only ever reads/writes its own key). On sign-in, `CityProvider` reads that uid's stored key; if nothing is stored, or the stored value no longer resolves to a real catalog city, it falls back to that user's own Home City — never an error, never another account's city. `resetToHomeCity()` clears the stored key entirely rather than just setting it to the home value. No location history, no timestamp array, no server-side city-browsing tracking — this is exactly one current value, locally held, nothing more.
+
+### Which surfaces use Active City
+
+Around (`src/app/(app)/(tabs)/index.tsx`), Happening Now (same screen), and the Reels feed (`src/app/(app)/(tabs)/reels.tsx`) all query `activeCity.cityKey` — switching cities in the explorer refetches all three without an app restart, and any previous city's results are cleared immediately on switch (not just on the next successful fetch) so a stale city's content never renders under the new city's header while the fetch is in flight.
+
+**Following stays city-aware, by design** — `FollowingFeed` receives `cityKey` from Home's Active City too, so if your Home City is Karlstad but you're exploring Stockholm, Following shows the people you follow's **Stockholm** content, not Karlstad's and not everything globally. This keeps the whole discovery context internally consistent: whatever city the header says, that's the city every discovery surface (including Following) is scoped to.
+
+**What deliberately does NOT use Active City**: public profiles (`/user/{uid}`) always show that user's own real Home City, regardless of what the viewer is currently exploring; Inbox (Activity notifications, DM conversations) is global to the signed-in user's own social graph, not city-filtered at all; Create Post/Activity/Event/Reel always publish under the caller's **Home City** — see below.
+
+### Creation always uses Home City — enforced by unchanged rules, not new client logic
+
+Step 21 adds no new way for a client to supply a city when creating content. `createReelDraft`, `createPost`, `createActivity`, `createEvent` were already deriving the author/city snapshot server-side from the caller's own `users/{uid}` profile (see `src/services/reels.ts`/`content.ts`), and `firestore.rules`'s existing `isValidContentCreate`/`isValidReelCreate` already require the written `cityKey` to exactly match that profile — so a Karlstad user exploring Stockholm structurally cannot publish anything tagged Stockholm, with zero rules changes needed this step. The Create hub (`src/app/(app)/(tabs)/create.tsx`) shows an informational banner — "You're exploring Stockholm. Your posts are published to your home city, Karlstad." — whenever Active City differs from Home City, so this is never a surprise; it never blocks creation or silently changes anything.
+
+### City switcher
+
+`/cities` (`src/app/(app)/cities.tsx`) — a search field, a "Home" section (the user's actual Home City, with a checkmark when it's also the Active City), and an "Explore" section listing the rest of the catalog (Home City itself is filtered out of Explore to avoid a duplicate row). No map, no GPS, no external API. Tapping a city sets it Active and returns; a "Back to {Home City}" shortcut appears whenever actively exploring elsewhere.
+
+### Empty/loading/error states are Active-City-aware
+
+Around's empty state distinguishes "Nothing happening here yet. Be one of the first people to post in Karlstad." (on Home City) from "Not much happening in Stockholm yet. Explore another city or check back later." (while exploring) — the latter offers "Explore another city" instead of a Create CTA that would misleadingly suggest creating a Stockholm post. The Reels feed's empty state keeps its "Create Reel" CTA in both cases, but adds "Reels you create publish to your home city, {Home City}." while exploring, so the CTA is never misleading about where the Reel will land. Happening Now and Following each have their own Active-City-scoped empty copy. A failed city query shows "Couldn't load what's happening in {city}." with Try again — it never silently falls back to showing the previous city's content.
+
 ## Reels (Cloud Storage — Step 18)
 
 Reels are short (≤60s), video-only posts with vertical, city-scoped playback — the first feature in this app to use Cloud Storage rather than Firestore alone. They live in their own root collection, `reels/{reelId}`, separate from `content/{contentId}` (posts/activities/events): a Reel has a media-upload lifecycle and Storage metadata that the other content types never had, and folding it into `content` would have meant giving every Post/Activity/Event query an upload-status field it never needs.

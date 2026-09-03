@@ -2,7 +2,7 @@ import { Ionicons } from '@expo/vector-icons';
 import * as Clipboard from 'expo-clipboard';
 import { router, useFocusEffect } from 'expo-router';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { FlatList, StyleSheet, Text, View, type ViewToken } from 'react-native';
+import { FlatList, Pressable, StyleSheet, Text, View, type ViewToken } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { Button } from '@/components/Button';
@@ -12,10 +12,9 @@ import { ReelFeedItem } from '@/components/ReelFeedItem';
 import { ReportModal } from '@/components/ReportModal';
 import { Colors, Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
-import { useProfile } from '@/hooks/useProfile';
+import { useCity } from '@/providers/CityProvider';
 import { blockUser, fetchMyBlockedUserIds } from '@/services/blocks';
 import { fetchCityReels } from '@/services/reels';
-import { formatCityDisplayName } from '@/utils/cityDisplay';
 import { buildReelShareUrl, shareReel } from '@/utils/reelShare';
 import type { Reel } from '@/types/reel';
 
@@ -25,7 +24,7 @@ const VIEWABILITY_CONFIG = { itemVisiblePercentThreshold: 90 };
 
 export default function ReelsScreen() {
   const { user } = useAuth();
-  const { profile } = useProfile();
+  const { activeCity, homeCity, isExploringAnotherCity, isReady: isCityReady } = useCity();
   const [status, setStatus] = useState<LoadStatus>('loading');
   const [reels, setReels] = useState<Reel[]>([]);
   const [containerHeight, setContainerHeight] = useState(0);
@@ -38,12 +37,17 @@ export default function ReelsScreen() {
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const cityKey = profile?.cityKey;
-  const cityLabel = profile?.cityName ? formatCityDisplayName(profile.cityName) : 'your city';
+  const cityKey = activeCity?.cityKey;
+  const cityLabel = activeCity?.cityName ?? 'your city';
 
   const load = useCallback(async () => {
     if (!cityKey || !user) return;
     setStatus('loading');
+    // Clears the previous city's Reels immediately so switching cities
+    // never shows a stale city's video under the new city's header while
+    // the fresh fetch is in flight (see the Step 21 spec's city-switch
+    // loading requirement).
+    setReels([]);
     try {
       const [cityReels, blockedUids] = await Promise.all([fetchCityReels(cityKey), fetchMyBlockedUserIds(user.uid)]);
       const blockedSet = new Set(blockedUids);
@@ -59,9 +63,10 @@ export default function ReelsScreen() {
 
   useFocusEffect(
     useCallback(() => {
+      if (!isCityReady) return;
       setActiveIndex(0);
       load();
-    }, [load])
+    }, [load, isCityReady])
   );
 
   // setActiveIndex is stable across renders, so this callback never needs
@@ -128,6 +133,16 @@ export default function ReelsScreen() {
 
   return (
     <SafeAreaView style={styles.safeArea} edges={['top']}>
+      <Pressable
+        style={styles.cityIndicator}
+        onPress={() => router.push('/cities')}
+        accessibilityRole="button"
+        accessibilityLabel="Change city"
+      >
+        <Text style={styles.cityIndicatorText}>{cityLabel}</Text>
+        <Ionicons name="chevron-down" size={14} color={Colors.text} />
+      </Pressable>
+
       <View
         style={styles.content}
         onLayout={(event) => {
@@ -144,7 +159,7 @@ export default function ReelsScreen() {
         ) : status === 'error' ? (
           <View style={styles.centered}>
             <Ionicons name="cloud-offline-outline" size={40} color={Colors.textSecondary} />
-            <Text style={styles.emptyTitle}>Couldn&apos;t load Reels</Text>
+            <Text style={styles.emptyTitle}>Couldn&apos;t load Reels in {cityLabel}</Text>
             <Button label="Try again" onPress={load} />
           </View>
         ) : reels.length === 0 ? (
@@ -153,6 +168,9 @@ export default function ReelsScreen() {
             <Text style={styles.emptyTitle}>No Reels yet</Text>
             <Text style={styles.emptyBody}>Be the first to show what&apos;s happening in {cityLabel}.</Text>
             <Button label="Create Reel" onPress={() => router.push('/create/reel')} />
+            {isExploringAnotherCity && homeCity ? (
+              <Text style={styles.exploringHint}>Reels you create publish to your home city, {homeCity.cityName}.</Text>
+            ) : null}
           </View>
         ) : containerHeight > 0 ? (
           <FlatList
@@ -245,6 +263,25 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     lineHeight: 20,
     marginBottom: Spacing.sm,
+  },
+  exploringHint: {
+    color: Colors.textSecondary,
+    fontSize: 12,
+    textAlign: 'center',
+    marginTop: Spacing.xs,
+  },
+  cityIndicator: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    alignSelf: 'center',
+    gap: 4,
+    paddingHorizontal: Spacing.md,
+    paddingVertical: Spacing.xs,
+  },
+  cityIndicatorText: {
+    color: Colors.text,
+    fontSize: 15,
+    fontWeight: '700',
   },
   toast: {
     position: 'absolute',
