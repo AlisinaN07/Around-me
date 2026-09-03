@@ -28,6 +28,7 @@ import {
   PLACE_NAME_MAX_LENGTH,
   TITLE_MAX_LENGTH,
 } from '@/types/content';
+import { getTodayOrTonightWindow, getUpcomingWindow } from '@/utils/dateWindows';
 
 import { fetchFollowingUids } from './following';
 import { firestore } from './firestore';
@@ -462,6 +463,92 @@ export function fetchUpcomingEvents(cityKey: string, limitCount = DEFAULT_FEED_L
 
 export function fetchUpcomingActivities(cityKey: string, limitCount = DEFAULT_FEED_LIMIT): Promise<ActivityContent[]> {
   return fetchUpcomingByType<ActivityContent>('activity', cityKey, limitCount);
+}
+
+/**
+ * Activities/Events whose startsAt falls in [window.start, window.end) —
+ * reuses the same composite index as fetchUpcomingByType/
+ * fetchHappeningNowByType (cityKey, status, type, startsAt ASC): a second
+ * range clause on the SAME field (startsAt) is allowed by Firestore in a
+ * single query, so no new index is needed for Today/Tonight or Upcoming.
+ */
+async function fetchByStartsAtWindowByType<T extends ActivityContent | EventContent>(
+  type: 'activity' | 'event',
+  cityKey: string,
+  window: { start: Date; end: Date },
+  limitCount: number
+): Promise<T[]> {
+  if (!firestore) {
+    return [];
+  }
+  const windowQuery = query(
+    collection(firestore, CONTENT_COLLECTION),
+    where('type', '==', type),
+    where('cityKey', '==', cityKey),
+    where('status', '==', 'published'),
+    where('startsAt', '>=', Timestamp.fromDate(window.start)),
+    where('startsAt', '<', Timestamp.fromDate(window.end)),
+    orderBy('startsAt', 'asc'),
+    limit(limitCount)
+  );
+  const snapshot = await getDocs(windowQuery);
+  return snapshot.docs.map((docSnapshot) => docSnapshot.data() as T);
+}
+
+async function fetchByStartsAtWindow(
+  cityKey: string,
+  window: { start: Date; end: Date },
+  limitCount: number
+): Promise<(ActivityContent | EventContent)[]> {
+  const [events, activities] = await Promise.all([
+    fetchByStartsAtWindowByType<EventContent>('event', cityKey, window, limitCount),
+    fetchByStartsAtWindowByType<ActivityContent>('activity', cityKey, window, limitCount),
+  ]);
+  return [...events, ...activities].sort((a, b) => a.startsAt.toMillis() - b.startsAt.toMillis());
+}
+
+const DEFAULT_DISCOVERY_SECTION_LIMIT = 20;
+
+export type DiscoverySections = {
+  happeningNow: (ActivityContent | EventContent)[];
+  /** "Today" before the evening cutoff, "Tonight" from it on — see getTodayOrTonightWindow. */
+  todayLabel: 'Today' | 'Tonight';
+  today: (ActivityContent | EventContent)[];
+  upcoming: (ActivityContent | EventContent)[];
+};
+
+/**
+ * The three time-based discovery rails (Happening Now / Today-or-Tonight /
+ * Upcoming) for one city, fetched together so duplicate precedence can be
+ * applied once, in one place, rather than re-implemented by every screen
+ * that shows these rails (Home, /events). Precedence: Happening Now →
+ * Today/Tonight → Upcoming — an item already shown in an earlier rail is
+ * filtered out of later ones by contentId.
+ *
+ * Today/Tonight and Upcoming never overlap by construction (Upcoming's
+ * window starts exactly where Today/Tonight's ends — see
+ * getUpcomingWindow), so only Today/Tonight needs deduping against
+ * Happening Now (an item that started earlier today and hasn't ended yet
+ * matches both queries).
+ */
+export async function fetchDiscoverySections(cityKey: string, limitCount = DEFAULT_DISCOVERY_SECTION_LIMIT): Promise<DiscoverySections> {
+  const now = new Date();
+  const todayWindow = getTodayOrTonightWindow(now);
+  const upcomingWindow = getUpcomingWindow(todayWindow.end);
+
+  const [happeningNow, todayCandidates, upcoming] = await Promise.all([
+    fetchHappeningNow(cityKey, limitCount),
+    fetchByStartsAtWindow(cityKey, todayWindow, limitCount),
+    fetchByStartsAtWindow(cityKey, upcomingWindow, limitCount),
+  ]);
+
+  const happeningIds = new Set(happeningNow.map((item) => item.contentId));
+  const nowMs = now.getTime();
+  const today = todayCandidates.filter(
+    (item) => !happeningIds.has(item.contentId) && item.endsAt.toMillis() >= nowMs
+  );
+
+  return { happeningNow, todayLabel: todayWindow.label, today, upcoming };
 }
 
 /**

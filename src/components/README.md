@@ -10,4 +10,6 @@ Reusable UI components shared across screens.
 - `Avatar.tsx` — initials-based circular avatar placeholder.
 - `SectionHeader.tsx` — "Title" + optional "See all" row used across Home sections.
 - `CategoryChip.tsx` — selectable pill with icon, used for Home/Map category filters.
-- `HappeningNowCard.tsx`, `ReelPreviewCard.tsx`, `FeedCard.tsx` — Home feed cards (see `@/fixtures/homeFeed`).
+- `ContentCard.tsx` — Post/Activity/Event card for the Around/Following/profile/place feeds.
+- `EventCard.tsx` — compact Activity/Event discovery card (Happening Now/Today/Upcoming rails, `/events`) with a NOW/Today/Tonight badge and tappable Place link.
+- `ReelPreviewCard.tsx` — Reel grid thumbnail (profile Reels tab).

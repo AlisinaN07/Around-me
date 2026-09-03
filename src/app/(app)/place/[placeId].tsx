@@ -1,10 +1,11 @@
 import { Ionicons } from '@expo/vector-icons';
 import { router, useLocalSearchParams } from 'expo-router';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { StyleSheet, Text, View } from 'react-native';
 
 import { Button } from '@/components/Button';
 import { ContentCard } from '@/components/ContentCard';
+import { EventCard } from '@/components/EventCard';
 import { HeaderScreenLayout } from '@/components/HeaderScreenLayout';
 import { SectionHeader } from '@/components/SectionHeader';
 import { getPlaceCategory } from '@/constants/placeCategories';
@@ -12,11 +13,16 @@ import { Colors, Radius, Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
 import { fetchPlaceContent } from '@/services/content';
 import { fetchPlace } from '@/services/places';
-import type { Content } from '@/types/content';
+import type { ActivityContent, Content, EventContent } from '@/types/content';
 import type { Place } from '@/types/place';
 import { formatCityDisplayName } from '@/utils/cityDisplay';
+import { isHappeningNow } from '@/utils/dateWindows';
 
 type LoadStatus = 'loading' | 'loaded' | 'error';
+
+function isTimedContent(item: Content): item is ActivityContent | EventContent {
+  return item.type === 'activity' || item.type === 'event';
+}
 
 export default function PlaceDetailScreen() {
   const { placeId } = useLocalSearchParams<{ placeId: string }>();
@@ -50,6 +56,33 @@ export default function PlaceDetailScreen() {
 
   const category = place ? getPlaceCategory(place.categoryId) : undefined;
 
+  // Splits the one bounded fetchPlaceContent result (already capped, see
+  // content.ts) into Happening Now / Upcoming / everything else, client-side
+  // — no extra queries. A Place typically has few linked items, so this is
+  // cheap; the general list below the two rails still shows posts and
+  // past Activities/Events, same as before this split.
+  const { happeningNow, upcoming, general } = useMemo(() => {
+    const now = new Date();
+    const happeningNowItems: (ActivityContent | EventContent)[] = [];
+    const upcomingItems: (ActivityContent | EventContent)[] = [];
+    const generalItems: Content[] = [];
+    for (const item of content) {
+      if (isTimedContent(item)) {
+        if (isHappeningNow(item, now)) {
+          happeningNowItems.push(item);
+          continue;
+        }
+        if (item.startsAt.toMillis() > now.getTime()) {
+          upcomingItems.push(item);
+          continue;
+        }
+      }
+      generalItems.push(item);
+    }
+    upcomingItems.sort((a, b) => a.startsAt.toMillis() - b.startsAt.toMillis());
+    return { happeningNow: happeningNowItems, upcoming: upcomingItems, general: generalItems };
+  }, [content]);
+
   return (
     <HeaderScreenLayout title={place?.name ?? 'Place'}>
       {status === 'loading' ? (
@@ -78,22 +111,51 @@ export default function PlaceDetailScreen() {
             </View>
           </View>
 
-          <View>
-            <SectionHeader title="What's happening here" />
-            {content.length === 0 ? (
+          {content.length === 0 ? (
+            <View>
+              <SectionHeader title="What's happening here" />
               <View style={styles.emptyPanel}>
                 <Text style={styles.emptyTitle}>Nothing happening here yet.</Text>
                 <Text style={styles.emptyBody}>Be the first to share something happening at {place.name}.</Text>
                 {user ? <Button label="Create" onPress={() => router.push('/create')} /> : null}
               </View>
-            ) : (
-              <View style={styles.contentList}>
-                {content.map((item) => (
-                  <ContentCard key={item.contentId} item={item} currentUid={user?.uid ?? null} />
-                ))}
-              </View>
-            )}
-          </View>
+            </View>
+          ) : (
+            <>
+              {happeningNow.length > 0 ? (
+                <View>
+                  <SectionHeader title="Happening now 🔥" />
+                  <View style={styles.cardRail}>
+                    {happeningNow.map((item) => (
+                      <EventCard key={item.contentId} item={item} />
+                    ))}
+                  </View>
+                </View>
+              ) : null}
+
+              {upcoming.length > 0 ? (
+                <View>
+                  <SectionHeader title="Upcoming" />
+                  <View style={styles.cardRail}>
+                    {upcoming.map((item) => (
+                      <EventCard key={item.contentId} item={item} />
+                    ))}
+                  </View>
+                </View>
+              ) : null}
+
+              {general.length > 0 ? (
+                <View>
+                  <SectionHeader title="Posts" />
+                  <View style={styles.contentList}>
+                    {general.map((item) => (
+                      <ContentCard key={item.contentId} item={item} currentUid={user?.uid ?? null} />
+                    ))}
+                  </View>
+                </View>
+              ) : null}
+            </>
+          )}
         </View>
       )}
     </HeaderScreenLayout>
@@ -182,5 +244,10 @@ const styles = StyleSheet.create({
     // built-in marginHorizontal is the only inset — matching how cards look
     // everywhere else they're used (Home, Following, public profile).
     marginHorizontal: -Spacing.xl,
+  },
+  cardRail: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: Spacing.sm,
   },
 });

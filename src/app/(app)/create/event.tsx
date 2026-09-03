@@ -109,7 +109,9 @@ export default function CreateEventScreen() {
 
   return (
     <HeaderScreenLayout title="Create event">
-      <Text style={styles.subtitle}>Share something happening in the city.</Text>
+      <Text style={styles.subtitle}>
+        Share something happening in the city. People can mark themselves Interested or Going.
+      </Text>
 
       <FormField
         label="Title"

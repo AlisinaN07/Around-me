@@ -20,3 +20,16 @@ export const CATEGORY_FILTERS: CategoryFilter[] = [
   { id: 'nightlife', label: 'Nightlife', icon: 'moon-outline' },
   { id: 'sports', label: 'Sports', icon: 'football-outline' },
 ];
+
+const META_CATEGORY_FILTER_IDS = new Set(['all', 'happening-now', 'events', 'activities']);
+
+/**
+ * True for the feed-view-mode chips ('all'/'happening-now'/'events'/
+ * 'activities') that only affect the Around feed's own display mode; false
+ * for a real content categoryId (e.g. 'food', 'sports') that should also
+ * filter the time-based discovery rails (Happening Now/Today/Upcoming) —
+ * see Home's `isRealCategory`.
+ */
+export function isMetaCategoryFilter(filterId: string): boolean {
+  return META_CATEGORY_FILTER_IDS.has(filterId);
+}

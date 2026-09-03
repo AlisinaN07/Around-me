@@ -125,7 +125,7 @@ export default function CreateActivityScreen() {
 
   return (
     <HeaderScreenLayout title="Create activity">
-      <Text style={styles.subtitle}>Find people nearby to do something together.</Text>
+      <Text style={styles.subtitle}>Find people nearby to do something together — they join directly, no RSVP.</Text>
 
       <FormField
         label="Title"

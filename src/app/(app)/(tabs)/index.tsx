@@ -7,19 +7,17 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { Button } from '@/components/Button';
 import { CategoryChip } from '@/components/CategoryChip';
 import { ContentCard } from '@/components/ContentCard';
+import { EventCard } from '@/components/EventCard';
 import { FollowingFeed } from '@/components/FollowingFeed';
-import { HappeningNowCard } from '@/components/HappeningNowCard';
 import { SectionHeader } from '@/components/SectionHeader';
 import { SegmentedControl } from '@/components/SegmentedControl';
-import { CATEGORY_FILTERS } from '@/constants/categoryFilters';
-import { INTERESTS } from '@/constants/interests';
+import { CATEGORY_FILTERS, isMetaCategoryFilter } from '@/constants/categoryFilters';
 import { Colors, Layout, Radius, Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
 import { useCity } from '@/providers/CityProvider';
 import { fetchMyBlockedUserIds } from '@/services/blocks';
-import { fetchCityFeed, fetchHappeningNow } from '@/services/content';
+import { fetchCityFeed, fetchDiscoverySections } from '@/services/content';
 import type { ActivityContent, Content, EventContent } from '@/types/content';
-import { formatEventTime } from '@/utils/timeFormat';
 
 type LoadStatus = 'loading' | 'loaded' | 'error';
 
@@ -40,6 +38,9 @@ export default function HomeScreen() {
   const [selectedCategory, setSelectedCategory] = useState('all');
   const [feedItems, setFeedItems] = useState<Content[]>([]);
   const [happeningItems, setHappeningItems] = useState<(ActivityContent | EventContent)[]>([]);
+  const [todayItems, setTodayItems] = useState<(ActivityContent | EventContent)[]>([]);
+  const [todayLabel, setTodayLabel] = useState<'Today' | 'Tonight'>('Today');
+  const [upcomingItems, setUpcomingItems] = useState<(ActivityContent | EventContent)[]>([]);
   const [status, setStatus] = useState<LoadStatus>('loading');
   const [isRefreshing, setIsRefreshing] = useState(false);
 
@@ -59,21 +60,28 @@ export default function HomeScreen() {
         // under the new city's header for the duration of the fetch.
         setFeedItems([]);
         setHappeningItems([]);
+        setTodayItems([]);
+        setUpcomingItems([]);
       }
       try {
-        const [feed, happening, blockedUids] = await Promise.all([
+        const [feed, discovery, blockedUids] = await Promise.all([
           fetchCityFeed(activeCity.cityKey),
-          fetchHappeningNow(activeCity.cityKey),
+          fetchDiscoverySections(activeCity.cityKey),
           // Client-side only: this does NOT make blocked users' published
           // content inaccessible (see the Step 17 MVP boundary in
           // firestore.rules) — it just keeps them out of MY OWN Around/
-          // Happening Now view. A single one-shot fetch per load, not a
+          // discovery-rail view. A single one-shot fetch per load, not a
           // query per blocked user.
           user ? fetchMyBlockedUserIds(user.uid) : Promise.resolve<string[]>([]),
         ]);
         const blockedSet = new Set(blockedUids);
-        setFeedItems(blockedSet.size > 0 ? feed.filter((item) => !blockedSet.has(item.authorUid)) : feed);
-        setHappeningItems(blockedSet.size > 0 ? happening.filter((item) => !blockedSet.has(item.authorUid)) : happening);
+        const dropBlocked = <T extends { authorUid: string }>(items: T[]) =>
+          blockedSet.size > 0 ? items.filter((item) => !blockedSet.has(item.authorUid)) : items;
+        setFeedItems(dropBlocked(feed));
+        setHappeningItems(dropBlocked(discovery.happeningNow));
+        setTodayItems(dropBlocked(discovery.today));
+        setTodayLabel(discovery.todayLabel);
+        setUpcomingItems(dropBlocked(discovery.upcoming));
         setStatus('loaded');
       } catch {
         setStatus('error');
@@ -111,6 +119,24 @@ export default function HomeScreen() {
         return feedItems.filter((item) => item.categoryId === selectedCategory);
     }
   }, [selectedCategory, feedItems, happeningItems]);
+
+  // The 'all'/'happening-now'/'events'/'activities' chips are Around-feed
+  // VIEW MODES (handled above); a real categoryId (e.g. 'sports') instead
+  // filters the time-based discovery rails too, so tapping "Sports" shows
+  // Sports content consistently everywhere on Home, not just in the feed.
+  const isRealCategory = !isMetaCategoryFilter(selectedCategory);
+  const visibleHappeningItems = useMemo(
+    () => (isRealCategory ? happeningItems.filter((item) => item.categoryId === selectedCategory) : happeningItems),
+    [isRealCategory, happeningItems, selectedCategory]
+  );
+  const visibleTodayItems = useMemo(
+    () => (isRealCategory ? todayItems.filter((item) => item.categoryId === selectedCategory) : todayItems),
+    [isRealCategory, todayItems, selectedCategory]
+  );
+  const visibleUpcomingItems = useMemo(
+    () => (isRealCategory ? upcomingItems.filter((item) => item.categoryId === selectedCategory) : upcomingItems),
+    [isRealCategory, upcomingItems, selectedCategory]
+  );
 
   return (
     <SafeAreaView style={styles.safeArea} edges={['top']}>
@@ -210,7 +236,7 @@ export default function HomeScreen() {
             ) : (
               <>
                 <View style={styles.section}>
-                  <SectionHeader title="Happening Now 🔥" />
+                  <SectionHeader title="Happening Now 🔥" actionLabel="See all" onActionPress={() => router.push('/events')} />
                   {status === 'loading' && happeningItems.length === 0 ? (
                     <ScrollView
                       horizontal
@@ -218,10 +244,10 @@ export default function HomeScreen() {
                       style={styles.horizontalScroll}
                       contentContainerStyle={styles.horizontalListContent}
                     >
-                      <SkeletonBlock width={168} height={148} />
-                      <SkeletonBlock width={168} height={148} />
+                      <SkeletonBlock width={188} height={148} />
+                      <SkeletonBlock width={188} height={148} />
                     </ScrollView>
-                  ) : happeningItems.length === 0 ? (
+                  ) : visibleHappeningItems.length === 0 ? (
                     <View style={styles.emptyPanel}>
                       <Text style={styles.emptyPanelTitle}>Nothing happening right now in {cityLabel}</Text>
                       <Text style={styles.emptyPanelBody}>Check Activities and Events coming up soon.</Text>
@@ -233,19 +259,69 @@ export default function HomeScreen() {
                       style={styles.horizontalScroll}
                       contentContainerStyle={styles.horizontalListContent}
                     >
-                      {happeningItems.map((item) => {
-                        const category = INTERESTS.find((interest) => interest.id === item.categoryId);
-                        return (
-                          <HappeningNowCard
-                            key={item.contentId}
-                            category={category ? `${category.emoji} ${category.label}` : item.categoryId}
-                            title={item.title}
-                            place={item.placeName}
-                            timeLabel={formatEventTime(item.startsAt.toDate())}
-                            onPress={() => router.push(`/content/${item.contentId}`)}
-                          />
-                        );
-                      })}
+                      {visibleHappeningItems.map((item) => (
+                        <EventCard key={item.contentId} item={item} />
+                      ))}
+                    </ScrollView>
+                  )}
+                </View>
+
+                <View style={styles.section}>
+                  <SectionHeader title={`${todayLabel} in ${cityLabel}`} actionLabel="See all" onActionPress={() => router.push('/events')} />
+                  {status === 'loading' && todayItems.length === 0 ? (
+                    <ScrollView
+                      horizontal
+                      showsHorizontalScrollIndicator={false}
+                      style={styles.horizontalScroll}
+                      contentContainerStyle={styles.horizontalListContent}
+                    >
+                      <SkeletonBlock width={188} height={148} />
+                      <SkeletonBlock width={188} height={148} />
+                    </ScrollView>
+                  ) : visibleTodayItems.length === 0 ? (
+                    <View style={styles.emptyPanel}>
+                      <Text style={styles.emptyPanelBody}>Nothing else lined up for {todayLabel.toLowerCase()} yet.</Text>
+                    </View>
+                  ) : (
+                    <ScrollView
+                      horizontal
+                      showsHorizontalScrollIndicator={false}
+                      style={styles.horizontalScroll}
+                      contentContainerStyle={styles.horizontalListContent}
+                    >
+                      {visibleTodayItems.map((item) => (
+                        <EventCard key={item.contentId} item={item} />
+                      ))}
+                    </ScrollView>
+                  )}
+                </View>
+
+                <View style={styles.section}>
+                  <SectionHeader title="Coming up this week" actionLabel="See all" onActionPress={() => router.push('/events')} />
+                  {status === 'loading' && upcomingItems.length === 0 ? (
+                    <ScrollView
+                      horizontal
+                      showsHorizontalScrollIndicator={false}
+                      style={styles.horizontalScroll}
+                      contentContainerStyle={styles.horizontalListContent}
+                    >
+                      <SkeletonBlock width={188} height={148} />
+                      <SkeletonBlock width={188} height={148} />
+                    </ScrollView>
+                  ) : visibleUpcomingItems.length === 0 ? (
+                    <View style={styles.emptyPanel}>
+                      <Text style={styles.emptyPanelBody}>Nothing coming up in {cityLabel} yet.</Text>
+                    </View>
+                  ) : (
+                    <ScrollView
+                      horizontal
+                      showsHorizontalScrollIndicator={false}
+                      style={styles.horizontalScroll}
+                      contentContainerStyle={styles.horizontalListContent}
+                    >
+                      {visibleUpcomingItems.map((item) => (
+                        <EventCard key={item.contentId} item={item} />
+                      ))}
                     </ScrollView>
                   )}
                 </View>

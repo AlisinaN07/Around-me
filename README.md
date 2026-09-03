@@ -238,6 +238,80 @@ Step 21 adds no new way for a client to supply a city when creating content. `cr
 
 Around's empty state distinguishes "Nothing happening here yet. Be one of the first people to post in Karlstad." (on Home City) from "Not much happening in Stockholm yet. Explore another city or check back later." (while exploring) — the latter offers "Explore another city" instead of a Create CTA that would misleadingly suggest creating a Stockholm post. The Reels feed's empty state keeps its "Create Reel" CTA in both cases, but adds "Reels you create publish to your home city, {Home City}." while exploring, so the CTA is never misleading about where the Reel will land. Happening Now and Following each have their own Active-City-scoped empty copy. A failed city query shows "Couldn't load what's happening in {city}." with Try again — it never silently falls back to showing the previous city's content.
 
+## Karlstad launch discovery (Step 22)
+
+Step 22 doesn't add a new content model — it builds product surfaces on top of the existing `content/{contentId}` Activities/Events so Karlstad feels useful even with a small number of early posts.
+
+### Discovery hierarchy
+
+Home answers, top to bottom: **What's happening right now?** (Happening Now) → **What's happening today/tonight?** (Today/Tonight) → **What's coming up?** (Upcoming) → **What are people posting?** (Around feed). All four use Active City, never `profile.cityKey` (see Step 21's rule below). A dedicated `/events` screen (reached via each rail's "See all") shows the same three time-based sections merged into one filterable, chronological list — it is not a new bottom tab.
+
+### Happening Now
+
+Exact definition: `startsAt <= now AND endsAt >= now AND cityKey == activeCity.cityKey AND status == 'published'`, Activities and Events only — never Posts. `fetchHappeningNow` (`src/services/content.ts`, unchanged since Step 9) can't express both inequalities in one Firestore query (only one range filter per query is allowed), so it queries `startsAt <= now` ordered ascending and filters `endsAt >= now` client-side on the bounded result set — not a collection scan.
+
+### Today / Tonight
+
+One section, not two redundant ones (see `getTodayOrTonightWindow` in `src/utils/dateWindows.ts`): before 17:00 local time it's **Today** (the whole remaining calendar day); from 17:00 on it narrows to the evening-only window and relabels itself **Tonight**. "Local" here means a fixed `Europe/Stockholm` constant, not the viewing device's own timezone or any per-city timezone field — **content has no timezone field, and this launch is Sweden-only, so every city currently shares the same day-boundary math.** Real per-city timezone metadata is future work for international expansion; it is intentionally not persisted onto any content doc now. Day boundaries are computed by resampling the zone's actual UTC offset at the guessed instant (handles Sweden's DST transitions correctly) rather than assuming a fixed offset.
+
+### Upcoming
+
+The next 7 days, starting exactly where the Today/Tonight window ends (`getUpcomingWindow`) — not from `now` — so Today/Tonight and Upcoming never overlap by construction.
+
+### Duplicate precedence
+
+**Happening Now → Today/Tonight → Upcoming.** An item already shown in an earlier rail is filtered out of later ones by `contentId`. Today/Tonight and Upcoming can't overlap each other (see above); an item that's already started but hasn't ended yet could otherwise match both Happening Now and Today/Tonight, so `fetchDiscoverySections` (`src/services/content.ts`) explicitly excludes Happening Now's ids from Today/Tonight's results before returning. Both Home and `/events` call this one function, so precedence is enforced in exactly one place.
+
+### Categories
+
+Content categoryId and onboarding interests already share one taxonomy (`src/constants/interests.ts`) since Step 9 — Step 22 didn't need to add a mapping layer. `src/constants/launchCategories.ts` adds a Karlstad launch-facing shortlist as a pure DISPLAY/grouping layer over those same stable ids — no new ids were invented:
+
+| Launch label | Existing `interests.ts` id |
+| --- | --- |
+| Nightlife | `nightlife` |
+| Sports & Football | `sports` |
+| Music | `music` |
+| Food & Drink | `food` |
+| Culture | `art` |
+| Student | `student_life` |
+| Family | `family` |
+| Outdoor | `outdoors` |
+| Community | `networking` |
+
+Home's category chips filter Happening Now/Today/Upcoming in addition to the Around feed (previously they only filtered the feed) — a real categoryId (e.g. "Sports") narrows all of them; the `all`/`happening-now`/`events`/`activities` chips remain Around-feed view-mode toggles only (`isMetaCategoryFilter` in `src/constants/categoryFilters.ts`).
+
+### No distance semantics
+
+The app has no GPS/coordinate-distance calculation. Discovery copy always says "in Karlstad" / "around Karlstad" — never "500m away," "near you," or "closest," which would imply a capability that doesn't exist.
+
+### Event vs Activity cards
+
+`EventCard` (`src/components/EventCard.tsx`) is the one reusable discovery card for both types — an Activity badge or Event badge distinguishes them, plus a small "Join" pill on Activities as a visual hint (tapping still opens `/content/{contentId}`, where the real Join/Interested/Going actions already live — no separate detail architecture was created). Shows a NOW/Today/Tonight badge, category, and a tappable Place link when `placeId` is set (`/place/{placeId}`) or plain text when only a manually-typed `placeName` exists. Deliberately shows no attendance/popularity/price numbers — real RSVP/participant counts stay on the detail screen only, so a horizontal rail of cards never triggers one Firestore read per card.
+
+### Place integration
+
+`EventDetail`/`ActivityDetail` now make the place tappable (→ `/place/{placeId}`) whenever a known Place is linked, instead of always rendering plain text. The Place detail screen splits its existing bounded `fetchPlaceContent` result into Happening Now / Upcoming / Posts client-side (still one query, no new index) rather than one flat mixed list.
+
+### Query/index strategy
+
+No new Firestore indexes. Today/Tonight and Upcoming both add a second range clause on the same field (`startsAt`) to the existing `(type, cityKey, status, startsAt ASC)` composite index — Firestore allows multiple range filters on one field in a single query, so the index Step 9 already created covers Happening Now, Today/Tonight, and Upcoming. Caps: Happening Now/Today/Upcoming default to 20 each on Home, 15 each (45 total) on `/events`; no infinite scroll.
+
+### Creation vs Home/Active City (unchanged Step 21 rule)
+
+All discovery reads (Happening Now, Today/Tonight, Upcoming, `/events`) use `activeCity.cityKey`. Creation still always publishes under the caller's Home City — `/events`' own "Create event" CTA reads "Create event" when Active == Home, or "Create in {Home City}" with a one-line clarifying hint when exploring elsewhere; it never implies the post would land in the explored city.
+
+### Launch-content provenance (seed tooling, not run against production)
+
+`scripts/seed-launch-content.cjs` documents a fixture JSON shape (`type`, `title`, `description`, `categoryId`, `cityKey`, `placeId`/`placeName`, `startsAt`, `endsAt`, plus `sourceName`/`sourceUrl` for the preparer's own record) and validates it locally — but **this step never ran it against production with any real or invented events.** It deliberately does NOT reuse the `firebase login` CLI session other maintenance scripts use (that session's IAM permissions bypass Firestore Security Rules entirely) — instead, `--commit` mode signs in as a real, already-onboarded organizer account through the ordinary Firebase Auth client SDK, so every write is subject to the same rules a real user's own client would hit, and a fixture can't claim a city or identity the signed-in account doesn't actually have. `sourceName`/`sourceUrl` are never written to the public `content/{contentId}` schema — they stay in the local console log / an optional `--manifest-out` file only (see Section 33 below).
+
+**Official Around Me city account (future, not built now):** a verified "Around Me Karlstad" account could publish launch content without needing dozens of individually-onboarded organizers, but Step 22 does not create it — that's an explicit future decision for the owner.
+
+**Future external ingestion (not built now):** real-world event sources (a venue's calendar, a municipality listing) will eventually need `sourceUrl`/`sourceProvider`/`lastVerifiedTimestamp` provenance fields — deliberately kept OUT of the current social `content/{contentId}` schema for now, to avoid mixing a future scraping/import pipeline's concerns into the schema real users' own Posts/Activities/Events use today. `accountType` and the existing author-snapshot pattern already don't block a future `business`/`organizer` accountType from publishing Events the same way a `personal` account does.
+
+### No-fake-content policy
+
+No fake accounts, no fake attendance/RSVP counts, no fake distance, and no synthetic Karlstad "residents." Test accounts created for verification are disposable and deleted by exact ID immediately after (see Cleanup below).
+
 ## Reels (Cloud Storage — Step 18)
 
 Reels are short (≤60s), video-only posts with vertical, city-scoped playback — the first feature in this app to use Cloud Storage rather than Firestore alone. They live in their own root collection, `reels/{reelId}`, separate from `content/{contentId}` (posts/activities/events): a Reel has a media-upload lifecycle and Storage metadata that the other content types never had, and folding it into `content` would have meant giving every Post/Activity/Event query an upload-status field it never needs.
@@ -347,3 +421,6 @@ Onboarding's city step can use `expo-location` for a one-time, foreground-only l
 - `npm run ios` / `npm run android` / `npm run web` — start and open on a platform
 - `npm run lint` — run ESLint
 - `npx tsc --noEmit` — type-check
+- `npm run test:cities` — city catalog unit tests (Step 21)
+- `node scripts/seed-launch-content.cjs --file <fixtures.json>` — validates a launch-content fixture file (dry run by default; see the Karlstad launch discovery section above for the fixture shape and why `--commit` requires a real organizer account, never the CLI/IAM session)
+- `node scripts/delete-test-documents.cjs` — exact-ID cleanup for disposable verification accounts/documents

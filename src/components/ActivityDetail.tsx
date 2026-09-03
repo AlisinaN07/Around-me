@@ -1,6 +1,7 @@
 import { Ionicons } from '@expo/vector-icons';
+import { router } from 'expo-router';
 import { useCallback, useEffect, useState } from 'react';
-import { StyleSheet, Text, View } from 'react-native';
+import { Pressable, StyleSheet, Text, View } from 'react-native';
 
 import { Avatar } from '@/components/Avatar';
 import { AuthorLink } from '@/components/AuthorLink';
@@ -98,10 +99,22 @@ export function ActivityDetail({ content }: { content: ActivityContent }) {
 
       <Text style={styles.description}>{content.description}</Text>
 
-      <View style={styles.infoRow}>
-        <Ionicons name="location-outline" size={16} color={Colors.textSecondary} />
-        <Text style={styles.infoText}>{content.placeName}</Text>
-      </View>
+      {content.placeId ? (
+        <Pressable
+          onPress={() => router.push(`/place/${content.placeId}`)}
+          style={styles.infoRow}
+          accessibilityRole="button"
+          accessibilityLabel={`View ${content.placeName}`}
+        >
+          <Ionicons name="location" size={16} color={Colors.accent} />
+          <Text style={styles.placeLinkText}>{content.placeName}</Text>
+        </Pressable>
+      ) : (
+        <View style={styles.infoRow}>
+          <Ionicons name="location-outline" size={16} color={Colors.textSecondary} />
+          <Text style={styles.infoText}>{content.placeName}</Text>
+        </View>
+      )}
       <View style={styles.infoRow}>
         <Ionicons name="time-outline" size={16} color={Colors.textSecondary} />
         <Text style={styles.infoText}>
@@ -216,6 +229,11 @@ const styles = StyleSheet.create({
   infoText: {
     color: Colors.text,
     fontSize: 14,
+  },
+  placeLinkText: {
+    color: Colors.accent,
+    fontSize: 14,
+    fontWeight: '600',
   },
   countCard: {
     borderRadius: Radius.md,
