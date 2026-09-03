@@ -78,6 +78,7 @@ export async function followUser(followerUid: string, targetUid: string): Promis
       actorUsername: actorProfile.username,
       type: 'follow',
       contentId: null,
+      reelId: null,
       commentId: null,
       previewText: null,
       read: false,

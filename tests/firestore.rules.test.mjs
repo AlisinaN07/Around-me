@@ -212,6 +212,12 @@ function validNotification(notificationId, recipientUid, actorUid, actorDisplayN
     actorUsername,
     type,
     contentId: null,
+    // reelId: null by default — matches every real notification write
+    // (src/services/socialEngagement.ts, following.ts, reelEngagement.ts),
+    // which always sets this field explicitly even for non-Reel types
+    // (see src/types/notification.ts). Only reel_like/reel_comment tests
+    // override it to a real reelId.
+    reelId: null,
     commentId: null,
     previewText: null,
     read: false,
@@ -219,6 +225,15 @@ function validNotification(notificationId, recipientUid, actorUid, actorDisplayN
     updatedAt: serverTimestamp(),
     ...overrides,
   };
+}
+
+// Same deterministic ID scheme as buildNotificationId in
+// src/services/notifications.ts for the two Reel notification types.
+function reelLikeNotificationId(reelId, actorUid) {
+  return `reel_like_${reelId}_${actorUid}`;
+}
+function reelCommentNotificationId(commentId) {
+  return `reel_comment_${commentId}`;
 }
 
 // Same deterministic ID scheme as getConversationId in
@@ -341,6 +356,23 @@ function joinTransaction(db, activityId, uid, displayName, username, nextCount) 
 async function seedProfile(testEnv, uid, usernameLower, overrides = {}) {
   await testEnv.withSecurityRulesDisabled(async (adminContext) => {
     await setDoc(doc(adminContext.firestore(), 'users', uid), { ...validUserProfile(uid, usernameLower), ...overrides });
+  });
+}
+
+/**
+ * Seeds a published reels/{reelId} directly, bypassing rules — the
+ * create/publish transition itself is already thoroughly covered by the
+ * Step 18 reel tests above; Step 19's engagement tests just need a real
+ * published Reel to hang Likes/Comments/notifications off of.
+ */
+async function seedReel(testEnv, authorUid, displayName, username, reelId, overrides = {}) {
+  await testEnv.withSecurityRulesDisabled(async (adminContext) => {
+    await setDoc(doc(adminContext.firestore(), 'reels', reelId), {
+      ...validReel(authorUid, displayName, username, reelId),
+      status: 'published',
+      publishedAt: serverTimestamp(),
+      ...overrides,
+    });
   });
 }
 
@@ -2919,6 +2951,404 @@ async function main() {
 
     await check('DENY: reported Reel author reads the report about them', async () => {
       await assertFails(getDoc(doc(r18a, 'reports', reelReportId('r18b', 'reel-1'))));
+    });
+
+    // ==========================================================
+    // Step 19 — Reel engagement: reels/{reelId}/likes,
+    // reels/{reelId}/comments, and reel_like/reel_comment
+    // notifications. Fresh users, independent of everything above.
+    // ==========================================================
+
+    await seedProfile(testEnv, 's19a', 's19a_handle', { displayName: 'Step19 Alpha' });
+    await seedProfile(testEnv, 's19b', 's19b_handle', { displayName: 'Step19 Bravo' });
+    await seedProfile(testEnv, 's19c', 's19c_handle', { displayName: 'Step19 Charlie' });
+
+    const s19a = testEnv.authenticatedContext('s19a').firestore();
+    const s19b = testEnv.authenticatedContext('s19b').firestore();
+    const s19c = testEnv.authenticatedContext('s19c').firestore();
+
+    await seedReel(testEnv, 's19a', 'Step19 Alpha', 's19a_handle', 'reel-19-1');
+    await seedReel(testEnv, 's19a', 'Step19 Alpha', 's19a_handle', 'reel-19-draft', { status: 'uploading', publishedAt: null });
+
+    // --- Reel Likes: create ---
+
+    await check('DENY: unauthenticated Reel like', async () => {
+      await assertFails(setDoc(doc(anon, 'reels', 'reel-19-1', 'likes', 's19c'), validLike('s19c')));
+    });
+
+    await check('DENY: Reel Like doc ID does not match auth uid', async () => {
+      await assertFails(setDoc(doc(s19b, 'reels', 'reel-19-1', 'likes', 's19c'), validLike('s19c')));
+    });
+
+    await check('DENY: Reel Like uid field spoofed (doc id matches auth, field does not)', async () => {
+      await assertFails(setDoc(doc(s19b, 'reels', 'reel-19-1', 'likes', 's19b'), validLike('s19c')));
+    });
+
+    await check('DENY: like an unpublished (uploading) Reel', async () => {
+      await assertFails(setDoc(doc(s19b, 'reels', 'reel-19-draft', 'likes', 's19b'), validLike('s19b')));
+    });
+
+    await check('DENY: like a nonexistent Reel', async () => {
+      await assertFails(setDoc(doc(s19b, 'reels', 'does-not-exist', 'likes', 's19b'), validLike('s19b')));
+    });
+
+    await check('ALLOW: B likes A\'s published Reel', async () => {
+      await assertSucceeds(setDoc(doc(s19b, 'reels', 'reel-19-1', 'likes', 's19b'), validLike('s19b')));
+    });
+
+    await check('ALLOW: self-like (A likes own Reel) — same product behavior as content Likes', async () => {
+      await assertSucceeds(setDoc(doc(s19a, 'reels', 'reel-19-1', 'likes', 's19a'), validLike('s19a')));
+    });
+
+    await check('DENY: update a Reel Like (re-liking must go through create, not update)', async () => {
+      await assertFails(updateDoc(doc(s19b, 'reels', 'reel-19-1', 'likes', 's19b'), { createdAt: serverTimestamp() }));
+    });
+
+    await check('ALLOW: C (any authenticated user) reads a Like on a published Reel', async () => {
+      await assertSucceeds(getDoc(doc(s19c, 'reels', 'reel-19-1', 'likes', 's19b')));
+    });
+
+    await check('DENY: C deletes B\'s Reel Like', async () => {
+      await assertFails(deleteDoc(doc(s19c, 'reels', 'reel-19-1', 'likes', 's19b')));
+    });
+
+    await check('ALLOW: B unlikes (deletes their own Reel Like)', async () => {
+      await assertSucceeds(deleteDoc(doc(s19b, 'reels', 'reel-19-1', 'likes', 's19b')));
+    });
+
+    await check('ALLOW: A removes their own self-like', async () => {
+      await assertSucceeds(deleteDoc(doc(s19a, 'reels', 'reel-19-1', 'likes', 's19a')));
+    });
+
+    // --- Reel Comments: create/read/update/delete ---
+
+    await check('DENY: unauthenticated Reel comment', async () => {
+      await assertFails(
+        setDoc(doc(anon, 'reels', 'reel-19-1', 'comments', 'reel-comment-x'), validComment('reel-comment-x', 's19b', 'Step19 Bravo', 's19b_handle', 'hi'))
+      );
+    });
+
+    await check('DENY: spoofed authorUid on Reel comment', async () => {
+      await assertFails(
+        setDoc(doc(s19b, 'reels', 'reel-19-1', 'comments', 'reel-comment-1'), validComment('reel-comment-1', 's19c', 'Step19 Bravo', 's19b_handle', 'hi'))
+      );
+    });
+
+    await check('DENY: spoofed authorDisplayName on Reel comment', async () => {
+      await assertFails(
+        setDoc(doc(s19b, 'reels', 'reel-19-1', 'comments', 'reel-comment-1'), validComment('reel-comment-1', 's19b', 'Fake Name', 's19b_handle', 'hi'))
+      );
+    });
+
+    await check('DENY: spoofed authorUsername on Reel comment', async () => {
+      await assertFails(
+        setDoc(doc(s19b, 'reels', 'reel-19-1', 'comments', 'reel-comment-1'), validComment('reel-comment-1', 's19b', 'Step19 Bravo', 'fake_handle', 'hi'))
+      );
+    });
+
+    await check('DENY: comment on an unpublished Reel', async () => {
+      await assertFails(
+        setDoc(
+          doc(s19b, 'reels', 'reel-19-draft', 'comments', 'reel-comment-1'),
+          validComment('reel-comment-1', 's19b', 'Step19 Bravo', 's19b_handle', 'hi')
+        )
+      );
+    });
+
+    await check('DENY: comment on a nonexistent Reel', async () => {
+      await assertFails(
+        setDoc(
+          doc(s19b, 'reels', 'does-not-exist', 'comments', 'reel-comment-1'),
+          validComment('reel-comment-1', 's19b', 'Step19 Bravo', 's19b_handle', 'hi')
+        )
+      );
+    });
+
+    await check('DENY: empty Reel comment body', async () => {
+      await assertFails(
+        setDoc(doc(s19b, 'reels', 'reel-19-1', 'comments', 'reel-comment-1'), validComment('reel-comment-1', 's19b', 'Step19 Bravo', 's19b_handle', ''))
+      );
+    });
+
+    await check('DENY: Reel comment body over 500 characters', async () => {
+      await assertFails(
+        setDoc(
+          doc(s19b, 'reels', 'reel-19-1', 'comments', 'reel-comment-1'),
+          validComment('reel-comment-1', 's19b', 'Step19 Bravo', 's19b_handle', 'x'.repeat(501))
+        )
+      );
+    });
+
+    await check('DENY: wrong commentId field on Reel comment', async () => {
+      await assertFails(
+        setDoc(doc(s19b, 'reels', 'reel-19-1', 'comments', 'reel-comment-1'), validComment('wrong-id', 's19b', 'Step19 Bravo', 's19b_handle', 'hi'))
+      );
+    });
+
+    await check('ALLOW: B comments on A\'s Reel', async () => {
+      await assertSucceeds(
+        setDoc(
+          doc(s19b, 'reels', 'reel-19-1', 'comments', 'reel-comment-1'),
+          validComment('reel-comment-1', 's19b', 'Step19 Bravo', 's19b_handle', 'Looks fun!')
+        )
+      );
+    });
+
+    await check('ALLOW: self-comment (A comments on own Reel) — same as content Comments', async () => {
+      await assertSucceeds(
+        setDoc(
+          doc(s19a, 'reels', 'reel-19-1', 'comments', 'reel-comment-self'),
+          validComment('reel-comment-self', 's19a', 'Step19 Alpha', 's19a_handle', 'my own reel!')
+        )
+      );
+    });
+
+    await check('ALLOW: C (any authenticated user) reads a comment on a published Reel', async () => {
+      await assertSucceeds(getDoc(doc(s19c, 'reels', 'reel-19-1', 'comments', 'reel-comment-1')));
+    });
+
+    await check('DENY: update a Reel comment (no edit in Step 19)', async () => {
+      await assertFails(updateDoc(doc(s19b, 'reels', 'reel-19-1', 'comments', 'reel-comment-1'), { body: 'edited' }));
+    });
+
+    await check('DENY: C deletes B\'s Reel comment', async () => {
+      await assertFails(deleteDoc(doc(s19c, 'reels', 'reel-19-1', 'comments', 'reel-comment-1')));
+    });
+
+    await check('ALLOW: B deletes their own Reel comment', async () => {
+      await assertSucceeds(deleteDoc(doc(s19b, 'reels', 'reel-19-1', 'comments', 'reel-comment-1')));
+    });
+
+    await check('ALLOW: A deletes their own self-comment', async () => {
+      await assertSucceeds(deleteDoc(doc(s19a, 'reels', 'reel-19-1', 'comments', 'reel-comment-self')));
+    });
+
+    // --- reel_like / reel_comment notifications (atomic pairing) ---
+
+    await seedReel(testEnv, 's19a', 'Step19 Alpha', 's19a_handle', 'reel-notif-1');
+
+    await check('ALLOW: B likes A\'s Reel + reel_like notification created atomically', async () => {
+      const notificationId = reelLikeNotificationId('reel-notif-1', 's19b');
+      const batch = writeBatch(s19b);
+      batch.set(doc(s19b, 'reels', 'reel-notif-1', 'likes', 's19b'), validLike('s19b'));
+      batch.set(
+        doc(s19b, 'notifications', notificationId),
+        validNotification(notificationId, 's19a', 's19b', 'Step19 Bravo', 's19b_handle', 'reel_like', { reelId: 'reel-notif-1' })
+      );
+      await assertSucceeds(batch.commit());
+
+      const snapshot = await getDoc(doc(s19a, 'notifications', notificationId));
+      assert.equal(snapshot.exists(), true);
+      assert.equal(snapshot.data().reelId, 'reel-notif-1');
+      assert.equal(snapshot.data().contentId, null);
+    });
+
+    await check('DENY: self reel_like notification (A likes own Reel, notification targets self)', async () => {
+      const notificationId = reelLikeNotificationId('reel-notif-1', 's19a');
+      const batch = writeBatch(s19a);
+      batch.set(doc(s19a, 'reels', 'reel-notif-1', 'likes', 's19a'), validLike('s19a'));
+      batch.set(
+        doc(s19a, 'notifications', notificationId),
+        validNotification(notificationId, 's19a', 's19a', 'Step19 Alpha', 's19a_handle', 'reel_like', { reelId: 'reel-notif-1' })
+      );
+      await assertFails(batch.commit());
+    });
+
+    await check('DENY: fake reel_like notification with no matching Like', async () => {
+      const notificationId = reelLikeNotificationId('reel-notif-1', 's19c');
+      await assertFails(
+        setDoc(
+          doc(s19c, 'notifications', notificationId),
+          validNotification(notificationId, 's19a', 's19c', 'Step19 Charlie', 's19c_handle', 'reel_like', { reelId: 'reel-notif-1' })
+        )
+      );
+    });
+
+    await check('DENY: reel_like notification with spoofed actorUid', async () => {
+      const notificationId = reelLikeNotificationId('reel-notif-1', 's19a');
+      await assertFails(
+        setDoc(
+          doc(s19c, 'notifications', notificationId),
+          validNotification(notificationId, 's19a', 's19a', 'Step19 Alpha', 's19a_handle', 'reel_like', { reelId: 'reel-notif-1' })
+        )
+      );
+    });
+
+    await check('DENY: reel_like notification with wrong reelId', async () => {
+      const notificationId = reelLikeNotificationId('reel-19-1', 's19c');
+      const batch = writeBatch(s19c);
+      batch.set(doc(s19c, 'reels', 'reel-notif-1', 'likes', 's19c'), validLike('s19c'));
+      batch.set(
+        doc(s19c, 'notifications', notificationId),
+        validNotification(notificationId, 's19a', 's19c', 'Step19 Charlie', 's19c_handle', 'reel_like', { reelId: 'reel-19-1' })
+      );
+      await assertFails(batch.commit());
+    });
+
+    await check('ALLOW: B comments on A\'s Reel + reel_comment notification created atomically', async () => {
+      const notificationId = reelCommentNotificationId('reel-notif-comment-1');
+      const batch = writeBatch(s19b);
+      batch.set(
+        doc(s19b, 'reels', 'reel-notif-1', 'comments', 'reel-notif-comment-1'),
+        validComment('reel-notif-comment-1', 's19b', 'Step19 Bravo', 's19b_handle', 'Looks fun!')
+      );
+      batch.set(
+        doc(s19b, 'notifications', notificationId),
+        validNotification(notificationId, 's19a', 's19b', 'Step19 Bravo', 's19b_handle', 'reel_comment', {
+          reelId: 'reel-notif-1',
+          commentId: 'reel-notif-comment-1',
+          previewText: 'Looks fun!',
+        })
+      );
+      await assertSucceeds(batch.commit());
+
+      const snapshot = await getDoc(doc(s19a, 'notifications', notificationId));
+      assert.equal(snapshot.exists(), true);
+      assert.equal(snapshot.data().previewText, 'Looks fun!');
+    });
+
+    await check('DENY: fake reel_comment notification with no matching Comment', async () => {
+      const notificationId = reelCommentNotificationId('reel-comment-fake-1');
+      await assertFails(
+        setDoc(
+          doc(s19c, 'notifications', notificationId),
+          validNotification(notificationId, 's19a', 's19c', 'Step19 Charlie', 's19c_handle', 'reel_comment', {
+            reelId: 'reel-notif-1',
+            commentId: 'reel-comment-fake-1',
+          })
+        )
+      );
+    });
+
+    await check('DENY: wrong deterministic notification ID for a real Reel comment', async () => {
+      const batch = writeBatch(s19c);
+      batch.set(
+        doc(s19c, 'reels', 'reel-notif-1', 'comments', 'reel-notif-comment-2'),
+        validComment('reel-notif-comment-2', 's19c', 'Step19 Charlie', 's19c_handle', 'hi')
+      );
+      batch.set(
+        doc(s19c, 'notifications', reelCommentNotificationId('some-other-comment-id')),
+        validNotification(reelCommentNotificationId('some-other-comment-id'), 's19a', 's19c', 'Step19 Charlie', 's19c_handle', 'reel_comment', {
+          reelId: 'reel-notif-1',
+          commentId: 'reel-notif-comment-2',
+        })
+      );
+      await assertFails(batch.commit());
+    });
+
+    await check('ALLOW: A (recipient) reads their own reel_like notification', async () => {
+      await assertSucceeds(getDoc(doc(s19a, 'notifications', reelLikeNotificationId('reel-notif-1', 's19b'))));
+    });
+
+    await check('DENY: B reads A\'s reel_like notification', async () => {
+      await assertFails(getDoc(doc(s19b, 'notifications', reelLikeNotificationId('reel-notif-1', 's19b'))));
+    });
+
+    await check('DENY: B marks A\'s reel_like notification read', async () => {
+      await assertFails(
+        updateDoc(doc(s19b, 'notifications', reelLikeNotificationId('reel-notif-1', 's19b')), { read: true, updatedAt: serverTimestamp() })
+      );
+    });
+
+    await check('ALLOW: A marks their own reel_like notification read', async () => {
+      await assertSucceeds(
+        updateDoc(doc(s19a, 'notifications', reelLikeNotificationId('reel-notif-1', 's19b')), { read: true, updatedAt: serverTimestamp() })
+      );
+    });
+
+    await check('ALLOW: A still reads an old pre-Step-19 like notification lacking a reelId field', async () => {
+      // Regression for backward compatibility — a notification created
+      // before Step 19 predates the reelId field entirely. isValidNotificationUpdate
+      // reads it via .get('reelId', null), not plain dot access, specifically
+      // so mark-as-read keeps working for these. Simulate one directly
+      // (bypassing rules, since a real client can no longer write a
+      // notification missing the field) and confirm update still succeeds.
+      await testEnv.withSecurityRulesDisabled(async (adminContext) => {
+        await setDoc(doc(adminContext.firestore(), 'notifications', 'legacy-notif-1'), {
+          notificationId: 'legacy-notif-1',
+          recipientUid: 's19a',
+          actorUid: 's19b',
+          actorDisplayName: 'Step19 Bravo',
+          actorUsername: 's19b_handle',
+          type: 'like',
+          contentId: 'some-old-content-id',
+          commentId: null,
+          previewText: null,
+          read: false,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+          // reelId intentionally omitted — simulating a pre-Step-19 doc.
+        });
+      });
+      await assertSucceeds(updateDoc(doc(s19a, 'notifications', 'legacy-notif-1'), { read: true, updatedAt: serverTimestamp() }));
+    });
+
+    await check('DENY: B deletes their own reel_like notification without removing the underlying Like', async () => {
+      await assertFails(deleteDoc(doc(s19b, 'notifications', reelLikeNotificationId('reel-notif-1', 's19b'))));
+    });
+
+    await check('ALLOW: B unlikes + deletes the paired reel_like notification atomically', async () => {
+      const batch = writeBatch(s19b);
+      batch.delete(doc(s19b, 'reels', 'reel-notif-1', 'likes', 's19b'));
+      batch.delete(doc(s19b, 'notifications', reelLikeNotificationId('reel-notif-1', 's19b')));
+      await assertSucceeds(batch.commit());
+    });
+
+    await check('ALLOW: B deletes their Reel comment + the paired reel_comment notification atomically', async () => {
+      const batch = writeBatch(s19b);
+      batch.delete(doc(s19b, 'reels', 'reel-notif-1', 'comments', 'reel-notif-comment-1'));
+      batch.delete(doc(s19b, 'notifications', reelCommentNotificationId('reel-notif-comment-1')));
+      await assertSucceeds(batch.commit());
+    });
+
+    // --- Block integration: A blocks B, both directions denied ---
+
+    await seedReel(testEnv, 's19b', 'Step19 Bravo', 's19b_handle', 'reel-19-2');
+
+    await check('setup: B likes A\'s Reel before any block exists', async () => {
+      await assertSucceeds(setDoc(doc(s19b, 'reels', 'reel-19-1', 'likes', 's19b'), validLike('s19b')));
+    });
+
+    await check('setup: A blocks B for Reel engagement block tests', async () => {
+      await assertSucceeds(setDoc(doc(s19a, 'blocks', blockId('s19a', 's19b')), validBlock('s19a', 's19b')));
+    });
+
+    await check('ALLOW: B can still unlike a pre-existing Like even after being blocked', async () => {
+      // Explicit Step 19 requirement: a Block only stops NEW interaction —
+      // it must never trap a stale Like the unliker can no longer remove.
+      await assertSucceeds(deleteDoc(doc(s19b, 'reels', 'reel-19-1', 'likes', 's19b')));
+    });
+
+    await check('DENY: B likes A\'s Reel while blocked', async () => {
+      await assertFails(setDoc(doc(s19b, 'reels', 'reel-19-1', 'likes', 's19b'), validLike('s19b')));
+    });
+
+    await check('DENY: B comments on A\'s Reel while blocked', async () => {
+      await assertFails(
+        setDoc(
+          doc(s19b, 'reels', 'reel-19-1', 'comments', 'reel-comment-blocked-1'),
+          validComment('reel-comment-blocked-1', 's19b', 'Step19 Bravo', 's19b_handle', 'hi')
+        )
+      );
+    });
+
+    await check('DENY: A likes B\'s Reel while blocking B', async () => {
+      await assertFails(setDoc(doc(s19a, 'reels', 'reel-19-2', 'likes', 's19a'), validLike('s19a')));
+    });
+
+    await check('DENY: A comments on B\'s Reel while blocking B', async () => {
+      await assertFails(
+        setDoc(
+          doc(s19a, 'reels', 'reel-19-2', 'comments', 'reel-comment-blocked-2'),
+          validComment('reel-comment-blocked-2', 's19a', 'Step19 Alpha', 's19a_handle', 'hi')
+        )
+      );
+    });
+
+    await check('ALLOW: A unblocks B, ordinary Reel interaction works again', async () => {
+      await assertSucceeds(deleteDoc(doc(s19a, 'blocks', blockId('s19a', 's19b'))));
+      await assertSucceeds(setDoc(doc(s19b, 'reels', 'reel-19-1', 'likes', 's19b'), validLike('s19b')));
+      await assertSucceeds(deleteDoc(doc(s19b, 'reels', 'reel-19-1', 'likes', 's19b')));
     });
 
     await testEnv.clearFirestore();

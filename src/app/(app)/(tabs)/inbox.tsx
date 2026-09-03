@@ -129,6 +129,8 @@ export default function InboxScreen() {
 
     if (notification.type === 'follow') {
       router.push(`/user/${notification.actorUid}`);
+    } else if (notification.reelId) {
+      router.push(`/reel/${notification.reelId}`);
     } else if (notification.contentId) {
       router.push(`/content/${notification.contentId}`);
     }

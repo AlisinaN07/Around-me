@@ -9,6 +9,7 @@ import { ConfirmDialog } from '@/components/ConfirmDialog';
 import { ContentCard } from '@/components/ContentCard';
 import { HeaderScreenLayout } from '@/components/HeaderScreenLayout';
 import { OptionsMenu, type OptionsMenuOption } from '@/components/OptionsMenu';
+import { ReelPreviewCard } from '@/components/ReelPreviewCard';
 import { ReportModal } from '@/components/ReportModal';
 import { SegmentedControl } from '@/components/SegmentedControl';
 import { COUNTRIES } from '@/constants/countries';
@@ -21,16 +22,20 @@ import { fetchFollowerCount, fetchFollowingCount, followUser, isFollowing, unfol
 import { fetchConversation, getConversationId } from '@/services/messages';
 import { fetchMyNewMessagesFrom } from '@/services/privacySettings';
 import { fetchPublicProfile } from '@/services/publicProfile';
+import { fetchProfileReels } from '@/services/reels';
 import type { Content, ContentType } from '@/types/content';
+import type { Reel } from '@/types/reel';
 import type { PublicProfile } from '@/types/social';
 import { formatCityDisplayName } from '@/utils/cityDisplay';
 
 type LoadStatus = 'loading' | 'loaded' | 'error';
+type ProfileTab = ContentType | 'reel';
 
-const CONTENT_TABS: { id: ContentType; label: string; emptyText: string }[] = [
+const CONTENT_TABS: { id: ProfileTab; label: string; emptyText: string }[] = [
   { id: 'post', label: 'Posts', emptyText: 'No posts yet' },
   { id: 'activity', label: 'Activities', emptyText: 'No activities yet' },
   { id: 'event', label: 'Events', emptyText: 'No events yet' },
+  { id: 'reel', label: 'Reels', emptyText: 'No Reels yet' },
 ];
 
 export default function PublicProfileScreen() {
@@ -46,7 +51,8 @@ export default function PublicProfileScreen() {
   const [isFollowSubmitting, setIsFollowSubmitting] = useState(false);
   const [followError, setFollowError] = useState<string | null>(null);
   const [content, setContent] = useState<Content[]>([]);
-  const [contentTab, setContentTab] = useState<ContentType>('post');
+  const [reels, setReels] = useState<Reel[]>([]);
+  const [contentTab, setContentTab] = useState<ProfileTab>('post');
 
   // Safety state — see src/services/blocks.ts / privacySettings.ts.
   // canMessage is only ever used to proactively enable/disable the
@@ -63,7 +69,7 @@ export default function PublicProfileScreen() {
   // synchronously during the effect body below.
   const load = useCallback(async () => {
     try {
-      const [publicProfile, followers, following, followingState, userContent, blockedByMe] = await Promise.all([
+      const [publicProfile, followers, following, followingState, userContent, userReels, blockedByMe] = await Promise.all([
         fetchPublicProfile(uid),
         fetchFollowerCount(uid),
         fetchFollowingCount(uid),
@@ -72,6 +78,10 @@ export default function PublicProfileScreen() {
         // tabs in-memory below, rather than running three separate queries
         // for a single profile page.
         fetchPublicUserContent(uid),
+        // Reels are a separate root collection from content/{contentId}
+        // (see src/types/reel.ts), so this is its own capped query, not
+        // part of the mixed content query above.
+        fetchProfileReels(uid),
         !isOwnProfile && user ? isUserBlocked(user.uid, uid) : Promise.resolve(false),
       ]);
       if (!publicProfile) {
@@ -83,6 +93,7 @@ export default function PublicProfileScreen() {
       setFollowingCount(following);
       setAmFollowing(followingState);
       setContent(userContent);
+      setReels(userReels);
       setAmIBlockingThem(blockedByMe);
 
       if (!isOwnProfile && user && !blockedByMe) {
@@ -160,7 +171,10 @@ export default function PublicProfileScreen() {
     .map((id) => INTERESTS.find((interest) => interest.id === id)?.label)
     .filter((label): label is string => Boolean(label));
 
-  const visibleContent = useMemo(() => content.filter((item) => item.type === contentTab), [content, contentTab]);
+  const visibleContent = useMemo(
+    () => (contentTab === 'reel' ? [] : content.filter((item) => item.type === contentTab)),
+    [content, contentTab]
+  );
   const activeTabInfo = CONTENT_TABS.find((tab) => tab.id === contentTab) ?? CONTENT_TABS[0];
 
   const optionsMenuOptions: OptionsMenuOption[] = amIBlockingThem
@@ -281,7 +295,24 @@ export default function PublicProfileScreen() {
               value={contentTab}
               onChange={setContentTab}
             />
-            {visibleContent.length === 0 ? (
+            {contentTab === 'reel' ? (
+              reels.length === 0 ? (
+                <View style={styles.contentEmpty}>
+                  <Text style={styles.contentEmptyText}>{activeTabInfo.emptyText}</Text>
+                  {isOwnProfile ? (
+                    <View style={styles.contentEmptyAction}>
+                      <Button label="Create Reel" variant="secondary" onPress={() => router.push('/create/reel')} />
+                    </View>
+                  ) : null}
+                </View>
+              ) : (
+                <View style={styles.reelGrid}>
+                  {reels.map((reel) => (
+                    <ReelPreviewCard key={reel.reelId} reel={reel} />
+                  ))}
+                </View>
+              )
+            ) : visibleContent.length === 0 ? (
               <View style={styles.contentEmpty}>
                 <Text style={styles.contentEmptyText}>{activeTabInfo.emptyText}</Text>
               </View>
@@ -470,6 +501,16 @@ const styles = StyleSheet.create({
     borderStyle: 'dashed',
     padding: Spacing.lg,
     alignItems: 'center',
+    gap: Spacing.sm,
+  },
+  contentEmptyAction: {
+    minWidth: 160,
+  },
+  reelGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    justifyContent: 'space-between',
+    rowGap: Spacing.sm,
   },
   contentEmptyText: {
     color: Colors.textSecondary,

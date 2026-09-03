@@ -128,6 +128,7 @@ export default function ReelsScreen() {
                 reel={item}
                 height={containerHeight}
                 isActive={index === activeIndex}
+                shouldPrepare={Math.abs(index - activeIndex) <= 1}
                 isOwnReel={item.authorUid === user?.uid}
                 onOpenOptions={() => handleOpenOptions(item)}
               />
@@ -140,9 +141,15 @@ export default function ReelsScreen() {
             getItemLayout={(_, index) => ({ length: containerHeight, offset: containerHeight * index, index })}
             viewabilityConfig={VIEWABILITY_CONFIG}
             onViewableItemsChanged={onViewableItemsChanged}
-            // Only a handful of Reels are ever in this list (see
-            // fetchCityReels's explicit limit) — no windowing tuning
-            // beyond React Native's own list defaults is needed.
+            // Conservative preload strategy (see ReelFeedItem's
+            // shouldPrepare prop): only the active item plus one neighbor
+            // on each side ever resolve a playback URL or hold a real
+            // video player — everything else stays released. windowSize=3
+            // keeps FlatList's own render window matched to that same
+            // active-neighbor range, so distant items aren't even mounted,
+            // let alone holding buffered video.
+            windowSize={3}
+            maxToRenderPerBatch={2}
           />
         ) : null}
       </View>

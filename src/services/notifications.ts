@@ -23,7 +23,7 @@ const DEFAULT_NOTIFICATIONS_LIMIT = 50;
  */
 export function buildNotificationId(
   type: NotificationType,
-  params: { contentId?: string; actorUid?: string; commentId?: string; recipientUid?: string }
+  params: { contentId?: string; actorUid?: string; commentId?: string; recipientUid?: string; reelId?: string }
 ): string {
   switch (type) {
     case 'like':
@@ -32,6 +32,10 @@ export function buildNotificationId(
       return `comment_${params.commentId}`;
     case 'follow':
       return `follow_${params.actorUid}_${params.recipientUid}`;
+    case 'reel_like':
+      return `reel_like_${params.reelId}_${params.actorUid}`;
+    case 'reel_comment':
+      return `reel_comment_${params.commentId}`;
   }
 }
 

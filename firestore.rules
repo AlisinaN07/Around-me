@@ -559,6 +559,79 @@ service cloud.firestore {
       allow delete: if isSignedIn()
         && resource.data.authorUid == request.auth.uid
         && resource.data.status == 'uploading';
+
+      // reels/{reelId}/likes/{uid} — one document per user who liked this
+      // Reel, keyed by the liker's own uid (same uniqueness guarantee as
+      // content/{contentId}/likes/{uid} — see isValidUserReport's sibling
+      // pattern above). Structurally parallel to content Likes but kept
+      // under reels/ since Reels are a separate root collection (see
+      // src/types/reel.ts). No counter: like counts come from a
+      // getCountFromServer() aggregation query (see
+      // src/services/reelEngagement.ts), same as content Likes.
+      match /likes/{uid} {
+        function reelLikeParent() {
+          return get(/databases/$(database)/documents/reels/$(reelId)).data;
+        }
+
+        allow read: if isSignedIn() && reelLikeParent().status == 'published';
+
+        allow create: if isSignedIn()
+          && uid == request.auth.uid
+          && reelLikeParent().status == 'published'
+          && isNotBlockedEitherWay(request.auth.uid, reelLikeParent().authorUid)
+          && request.resource.data.uid == request.auth.uid
+          && isServerTimestamp(request.resource.data.createdAt)
+          && request.resource.data.keys().hasOnly(['uid', 'createdAt']);
+
+        // Re-liking an existing Like doc is an update, not a create — same
+        // reasoning as content Likes: denying update is what actually
+        // prevents a duplicate/overwritten Like.
+        allow update: if false;
+
+        // Only the Like's own owner may remove it — allowed even if a
+        // Block was created after the Like, so unliking never traps a
+        // stale Like (see the Step 19 spec's explicit requirement).
+        allow delete: if isOwner(uid);
+      }
+
+      // reels/{reelId}/comments/{commentId} — top-level comments only, no
+      // replies/threads, no edit — structurally parallel to
+      // content/{contentId}/comments/{commentId}.
+      match /comments/{commentId} {
+        function reelCommentParentPublished() {
+          return get(/databases/$(database)/documents/reels/$(reelId)).data.status == 'published';
+        }
+
+        allow read: if isSignedIn() && reelCommentParentPublished();
+
+        allow create: if isSignedIn() && isValidReelCommentCreate(reelId, commentId, request.resource.data);
+
+        // Comment editing is not part of Step 19, same as content comments.
+        allow update: if false;
+
+        // Only the comment's own author may delete it — allowed even if a
+        // Block was created after the comment was posted.
+        allow delete: if isOwner(resource.data.authorUid);
+      }
+    }
+
+    function isValidReelCommentCreate(reelId, commentId, data) {
+      let reel = get(/databases/$(database)/documents/reels/$(reelId)).data;
+      let profile = get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+      return exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && profile.onboardingCompleted == true
+        && reel.status == 'published'
+        && isNotBlockedEitherWay(request.auth.uid, reel.authorUid)
+        && data.commentId == commentId
+        && data.authorUid == request.auth.uid
+        && data.authorDisplayName == profile.displayName
+        && data.authorUsername == profile.username
+        && data.body is string
+        && data.body.size() > 0
+        && data.body.size() <= 500
+        && isServerTimestamp(data.createdAt)
+        && isServerTimestamp(data.updatedAt)
+        && data.keys().hasOnly(['commentId', 'authorUid', 'authorDisplayName', 'authorUsername', 'body', 'createdAt', 'updatedAt']);
     }
 
     function reelBaseKeys() {
@@ -661,6 +734,8 @@ service cloud.firestore {
           isValidLikeNotification(notificationId, request.resource.data)
           || isValidCommentNotification(notificationId, request.resource.data)
           || isValidFollowNotification(notificationId, request.resource.data)
+          || isValidReelLikeNotification(notificationId, request.resource.data)
+          || isValidReelCommentNotification(notificationId, request.resource.data)
         );
 
       allow update: if isSignedIn() && isValidNotificationUpdate(request.resource.data, resource.data);
@@ -689,17 +764,20 @@ service cloud.firestore {
         && isServerTimestamp(data.updatedAt)
         && data.keys().hasOnly([
           'notificationId', 'recipientUid', 'actorUid', 'actorDisplayName', 'actorUsername',
-          'type', 'contentId', 'commentId', 'previewText', 'read', 'createdAt', 'updatedAt'
+          'type', 'contentId', 'reelId', 'commentId', 'previewText', 'read', 'createdAt', 'updatedAt'
         ]);
     }
 
     // The deterministic ID ties this doc to one exact (content, actor) pair,
     // and existsAfter() on the Like doc proves a real Like landed in the
-    // same batch — not just a claim that one exists.
+    // same batch — not just a claim that one exists. reelId == null keeps
+    // this type from ever being paired with a Reel reference (see
+    // isValidReelLikeNotification below for that pairing instead).
     function isValidLikeNotification(notificationId, data) {
       let contentPath = /databases/$(database)/documents/content/$(data.contentId);
       return data.type == 'like'
         && data.contentId is string
+        && data.reelId == null
         && data.commentId == null
         && data.previewText == null
         && notificationId == 'like_' + data.contentId + '_' + data.actorUid
@@ -717,6 +795,7 @@ service cloud.firestore {
       let commentPath = /databases/$(database)/documents/content/$(data.contentId)/comments/$(data.commentId);
       return data.type == 'comment'
         && data.contentId is string
+        && data.reelId == null
         && data.commentId is string
         && notificationId == 'comment_' + data.commentId
         && (data.previewText == null || (data.previewText is string && data.previewText.size() <= 500))
@@ -734,6 +813,7 @@ service cloud.firestore {
       let followPath = /databases/$(database)/documents/follows/$(data.actorUid + '_' + data.recipientUid);
       return data.type == 'follow'
         && data.contentId == null
+        && data.reelId == null
         && data.commentId == null
         && data.previewText == null
         && notificationId == 'follow_' + data.actorUid + '_' + data.recipientUid
@@ -743,10 +823,53 @@ service cloud.firestore {
         && getAfter(followPath).data.followingUid == data.recipientUid;
     }
 
+    // Reels are a separate root collection from content/{contentId} (see
+    // reels/{reelId} above), so reel_like/reel_comment reference reelId
+    // directly rather than reusing the content notification validators —
+    // same reasoning as isValidReelReport in the reports section below.
+    // The deterministic ID and existsAfter() check on the Reel Like doc are
+    // exactly the same pairing guarantee as isValidLikeNotification.
+    function isValidReelLikeNotification(notificationId, data) {
+      let reelPath = /databases/$(database)/documents/reels/$(data.reelId);
+      return data.type == 'reel_like'
+        && data.reelId is string
+        && data.contentId == null
+        && data.commentId == null
+        && data.previewText == null
+        && notificationId == 'reel_like_' + data.reelId + '_' + data.actorUid
+        && exists(reelPath)
+        && get(reelPath).data.status == 'published'
+        && get(reelPath).data.authorUid == data.recipientUid
+        && existsAfter(/databases/$(database)/documents/reels/$(data.reelId)/likes/$(data.actorUid));
+    }
+
+    function isValidReelCommentNotification(notificationId, data) {
+      let reelPath = /databases/$(database)/documents/reels/$(data.reelId);
+      let commentPath = /databases/$(database)/documents/reels/$(data.reelId)/comments/$(data.commentId);
+      return data.type == 'reel_comment'
+        && data.reelId is string
+        && data.contentId == null
+        && data.commentId is string
+        && notificationId == 'reel_comment_' + data.commentId
+        && (data.previewText == null || (data.previewText is string && data.previewText.size() <= 500))
+        && exists(reelPath)
+        && get(reelPath).data.status == 'published'
+        && get(reelPath).data.authorUid == data.recipientUid
+        && existsAfter(commentPath)
+        && getAfter(commentPath).data.authorUid == data.actorUid;
+    }
+
     // Only the recipient, and only to toggle read state — every other
     // field, including actorUid/recipientUid/type, must stay byte-identical
     // to what create validated. Nobody can "retarget" or "relabel" an
-    // existing notification via update.
+    // existing notification via update. reelId is read via .get() with a
+    // null default (not plain dot access) because notifications created
+    // before Step 19 predate that field entirely and genuinely lack the
+    // key — plain dot access on a missing map key errors out the whole
+    // rule evaluation, which would have broken mark-as-read for every
+    // pre-Step-19 notification. New writes always set reelId explicitly
+    // (null for non-Reel types — see src/types/notification.ts), so this
+    // only ever matters for reading OLD stored documents.
     function isValidNotificationUpdate(newData, oldData) {
       return oldData.recipientUid == request.auth.uid
         && newData.notificationId == oldData.notificationId
@@ -756,6 +879,7 @@ service cloud.firestore {
         && newData.actorUsername == oldData.actorUsername
         && newData.type == oldData.type
         && newData.contentId == oldData.contentId
+        && newData.get('reelId', null) == oldData.get('reelId', null)
         && newData.commentId == oldData.commentId
         && newData.previewText == oldData.previewText
         && newData.createdAt == oldData.createdAt
@@ -763,7 +887,7 @@ service cloud.firestore {
         && isServerTimestamp(newData.updatedAt)
         && newData.keys().hasOnly([
           'notificationId', 'recipientUid', 'actorUid', 'actorDisplayName', 'actorUsername',
-          'type', 'contentId', 'commentId', 'previewText', 'read', 'createdAt', 'updatedAt'
+          'type', 'contentId', 'reelId', 'commentId', 'previewText', 'read', 'createdAt', 'updatedAt'
         ]);
     }
 
@@ -781,6 +905,8 @@ service cloud.firestore {
             (data.type == 'like' && !existsAfter(/databases/$(database)/documents/content/$(data.contentId)/likes/$(data.actorUid)))
             || (data.type == 'comment' && !existsAfter(/databases/$(database)/documents/content/$(data.contentId)/comments/$(data.commentId)))
             || (data.type == 'follow' && !existsAfter(/databases/$(database)/documents/follows/$(data.actorUid + '_' + data.recipientUid)))
+            || (data.type == 'reel_like' && !existsAfter(/databases/$(database)/documents/reels/$(data.reelId)/likes/$(data.actorUid)))
+            || (data.type == 'reel_comment' && !existsAfter(/databases/$(database)/documents/reels/$(data.reelId)/comments/$(data.commentId)))
           )
         );
     }

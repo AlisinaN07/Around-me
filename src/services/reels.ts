@@ -46,9 +46,11 @@ import { fetchUserProfile } from './userProfile';
 
 const REELS_COLLECTION = 'reels';
 const DEFAULT_FEED_LIMIT = 20;
+const DEFAULT_PROFILE_REEL_LIMIT = 30;
 const VALID_CATEGORY_IDS = new Set(INTERESTS.map((interest) => interest.id));
 
-function reelRef(reelId: string) {
+/** Exported so reelEngagement.ts can reference the same document without a second constant. */
+export function reelRef(reelId: string) {
   return doc(firestore!, REELS_COLLECTION, reelId);
 }
 
@@ -316,6 +318,24 @@ export async function fetchCityReels(cityKey: string, limitCount = DEFAULT_FEED_
     limit(limitCount)
   );
   const snapshot = await getDocs(feedQuery);
+  return snapshot.docs.map((docSnapshot) => docSnapshot.data() as Reel);
+}
+
+/**
+ * Newest published Reels by one author, for the public profile Reels tab.
+ * Never fetches the whole reels collection then filters client-side — same
+ * pattern as fetchPublicUserContent in src/services/content.ts.
+ */
+export async function fetchProfileReels(uid: string, limitCount = DEFAULT_PROFILE_REEL_LIMIT): Promise<Reel[]> {
+  if (!firestore) return [];
+  const profileReelsQuery = query(
+    collection(firestore, REELS_COLLECTION),
+    where('authorUid', '==', uid),
+    where('status', '==', 'published'),
+    orderBy('publishedAt', 'desc'),
+    limit(limitCount)
+  );
+  const snapshot = await getDocs(profileReelsQuery);
   return snapshot.docs.map((docSnapshot) => docSnapshot.data() as Reel);
 }
 

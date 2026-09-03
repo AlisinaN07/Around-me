@@ -237,11 +237,36 @@ An earlier, incorrect hypothesis (visible in this file's git history) blamed a F
 
 ### Playback
 
-`storagePath` is what's persisted in Firestore — never a `getDownloadURL()` token URL. Playback URLs are resolved from `storagePath` at call time (`resolveReelPlaybackUrl`, cached in-memory for the session) via `expo-video`'s `useVideoPlayer`/`VideoView`. The vertical feed (`src/app/(app)/(tabs)/reels.tsx` + `src/components/ReelFeedItem.tsx`) tracks the active item via `FlatList`'s `onViewableItemsChanged` and only ever plays the currently-active item's player — every other item is paused, so at most one video decodes at a time.
+`storagePath` is what's persisted in Firestore — never a `getDownloadURL()` token URL. Playback URLs are resolved from `storagePath` at call time (`resolveReelPlaybackUrl`, cached in-memory for the session) via `expo-video`'s `useVideoPlayer`/`VideoView`. The vertical feed (`src/app/(app)/(tabs)/reels.tsx` + `src/components/ReelFeedItem.tsx`) tracks the active item via `FlatList`'s `onViewableItemsChanged` and only ever plays the currently-active item's player — every other item is paused, so at most one video decodes at a time. The Reel detail route (`src/app/(app)/reel/[reelId].tsx`) reuses the exact same playback architecture for a single, non-feed player.
 
-### Not in Step 18
+### Preload/player-resource strategy (Step 19)
 
-Camera recording, video editing/filters, a music library, duets/stitches, a shares backend, Reel Likes/Comments, thumbnail generation, transcoding, and any ML-based ranking are all explicitly out of scope — Step 18 is publish-and-watch only, newest-first per city.
+`useVideoPlayer`'s underlying `useReleasingSharedObject` recreates (and releases the previous) native player instance whenever its source changes — passing `null` as the source is a real, supported "no player resources held" state, not a placeholder. `ReelFeedItem` takes this a step further with a `shouldPrepare` prop: only the active item and its immediate neighbor on each side ever resolve a real playback URL or hold a live player; every other item's `playbackUrl` is forced back to `null` (releasing whatever it held) the moment it falls outside that window. `ReelsScreen` computes this window as `Math.abs(index - activeIndex) <= 1` and pairs it with `windowSize={3}` on the `FlatList` so distant items aren't even mounted. The result: at most 3 prepared players exist at once regardless of feed length, only 1 ever plays, and scrolling releases resources as it goes rather than accumulating them.
+
+### Reel engagement (Step 19)
+
+Reel Likes and Comments are **Firestore-only** — no Storage involvement, structurally parallel to `content/{contentId}`'s own Likes/Comments (`src/services/socialEngagement.ts`) but kept in a dedicated `src/services/reelEngagement.ts` module since Reels are a separate root collection:
+
+- **Likes**: `reels/{reelId}/likes/{uid}` — `{ uid, createdAt }`, document ID is the liker's own uid (at most one Like per user). Self-likes are allowed (matches content Like behavior); unliking stays allowed even if a Block was created after the Like, so a Block can never trap a stale Like.
+- **Comments**: `reels/{reelId}/comments/{commentId}` — `{ commentId, authorUid, authorDisplayName, authorUsername, body, createdAt, updatedAt }`, 1–500 characters, no edit, no replies. Same author-snapshot validation pattern as content comments.
+- **Counts**: always `getCountFromServer()` aggregation queries (`fetchReelLikeCount`, `fetchReelCommentCount`) — no `likeCount`/`commentCount` field is stored on the Reel document itself, avoiding write amplification on every Like/Comment.
+- **Block-aware**: both Like and Comment creation deny if either user has blocked the other (`isNotBlockedEitherWay`, same helper as content).
+
+Notifications gain two new types, `reel_like` and `reel_comment`, alongside a new optional `reelId` field on `Notification` (`src/types/notification.ts`). Exactly one of `contentId`/`reelId` is ever non-null for a given notification; every existing `like`/`comment`/`follow` write now sets `reelId: null` explicitly. Old, pre-Step-19 notifications that predate the field entirely keep working — `isValidNotificationUpdate` in `firestore.rules` reads it via `.get('reelId', null)` rather than plain dot access, specifically because Firestore Rules errors out on dot-accessing a genuinely absent map key. Both new types follow the exact same atomic-pairing pattern as their content equivalents: the Like/Comment write and its notification land in the same `writeBatch`, and Firestore Rules independently verify (via `existsAfter`) that the real Like/Comment actually exists before allowing the notification — a client can never fabricate one.
+
+Notification navigation: `NotificationRow` shows "{Actor} liked your Reel" / "{Actor} commented on your Reel" (with preview) and routes to `/reel/{reelId}` on tap (`src/app/(app)/(tabs)/inbox.tsx`'s `handleRowPress`), reusing the same `read`/mark-as-read plumbing as every other notification type.
+
+### Reel detail route
+
+`src/app/(app)/reel/[reelId].tsx` — a stable, ID-addressable route (fetches the Reel fresh by ID, never relies on feed-index state) used by notification taps, profile Reel cards, and anywhere else a direct link to one Reel is needed. Shows a single video player (native controls, muted-by-default autoplay), author, caption, and `ReelEngagementSection` (like button + comment list + composer, structurally parallel to `EngagementSection`). Report/Block are available via the same `OptionsMenu`/`ReportModal`/`ConfirmDialog` components used everywhere else in the app.
+
+### Public profile Reels tab
+
+The public profile screen (`src/app/(app)/user/[uid]/index.tsx`) gained a fourth content tab, "Reels", alongside Posts/Activities/Events. `fetchProfileReels` (`src/services/reels.ts`) queries `authorUid == uid && status == 'published'`, ordered by `publishedAt desc`, capped at 30 — a dedicated, explicitly-limited query, never the whole `reels` collection filtered client-side. Since Step 19 has no thumbnail generation, each Reel renders as a compact `ReelPreviewCard` (play icon, caption, published time on a plain surface card) rather than a real video frame — no video is loaded just to populate a grid. Tapping a card opens `/reel/{reelId}`. Empty state offers a "Create Reel" shortcut on the viewer's own profile.
+
+### Not in Step 19 (or earlier)
+
+Reel sharing/deep links, camera recording, video editing/filters, a music library, duets/stitches, view counts, saves/bookmarks, reposts, thumbnail generation, transcoding, push notifications, and any ML-based ranking are all explicitly out of scope.
 
 ## Location
 

@@ -69,3 +69,35 @@ export type Reel = {
   updatedAt: Timestamp;
   publishedAt: Timestamp | null;
 };
+
+/**
+ * reels/{reelId}/likes/{uid} — one document per user who liked a Reel.
+ * Structurally parallel to content/{contentId}/likes/{uid} (see
+ * src/types/content.ts's ContentLike) — the document ID (the liker's own
+ * uid) is what guarantees at most one Like per user, so there's nothing
+ * else to store beyond who and when.
+ */
+export type ReelLike = {
+  uid: string;
+  createdAt: Timestamp;
+};
+
+export const REEL_COMMENT_BODY_MAX_LENGTH = 500;
+
+/**
+ * reels/{reelId}/comments/{commentId} — top-level comments only, no
+ * replies/threads, no edit — structurally parallel to
+ * content/{contentId}/comments/{commentId} (see src/types/content.ts's
+ * ContentComment). authorDisplayName/authorUsername are a public-safe
+ * snapshot of the commenter's own profile, verified against it by
+ * Firestore rules on create.
+ */
+export type ReelComment = {
+  commentId: string;
+  authorUid: string;
+  authorDisplayName: string;
+  authorUsername: string;
+  body: string;
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+};

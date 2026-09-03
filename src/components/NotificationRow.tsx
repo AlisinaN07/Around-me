@@ -10,6 +10,8 @@ const TYPE_ICON: Record<Notification['type'], keyof typeof Ionicons.glyphMap> = 
   like: 'heart',
   comment: 'chatbubble',
   follow: 'person-add',
+  reel_like: 'heart',
+  reel_comment: 'chatbubble',
 };
 
 function describeNotification(notification: Notification): string {
@@ -22,6 +24,12 @@ function describeNotification(notification: Notification): string {
         : `${notification.actorDisplayName} commented on your post`;
     case 'follow':
       return `${notification.actorDisplayName} started following you`;
+    case 'reel_like':
+      return `${notification.actorDisplayName} liked your Reel`;
+    case 'reel_comment':
+      return notification.previewText
+        ? `${notification.actorDisplayName} commented on your Reel: "${notification.previewText}"`
+        : `${notification.actorDisplayName} commented on your Reel`;
   }
 }
 
