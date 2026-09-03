@@ -26,7 +26,6 @@ type ReelFeedItemProps = {
    * bounded to at most 3 regardless of feed length.
    */
   shouldPrepare: boolean;
-  isOwnReel: boolean;
   onOpenOptions: () => void;
 };
 
@@ -38,7 +37,7 @@ const CATEGORY_LABEL_BY_ID = new Map(INTERESTS.map((interest) => [interest.id, `
  * `shouldPrepare`) — see ReelsScreen for how activity/prepare windows are
  * tracked and how only one item is ever active at a time.
  */
-export function ReelFeedItem({ reel, height, isActive, shouldPrepare, isOwnReel, onOpenOptions }: ReelFeedItemProps) {
+export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOptions }: ReelFeedItemProps) {
   const { user } = useAuth();
   const [playbackUrl, setPlaybackUrl] = useState<string | null>(null);
   const [urlStatus, setUrlStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
@@ -203,11 +202,9 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, isOwnReel,
         <Ionicons name={muted ? 'volume-mute' : 'volume-high'} size={18} color={Colors.text} />
       </Pressable>
 
-      {!isOwnReel && (
-        <Pressable style={styles.optionsButton} onPress={onOpenOptions} accessibilityRole="button" accessibilityLabel="Reel options">
-          <Ionicons name="ellipsis-horizontal" size={20} color={Colors.text} />
-        </Pressable>
-      )}
+      <Pressable style={styles.optionsButton} onPress={onOpenOptions} accessibilityRole="button" accessibilityLabel="Reel options">
+        <Ionicons name="ellipsis-horizontal" size={20} color={Colors.text} />
+      </Pressable>
 
       <View style={styles.actionRail}>
         <Pressable

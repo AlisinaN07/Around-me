@@ -63,6 +63,15 @@
           "cameraPermission": false,
           "microphonePermission": false
         }
+      ],
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Around Me uses your camera only when you choose to record a Reel.",
+          "microphonePermission": "Around Me uses your microphone only when recording a Reel with sound.",
+          "recordAudioAndroid": true,
+          "barcodeScannerEnabled": false
+        }
       ]
     ],
     "experiments": {

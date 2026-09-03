@@ -1,23 +1,27 @@
 import { Ionicons } from '@expo/vector-icons';
 import { router } from 'expo-router';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { Avatar } from '@/components/Avatar';
 import { Button } from '@/components/Button';
+import { ReelPreviewCard } from '@/components/ReelPreviewCard';
 import { COUNTRIES } from '@/constants/countries';
 import { INTERESTS } from '@/constants/interests';
 import { Colors, Layout, Radius, Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
 import { useProfile } from '@/hooks/useProfile';
+import { fetchProfileReels } from '@/services/reels';
+import type { Reel } from '@/types/reel';
 import { formatCityDisplayName } from '@/utils/cityDisplay';
 
-type ProfileTab = 'posts' | 'activities' | 'saved';
+type ProfileTab = 'posts' | 'activities' | 'saved' | 'reels';
 
 const PROFILE_TABS: { id: ProfileTab; label: string; icon: keyof typeof Ionicons.glyphMap; emptyText: string }[] = [
   { id: 'posts', label: 'Posts', icon: 'grid-outline', emptyText: 'No posts yet.' },
   { id: 'activities', label: 'Activities', icon: 'people-outline', emptyText: 'No activities yet.' },
+  { id: 'reels', label: 'Reels', icon: 'videocam-outline', emptyText: 'No Reels yet' },
   { id: 'saved', label: 'Saved', icon: 'bookmark-outline', emptyText: 'Nothing saved yet.' },
 ];
 
@@ -25,6 +29,21 @@ export default function ProfileScreen() {
   const { user, signOut } = useAuth();
   const { profile } = useProfile();
   const [activeTab, setActiveTab] = useState<ProfileTab>('posts');
+  const [reels, setReels] = useState<Reel[]>([]);
+  const [reelsLoaded, setReelsLoaded] = useState(false);
+
+  useEffect(() => {
+    if (!user) return;
+    let cancelled = false;
+    fetchProfileReels(user.uid).then((result) => {
+      if (cancelled) return;
+      setReels(result);
+      setReelsLoaded(true);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [user]);
 
   const handleSignOut = () => {
     signOut().catch(() => {});
@@ -116,10 +135,30 @@ export default function ProfileScreen() {
             })}
           </View>
 
-          <View style={styles.emptyState}>
-            <Ionicons name={activeTabInfo.icon} size={28} color={Colors.textSecondary} />
-            <Text style={styles.emptyStateText}>{activeTabInfo.emptyText}</Text>
-          </View>
+          {activeTab === 'reels' ? (
+            reels.length === 0 ? (
+              <View style={styles.emptyState}>
+                <Ionicons name={activeTabInfo.icon} size={28} color={Colors.textSecondary} />
+                <Text style={styles.emptyStateText}>{reelsLoaded ? activeTabInfo.emptyText : 'Loading…'}</Text>
+                {reelsLoaded ? (
+                  <View style={styles.emptyStateAction}>
+                    <Button label="Create Reel" variant="secondary" onPress={() => router.push('/create/reel')} />
+                  </View>
+                ) : null}
+              </View>
+            ) : (
+              <View style={styles.reelGrid}>
+                {reels.map((reel) => (
+                  <ReelPreviewCard key={reel.reelId} reel={reel} />
+                ))}
+              </View>
+            )
+          ) : (
+            <View style={styles.emptyState}>
+              <Ionicons name={activeTabInfo.icon} size={28} color={Colors.textSecondary} />
+              <Text style={styles.emptyStateText}>{activeTabInfo.emptyText}</Text>
+            </View>
+          )}
         </View>
       </ScrollView>
     </SafeAreaView>
@@ -262,5 +301,17 @@ const styles = StyleSheet.create({
   emptyStateText: {
     color: Colors.textSecondary,
     fontSize: 13,
+  },
+  emptyStateAction: {
+    minWidth: 160,
+    marginTop: Spacing.xs,
+  },
+  reelGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    justifyContent: 'space-between',
+    rowGap: Spacing.sm,
+    marginTop: Spacing.md,
+    marginHorizontal: Spacing.xl,
   },
 });

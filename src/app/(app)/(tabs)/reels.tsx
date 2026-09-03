@@ -1,6 +1,7 @@
 import { Ionicons } from '@expo/vector-icons';
+import * as Clipboard from 'expo-clipboard';
 import { router, useFocusEffect } from 'expo-router';
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { FlatList, StyleSheet, Text, View, type ViewToken } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
@@ -15,6 +16,7 @@ import { useProfile } from '@/hooks/useProfile';
 import { blockUser, fetchMyBlockedUserIds } from '@/services/blocks';
 import { fetchCityReels } from '@/services/reels';
 import { formatCityDisplayName } from '@/utils/cityDisplay';
+import { buildReelShareUrl, shareReel } from '@/utils/reelShare';
 import type { Reel } from '@/types/reel';
 
 type LoadStatus = 'loading' | 'loaded' | 'error';
@@ -33,6 +35,8 @@ export default function ReelsScreen() {
   const [reportReel, setReportReel] = useState<Reel | null>(null);
   const [blockTarget, setBlockTarget] = useState<Reel | null>(null);
   const [isBlockSubmitting, setIsBlockSubmitting] = useState(false);
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const cityKey = profile?.cityKey;
   const cityLabel = profile?.cityName ? formatCityDisplayName(profile.cityName) : 'your city';
@@ -73,11 +77,42 @@ export default function ReelsScreen() {
 
   const handleOpenOptions = (reel: Reel) => setOptionsReel(reel);
 
+  const showToast = useCallback((message: string) => {
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    setToastMessage(message);
+    toastTimerRef.current = setTimeout(() => setToastMessage(null), 2500);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    };
+  }, []);
+
+  const handleShare = async (reel: Reel) => {
+    const result = await shareReel(reel.reelId);
+    if (!result.ok && !/cancel/i.test(result.message)) {
+      await handleCopyLink(reel);
+    }
+  };
+
+  const handleCopyLink = async (reel: Reel) => {
+    await Clipboard.setStringAsync(buildReelShareUrl(reel.reelId));
+    showToast('Link copied');
+  };
+
   const optionsMenuOptions: OptionsMenuOption[] = optionsReel
-    ? [
-        { label: 'Report reel', onPress: () => setReportReel(optionsReel) },
-        { label: `Block ${optionsReel.authorDisplayName}`, onPress: () => setBlockTarget(optionsReel), destructive: true },
-      ]
+    ? optionsReel.authorUid === user?.uid
+      ? [
+          { label: 'Share Reel', onPress: () => handleShare(optionsReel) },
+          { label: 'Copy link', onPress: () => handleCopyLink(optionsReel) },
+        ]
+      : [
+          { label: 'Share Reel', onPress: () => handleShare(optionsReel) },
+          { label: 'Copy link', onPress: () => handleCopyLink(optionsReel) },
+          { label: 'Report reel', onPress: () => setReportReel(optionsReel) },
+          { label: `Block ${optionsReel.authorDisplayName}`, onPress: () => setBlockTarget(optionsReel), destructive: true },
+        ]
     : [];
 
   const handleConfirmBlock = async () => {
@@ -129,7 +164,6 @@ export default function ReelsScreen() {
                 height={containerHeight}
                 isActive={index === activeIndex}
                 shouldPrepare={Math.abs(index - activeIndex) <= 1}
-                isOwnReel={item.authorUid === user?.uid}
                 onOpenOptions={() => handleOpenOptions(item)}
               />
             )}
@@ -153,6 +187,12 @@ export default function ReelsScreen() {
           />
         ) : null}
       </View>
+
+      {toastMessage ? (
+        <View style={styles.toast} pointerEvents="none">
+          <Text style={styles.toastText}>{toastMessage}</Text>
+        </View>
+      ) : null}
 
       <OptionsMenu visible={!!optionsReel} onClose={() => setOptionsReel(null)} options={optionsMenuOptions} />
 
@@ -205,5 +245,19 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     lineHeight: 20,
     marginBottom: Spacing.sm,
+  },
+  toast: {
+    position: 'absolute',
+    bottom: Spacing.xxl * 2,
+    alignSelf: 'center',
+    backgroundColor: 'rgba(11, 11, 15, 0.9)',
+    borderRadius: 999,
+    paddingHorizontal: Spacing.md,
+    paddingVertical: Spacing.sm,
+  },
+  toastText: {
+    color: Colors.text,
+    fontSize: 13,
+    fontWeight: '600',
   },
 });

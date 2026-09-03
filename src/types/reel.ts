@@ -101,3 +101,32 @@ export type ReelComment = {
   createdAt: Timestamp;
   updatedAt: Timestamp;
 };
+
+/**
+ * UI/runtime-only state for a video the user has picked or recorded but not
+ * yet published (Step 20). Never persisted anywhere — `source` and `uri`
+ * exist purely to drive the Create Reel screen (e.g. "Retake" vs. "Choose
+ * another" copy) and are deliberately absent from the `Reel` document
+ * itself: there is no product reason for other users (or even the author,
+ * later) to know whether a given published Reel originally came from the
+ * camera or the library, so nothing here crosses into `createReelDraft`
+ * beyond the same category/caption/media fields library-picked videos
+ * already provided.
+ *
+ * Metadata fields are nullable because the two sources populate them
+ * differently: `expo-image-picker` returns fileSize/duration/width/height
+ * directly from the asset; `expo-camera`'s `recordAsync()` returns only a
+ * `uri` (see src/app/(app)/create/reel/camera.tsx), so a camera-sourced
+ * value starts with these null and gets them filled in by a real probe
+ * (see resolveCameraVideoMetadata) before publish is ever enabled — never
+ * fabricated.
+ */
+export type SelectedReelVideo = {
+  uri: string;
+  source: 'camera' | 'library';
+  fileSizeBytes: number | null;
+  durationMs: number | null;
+  width: number | null;
+  height: number | null;
+  mimeType: string | null;
+};

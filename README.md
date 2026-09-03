@@ -264,9 +264,41 @@ Notification navigation: `NotificationRow` shows "{Actor} liked your Reel" / "{A
 
 The public profile screen (`src/app/(app)/user/[uid]/index.tsx`) gained a fourth content tab, "Reels", alongside Posts/Activities/Events. `fetchProfileReels` (`src/services/reels.ts`) queries `authorUid == uid && status == 'published'`, ordered by `publishedAt desc`, capped at 30 — a dedicated, explicitly-limited query, never the whole `reels` collection filtered client-side. Since Step 19 has no thumbnail generation, each Reel renders as a compact `ReelPreviewCard` (play icon, caption, published time on a plain surface card) rather than a real video frame — no video is loaded just to populate a grid. Tapping a card opens `/reel/{reelId}`. Empty state offers a "Create Reel" shortcut on the viewer's own profile.
 
-### Not in Step 19 (or earlier)
+### Reel creation: camera + library, one unified flow (Step 20)
 
-Reel sharing/deep links, camera recording, video editing/filters, a music library, duets/stitches, view counts, saves/bookmarks, reposts, thumbnail generation, transcoding, push notifications, and any ML-based ranking are all explicitly out of scope.
+Create Reel (`src/app/(app)/create/reel/index.tsx`) offers **Record video** and **Choose from library** side by side before either permission is ever requested — no camera/microphone prompt until "Record video" is tapped, no photo-library prompt until "Choose from library" is tapped (same minimum-permissions rule as Step 18). "Record video" is only shown on native (`Platform.OS !== 'web'`): `expo-camera`'s `CameraView` implements video recording (`recordAsync`/`stopRecording`) only on Android/iOS — its web ref exposes picture capture only, no recording methods at all — so offering it on web would be a dead end rather than a working feature.
+
+Recording (`src/app/(app)/create/reel/camera.tsx`) is a focused, filter-free screen: camera + microphone permissions requested together on entry (audio recording needs both), a 60-second hard cap via `recordAsync({ maxDuration: 60 })` — enforced by the API itself, not just a UI countdown — front/back toggle (disabled mid-recording, since flipping cameras stops an in-progress recording per `expo-camera`'s own docs), and a live `00:07 / 01:00` timer. A denied permission shows "Camera access is needed to record a Reel." with **Try again** and **Choose from library** — never a dead end.
+
+Both sources normalize into one local-only `SelectedReelVideo` type (`src/types/reel.ts`: `uri`, `source: 'camera' | 'library'`, and nullable `fileSizeBytes`/`durationMs`/`width`/`height`/`mimeType`) that the rest of the screen — preview, validation, publish — treats identically regardless of origin. `source` exists purely to drive UI copy ("Retake" for camera vs. "Choose another" for library) and is never written to the published `Reel` document; there's no product reason for that to be visible anywhere.
+
+The two sources differ in what metadata they hand back: `expo-image-picker`'s library asset already carries real fileSize/duration/width/height. `expo-camera`'s `recordAsync()` resolves to only `{ uri }`. For camera-sourced video, `resolveCameraVideoMetadata` (`src/utils/cameraVideoMetadata.ts`) fills in the gap for real — it briefly loads the recording into an `expo-video` `createVideoPlayer` instance and reads `duration` + `availableVideoTracks[0].size` from the player's own `sourceLoad` event, and file size comes from `expo-file-system`'s current `File` class (`new File(uri).size`). If either can't be determined before an 8s timeout, the result is `null` — **never a fabricated number** — and `validateSelectedReelVideo` (`src/utils/reelVideoValidation.ts`, the one shared validator both sources now go through) rejects the selection with an honest error instead of letting an unverifiable video reach Publish. mimeType for a camera recording is inferred from its real file extension (`.mp4`/`.mov`/`.m4v`/`.webm`) — an unrecognized extension is rejected, never defaulted.
+
+The recorded-video handoff from the camera route back to the entry screen (`src/services/reelCameraHandoff.ts`) is a one-shot module-level value read via `useFocusEffect` when the entry screen regains focus — not a router param, since Expo Router params aren't meant for handing an ephemeral local-file URI back to the exact screen instance already underneath the camera route on the navigation stack.
+
+Preview adds a play/pause toggle (no scrubbing, no trim, no filters — out of scope) and never uploads until Publish is pressed; retaking a camera recording or choosing a different library video before that point never touches Firestore or Storage, since `createReelDraft` is only ever called from the Publish handler. Publish shows plain-language progress ("Creating Reel…" → "Uploading NN%" → "Publishing…") and, on upload/publish failure, a dedicated banner with **Try again** (retries the whole publish, keeping the local video selected — no need to re-record) and **Cancel** (discards the failed draft via the existing `discardReelDraft` cleanup and returns to the ready-to-publish state). On success, navigation goes to `/reel/{reelId}` — not the feed — so the user gets deterministic confirmation of exactly which Reel published.
+
+### Share (Step 20)
+
+A published Reel's shareable identity is always its `reelId` via the app's own `/reel/{reelId}` route (`src/utils/reelShare.ts`) — never a Storage path, a `getDownloadURL()` token, or a feed position. Share is only ever offered once a Reel is confirmed loaded and published (Reel detail's overflow menu, and each feed item's own overflow menu now that it's shown for own Reels too, not just others').
+
+`shareReel` uses React Native's own `Share.share()` — react-native-web forwards this to `navigator.share()` and rejects cleanly (a catchable error, not a crash) when the browser doesn't support it, which is exactly what happens today: no separate sharing package was needed. On that rejection (or if the user just wants a link instead of the OS share sheet), **Copy link** uses `expo-clipboard`'s `setStringAsync`, with a small in-screen toast ("Link copied") — no system alert.
+
+`buildReelShareUrl` picks the link itself based on what's actually running:
+- **Web**: `${window.location.origin}/reel/{reelId}` — the real, currently-serving origin (confirmed by `expo export --platform web` actually emitting `/reel/[reelId]` as a route), never a hardcoded guess like `aroundme.com`. We don't own a production domain yet, so in local development this is a `localhost` URL — genuinely correct for what's running, not a placeholder.
+- **Native**: `aroundme://reel/{reelId}` — the app's own registered scheme (`app.json`'s `"scheme": "aroundme"`, already in place before Step 20). This only resolves for someone who already has this exact app installed; without a web domain to back a Universal Link/App Link, there's no graceful "open the App Store instead" fallback yet. That's a real, documented limitation of not having shipped a web presence, not something client code can paper over.
+
+Deep-link foundation: Expo Router derives everything from the file-based routes plus `app.json`'s `scheme` automatically — there is no separate linking-config file in this project, and Step 20 didn't need to add one. `/reel/{reelId}` (and `aroundme://reel/{reelId}` on native) already resolves to the same route that fetches a Reel fresh by ID and shows a clean "Reel not available" for a missing/unpublished Reel rather than crashing or leaking uploading-Reel metadata — this was already true from Step 19's own detail route and needed no change here.
+
+Nothing here adds a `shareCount`, a `viewCount`, or any "shares" collection — sharing and playback both stay writes-free, matching the existing no-view-count/no-analytics boundary.
+
+### Own profile Reels tab (Step 20)
+
+The own-Profile tab screen (`src/app/(app)/(tabs)/profile.tsx`) gained a real, data-backed "Reels" tab (its Posts/Activities/Saved tabs remain the pre-existing static placeholders — out of scope for this step) using the same `fetchProfileReels`/`ReelPreviewCard` the public profile tab already used. Empty state offers a "Create Reel" CTA, since this screen is always the viewer's own profile.
+
+### Not in Step 20 (or earlier)
+
+A video timeline editor, trimming UI, transitions, filters, beauty filters, a music catalogue, licensed audio, text overlays, stickers, AR effects, duets, stitches, reposts, view counts, saves, creator analytics, transcoding, Cloud Functions, and push notifications are all explicitly out of scope.
 
 ## Location
 

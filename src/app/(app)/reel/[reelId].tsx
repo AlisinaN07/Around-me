@@ -1,6 +1,7 @@
 import { Ionicons } from '@expo/vector-icons';
+import * as Clipboard from 'expo-clipboard';
 import { useLocalSearchParams } from 'expo-router';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Pressable, StyleSheet, Text, View } from 'react-native';
 import { VideoView, useVideoPlayer } from 'expo-video';
 
@@ -18,6 +19,7 @@ import { useAuth } from '@/hooks/useAuth';
 import { blockUser, isUserBlocked, unblockUser } from '@/services/blocks';
 import { fetchReel, resolveReelPlaybackUrl } from '@/services/reels';
 import type { Reel } from '@/types/reel';
+import { buildReelShareUrl, shareReel } from '@/utils/reelShare';
 import { formatTimeAgo } from '@/utils/timeFormat';
 
 type LoadStatus = 'loading' | 'loaded' | 'error';
@@ -41,6 +43,8 @@ export default function ReelDetailScreen() {
   const [isOptionsMenuOpen, setIsOptionsMenuOpen] = useState(false);
   const [isBlockConfirmOpen, setIsBlockConfirmOpen] = useState(false);
   const [isReportOpen, setIsReportOpen] = useState(false);
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const isOwnReel = !!user && !!reel && reel.authorUid === user.uid;
 
@@ -140,15 +144,56 @@ export default function ReelDetailScreen() {
     }
   };
 
-  const optionsMenuOptions: OptionsMenuOption[] = amIBlockingThem
+  const showToast = useCallback((message: string) => {
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    setToastMessage(message);
+    toastTimerRef.current = setTimeout(() => setToastMessage(null), 2500);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    };
+  }, []);
+
+  // Share is only ever offered once a real, published Reel is loaded (see
+  // the Step 20 spec — never generate a Share action for a Reel that
+  // isn't loaded/published yet), which is already guaranteed here since
+  // these options only render when status === 'loaded' && reel below.
+  const handleShare = async () => {
+    if (!reel) return;
+    const result = await shareReel(reel.reelId);
+    if (!result.ok && !/cancel/i.test(result.message)) {
+      // Web browsers without the Web Share API reject predictably — fall
+      // back to copying the link instead of leaving the user stuck.
+      await handleCopyLink();
+    }
+  };
+
+  const handleCopyLink = async () => {
+    if (!reel) return;
+    await Clipboard.setStringAsync(buildReelShareUrl(reel.reelId));
+    showToast('Link copied');
+  };
+
+  const optionsMenuOptions: OptionsMenuOption[] = isOwnReel
     ? [
-        { label: `Unblock ${reel?.authorDisplayName ?? 'this user'}`, onPress: handleUnblock },
-        { label: 'Report reel', onPress: () => setIsReportOpen(true) },
+        { label: 'Share Reel', onPress: handleShare },
+        { label: 'Copy link', onPress: handleCopyLink },
       ]
-    : [
-        { label: `Block ${reel?.authorDisplayName ?? 'this user'}`, onPress: () => setIsBlockConfirmOpen(true), destructive: true },
-        { label: 'Report reel', onPress: () => setIsReportOpen(true) },
-      ];
+    : amIBlockingThem
+      ? [
+          { label: 'Share Reel', onPress: handleShare },
+          { label: 'Copy link', onPress: handleCopyLink },
+          { label: `Unblock ${reel?.authorDisplayName ?? 'this user'}`, onPress: handleUnblock },
+          { label: 'Report reel', onPress: () => setIsReportOpen(true) },
+        ]
+      : [
+          { label: 'Share Reel', onPress: handleShare },
+          { label: 'Copy link', onPress: handleCopyLink },
+          { label: `Block ${reel?.authorDisplayName ?? 'this user'}`, onPress: () => setIsBlockConfirmOpen(true), destructive: true },
+          { label: 'Report reel', onPress: () => setIsReportOpen(true) },
+        ];
 
   const categoryLabel = reel ? CATEGORY_LABEL_BY_ID.get(reel.categoryId) : undefined;
 
@@ -156,7 +201,7 @@ export default function ReelDetailScreen() {
     <HeaderScreenLayout
       title="Reel"
       headerRight={
-        status === 'loaded' && reel && !isOwnReel ? (
+        status === 'loaded' && reel ? (
           <Pressable
             onPress={() => setIsOptionsMenuOpen(true)}
             hitSlop={8}
@@ -223,6 +268,12 @@ export default function ReelDetailScreen() {
           <ReelEngagementSection reelId={reel.reelId} />
         </View>
       )}
+
+      {toastMessage ? (
+        <View style={styles.toast} pointerEvents="none">
+          <Text style={styles.toastText}>{toastMessage}</Text>
+        </View>
+      ) : null}
 
       <OptionsMenu visible={isOptionsMenuOpen} onClose={() => setIsOptionsMenuOpen(false)} options={optionsMenuOptions} />
 
@@ -339,5 +390,19 @@ const styles = StyleSheet.create({
   time: {
     color: Colors.textSecondary,
     fontSize: 12,
+  },
+  toast: {
+    position: 'absolute',
+    bottom: Spacing.xxl,
+    alignSelf: 'center',
+    backgroundColor: 'rgba(11, 11, 15, 0.9)',
+    borderRadius: Radius.full,
+    paddingHorizontal: Spacing.md,
+    paddingVertical: Spacing.sm,
+  },
+  toastText: {
+    color: Colors.text,
+    fontSize: 13,
+    fontWeight: '600',
   },
 });
