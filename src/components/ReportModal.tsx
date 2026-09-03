@@ -5,13 +5,14 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { Button } from '@/components/Button';
 import { Colors, Radius, Spacing } from '@/constants/theme';
-import { reportContent, reportMessage, reportUser } from '@/services/reports';
+import { reportContent, reportMessage, reportReel, reportUser } from '@/services/reports';
 import { REPORT_DETAILS_MAX_LENGTH, REPORT_REASON_OPTIONS, type ReportReason } from '@/types/report';
 
 export type ReportTarget =
   | { type: 'user'; targetUid: string }
   | { type: 'content'; contentId: string }
-  | { type: 'message'; conversationId: string; messageId: string };
+  | { type: 'message'; conversationId: string; messageId: string }
+  | { type: 'reel'; reelId: string };
 
 type ReportModalProps = {
   visible: boolean;
@@ -52,7 +53,9 @@ export function ReportModal({ visible, onClose, reporterUid, target }: ReportMod
         ? await reportUser(reporterUid, target.targetUid, reason, details)
         : target.type === 'content'
           ? await reportContent(reporterUid, target.contentId, reason, details)
-          : await reportMessage(reporterUid, target.conversationId, target.messageId, reason, details);
+          : target.type === 'reel'
+            ? await reportReel(reporterUid, target.reelId, reason, details)
+            : await reportMessage(reporterUid, target.conversationId, target.messageId, reason, details);
     if (!result.ok) {
       setStatus('error');
       setErrorMessage(result.message);

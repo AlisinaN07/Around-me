@@ -71,6 +71,15 @@
         { "fieldPath": "participantUids", "arrayConfig": "CONTAINS" },
         { "fieldPath": "lastMessageAt", "order": "DESCENDING" }
       ]
+    },
+    {
+      "collectionGroup": "reels",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "cityKey", "order": "ASCENDING" },
+        { "fieldPath": "status", "order": "ASCENDING" },
+        { "fieldPath": "publishedAt", "order": "DESCENDING" }
+      ]
     }
   ],
   "fieldOverrides": []

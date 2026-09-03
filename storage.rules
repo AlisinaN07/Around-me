@@ -1,0 +1,111 @@
+rules_version = '2';
+
+// Cloud Storage Rules for Around Me — Step 18 Reels media only. Every
+// other path is denied by the catch-all at the bottom.
+//
+// IMPORTANT LIMITATION — read before editing this file:
+//
+// Storage Rules' cross-service firestore.get()/firestore.exists() calls
+// (Firebase's own officially documented mechanism for a Storage rule to
+// read a Firestore document — see firebase-tools' own default
+// storage.rules template, which shows exactly this pattern) do NOT
+// evaluate successfully for this project. This was verified empirically
+// during Step 18: a call against a Firestore document that had existed
+// for 10+ minutes still behaved as if the document did not exist (ruling
+// out propagation lag), while the equivalent Firestore Rules were
+// deployed and verified working correctly in the same session. The
+// Storage service agent's IAM binding (roles/firebasestorage.serviceAgent)
+// and the Firestore database's mode (FIRESTORE_NATIVE) both check out —
+// the most likely cause is that the Firestore database
+// (europe-north2) and the Storage bucket (US-EAST1) are in different
+// regions. This can't be fixed by editing rules; it would require
+// deleting and recreating the Storage bucket in a matching region, which
+// this project was explicitly told never to do unilaterally (see the
+// Step 18 report's "Need from me" section).
+//
+// Because of this, the rules below intentionally do NOT check Firestore
+// for the Reel's status/ownership before allowing Storage operations.
+// Firestore Rules (firestore.rules) remain the sole, fully-working
+// authority on which Reels exist, who owns them, and who may ever learn
+// a given Reel's storagePath in the first place — see the per-rule
+// comments below for exactly what each Storage rule can and cannot
+// guarantee as a result.
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    // reels/{authorUid}/{reelId}/source — the one Reel media object per
+    // Reel (see src/services/reels.ts's reelStoragePath). Deterministic
+    // and ownership-aware: never derived from a user-supplied filename.
+    match /reels/{authorUid}/{reelId}/source {
+      // Any signed-in user may read Reel media — no unauthenticated
+      // access, ever. The real confidentiality boundary (uploading vs.
+      // published) is enforced by Firestore Rules: the app only ever
+      // learns a Reel's storagePath by reading its reels/{reelId}
+      // document, and that document is only readable by the author while
+      // "uploading" (see firestore.rules) — so nobody but the author is
+      // ever handed the storagePath for a Reel that isn't published yet.
+      // reelId itself is an unguessable Firestore auto-ID, so directly
+      // guessing a path stays outside the practical threat model even
+      // without a per-object Storage-side status re-check.
+      allow read: if isSignedIn();
+
+      // Requires the caller to own this exact author path. Actual (not
+      // client-claimed) size and content type are enforced by Storage
+      // itself via request.resource.
+      //
+      // `resource == null` is the actual create-once guard — Cloud
+      // Storage has no real distinct "update file content" operation the
+      // way Firestore does; a second uploadBytes()/uploadBytesResumable()
+      // to an existing path is STILL evaluated under this same `create`
+      // rule (verified empirically: denying only `allow update` did NOT
+      // block a second upload from succeeding), not routed to `allow
+      // update` below. `allow update` only ever governs metadata-only
+      // changes (updateMetadata()), never a content re-upload — so
+      // `resource == null` here is what actually makes this create-once:
+      // no overwrite of existing media.
+      //
+      // Cannot independently verify a matching Firestore "uploading"
+      // draft exists first (see the file header). The app's own
+      // two-phase flow (src/services/reels.ts) always creates the draft
+      // before uploading, but a maliciously modified client COULD upload
+      // an object here with no matching Firestore document. Such an
+      // orphan object is never discoverable or playable by anyone — the
+      // Reels feed and playback resolution only ever operate from a real
+      // reels/{reelId} Firestore document — so this is a storage-quota
+      // nuisance to the uploader's own account, not a confidentiality or
+      // cross-user integrity issue.
+      allow create: if isSignedIn()
+        && request.auth.uid == authorUid
+        && resource == null
+        && request.resource.size > 0
+        && request.resource.size <= 50 * 1024 * 1024
+        && request.resource.contentType.matches('video/.*');
+
+      // No metadata-only changes to an existing object either.
+      allow update: if false;
+
+      // Denied unconditionally. Without the cross-service check, Storage
+      // Rules can't distinguish a still-uploading draft (safe to delete)
+      // from a published Reel (must never be deletable) on their own —
+      // and denying is the safe direction to fail in, since it can never
+      // let published media be deleted. Failed/cancelled-upload cleanup
+      // therefore relies on trusted CLI tooling with the exact object
+      // path (see scripts/delete-test-documents.cjs's pattern) rather
+      // than a client-side delete — src/services/reels.ts's
+      // discardReelDraft still attempts a best-effort client delete and
+      // logs (never silently swallows) if it fails, so orphaned objects
+      // stay visible for cleanup instead of hidden.
+      allow delete: if false;
+    }
+
+    // Everything else — including the bucket root and any other path —
+    // is denied by default. No public/open bucket access of any kind.
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

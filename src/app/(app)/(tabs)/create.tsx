@@ -40,7 +40,7 @@ const CREATE_OPTIONS: CreateOption[] = [
     icon: 'videocam-outline',
     label: 'Reel',
     description: 'Show what is happening right now.',
-    href: null,
+    href: '/create/reel',
   },
 ];
 

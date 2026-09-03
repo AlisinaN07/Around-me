@@ -10,6 +10,7 @@ import { doc, getDoc, serverTimestamp, setDoc, type WithFieldValue } from 'fireb
 import { fetchContentById } from '@/services/content';
 import { firestore } from '@/services/firestore';
 import { fetchPublicProfile } from '@/services/publicProfile';
+import { fetchReel } from '@/services/reels';
 import { REPORT_DETAILS_MAX_LENGTH, type Report, type ReportReason } from '@/types/report';
 import type { Message } from '@/types/message';
 
@@ -27,6 +28,9 @@ function contentReportId(reporterUid: string, contentId: string): string {
 }
 function messageReportId(reporterUid: string, messageId: string): string {
   return `message_${reporterUid}_${messageId}`;
+}
+function reelReportId(reporterUid: string, reelId: string): string {
+  return `reel_${reporterUid}_${reelId}`;
 }
 
 function normalizeDetails(details: string | undefined): string | null {
@@ -69,6 +73,7 @@ export async function reportUser(reporterUid: string, targetUid: string, reason:
     contentId: null,
     conversationId: null,
     messageId: null,
+    reelId: null,
     reason,
     details: normalizeDetails(details),
     createdAt: serverTimestamp(),
@@ -89,6 +94,31 @@ export async function reportContent(reporterUid: string, contentId: string, reas
     contentId,
     conversationId: null,
     messageId: null,
+    reelId: null,
+    reason,
+    details: normalizeDetails(details),
+    createdAt: serverTimestamp(),
+  });
+}
+
+export async function reportReel(reporterUid: string, reelId: string, reason: ReportReason, details?: string): Promise<ReportResult> {
+  const reel = await fetchReel(reelId);
+  if (!reel || reel.status !== 'published') {
+    return { ok: false, error: 'not-found', message: "Couldn't find that Reel." };
+  }
+  if (reel.authorUid === reporterUid) {
+    return { ok: false, error: 'invalid-input', message: "You can't report your own Reel." };
+  }
+  const reportId = reelReportId(reporterUid, reelId);
+  return submitReport(reportId, {
+    reportId,
+    reporterUid,
+    targetType: 'reel',
+    targetUid: reel.authorUid,
+    contentId: null,
+    conversationId: null,
+    messageId: null,
+    reelId,
     reason,
     details: normalizeDetails(details),
     createdAt: serverTimestamp(),
@@ -120,6 +150,7 @@ export async function reportMessage(
     contentId: null,
     conversationId,
     messageId,
+    reelId: null,
     reason,
     details: normalizeDetails(details),
     createdAt: serverTimestamp(),

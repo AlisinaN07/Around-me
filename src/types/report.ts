@@ -1,6 +1,6 @@
 import type { Timestamp } from 'firebase/firestore';
 
-export type ReportTargetType = 'user' | 'content' | 'message';
+export type ReportTargetType = 'user' | 'content' | 'message' | 'reel';
 
 export type ReportReason = 'spam' | 'harassment' | 'hate' | 'sexual' | 'violence' | 'scam' | 'other';
 
@@ -27,9 +27,14 @@ export const REPORT_DETAILS_MAX_LENGTH = 1000;
  * src/services/reports.ts for the exact ID scheme per targetType.
  *
  * Exactly one of (targetUid alone) / (contentId + targetUid) /
- * (conversationId + messageId + targetUid) is populated depending on
- * targetType; the other ID fields stay null. Never include emails, GPS,
- * private settings, or message history beyond the one reported message.
+ * (conversationId + messageId + targetUid) / (reelId + targetUid) is
+ * populated depending on targetType; the other ID fields stay null. Never
+ * include emails, GPS, private settings, or message history beyond the
+ * one reported message.
+ *
+ * A Reel is reports/{reportId}'s own separate reference (reelId), not
+ * contentId — reels/{reelId} is a separate root collection from
+ * content/{contentId} (see src/types/reel.ts).
  */
 export type Report = {
   reportId: string;
@@ -39,6 +44,7 @@ export type Report = {
   contentId: string | null;
   conversationId: string | null;
   messageId: string | null;
+  reelId: string | null;
   reason: ReportReason;
   details: string | null;
   createdAt: Timestamp;

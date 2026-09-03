@@ -2,7 +2,7 @@
 
 Location-based social network organized around cities — "See what's happening around you, right now."
 
-Email/password authentication, onboarding (name, username, city, interests), a full tab-based application shell (Home, Reels, Create, Map, Profile), and the real Firestore content backend (posts, activities, events) are implemented. Create → Post/Activity/Event → Publish is wired to that backend, and Home's Around You / Happening Now sections render the real city feed. Every content type has a real detail screen — Activity with Join/Leave, Event with Interested/Going, and all three with Likes and Comments — backed by Firestore transactions/writes and security rules. Every user also has a public social profile (separate from their private account data) with real Follow/Unfollow and follower/following lists, reachable by tapping any author, commenter, or `@username` in the app. Reels (both creation and the Local Reels feed) remain unimplemented placeholders — no media/Storage layer exists yet. Direct messaging, notifications, saves, and a personalized Following feed are not implemented yet either.
+Email/password authentication, onboarding (name, username, city, interests), a full tab-based application shell (Home, Reels, Create, Inbox, Profile), and the real Firestore content backend (posts, activities, events) are implemented. Create → Post/Activity/Event → Publish is wired to that backend, and Home's Around You / Happening Now sections render the real city feed. Every content type has a real detail screen — Activity with Join/Leave, Event with Interested/Going, and all three with Likes and Comments — backed by Firestore transactions/writes and security rules. Every user also has a public social profile (separate from their private account data) with real Follow/Unfollow and follower/following lists, private 1:1 Direct Messages, and Block/Report safety controls (see the Reels section below for the newest addition — city-scoped short-video publishing and playback, backed by Cloud Storage).
 
 ## Stack
 
@@ -47,7 +47,7 @@ src/
     (onboarding)/      Name+username, city, interests — logged in, no profile yet
     (app)/
       (tabs)/           Home, Reels, Create, Map, Profile — logged in, profile complete
-      create/            Post/Activity/Event forms — stack screens above the tab bar, not tabs
+      create/            Post/Activity/Event/Reel forms — stack screens above the tab bar, not tabs
       content/           [contentId] detail screen (Activity/Event participation) — also a stack
                         screen above the tab bar
       user/              [uid]/index (public profile), [uid]/followers, [uid]/following —
@@ -62,18 +62,24 @@ src/
   hooks/                useAuth.ts, useProfile.ts
   providers/            AuthProvider, ProfileProvider, OnboardingDraftProvider
   services/            firebase.ts (App), auth.ts (Auth), firestore.ts (Firestore),
-                       userProfile.ts (private profile data layer), content.ts (posts/activities/
-                       events data layer), engagement.ts (activity participation + event
-                       responses), socialEngagement.ts (likes + comments), publicProfile.ts
-                       (public social profiles), following.ts (follow graph), location.ts
+                       storage.ts (Cloud Storage — Step 18), userProfile.ts (private profile
+                       data layer), content.ts (posts/activities/events data layer),
+                       engagement.ts (activity participation + event responses),
+                       socialEngagement.ts (likes + comments), publicProfile.ts (public social
+                       profiles), following.ts (follow graph), messages.ts (1:1 DMs),
+                       blocks.ts, privacySettings.ts, reports.ts (safety), reels.ts
+                       (Reel upload/publish/feed — see Reels section below), location.ts
                        (one-time city lookup)
   types/                Shared TypeScript types and type augmentations (user.ts = private,
-                       social.ts = public profile + follow)
+                       social.ts = public profile + follow, reel.ts = Step 18 Reels)
   utils/                authErrors.ts, username.ts, cityKey.ts, cityDisplay.ts, timeFormat.ts
-scripts/                delete-test-documents.cjs — explicit-ID-only disposable test cleanup
+scripts/                delete-test-documents.cjs — explicit-ID-only disposable Firestore/Auth
+                       test cleanup; delete-test-storage-objects.cjs — same pattern for exact
+                       Cloud Storage object paths
 firestore.rules         Firestore security rules (see Firestore section below)
-firestore.indexes.json  Composite indexes the content queries need
-firebase.json           Firebase CLI config — Firestore rules + indexes only
+firestore.indexes.json  Composite indexes the content/reels queries need
+storage.rules           Cloud Storage security rules (Reel media only — see Reels section)
+firebase.json           Firebase CLI config — Firestore rules/indexes + Storage rules
 .firebaserc              Points the CLI at the around-me-6a437 project
 ```
 
@@ -87,7 +93,7 @@ App data lives in Cloud Firestore, on the same Firebase project as Auth (`around
 - `usernames/{usernameLower}` — a uniqueness index reserving each username to one `uid`. Created atomically with the profile in a single transaction (see `src/services/userProfile.ts`).
 - `publicProfiles/{uid}` — the social-facing counterpart to `users/{uid}`, containing only what's safe to show any signed-in user: `displayName`, `username`, `usernameLower`, `cityName`, `countryCode`, `cityKey`, `interests`, `accountType`, `createdAt`, `updatedAt`. No email, GPS, tokens, or other private fields — enforced by Firestore rules requiring every field to exactly match the caller's own `users/{uid}` document on create. Created atomically alongside `users`/`usernames` during onboarding; accounts that completed onboarding before Step 11 get one lazily via `ensureMyPublicProfile()` (see Social graph below).
 - `follows/{followerUid}_{followingUid}` — a directed edge in the social graph (`src/services/following.ts`), with a deterministic ID so at most one follow document can ever exist per (follower, following) pair. No copied profile data, just `followerUid`, `followingUid`, `createdAt` — resolve to `publicProfiles/{uid}` for display.
-- `content/{contentId}` — one unified collection for `post` / `activity` / `event` (a discriminated union in `src/types/content.ts`), since Home will eventually be a mixed feed of all three. Reels get their own architecture in a later step — different media/storage concerns.
+- `content/{contentId}` — one unified collection for `post` / `activity` / `event` (a discriminated union in `src/types/content.ts`), since Home will eventually be a mixed feed of all three. Reels live in their own separate `reels/{reelId}` collection instead — see the Reels section below for why.
 
 Every content document carries `authorUid`, `authorDisplayName`, `authorUsername`, `cityName`, `countryCode`, `cityKey` — a **public-safe snapshot** of the author's private profile, copied at write time so the feed never has to read another user's `users/{uid}` document. Firestore rules verify this snapshot exactly matches the author's own profile on create, so a modified client can't post as another user or claim another city. Reads are open to any signed-in user (not scoped to the reader's own city — browsing other cities is intentional); creates require a completed profile; updates are denied entirely for now (no edit UI exists yet, so there's nothing to validate "which fields are safely mutable" against). **Root content delete is disabled** (`allow delete: if false`) as of Step 10 — content now has five possible subcollections (`participants`, `stats`, `responses`, `likes`, `comments`) that Firestore never cascade-deletes, and there's no safe production cascade-delete workflow or client "delete content" UI yet, so allowing a client to delete the parent alone would leave those subcollections permanently orphaned.
 
@@ -140,9 +146,17 @@ npm run cleanup:test-data -- --users uid1,uid2 --usernames someuser,otheruser --
 
 `scripts/delete-test-documents.cjs` deletes only the exact document IDs you pass it — it has no "delete everything" mode and running it with no flags is a no-op. **Never** run `firebase firestore:delete <collection> --recursive` against this project: that deletes the entire collection, real user data included, not just test documents.
 
+For disposable Reel test videos in Cloud Storage, use the equivalent Storage-only script with exact object paths:
+
+```bash
+node scripts/delete-test-storage-objects.cjs "reels/<uid>/<reelId>/source"
+```
+
+Same rule applies: exact paths only, no bucket-wide or folder-wide delete.
+
 ## Create flow
 
-Create → choose Post/Activity/Event → fill in the form → Publish calls the matching `create*` function in `src/services/content.ts` directly (screens never write to Firestore themselves). On success the app navigates back to Home; Home refetches on every focus (`useFocusEffect`, still a one-shot query, not a realtime listener), so newly-published content shows up without an app restart. Reel stays "Coming soon" — no upload UI or Storage integration exists yet.
+Create → choose Post/Activity/Event → fill in the form → Publish calls the matching `create*` function in `src/services/content.ts` directly (screens never write to Firestore themselves). On success the app navigates back to Home; Home refetches on every focus (`useFocusEffect`, still a one-shot query, not a realtime listener), so newly-published content shows up without an app restart. Reel is a separate flow with its own two-phase upload lifecycle — see the Reels section below.
 
 Date/time fields use `@react-native-community/datetimepicker` on iOS/Android (`src/components/DateTimeField.tsx`) and plain HTML `date`/`time` inputs on web (`DateTimeField.web.tsx`, picked automatically by Metro's platform file resolution) — the picker package has no web support of its own.
 
@@ -186,6 +200,51 @@ Home intentionally does **not** run Like/Comment aggregation queries per card �
 A subtlety worth knowing if you touch `firestore.rules`: the onboarding transaction creates `users/{uid}` and `publicProfiles/{uid}` in the **same** transaction, so the public-profile create rule can't validate against `get(users/{uid})` — that only sees the pre-transaction snapshot, and for a brand-new user the document doesn't exist there yet, which would make every signup fail. It uses `getAfter()`/`existsAfter()` instead (same pairing pattern as the participants/stats rules from Step 9), which correctly sees same-transaction writes.
 
 `/user/{uid}` (public profile), `/user/{uid}/followers`, `/user/{uid}/following` are reachable by tapping any author, commenter, participant name, or `@username` throughout the app (`src/components/AuthorLink.tsx`) — including from inside a `ContentCard`, where it's nested inside that card's own tap-to-open-detail `Pressable` and calls `stopPropagation()` so only one of the two navigations fires.
+
+## Reels (Cloud Storage — Step 18)
+
+Reels are short (≤60s), video-only posts with vertical, city-scoped playback — the first feature in this app to use Cloud Storage rather than Firestore alone. They live in their own root collection, `reels/{reelId}`, separate from `content/{contentId}` (posts/activities/events): a Reel has a media-upload lifecycle and Storage metadata that the other content types never had, and folding it into `content` would have meant giving every Post/Activity/Event query an upload-status field it never needs.
+
+### Two-phase lifecycle
+
+A Reel is never created already "published." `src/services/reels.ts` enforces two phases:
+
+1. **`createReelDraft`** — writes `reels/{reelId}` with `status: "uploading"`, `publishedAt: null`, and every author/city/media field fixed up front (author snapshot from the caller's own `users/{uid}`, category, caption, and the video's own declared `storageContentType`/`fileSizeBytes`/`durationMs`/`width`/`height`).
+2. **`uploadReelVideo`** — a resumable upload (`uploadBytesResumable`) of the picked video to `reels/{authorUid}/{reelId}/source`, the exact Storage path the draft already committed to. Progress (0–100%) is surfaced to the Create Reel screen; cancelling calls `discardReelDraft`, which best-effort deletes both the Storage object and the Firestore draft.
+3. **`publishReel`** — the *only* allowed Firestore update on a Reel: `status: "uploading" → "published"`, `publishedAt: null → serverTimestamp()`. Every other field is immutable — enforced in `firestore.rules`, not just assumed client-side.
+
+The Reels feed (`fetchCityReels`) only ever queries `status == "published"`, so an in-progress or abandoned upload never appears there, and its draft document remains readable only by its own author.
+
+### The 50 MB / 60-second limits — what's actually enforced vs. declared
+
+- **50 MB file size** is enforced by `storage.rules` against the **real, transferred byte count** (`request.resource.size`) — a client can't lie about this.
+- **60-second duration** is a different story: Cloud Storage/Firestore Rules have no way to inspect a video file's actual duration. What's enforced is that the **declared** `durationMs` (read from the picker's own asset metadata) is ≤ 60,000 and matches what Firestore Rules validated at create time. A maliciously modified client could, in principle, declare a short duration while uploading a longer file. Real duration enforcement would require trusted server-side media processing (a Cloud Function that probes/transcodes the upload) — explicitly out of scope for Step 18. Treat the 60-second limit as a strong product convention backed by rules-level validation of the declared value, not a cryptographic guarantee about the video itself.
+
+### Storage rules — and a real infrastructure limitation
+
+`storage.rules` governs `reels/{authorUid}/{reelId}/source`:
+
+- **Create**: caller must own the `authorUid` path segment; the uploaded object's *actual* size and content type (`video/.*`) are checked by Storage itself; `resource == null` makes this create-once (Cloud Storage has no real "update file content" operation — a second upload to an existing path is evaluated under this same `create` rule, not `update`, so the overwrite guard has to live here, not in `allow update`).
+- **Update**: always denied (no metadata-only replacement either).
+- **Delete**: always denied to ordinary clients. Failed/cancelled uploads are cleaned up via `discardReelDraft`'s best-effort client delete (which will itself be denied — see below) or, if that fails, via `scripts/delete-test-storage-objects.cjs` using the same trusted-CLI-session pattern as `delete-test-documents.cjs`.
+- **Read**: any authenticated user, full stop.
+
+That last point is a deliberate, documented compromise, not an oversight. Firebase Storage Rules officially support calling into Firestore from a Storage rule (`firestore.get()`/`firestore.exists()` — shown in Firebase's own default `storage.rules` template) so a Storage rule can check a Reel's real `status`/`authorUid` before allowing an operation. **In this project, that cross-service call does not work** — verified empirically during Step 18 by testing it against a Firestore document that had existed for 10+ minutes (ruling out propagation lag) and by confirming the Storage service agent's IAM binding and the Firestore database's mode (`FIRESTORE_NATIVE`) are both correctly configured. The most likely cause: the Firestore database is in `europe-north2` while the Storage bucket is in `US-EAST1` — different regions. Fixing this would mean deleting and recreating the Storage bucket in a matching region, which this project was explicitly instructed never to do without the owner's direct decision (bucket location is a one-time, unchangeable choice).
+
+Because of this, `storage.rules` can't independently re-check a Reel's Firestore status before allowing Storage reads/writes, so:
+- **Confidentiality of an "uploading" Reel's media is enforced by Firestore, not Storage**: the app only ever learns a Reel's `storagePath` by reading its `reels/{reelId}` document, and that document is readable by non-authors only once `status == "published"` (see `firestore.rules`). `reelId` is an unguessable Firestore auto-ID, so directly guessing a Storage path to bypass this stays outside the practical threat model.
+- **A modified client could upload an orphan object** (Storage object with no matching "uploading" Firestore draft) into its own `authorUid` path. Such an object is never discoverable or playable by anyone — the feed and playback resolution only ever start from a real `reels/{reelId}` document — so this is a storage-quota nuisance to the uploader's own account, not a cross-user integrity or confidentiality issue.
+- **Client-side cleanup of a cancelled upload's Storage object will fail** (delete is unconditionally denied) — this is logged (`__DEV__`-gated `console.warn`, not silently swallowed) so orphaned test/abandoned objects stay visible for CLI cleanup instead of hidden.
+
+See `storage.rules`'s own file header for the full technical writeup — that comment is the source of truth if this ever gets revisited (e.g. after recreating the bucket in `europe-north2`, at which point the original cross-service design in that file's git history could be restored).
+
+### Playback
+
+`storagePath` is what's persisted in Firestore — never a `getDownloadURL()` token URL. Playback URLs are resolved from `storagePath` at call time (`resolveReelPlaybackUrl`, cached in-memory for the session) via `expo-video`'s `useVideoPlayer`/`VideoView`. The vertical feed (`src/app/(app)/(tabs)/reels.tsx` + `src/components/ReelFeedItem.tsx`) tracks the active item via `FlatList`'s `onViewableItemsChanged` and only ever plays the currently-active item's player — every other item is paused, so at most one video decodes at a time.
+
+### Not in Step 18
+
+Camera recording, video editing/filters, a music library, duets/stitches, a shares backend, Reel Likes/Comments, thumbnail generation, transcoding, and any ML-based ranking are all explicitly out of scope — Step 18 is publish-and-watch only, newest-first per city.
 
 ## Location
 

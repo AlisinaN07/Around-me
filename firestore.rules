@@ -520,6 +520,126 @@ service cloud.firestore {
       }
     }
 
+    // reels/{reelId} — a separate root collection from content/{contentId}
+    // (see src/types/reel.ts for why Reels don't share the content model).
+    // Two-phase lifecycle: "uploading" -> "published" (see
+    // src/services/reels.ts). Author/city fields are validated against the
+    // author's own private users/{uid} profile, exactly like content
+    // above. storagePath must exactly equal the deterministic path
+    // reels/{authorUid}/{reelId}/source. This is the ONLY place that
+    // check happens: storage.rules cannot independently re-verify it in
+    // this project (see storage.rules's file header for why — a
+    // cross-region Firestore/Storage mismatch breaks its cross-service
+    // Firestore lookup), so THIS collection's read rule is what actually
+    // keeps an "uploading" Reel's storagePath — and therefore its media —
+    // hidden from everyone but its own author.
+    match /reels/{reelId} {
+      // Published Reels are readable by any signed-in user (city feed
+      // queries always filter status == 'published', so an in-progress
+      // upload never appears there). An "uploading" draft is only
+      // readable by its own author — needed for the upload workflow
+      // (checking status, retrying, discarding) — nobody else can see an
+      // unfinished Reel.
+      allow read: if isSignedIn()
+        && (resource.data.status == 'published' || resource.data.authorUid == request.auth.uid);
+
+      allow create: if isSignedIn() && isValidReelCreate(reelId, request.resource.data);
+
+      // The ONLY allowed transition: uploading -> published. Every other
+      // field is immutable — no caption editing, no city changing, no
+      // storage path changing, no author changing, and once published,
+      // this rule can never fire again (oldData.status == 'uploading' is
+      // required, so a second update attempt against a published Reel is
+      // always denied here).
+      allow update: if isSignedIn()
+        && resource.data.authorUid == request.auth.uid
+        && isValidReelPublish(request.resource.data, resource.data);
+
+      // Only a still-uploading draft may be deleted, by its own author —
+      // for failed/cancelled-upload cleanup (see discardReelDraft). A
+      // published Reel can never be deleted by a client: there is no
+      // trusted media + Firestore cascade-deletion workflow yet.
+      allow delete: if isSignedIn()
+        && resource.data.authorUid == request.auth.uid
+        && resource.data.status == 'uploading';
+    }
+
+    function reelBaseKeys() {
+      return [
+        'reelId', 'authorUid', 'authorDisplayName', 'authorUsername',
+        'cityName', 'countryCode', 'cityKey', 'categoryId', 'caption',
+        'storagePath', 'storageContentType', 'fileSizeBytes', 'durationMs',
+        'width', 'height', 'status', 'visibility', 'createdAt', 'updatedAt', 'publishedAt'
+      ];
+    }
+
+    function isValidReelCreate(reelId, data) {
+      let profile = get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+      return exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && profile.onboardingCompleted == true
+        && data.reelId == reelId
+        && data.authorUid == request.auth.uid
+        && data.authorDisplayName == profile.displayName
+        && data.authorUsername == profile.username
+        && data.cityName == profile.cityName
+        && data.countryCode == profile.countryCode
+        && data.cityKey == profile.cityKey
+        && data.categoryId is string
+        && data.categoryId.size() > 0
+        && data.caption is string
+        && data.caption.size() <= 500
+        && data.storagePath == 'reels/' + request.auth.uid + '/' + reelId + '/source'
+        && data.storageContentType is string
+        && data.storageContentType.matches('video/.*')
+        && data.fileSizeBytes is int
+        && data.fileSizeBytes > 0
+        && data.fileSizeBytes <= 52428800
+        && data.durationMs is int
+        && data.durationMs > 0
+        && data.durationMs <= 60000
+        && data.width is number
+        && data.width > 0
+        && data.height is number
+        && data.height > 0
+        && data.status == 'uploading'
+        && data.visibility == 'city'
+        && data.publishedAt == null
+        && isServerTimestamp(data.createdAt)
+        && isServerTimestamp(data.updatedAt)
+        && data.keys().hasOnly(reelBaseKeys());
+    }
+
+    // Every field except status/publishedAt/updatedAt must stay
+    // byte-identical to what create validated — this is what actually
+    // enforces "no caption editing, no city changing, no storage path
+    // changing, no author changing" from the Step 18 spec, not just the
+    // status-transition check by itself.
+    function isValidReelPublish(newData, oldData) {
+      return oldData.status == 'uploading'
+        && newData.status == 'published'
+        && oldData.publishedAt == null
+        && isServerTimestamp(newData.publishedAt)
+        && isServerTimestamp(newData.updatedAt)
+        && newData.reelId == oldData.reelId
+        && newData.authorUid == oldData.authorUid
+        && newData.authorDisplayName == oldData.authorDisplayName
+        && newData.authorUsername == oldData.authorUsername
+        && newData.cityName == oldData.cityName
+        && newData.countryCode == oldData.countryCode
+        && newData.cityKey == oldData.cityKey
+        && newData.categoryId == oldData.categoryId
+        && newData.caption == oldData.caption
+        && newData.storagePath == oldData.storagePath
+        && newData.storageContentType == oldData.storageContentType
+        && newData.fileSizeBytes == oldData.fileSizeBytes
+        && newData.durationMs == oldData.durationMs
+        && newData.width == oldData.width
+        && newData.height == oldData.height
+        && newData.visibility == oldData.visibility
+        && newData.createdAt == oldData.createdAt
+        && newData.keys().hasOnly(reelBaseKeys());
+    }
+
     // notifications/{notificationId} — one social notification per Like,
     // Comment, or Follow (see src/types/notification.ts). These are always
     // written atomically with their underlying action (writeBatch, in
@@ -970,7 +1090,7 @@ service cloud.firestore {
     }
 
     function reportBaseKeys() {
-      return ['reportId', 'reporterUid', 'targetType', 'targetUid', 'contentId', 'conversationId', 'messageId', 'reason', 'details', 'createdAt'];
+      return ['reportId', 'reporterUid', 'targetType', 'targetUid', 'contentId', 'conversationId', 'messageId', 'reelId', 'reason', 'details', 'createdAt'];
     }
 
     function isValidReportBase(data) {
@@ -988,6 +1108,7 @@ service cloud.firestore {
         && data.contentId == null
         && data.conversationId == null
         && data.messageId == null
+        && data.reelId == null
         && reportId == 'user_' + request.auth.uid + '_' + data.targetUid
         && exists(/databases/$(database)/documents/publicProfiles/$(data.targetUid));
     }
@@ -998,6 +1119,7 @@ service cloud.firestore {
         && data.contentId is string
         && data.conversationId == null
         && data.messageId == null
+        && data.reelId == null
         && reportId == 'content_' + request.auth.uid + '_' + data.contentId
         && exists(contentPath)
         && get(contentPath).data.status == 'published'
@@ -1011,6 +1133,7 @@ service cloud.firestore {
         && data.conversationId is string
         && data.messageId is string
         && data.contentId == null
+        && data.reelId == null
         && exists(convPath)
         && request.auth.uid in get(convPath).data.participantUids
         && exists(msgPath)
@@ -1019,9 +1142,35 @@ service cloud.firestore {
         && reportId == 'message_' + request.auth.uid + '_' + data.messageId;
     }
 
+    // Reel is not content/{contentId} (see reels/{reelId} above), so a
+    // Reel report references reelId directly rather than reusing
+    // isValidContentReport. Requires the Reel to be published (an
+    // "uploading" draft's authorUid isn't public information worth
+    // reporting yet, and no UI ever offers Report on one), the claimed
+    // targetUid to exactly equal the Reel's real author, and — like every
+    // other report type — the reporter can't target themselves.
+    function isValidReelReport(reportId, data) {
+      let reelPath = /databases/$(database)/documents/reels/$(data.reelId);
+      return data.targetType == 'reel'
+        && data.reelId is string
+        && data.contentId == null
+        && data.conversationId == null
+        && data.messageId == null
+        && exists(reelPath)
+        && get(reelPath).data.status == 'published'
+        && data.targetUid == get(reelPath).data.authorUid
+        && data.targetUid != request.auth.uid
+        && reportId == 'reel_' + request.auth.uid + '_' + data.reelId;
+    }
+
     function isValidReportCreate(reportId, data) {
       return isValidReportBase(data)
-        && (isValidUserReport(reportId, data) || isValidContentReport(reportId, data) || isValidMessageReport(reportId, data));
+        && (
+          isValidUserReport(reportId, data)
+          || isValidContentReport(reportId, data)
+          || isValidMessageReport(reportId, data)
+          || isValidReelReport(reportId, data)
+        );
     }
 
     // Everything else is denied by default.

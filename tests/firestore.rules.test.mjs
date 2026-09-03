@@ -276,6 +276,9 @@ function contentReportId(reporterUid, contentId) {
 function messageReportId(reporterUid, messageId) {
   return `message_${reporterUid}_${messageId}`;
 }
+function reelReportId(reporterUid, reelId) {
+  return `reel_${reporterUid}_${reelId}`;
+}
 function validReport(reportId, reporterUid, targetType, overrides = {}) {
   return {
     reportId,
@@ -285,9 +288,40 @@ function validReport(reportId, reporterUid, targetType, overrides = {}) {
     contentId: null,
     conversationId: null,
     messageId: null,
+    reelId: null,
     reason: 'spam',
     details: null,
     createdAt: serverTimestamp(),
+    ...overrides,
+  };
+}
+
+// Same deterministic path scheme as src/services/reels.ts's reelStoragePath.
+function reelStoragePath(authorUid, reelId) {
+  return `reels/${authorUid}/${reelId}/source`;
+}
+function validReel(authorUid, displayName, username, reelId, overrides = {}) {
+  return {
+    reelId,
+    authorUid,
+    authorDisplayName: displayName,
+    authorUsername: username,
+    cityName: 'Karlstad',
+    countryCode: 'SE',
+    cityKey: 'se:karlstad',
+    categoryId: 'music',
+    caption: 'Test reel',
+    storagePath: reelStoragePath(authorUid, reelId),
+    storageContentType: 'video/mp4',
+    fileSizeBytes: 1024,
+    durationMs: 5000,
+    width: 720,
+    height: 1280,
+    status: 'uploading',
+    visibility: 'city',
+    createdAt: serverTimestamp(),
+    updatedAt: serverTimestamp(),
+    publishedAt: null,
     ...overrides,
   };
 }
@@ -2674,6 +2708,217 @@ async function main() {
 
     await check('DENY: unrelated authenticated user reads someone else\'s report', async () => {
       await assertFails(getDoc(doc(s17b, 'reports', userReportId('s17c', 's17a'))));
+    });
+
+    // ==========================================================
+    // Step 18 — reels/{reelId} (see firestore.rules and
+    // src/services/reels.ts's two-phase uploading -> published lifecycle)
+    // ==========================================================
+
+    await seedProfile(testEnv, 'r18a', 'r18a_handle', { displayName: 'Reel Author' });
+    await seedProfile(testEnv, 'r18b', 'r18b_handle', { displayName: 'Reel Viewer' });
+
+    const r18a = testEnv.authenticatedContext('r18a').firestore();
+    const r18b = testEnv.authenticatedContext('r18b').firestore();
+
+    await check('DENY: unauthenticated Reel create', async () => {
+      await assertFails(setDoc(doc(anon, 'reels', 'reel-1'), validReel('r18a', 'Reel Author', 'r18a_handle', 'reel-1')));
+    });
+
+    await check('DENY: Reel create with spoofed authorUid', async () => {
+      await assertFails(setDoc(doc(r18b, 'reels', 'reel-1'), validReel('r18a', 'Reel Author', 'r18a_handle', 'reel-1')));
+    });
+
+    await check('DENY: Reel create with spoofed authorDisplayName', async () => {
+      await assertFails(
+        setDoc(doc(r18a, 'reels', 'reel-1'), validReel('r18a', 'Fake Name', 'r18a_handle', 'reel-1'))
+      );
+    });
+
+    await check('DENY: Reel create with spoofed authorUsername', async () => {
+      await assertFails(
+        setDoc(doc(r18a, 'reels', 'reel-1'), validReel('r18a', 'Reel Author', 'fake_handle', 'reel-1'))
+      );
+    });
+
+    await check('DENY: Reel create with spoofed city', async () => {
+      await assertFails(
+        setDoc(
+          doc(r18a, 'reels', 'reel-1'),
+          validReel('r18a', 'Reel Author', 'r18a_handle', 'reel-1', { cityName: 'Stockholm', cityKey: 'se:stockholm' })
+        )
+      );
+    });
+
+    await check('DENY: Reel create with empty category', async () => {
+      await assertFails(
+        setDoc(doc(r18a, 'reels', 'reel-1'), validReel('r18a', 'Reel Author', 'r18a_handle', 'reel-1', { categoryId: '' }))
+      );
+    });
+
+    await check('DENY: Reel create with storagePath not matching authorUid/reelId', async () => {
+      await assertFails(
+        setDoc(
+          doc(r18a, 'reels', 'reel-1'),
+          validReel('r18a', 'Reel Author', 'r18a_handle', 'reel-1', { storagePath: reelStoragePath('r18a', 'some-other-reel') })
+        )
+      );
+    });
+
+    await check('DENY: Reel create with non-video contentType', async () => {
+      await assertFails(
+        setDoc(
+          doc(r18a, 'reels', 'reel-1'),
+          validReel('r18a', 'Reel Author', 'r18a_handle', 'reel-1', { storageContentType: 'image/png' })
+        )
+      );
+    });
+
+    await check('DENY: Reel create with declared file size over 50 MB', async () => {
+      await assertFails(
+        setDoc(
+          doc(r18a, 'reels', 'reel-1'),
+          validReel('r18a', 'Reel Author', 'r18a_handle', 'reel-1', { fileSizeBytes: 52428801 })
+        )
+      );
+    });
+
+    await check('DENY: Reel create with declared duration over 60 seconds', async () => {
+      await assertFails(
+        setDoc(
+          doc(r18a, 'reels', 'reel-1'),
+          validReel('r18a', 'Reel Author', 'r18a_handle', 'reel-1', { durationMs: 60001 })
+        )
+      );
+    });
+
+    await check('DENY: Reel created directly as published', async () => {
+      await assertFails(
+        setDoc(
+          doc(r18a, 'reels', 'reel-1'),
+          validReel('r18a', 'Reel Author', 'r18a_handle', 'reel-1', { status: 'published', publishedAt: serverTimestamp() })
+        )
+      );
+    });
+
+    await check('ALLOW: completed user creates a valid uploading Reel', async () => {
+      await assertSucceeds(setDoc(doc(r18a, 'reels', 'reel-1'), validReel('r18a', 'Reel Author', 'r18a_handle', 'reel-1')));
+    });
+
+    await check('ALLOW: author reads their own uploading Reel', async () => {
+      const snapshot = await assertSucceeds(getDoc(doc(r18a, 'reels', 'reel-1')));
+      assert.equal(snapshot.data().status, 'uploading');
+    });
+
+    await check('DENY: a different user reads someone else\'s uploading Reel', async () => {
+      await assertFails(getDoc(doc(r18b, 'reels', 'reel-1')));
+    });
+
+    await check('DENY: a different user publishes someone else\'s draft', async () => {
+      await assertFails(
+        updateDoc(doc(r18b, 'reels', 'reel-1'), { status: 'published', publishedAt: serverTimestamp(), updatedAt: serverTimestamp() })
+      );
+    });
+
+    await check('DENY: publish while changing the caption', async () => {
+      await assertFails(
+        updateDoc(doc(r18a, 'reels', 'reel-1'), {
+          status: 'published',
+          publishedAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+          caption: 'sneaky edit',
+        })
+      );
+    });
+
+    await check('DENY: publish while changing the city', async () => {
+      await assertFails(
+        updateDoc(doc(r18a, 'reels', 'reel-1'), {
+          status: 'published',
+          publishedAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+          cityKey: 'se:stockholm',
+        })
+      );
+    });
+
+    await check('ALLOW: author publishes their own Reel (uploading -> published)', async () => {
+      await assertSucceeds(
+        updateDoc(doc(r18a, 'reels', 'reel-1'), { status: 'published', publishedAt: serverTimestamp(), updatedAt: serverTimestamp() })
+      );
+    });
+
+    await check('DENY: update a published Reel', async () => {
+      await assertFails(updateDoc(doc(r18a, 'reels', 'reel-1'), { caption: 'edit after publish' }));
+    });
+
+    await check('DENY: delete a published Reel', async () => {
+      await assertFails(deleteDoc(doc(r18a, 'reels', 'reel-1')));
+    });
+
+    await check('ALLOW: any authenticated user reads a published Reel', async () => {
+      const snapshot = await assertSucceeds(getDoc(doc(r18b, 'reels', 'reel-1')));
+      assert.equal(snapshot.data().status, 'published');
+    });
+
+    await check('ALLOW: city Reel feed query returns the published Reel', async () => {
+      const snapshot = await assertSucceeds(
+        getDocs(
+          query(
+            collection(r18b, 'reels'),
+            where('cityKey', '==', 'se:karlstad'),
+            where('status', '==', 'published'),
+            orderBy('publishedAt', 'desc')
+          )
+        )
+      );
+      assert.ok(snapshot.docs.some((d) => d.id === 'reel-1'));
+    });
+
+    await check('setup: a second draft for delete/other-user-delete tests', async () => {
+      await assertSucceeds(setDoc(doc(r18a, 'reels', 'reel-2'), validReel('r18a', 'Reel Author', 'r18a_handle', 'reel-2')));
+    });
+
+    await check('DENY: a different user deletes someone else\'s uploading draft', async () => {
+      await assertFails(deleteDoc(doc(r18b, 'reels', 'reel-2')));
+    });
+
+    await check('ALLOW: author deletes their own still-uploading draft', async () => {
+      await assertSucceeds(deleteDoc(doc(r18a, 'reels', 'reel-2')));
+    });
+
+    // --- Reel reports (reports/{reportId} targetType == 'reel') ---
+
+    await check('ALLOW: valid published-Reel report', async () => {
+      const reportId = reelReportId('r18b', 'reel-1');
+      await assertSucceeds(
+        setDoc(doc(r18b, 'reports', reportId), validReport(reportId, 'r18b', 'reel', { reelId: 'reel-1', targetUid: 'r18a' }))
+      );
+    });
+
+    await check('DENY: Reel report with spoofed targetUid', async () => {
+      const reportId = reelReportId('r18b', 'reel-1');
+      await assertFails(
+        setDoc(doc(r18b, 'reports', reportId), validReport(reportId, 'r18b', 'reel', { reelId: 'reel-1', targetUid: 'r18b' }))
+      );
+    });
+
+    await check('DENY: self Reel report', async () => {
+      const reportId = reelReportId('r18a', 'reel-1');
+      await assertFails(
+        setDoc(doc(r18a, 'reports', reportId), validReport(reportId, 'r18a', 'reel', { reelId: 'reel-1', targetUid: 'r18a' }))
+      );
+    });
+
+    await check('DENY: report a nonexistent Reel', async () => {
+      const reportId = reelReportId('r18b', 'does-not-exist');
+      await assertFails(
+        setDoc(doc(r18b, 'reports', reportId), validReport(reportId, 'r18b', 'reel', { reelId: 'does-not-exist', targetUid: 'r18a' }))
+      );
+    });
+
+    await check('DENY: reported Reel author reads the report about them', async () => {
+      await assertFails(getDoc(doc(r18a, 'reports', reelReportId('r18b', 'reel-1'))));
     });
 
     await testEnv.clearFirestore();

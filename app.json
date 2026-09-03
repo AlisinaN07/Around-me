@@ -54,7 +54,16 @@
       ],
       "expo-font",
       "@react-native-community/datetimepicker",
-      "expo-maps"
+      "expo-maps",
+      "expo-video",
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Around Me uses your photo library only when you choose a video to share in a Reel.",
+          "cameraPermission": false,
+          "microphonePermission": false
+        }
+      ]
     ],
     "experiments": {
       "typedRoutes": true,
