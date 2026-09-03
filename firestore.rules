@@ -526,13 +526,10 @@ service cloud.firestore {
     // src/services/reels.ts). Author/city fields are validated against the
     // author's own private users/{uid} profile, exactly like content
     // above. storagePath must exactly equal the deterministic path
-    // reels/{authorUid}/{reelId}/source. This is the ONLY place that
-    // check happens: storage.rules cannot independently re-verify it in
-    // this project (see storage.rules's file header for why — a
-    // cross-region Firestore/Storage mismatch breaks its cross-service
-    // Firestore lookup), so THIS collection's read rule is what actually
-    // keeps an "uploading" Reel's storagePath — and therefore its media —
-    // hidden from everyone but its own author.
+    // reels/{authorUid}/{reelId}/source — independently re-verified by
+    // storage.rules itself via its own cross-service firestore.get() call
+    // (see storage.rules's file header for the IAM setup that makes that
+    // possible), not just here.
     match /reels/{reelId} {
       // Published Reels are readable by any signed-in user (city feed
       // queries always filter status == 'published', so an in-progress

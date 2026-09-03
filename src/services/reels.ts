@@ -262,18 +262,13 @@ export async function publishReel(reelId: string): Promise<PublishReelResult> {
 
 // ---------------------------------------------------------------------------
 // Discard — failed/cancelled upload cleanup. Only valid while the Reel is
-// still "uploading" (see firestore.rules) — a published Reel can never be
-// discarded this way.
-//
-// IMPORTANT: storage.rules currently denies ALL client-side deletes,
-// including this one — see storage.rules's file header for why (a
-// cross-region Firestore/Storage mismatch breaks its cross-service
-// Firestore lookup, so it can't safely distinguish "still uploading" from
-// "published" on its own, and denying unconditionally is the safe
-// direction to fail in). That means the Storage delete below will fail
-// for any object that actually finished uploading — this is expected
-// given that limitation, not silently swallowed: it's logged so orphaned
-// objects stay visible for cleanup via trusted CLI tooling (see
+// still "uploading" — storage.rules independently cross-checks this same
+// condition against Firestore before allowing the delete below, so a
+// published Reel's media can never be discarded this way even if this
+// function were called on one. If the delete still fails for some other
+// reason (e.g. the object never finished uploading in the first place),
+// that's logged rather than silently swallowed, so orphaned objects stay
+// visible for cleanup via trusted CLI tooling (see
 // scripts/delete-test-documents.cjs's pattern) rather than hidden.
 // ---------------------------------------------------------------------------
 
