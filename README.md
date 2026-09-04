@@ -407,6 +407,46 @@ Collection-group querying is not usable in this project for this purpose without
 
 All rules/index changes made while investigating this were reverted before finishing — production `firestore.rules`/`firestore.indexes.json` are byte-identical to before this step. `EventActionButtons` therefore keeps its Step 26 design and doc comment (now noting this investigation): actionable, never claiming a false "not selected"/"not joined" state, showing only what the viewer taps within the current session — the "state-neutral" fallback the Step 26.1 spec itself sanctioned for exactly this outcome.
 
+## Profile v1 — visual reconstruction (Step 27)
+
+Own Profile (`src/app/(app)/(tabs)/profile.tsx`) and public profile (`src/app/(app)/user/[uid]/index.tsx`) now share one visual system — `ProfileHeader`, `InterestPills`, `ProfileTabBar` — rather than two independently-styled screens. Own Profile's data-fetching was rebuilt to match public profile's existing real architecture (`fetchFollowerCount`/`fetchFollowingCount`/`fetchPublicUserContent`/`fetchProfileReels`) instead of the static placeholders it had before this step.
+
+### Stats — real only
+
+**Posts / Following / Followers**, in that order, on both screens. Follower/Following counts are real `getCountFromServer` aggregations (unchanged, cheap). Posts is `content.filter(item => item.type === 'post').length` over the same bounded `fetchPublicUserContent` result (`DEFAULT_FEED_LIMIT` = 20, mixed post/activity/event) already fetched for the content tabs — **not** a second query. This means an account with more than 20 total posts/activities/events combined can show an undercounted Posts number (only whichever posts fall within the newest 20 mixed items) — an explicit, documented MVP limitation, not a bug, matching the same "bounded and honest, not exact" tradeoff used elsewhere in this app (e.g. Following's 30-uid cap).
+
+**No Likes total** — this app has no efficient authoritative aggregated like count across a profile's content, and computing one would mean an N+1 aggregation per profile visit. Not shown, not faked.
+
+### No bio
+
+`UserProfile`/`PublicProfile` have no bio field. No placeholder biography text is rendered — `ProfileHeader` simply has no bio slot to leave a gap in. Adding a real bio field is future work, not a Step 27 schema change.
+
+### Content tabs
+
+**Reels, Posts, Events, Activities** — in that order on both own and public profile, all four real and data-backed (the previous own-Profile screen's "Posts"/"Activities" tabs were static placeholders regardless of real data, and a "Saved" tab existed with no Saved backend at all — both fixed/removed this step). Reels render via `ReelPreviewCard` (now using `MediaCard`'s Step 26 gradient+glow fallback for a more premium grid look — no thumbnail generation, still no fake media). Posts/Events/Activities render via the existing `ContentCard`, tapping through to `/content/{contentId}` exactly as before.
+
+### Edit profile — omitted, not disabled
+
+No edit-profile route or profile-update service function exists anywhere in the codebase. The previous own-Profile screen showed a permanently `disabled` "Edit profile" button; Step 27 removes it entirely rather than keep a dead control — the Settings screen's Account section is likewise entirely omitted for the same reason (see below).
+
+### Settings — real rows only
+
+New `/settings` home screen (`src/app/(app)/settings/index.tsx`) using new `SettingsSection`/`SettingsRow` components (rounded dark card, icon + label + optional value + chevron, thin separators, destructive-red styling for Log out). Reached from Own Profile's top-right gear icon (replacing the old inline "Privacy & safety" row and the old inline Log out button, both moved here).
+
+Sections shown, and only these:
+- **Privacy** — "Message privacy" (shows the real current setting as its value) and "Blocked accounts" (shows the real blocked count), both routing to the existing `/settings/privacy` screen, which still handles both and is otherwise unchanged (message-privacy `everyone`/`people_i_follow`/`nobody` semantics and blocked-list unblock behavior are untouched).
+- **Session** — Log out (moved from Profile; no longer duplicated in two places).
+
+Sections deliberately **not shown**: **Account** (its only candidate row, Edit profile, isn't real), **Notifications** (no notification-preference backend or push system exists — no toggles that do nothing), **Content & Reels** (no real per-account content preferences exist). **Private Account** is not shown anywhere — this app has no private-account/follow-request architecture. **Delete account** is not shown — account deletion doesn't exist yet; that's explicit future work, not this step.
+
+### Activity discovery-card state (Step 26.1 follow-up)
+
+Reviewed per this step's instructions: the Step 26 discovery Activity cards already render Join as a plain, neutral, actionable pill (never a confident "Joined" claim before a real tap) — exactly the "state-neutral" outcome Step 26.1 investigated and landed on. No further change was made; swapping it for a "View activity" link would have been a regression (removing a real, direct action Step 26 was explicit about preferring), not a fix for anything still broken.
+
+### Firebase/security
+
+No changes. No new Firestore rules, indexes, or schema fields — every stat/tab above is computed from data already fetched by existing, unchanged services.
+
 ## Reels (Cloud Storage — Step 18)
 
 Reels are short (≤60s), video-only posts with vertical, city-scoped playback — the first feature in this app to use Cloud Storage rather than Firestore alone. They live in their own root collection, `reels/{reelId}`, separate from `content/{contentId}` (posts/activities/events): a Reel has a media-upload lifecycle and Storage metadata that the other content types never had, and folding it into `content` would have meant giving every Post/Activity/Event query an upload-status field it never needs.

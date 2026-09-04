@@ -3,18 +3,20 @@ import { router, useLocalSearchParams } from 'expo-router';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 
-import { Avatar } from '@/components/Avatar';
 import { Button } from '@/components/Button';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
 import { ContentCard } from '@/components/ContentCard';
+import { EmptyState } from '@/components/EmptyState';
+import { ErrorState } from '@/components/ErrorState';
 import { HeaderScreenLayout } from '@/components/HeaderScreenLayout';
+import { InterestPills } from '@/components/InterestPills';
+import { LoadingState } from '@/components/LoadingState';
 import { OptionsMenu, type OptionsMenuOption } from '@/components/OptionsMenu';
+import { ProfileHeader } from '@/components/ProfileHeader';
+import { ProfileTabBar } from '@/components/ProfileTabBar';
 import { ReelPreviewCard } from '@/components/ReelPreviewCard';
 import { ReportModal } from '@/components/ReportModal';
-import { SegmentedControl } from '@/components/SegmentedControl';
-import { COUNTRIES } from '@/constants/countries';
-import { INTERESTS } from '@/constants/interests';
-import { Colors, Radius, Spacing } from '@/constants/theme';
+import { Colors, Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
 import { blockUser, isUserBlocked, unblockUser } from '@/services/blocks';
 import { fetchPublicUserContent } from '@/services/content';
@@ -31,13 +33,28 @@ import { formatCityDisplayName } from '@/utils/cityDisplay';
 type LoadStatus = 'loading' | 'loaded' | 'error';
 type ProfileTab = ContentType | 'reel';
 
-const CONTENT_TABS: { id: ProfileTab; label: string; emptyText: string }[] = [
-  { id: 'post', label: 'Posts', emptyText: 'No posts yet' },
-  { id: 'activity', label: 'Activities', emptyText: 'No activities yet' },
-  { id: 'event', label: 'Events', emptyText: 'No events yet' },
-  { id: 'reel', label: 'Reels', emptyText: 'No Reels yet' },
+const PROFILE_TABS: { id: ProfileTab; label: string }[] = [
+  { id: 'reel', label: 'Reels' },
+  { id: 'post', label: 'Posts' },
+  { id: 'event', label: 'Events' },
+  { id: 'activity', label: 'Activities' },
 ];
 
+const EMPTY_TEXT: Record<ProfileTab, string> = {
+  reel: 'No Reels yet',
+  post: 'No posts yet',
+  event: 'No events yet',
+  activity: 'No activities yet',
+};
+
+/**
+ * Public profile — Step 27 visual reconstruction. Shares ProfileHeader/
+ * InterestPills/ProfileTabBar with the own-Profile tab
+ * (src/app/(app)/(tabs)/profile.tsx) so the two read as one visual system
+ * (Step 27 Section 19) — all data-fetching and Follow/Message/Block/Report
+ * logic below is unchanged from before this step, only the render layer
+ * was rebuilt.
+ */
 export default function PublicProfileScreen() {
   const { uid } = useLocalSearchParams<{ uid: string }>();
   const { user } = useAuth();
@@ -52,7 +69,7 @@ export default function PublicProfileScreen() {
   const [followError, setFollowError] = useState<string | null>(null);
   const [content, setContent] = useState<Content[]>([]);
   const [reels, setReels] = useState<Reel[]>([]);
-  const [contentTab, setContentTab] = useState<ProfileTab>('post');
+  const [contentTab, setContentTab] = useState<ProfileTab>('reel');
 
   // Safety state — see src/services/blocks.ts / privacySettings.ts.
   // canMessage is only ever used to proactively enable/disable the
@@ -76,7 +93,8 @@ export default function PublicProfileScreen() {
         !isOwnProfile && user ? isFollowing(user.uid, uid) : Promise.resolve(false),
         // One mixed, limited query — then split into Posts/Activities/Events
         // tabs in-memory below, rather than running three separate queries
-        // for a single profile page.
+        // for a single profile page. Its own bounded limit is also the
+        // source of the real (but capped) Posts stat in ProfileHeader.
         fetchPublicUserContent(uid),
         // Reels are a separate root collection from content/{contentId}
         // (see src/types/reel.ts), so this is its own capped query, not
@@ -166,16 +184,12 @@ export default function PublicProfileScreen() {
   };
 
   const cityLabel = profile?.cityName ? formatCityDisplayName(profile.cityName) : '';
-  const countryLabel = COUNTRIES.find((country) => country.code === profile?.countryCode)?.name ?? '';
-  const interestLabels = (profile?.interests ?? [])
-    .map((id) => INTERESTS.find((interest) => interest.id === id)?.label)
-    .filter((label): label is string => Boolean(label));
 
+  const postsCount = useMemo(() => content.filter((item) => item.type === 'post').length, [content]);
   const visibleContent = useMemo(
     () => (contentTab === 'reel' ? [] : content.filter((item) => item.type === contentTab)),
     [content, contentTab]
   );
-  const activeTabInfo = CONTENT_TABS.find((tab) => tab.id === contentTab) ?? CONTENT_TABS[0];
 
   const optionsMenuOptions: OptionsMenuOption[] = amIBlockingThem
     ? [
@@ -190,63 +204,34 @@ export default function PublicProfileScreen() {
   return (
     <HeaderScreenLayout title={profile ? `@${profile.username}` : 'Profile'}>
       {status === 'loading' ? (
-        <View style={styles.centered}>
-          <Text style={styles.mutedText}>Loading…</Text>
-        </View>
+        <LoadingState size="large" />
       ) : status === 'error' || !profile ? (
-        <View style={styles.centered}>
-          <Ionicons name="alert-circle-outline" size={32} color={Colors.textSecondary} />
-          <Text style={styles.errorTitle}>Couldn&apos;t load this profile.</Text>
-          <Button label="Try again" onPress={load} />
-        </View>
+        <ErrorState title="Couldn't load this profile" onRetry={load} />
       ) : (
         <View style={styles.container}>
-          <View style={styles.header}>
-            {!isOwnProfile ? (
-              <Pressable
-                onPress={() => setIsOptionsMenuOpen(true)}
-                style={styles.overflowButton}
-                hitSlop={8}
-                accessibilityRole="button"
-                accessibilityLabel="More options"
-              >
-                <Ionicons name="ellipsis-horizontal" size={20} color={Colors.textSecondary} />
-              </Pressable>
-            ) : null}
-            <Avatar name={profile.displayName} size={80} />
-            <Text style={styles.displayName}>{profile.displayName}</Text>
-            <Text style={styles.username}>@{profile.username}</Text>
-            {cityLabel ? (
-              <View style={styles.locationRow}>
-                <Ionicons name="location" size={14} color={Colors.accent} />
-                <Text style={styles.locationText}>
-                  {cityLabel}
-                  {countryLabel ? `, ${countryLabel}` : ''}
-                </Text>
-              </View>
-            ) : null}
-          </View>
-
-          <View style={styles.countsRow}>
-            <Pressable
-              onPress={() => router.push(`/user/${uid}/followers`)}
-              style={styles.countItem}
-              accessibilityRole="button"
-              accessibilityLabel={`${followerCount} followers`}
-            >
-              <Text style={styles.countValue}>{followerCount}</Text>
-              <Text style={styles.countLabel}>Followers</Text>
-            </Pressable>
-            <Pressable
-              onPress={() => router.push(`/user/${uid}/following`)}
-              style={styles.countItem}
-              accessibilityRole="button"
-              accessibilityLabel={`${followingCount} following`}
-            >
-              <Text style={styles.countValue}>{followingCount}</Text>
-              <Text style={styles.countLabel}>Following</Text>
-            </Pressable>
-          </View>
+          <ProfileHeader
+            displayName={profile.displayName}
+            username={profile.username}
+            cityLabel={cityLabel}
+            postsCount={postsCount}
+            followersCount={followerCount}
+            followingCount={followingCount}
+            onPressFollowers={() => router.push(`/user/${uid}/followers`)}
+            onPressFollowing={() => router.push(`/user/${uid}/following`)}
+            headerRight={
+              !isOwnProfile ? (
+                <Pressable
+                  onPress={() => setIsOptionsMenuOpen(true)}
+                  style={styles.overflowButton}
+                  hitSlop={8}
+                  accessibilityRole="button"
+                  accessibilityLabel="More options"
+                >
+                  <Ionicons name="ellipsis-horizontal" size={20} color={Colors.textSecondary} />
+                </Pressable>
+              ) : undefined
+            }
+          />
 
           {followError ? <Text style={styles.errorText}>{followError}</Text> : null}
 
@@ -282,29 +267,21 @@ export default function PublicProfileScreen() {
             </View>
           )}
 
-          {interestLabels.length > 0 && (
-            <View style={styles.interestsSection}>
-              <Text style={styles.interestsLabel}>Interests</Text>
-              <Text style={styles.interestsValue}>{interestLabels.join(' · ')}</Text>
-            </View>
-          )}
+          <InterestPills interestIds={profile.interests} />
 
           <View style={styles.contentSection}>
-            <SegmentedControl
-              options={CONTENT_TABS.map(({ id, label }) => ({ id, label }))}
-              value={contentTab}
-              onChange={setContentTab}
-            />
+            <ProfileTabBar tabs={PROFILE_TABS} value={contentTab} onChange={setContentTab} />
+
             {contentTab === 'reel' ? (
               reels.length === 0 ? (
-                <View style={styles.contentEmpty}>
-                  <Text style={styles.contentEmptyText}>{activeTabInfo.emptyText}</Text>
-                  {isOwnProfile ? (
-                    <View style={styles.contentEmptyAction}>
-                      <Button label="Create Reel" variant="secondary" onPress={() => router.push('/create/reel')} />
-                    </View>
-                  ) : null}
-                </View>
+                <EmptyState
+                  bare
+                  icon="videocam-outline"
+                  title={EMPTY_TEXT.reel}
+                  action={
+                    isOwnProfile ? <Button label="Create Reel" variant="secondary" onPress={() => router.push('/create/reel')} /> : undefined
+                  }
+                />
               ) : (
                 <View style={styles.reelGrid}>
                   {reels.map((reel) => (
@@ -313,9 +290,7 @@ export default function PublicProfileScreen() {
                 </View>
               )
             ) : visibleContent.length === 0 ? (
-              <View style={styles.contentEmpty}>
-                <Text style={styles.contentEmptyText}>{activeTabInfo.emptyText}</Text>
-              </View>
+              <EmptyState bare icon="albums-outline" title={EMPTY_TEXT[contentTab]} />
             ) : (
               <View style={styles.contentList}>
                 {visibleContent.map((item) => (
@@ -352,75 +327,14 @@ export default function PublicProfileScreen() {
 }
 
 const styles = StyleSheet.create({
-  centered: {
-    alignItems: 'center',
-    gap: Spacing.sm,
-    paddingTop: Spacing.xxl,
-  },
-  mutedText: {
-    color: Colors.textSecondary,
-    fontSize: 14,
-  },
-  errorTitle: {
-    color: Colors.text,
-    fontSize: 15,
-    fontWeight: '700',
-    textAlign: 'center',
-  },
   container: {
     gap: Spacing.lg,
   },
-  header: {
-    alignItems: 'center',
-    gap: 4,
-  },
   overflowButton: {
-    position: 'absolute',
-    top: 0,
-    right: 0,
     width: 36,
     height: 36,
     alignItems: 'center',
     justifyContent: 'center',
-  },
-  displayName: {
-    color: Colors.text,
-    fontSize: 22,
-    fontWeight: '800',
-    marginTop: Spacing.sm,
-  },
-  username: {
-    color: Colors.textSecondary,
-    fontSize: 14,
-  },
-  locationRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 4,
-    marginTop: Spacing.xs,
-  },
-  locationText: {
-    color: Colors.textSecondary,
-    fontSize: 13,
-  },
-  countsRow: {
-    flexDirection: 'row',
-    justifyContent: 'center',
-    gap: Spacing.xxl,
-  },
-  countItem: {
-    alignItems: 'center',
-    gap: 2,
-  },
-  countValue: {
-    color: Colors.text,
-    fontSize: 18,
-    fontWeight: '800',
-  },
-  countLabel: {
-    color: Colors.textSecondary,
-    fontSize: 12,
-    fontWeight: '600',
   },
   errorText: {
     color: Colors.error,
@@ -449,7 +363,7 @@ const styles = StyleSheet.create({
     gap: Spacing.sm,
   },
   blockedBadge: {
-    borderRadius: Radius.full,
+    borderRadius: 999,
     backgroundColor: Colors.background,
     borderWidth: 1,
     borderColor: Colors.error,
@@ -463,7 +377,7 @@ const styles = StyleSheet.create({
   },
   selfBadge: {
     alignSelf: 'center',
-    borderRadius: Radius.full,
+    borderRadius: 999,
     backgroundColor: Colors.surface,
     borderWidth: 1,
     borderColor: Colors.border,
@@ -475,36 +389,8 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontWeight: '600',
   },
-  interestsSection: {
-    alignItems: 'center',
-    gap: 4,
-  },
-  interestsLabel: {
-    color: Colors.textSecondary,
-    fontSize: 11,
-    fontWeight: '700',
-    textTransform: 'uppercase',
-  },
-  interestsValue: {
-    color: Colors.text,
-    fontSize: 14,
-    textAlign: 'center',
-  },
   contentSection: {
     gap: Spacing.md,
-  },
-  contentEmpty: {
-    borderRadius: Radius.lg,
-    backgroundColor: Colors.surface,
-    borderWidth: 1,
-    borderColor: Colors.border,
-    borderStyle: 'dashed',
-    padding: Spacing.lg,
-    alignItems: 'center',
-    gap: Spacing.sm,
-  },
-  contentEmptyAction: {
-    minWidth: 160,
   },
   reelGrid: {
     flexDirection: 'row',
@@ -512,11 +398,8 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     rowGap: Spacing.sm,
   },
-  contentEmptyText: {
-    color: Colors.textSecondary,
-    fontSize: 13,
-  },
   contentList: {
+    gap: Spacing.md,
     // Cancels out HeaderScreenLayout's own paddingHorizontal so ContentCard's
     // built-in marginHorizontal is the only inset — matching how cards look
     // everywhere else they're used (Home, Following).

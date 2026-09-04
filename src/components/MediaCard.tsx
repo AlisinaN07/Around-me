@@ -16,7 +16,8 @@ type MediaCardProps = {
    */
   emoji?: string;
   fallbackIcon?: keyof typeof Ionicons.glyphMap;
-  height: number;
+  /** A fixed pixel height, or a percentage string to fill a sized parent (e.g. ReelPreviewCard's aspectRatio box). */
+  height: number | `${number}%`;
   radius?: number;
   children?: ReactNode;
 };
