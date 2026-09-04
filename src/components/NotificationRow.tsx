@@ -50,7 +50,7 @@ export function NotificationRow({ notification, onPress }: NotificationRowProps)
       accessibilityLabel={describeNotification(notification)}
     >
       <View style={styles.avatarWrap}>
-        <Avatar name={notification.actorDisplayName} size={44} />
+        <Avatar name={notification.actorDisplayName} size={52} />
         <View style={styles.badge}>
           <Ionicons name={TYPE_ICON[notification.type]} size={11} color={Colors.background} />
         </View>
@@ -77,7 +77,7 @@ const styles = StyleSheet.create({
     borderBottomColor: Colors.border,
   },
   rowUnread: {
-    backgroundColor: 'rgba(255, 107, 44, 0.08)',
+    backgroundColor: Colors.accentMuted,
   },
   rowPressed: {
     opacity: 0.75,

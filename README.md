@@ -407,6 +407,34 @@ Collection-group querying is not usable in this project for this purpose without
 
 All rules/index changes made while investigating this were reverted before finishing — production `firestore.rules`/`firestore.indexes.json` are byte-identical to before this step. `EventActionButtons` therefore keeps its Step 26 design and doc comment (now noting this investigation): actionable, never claiming a false "not selected"/"not joined" state, showing only what the viewer taps within the current session — the "state-neutral" fallback the Step 26.1 spec itself sanctioned for exactly this outcome.
 
+## Inbox — visual reconstruction (Step 28)
+
+Inbox keeps its exact real information architecture — **Activity** (notifications) and **Messages** (1-to-1 conversations) — restyled into the Step 24/26/27 visual language. Never renamed to "Primary"/"Groups" from the reference screenshot: Groups (group chats) doesn't exist in this app, and relabeling around a feature that isn't there would misdescribe what the tab actually shows.
+
+### Mode tabs
+
+A local `InboxModeTabs` pill selector (Activity/Messages) with a real unread-message-count badge on the Messages pill — replacing the old `Messages (3)`-in-the-label text approach with a proper badge, matching the reference's visual treatment without inventing new data (the count is the same `conversation.unreadCounts[uid]` sum already computed before this step). Kept local to Inbox rather than folded into the shared `SegmentedControl`, so its badge support can't affect that component's other caller (Events' type filter).
+
+### Messages search — real, local only
+
+A search field appears in Messages mode **only when at least one real conversation exists** (no dead search box on a first-time empty Inbox). It filters the already-fetched, bounded conversation list (capped at 30 by `fetchConversations`) in memory by the other participant's real `displayName`/`username` or the real `lastMessageText` — no new Firestore read, no debounce (a plain in-memory `Array.filter` needs none), no global user search, no new route. An empty result shows "No conversations found." rather than the normal empty state, so a real empty inbox and a non-matching search are never confused.
+
+### Conversation rows / notification rows
+
+`ConversationRow`/`NotificationRow` avatars bumped 44→52px for more presence, and their unread-row tint fixed from a stale, hardcoded pre-Step-24 orange (`rgba(255, 107, 44, 0.08)`, left over from before the Step 24 pink-red accent shift) to the real `Colors.accentMuted` token — a genuine visual bug fix, not a new design decision. All other real behavior (tap-through to `/user/{uid}`, `/reel/{reelId}`, `/content/{contentId}`, or `/chat/{uid}`; mark-read/mark-all-read; pull-to-refresh) is unchanged.
+
+### Loading/empty/error
+
+Row-shaped skeletons (avatar circle + two lines, via the shared `SkeletonBlock`) replace the old plain skeleton bars for both Activity and Messages while loading. Empty/error states now use the shared `EmptyState`/`ErrorState` components. Messages' old "Explore Around" empty-state button was removed — it routed to `/` (Home, the Reel feed as of Step 25), which doesn't actually help start a conversation; the empty copy ("Start a conversation from someone's profile.") is enough on its own, per this step's explicit "don't invent a fake Find People button" instruction.
+
+### Deliberately not implemented
+
+Friend Requests row, Groups/group chats, online presence, the reference's active-people/story avatar strip, message media, typing indicators, read receipts, and push notifications — none of that exists in this app's real backend. The reference screenshot's Requests row and people strip are omitted entirely rather than rendered with fake counts or fake presence dots.
+
+### Firebase/security
+
+No changes. No new Firestore rules, indexes, or schema fields — the search is pure client-side filtering over data already being fetched.
+
 ## Profile v1 — visual reconstruction (Step 27)
 
 Own Profile (`src/app/(app)/(tabs)/profile.tsx`) and public profile (`src/app/(app)/user/[uid]/index.tsx`) now share one visual system — `ProfileHeader`, `InterestPills`, `ProfileTabBar` — rather than two independently-styled screens. Own Profile's data-fetching was rebuilt to match public profile's existing real architecture (`fetchFollowerCount`/`fetchFollowingCount`/`fetchPublicUserContent`/`fetchProfileReels`) instead of the static placeholders it had before this step.

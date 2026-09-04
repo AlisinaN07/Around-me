@@ -1,14 +1,15 @@
 import { Ionicons } from '@expo/vector-icons';
 import { router, useFocusEffect } from 'expo-router';
 import { useCallback, useMemo, useState } from 'react';
-import { Platform, Pressable, RefreshControl, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { Platform, Pressable, RefreshControl, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
-import { Button } from '@/components/Button';
 import { ConversationRow } from '@/components/ConversationRow';
+import { EmptyState } from '@/components/EmptyState';
+import { ErrorState } from '@/components/ErrorState';
 import { NotificationRow } from '@/components/NotificationRow';
-import { SegmentedControl } from '@/components/SegmentedControl';
-import { Colors, Layout, Radius, Spacing } from '@/constants/theme';
+import { SkeletonBlock } from '@/components/LoadingState';
+import { Colors, Layout, Radius, Spacing, Typography } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
 import { fetchConversations, otherParticipantUid } from '@/services/messages';
 import { fetchNotifications, markAllNotificationsRead, markNotificationRead } from '@/services/notifications';
@@ -20,6 +21,14 @@ import type { PublicProfile } from '@/types/social';
 type InboxMode = 'activity' | 'messages';
 type LoadStatus = 'loading' | 'loaded' | 'error';
 
+/**
+ * Inbox — Step 28 visual reconstruction. Real product model preserved
+ * exactly: Activity (notifications) and Messages (1-to-1 conversations)
+ * are the only two modes — never renamed to "Primary"/"Groups" from the
+ * reference, since Groups doesn't exist. No Requests row, no active-
+ * people/story strip, no online presence — none of that has real backend
+ * support (see README "Inbox — Step 28").
+ */
 export default function InboxScreen() {
   const { user } = useAuth();
   const uid = user?.uid ?? null;
@@ -34,6 +43,7 @@ export default function InboxScreen() {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [otherProfiles, setOtherProfiles] = useState<Record<string, PublicProfile | null>>({});
   const [isMessagesRefreshing, setIsMessagesRefreshing] = useState(false);
+  const [messageQuery, setMessageQuery] = useState('');
 
   const load = useCallback(
     async (isRefresh = false) => {
@@ -109,13 +119,22 @@ export default function InboxScreen() {
     [conversations, uid]
   );
 
-  const modeOptions = useMemo(
-    () => [
-      { id: 'activity' as const, label: 'Activity' },
-      { id: 'messages' as const, label: totalUnreadMessages > 0 ? `Messages (${totalUnreadMessages})` : 'Messages' },
-    ],
-    [totalUnreadMessages]
-  );
+  // Local-only filter over the already-fetched, bounded conversation list
+  // (Step 28 Section 7/28) — never a new Firestore query, no debounce
+  // needed since it's just an in-memory Array.filter. Matches the other
+  // user's real displayName/username or the real last-message preview.
+  const filteredConversations = useMemo(() => {
+    const q = messageQuery.trim().toLowerCase();
+    if (!q) return conversations;
+    return conversations.filter((conversation) => {
+      const otherProfile = otherProfiles[otherParticipantUid(conversation, uid ?? '')];
+      return (
+        (otherProfile?.displayName.toLowerCase().includes(q) ?? false) ||
+        (otherProfile?.username.toLowerCase().includes(q) ?? false) ||
+        conversation.lastMessageText.toLowerCase().includes(q)
+      );
+    });
+  }, [conversations, otherProfiles, messageQuery, uid]);
 
   function handleRowPress(notification: Notification) {
     if (!notification.read) {
@@ -166,9 +185,27 @@ export default function InboxScreen() {
           ) : null}
         </View>
 
-        <View style={styles.segmentWrap}>
-          <SegmentedControl options={modeOptions} value={mode} onChange={setMode} />
+        <View style={styles.modeWrap}>
+          <InboxModeTabs value={mode} onChange={setMode} unreadMessages={totalUnreadMessages} />
         </View>
+
+        {mode === 'messages' && conversations.length > 0 ? (
+          <View style={styles.searchWrap}>
+            <View style={styles.searchField}>
+              <Ionicons name="search" size={16} color={Colors.textSecondary} />
+              <TextInput
+                value={messageQuery}
+                onChangeText={setMessageQuery}
+                placeholder="Search messages"
+                placeholderTextColor={Colors.textMuted}
+                style={styles.searchInput}
+                returnKeyType="search"
+                autoCapitalize="none"
+                autoCorrect={false}
+              />
+            </View>
+          </View>
+        ) : null}
 
         {mode === 'activity' ? (
           <ActivityList
@@ -182,7 +219,9 @@ export default function InboxScreen() {
         ) : (
           <MessagesList
             status={messagesStatus}
-            conversations={conversations}
+            conversations={filteredConversations}
+            hasAnyConversations={conversations.length > 0}
+            isSearching={messageQuery.trim().length > 0}
             otherProfiles={otherProfiles}
             currentUid={uid}
             isRefreshing={isMessagesRefreshing}
@@ -193,6 +232,46 @@ export default function InboxScreen() {
         )}
       </View>
     </SafeAreaView>
+  );
+}
+
+type InboxModeTabsProps = {
+  value: InboxMode;
+  onChange: (mode: InboxMode) => void;
+  unreadMessages: number;
+};
+
+/**
+ * Activity/Messages pill selector (Step 28) — real unread-count badge on
+ * Messages, never renamed to Primary/Groups. Kept local to this screen
+ * rather than folded into the generic SegmentedControl, so its badge
+ * support and pill styling can't affect SegmentedControl's other callers
+ * (Events' type filter).
+ */
+function InboxModeTabs({ value, onChange, unreadMessages }: InboxModeTabsProps) {
+  return (
+    <View style={styles.modeTrack}>
+      <ModePill label="Activity" active={value === 'activity'} onPress={() => onChange('activity')} />
+      <ModePill
+        label="Messages"
+        active={value === 'messages'}
+        onPress={() => onChange('messages')}
+        badge={unreadMessages > 0 ? unreadMessages : undefined}
+      />
+    </View>
+  );
+}
+
+function ModePill({ label, active, onPress, badge }: { label: string; active: boolean; onPress: () => void; badge?: number }) {
+  return (
+    <Pressable onPress={onPress} style={[styles.modePill, active && styles.modePillActive]} accessibilityRole="tab" accessibilityState={{ selected: active }}>
+      <Text style={[styles.modePillText, active && styles.modePillTextActive]}>{label}</Text>
+      {badge ? (
+        <View style={styles.modeBadge}>
+          <Text style={styles.modeBadgeText}>{badge > 99 ? '99+' : badge}</Text>
+        </View>
+      ) : null}
+    </Pressable>
   );
 }
 
@@ -219,23 +298,21 @@ function ActivityList({ status, notifications, isRefreshing, onRefresh, onRetry,
     >
       {status === 'loading' && notifications.length === 0 ? (
         <>
-          <SkeletonRow />
-          <SkeletonRow />
-          <SkeletonRow />
+          <InboxRowSkeleton />
+          <InboxRowSkeleton />
+          <InboxRowSkeleton />
         </>
       ) : status === 'error' ? (
-        <View style={styles.emptyPanel}>
-          <Ionicons name="cloud-offline-outline" size={32} color={Colors.textSecondary} />
-          <Text style={styles.emptyTitle}>Couldn&apos;t load activity</Text>
-          <Button label="Try again" onPress={onRetry} />
+        <View style={styles.statusPad}>
+          <ErrorState title="Couldn't load activity" onRetry={onRetry} />
         </View>
       ) : notifications.length === 0 ? (
-        <View style={styles.emptyPanel}>
-          <Ionicons name="notifications-outline" size={32} color={Colors.textSecondary} />
-          <Text style={styles.emptyTitle}>No activity yet</Text>
-          <Text style={styles.emptyBody}>
-            When people like your posts, comment, or follow you, you&apos;ll see it here.
-          </Text>
+        <View style={styles.statusPad}>
+          <EmptyState
+            icon="notifications-outline"
+            title="No activity yet"
+            body="Likes, comments and follows will appear here."
+          />
         </View>
       ) : (
         notifications.map((notification) => (
@@ -249,6 +326,8 @@ function ActivityList({ status, notifications, isRefreshing, onRefresh, onRetry,
 type MessagesListProps = {
   status: LoadStatus;
   conversations: Conversation[];
+  hasAnyConversations: boolean;
+  isSearching: boolean;
   otherProfiles: Record<string, PublicProfile | null>;
   currentUid: string | null;
   isRefreshing: boolean;
@@ -260,6 +339,8 @@ type MessagesListProps = {
 function MessagesList({
   status,
   conversations,
+  hasAnyConversations,
+  isSearching,
   otherProfiles,
   currentUid,
   isRefreshing,
@@ -278,24 +359,27 @@ function MessagesList({
         )
       }
     >
-      {status === 'loading' && conversations.length === 0 ? (
+      {status === 'loading' && conversations.length === 0 && !hasAnyConversations ? (
         <>
-          <SkeletonRow />
-          <SkeletonRow />
-          <SkeletonRow />
+          <InboxRowSkeleton />
+          <InboxRowSkeleton />
+          <InboxRowSkeleton />
         </>
       ) : status === 'error' ? (
-        <View style={styles.emptyPanel}>
-          <Ionicons name="cloud-offline-outline" size={32} color={Colors.textSecondary} />
-          <Text style={styles.emptyTitle}>Couldn&apos;t load messages</Text>
-          <Button label="Try again" onPress={onRetry} />
+        <View style={styles.statusPad}>
+          <ErrorState title="Couldn't load messages" onRetry={onRetry} />
         </View>
       ) : conversations.length === 0 ? (
-        <View style={styles.emptyPanel}>
-          <Ionicons name="chatbubbles-outline" size={32} color={Colors.textSecondary} />
-          <Text style={styles.emptyTitle}>No messages yet</Text>
-          <Text style={styles.emptyBody}>Start a conversation with someone around your city.</Text>
-          <Button label="Explore Around" variant="secondary" onPress={() => router.push('/')} />
+        <View style={styles.statusPad}>
+          {isSearching ? (
+            <EmptyState icon="search-outline" title="No conversations found." bare />
+          ) : (
+            <EmptyState
+              icon="chatbubbles-outline"
+              title="No messages yet"
+              body="Start a conversation from someone's profile."
+            />
+          )}
         </View>
       ) : (
         conversations.map((conversation) => (
@@ -312,8 +396,17 @@ function MessagesList({
   );
 }
 
-function SkeletonRow() {
-  return <View style={styles.skeleton} />;
+/** Row-shaped loading placeholder (Step 28) — matches ConversationRow/NotificationRow's avatar+two-lines shape instead of a plain spinner. */
+function InboxRowSkeleton() {
+  return (
+    <View style={styles.skeletonRow}>
+      <SkeletonBlock width={52} height={52} />
+      <View style={styles.skeletonLines}>
+        <SkeletonBlock width="60%" height={14} />
+        <SkeletonBlock width="85%" height={12} />
+      </View>
+    </View>
+  );
 }
 
 const styles = StyleSheet.create({
@@ -337,17 +430,80 @@ const styles = StyleSheet.create({
   },
   title: {
     color: Colors.text,
-    fontSize: 26,
-    fontWeight: '800',
+    ...Typography.screenTitle,
   },
   markAllText: {
     color: Colors.accent,
     fontSize: 13,
     fontWeight: '700',
   },
-  segmentWrap: {
+  modeWrap: {
     paddingHorizontal: Spacing.lg,
-    paddingBottom: Spacing.md,
+    paddingBottom: Spacing.sm,
+  },
+  modeTrack: {
+    flexDirection: 'row',
+    gap: Spacing.xs,
+    borderRadius: Radius.full,
+    backgroundColor: Colors.surface,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    padding: 4,
+  },
+  modePill: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+    paddingVertical: Spacing.sm,
+    borderRadius: Radius.full,
+  },
+  modePillActive: {
+    backgroundColor: Colors.background,
+  },
+  modePillText: {
+    color: Colors.textSecondary,
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  modePillTextActive: {
+    color: Colors.accent,
+  },
+  modeBadge: {
+    minWidth: 18,
+    height: 18,
+    borderRadius: Radius.full,
+    backgroundColor: Colors.accent,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 5,
+  },
+  modeBadgeText: {
+    color: Colors.background,
+    fontSize: 10,
+    fontWeight: '800',
+  },
+  searchWrap: {
+    paddingHorizontal: Spacing.lg,
+    paddingBottom: Spacing.sm,
+  },
+  searchField: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Spacing.sm,
+    borderRadius: Radius.full,
+    backgroundColor: Colors.surface,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    paddingHorizontal: Spacing.md,
+    height: 40,
+  },
+  searchInput: {
+    flex: 1,
+    color: Colors.text,
+    fontSize: 14,
+    height: '100%',
   },
   scroll: {
     flex: 1,
@@ -355,37 +511,19 @@ const styles = StyleSheet.create({
   scrollContent: {
     paddingBottom: Spacing.xxl,
   },
-  emptyPanel: {
-    marginHorizontal: Spacing.lg,
-    marginTop: Spacing.xl,
-    borderRadius: Radius.lg,
-    backgroundColor: Colors.surface,
-    borderWidth: 1,
-    borderColor: Colors.border,
-    padding: Spacing.xl,
+  statusPad: {
+    paddingHorizontal: Spacing.lg,
+    paddingTop: Spacing.md,
+  },
+  skeletonRow: {
+    flexDirection: 'row',
     alignItems: 'center',
+    gap: Spacing.md,
+    paddingHorizontal: Spacing.lg,
+    paddingVertical: Spacing.md,
+  },
+  skeletonLines: {
+    flex: 1,
     gap: Spacing.sm,
-  },
-  emptyTitle: {
-    color: Colors.text,
-    fontSize: 15,
-    fontWeight: '700',
-    textAlign: 'center',
-  },
-  emptyBody: {
-    color: Colors.textSecondary,
-    fontSize: 13,
-    lineHeight: 18,
-    textAlign: 'center',
-  },
-  skeleton: {
-    marginHorizontal: Spacing.lg,
-    marginBottom: Spacing.md,
-    height: 64,
-    borderRadius: Radius.lg,
-    backgroundColor: Colors.surface,
-    borderWidth: 1,
-    borderColor: Colors.border,
-    opacity: 0.5,
   },
 });

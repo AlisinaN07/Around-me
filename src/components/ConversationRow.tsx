@@ -25,7 +25,7 @@ export function ConversationRow({ conversation, otherProfile, unreadCount, onPre
       accessibilityRole="button"
       accessibilityLabel={`Conversation with ${displayName}`}
     >
-      <Avatar name={displayName} size={44} />
+      <Avatar name={displayName} size={52} />
       <View style={styles.body}>
         <View style={styles.line}>
           <Text style={[styles.name, isUnread && styles.nameUnread]} numberOfLines={1}>
@@ -59,7 +59,7 @@ const styles = StyleSheet.create({
     borderBottomColor: Colors.border,
   },
   rowUnread: {
-    backgroundColor: 'rgba(255, 107, 44, 0.08)',
+    backgroundColor: Colors.accentMuted,
   },
   rowPressed: {
     opacity: 0.75,
