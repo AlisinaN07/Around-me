@@ -1,19 +1,22 @@
 import { Ionicons } from '@expo/vector-icons';
 import { useLocalSearchParams } from 'expo-router';
 import { useCallback, useEffect, useState } from 'react';
-import { Pressable, StyleSheet, Text, View } from 'react-native';
+import { Pressable, ScrollView, StyleSheet, View } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { ActivityDetail } from '@/components/ActivityDetail';
-import { Button } from '@/components/Button';
+import { DetailHero } from '@/components/DetailHero';
+import { ErrorState } from '@/components/ErrorState';
 import { EventDetail } from '@/components/EventDetail';
 import { HeaderScreenLayout } from '@/components/HeaderScreenLayout';
+import { LoadingState, SkeletonBlock } from '@/components/LoadingState';
 import { OptionsMenu } from '@/components/OptionsMenu';
 import { PostDetail } from '@/components/PostDetail';
 import { ReportModal } from '@/components/ReportModal';
-import { Colors, Spacing } from '@/constants/theme';
+import { Colors, Layout, Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
 import { fetchContentById } from '@/services/content';
-import type { Content } from '@/types/content';
+import type { ActivityContent, Content, EventContent } from '@/types/content';
 
 type LoadStatus = 'loading' | 'loaded' | 'error';
 
@@ -46,8 +49,41 @@ export default function ContentDetailScreen() {
     load();
   }, [load]);
 
-  const title = content?.type === 'activity' ? 'Activity' : content?.type === 'event' ? 'Event' : 'Post';
   const isOwnContent = !!user && !!content && content.authorUid === user.uid;
+
+  // Event/Activity get the Step 29 media-first hero chrome — Back/More
+  // are overlaid directly on the hero, not shown in a separate header bar
+  // above it, so this branch owns its own SafeAreaView/ScrollView instead
+  // of HeaderScreenLayout. Post detail (Step 29 Section 28: not redesigned
+  // this step) and the loading/error states — where the content type
+  // isn't known yet — keep the original HeaderScreenLayout path, below,
+  // completely unchanged in structure.
+  if (status === 'loaded' && content && content.type !== 'post') {
+    return (
+      <>
+        <MediaDetailScreen
+          content={content}
+          isOwnContent={isOwnContent}
+          onOptionsPress={() => setIsOptionsMenuOpen(true)}
+        />
+        <OptionsMenu
+          visible={isOptionsMenuOpen}
+          onClose={() => setIsOptionsMenuOpen(false)}
+          options={[{ label: 'Report', onPress: () => setIsReportOpen(true) }]}
+        />
+        {user ? (
+          <ReportModal
+            visible={isReportOpen}
+            onClose={() => setIsReportOpen(false)}
+            reporterUid={user.uid}
+            target={{ type: 'content', contentId: content.contentId }}
+          />
+        ) : null}
+      </>
+    );
+  }
+
+  const title = content?.type === 'activity' ? 'Activity' : content?.type === 'event' ? 'Event' : 'Post';
 
   return (
     <HeaderScreenLayout
@@ -67,24 +103,22 @@ export default function ContentDetailScreen() {
       }
     >
       {status === 'loading' ? (
-        <View style={styles.centered}>
-          <Text style={styles.loadingText}>Loading…</Text>
+        <View style={styles.loadingShape}>
+          <SkeletonBlock width="100%" height={200} />
+          <View style={styles.loadingLines}>
+            <SkeletonBlock width="70%" height={20} />
+            <SkeletonBlock width="45%" height={14} />
+          </View>
+          <LoadingState />
         </View>
       ) : status === 'error' || !content ? (
-        <View style={styles.centered}>
-          <Ionicons name="alert-circle-outline" size={32} color={Colors.textSecondary} />
-          <Text style={styles.errorTitle}>
-            {title === 'Event' ? "Couldn't load event." : title === 'Activity' ? "Couldn't load activity." : "Couldn't load post."}
-          </Text>
-          <Button label="Try again" onPress={load} />
-        </View>
-      ) : content.type === 'activity' ? (
-        <ActivityDetail content={content} />
-      ) : content.type === 'event' ? (
-        <EventDetail content={content} />
-      ) : (
+        <ErrorState
+          title={title === 'Event' ? "Couldn't load event." : title === 'Activity' ? "Couldn't load activity." : "Couldn't load post."}
+          onRetry={load}
+        />
+      ) : content.type === 'post' ? (
         <PostDetail content={content} />
-      )}
+      ) : null}
 
       <OptionsMenu
         visible={isOptionsMenuOpen}
@@ -104,21 +138,59 @@ export default function ContentDetailScreen() {
   );
 }
 
+type MediaDetailScreenProps = {
+  content: EventContent | ActivityContent;
+  isOwnContent: boolean;
+  onOptionsPress: () => void;
+};
+
+/** Full-bleed hero + body for Event/Activity detail (Step 29) — see the branch above for why this bypasses HeaderScreenLayout. */
+function MediaDetailScreen({ content, isOwnContent, onOptionsPress }: MediaDetailScreenProps) {
+  return (
+    <SafeAreaView style={styles.mediaSafeArea} edges={['top']}>
+      <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.mediaScrollContent}>
+        <View style={styles.mediaPage}>
+          <DetailHero
+            title={content.title}
+            categoryId={content.categoryId}
+            startsAt={content.startsAt}
+            endsAt={content.endsAt}
+            onOptionsPress={isOwnContent ? undefined : onOptionsPress}
+          />
+          <View style={styles.mediaBody}>
+            {content.type === 'activity' ? <ActivityDetail content={content} /> : <EventDetail content={content} />}
+          </View>
+        </View>
+      </ScrollView>
+    </SafeAreaView>
+  );
+}
+
 const styles = StyleSheet.create({
-  centered: {
+  loadingShape: {
     alignItems: 'center',
+    gap: Spacing.md,
+    paddingTop: Spacing.sm,
+  },
+  loadingLines: {
+    width: '100%',
     gap: Spacing.sm,
-    paddingTop: Spacing.xxl,
   },
-  loadingText: {
-    color: Colors.textSecondary,
-    fontSize: 14,
+  mediaSafeArea: {
+    flex: 1,
+    backgroundColor: Colors.background,
   },
-  errorTitle: {
-    color: Colors.text,
-    fontSize: 15,
-    fontWeight: '700',
-    textAlign: 'center',
+  mediaScrollContent: {
+    alignItems: 'center',
+    paddingBottom: Spacing.xxl,
+  },
+  mediaPage: {
+    width: '100%',
+    maxWidth: Layout.maxContentWidth,
+  },
+  mediaBody: {
+    paddingHorizontal: Spacing.lg,
+    paddingTop: Spacing.lg,
   },
   overflowButton: {
     width: 40,

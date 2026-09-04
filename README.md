@@ -407,6 +407,38 @@ Collection-group querying is not usable in this project for this purpose without
 
 All rules/index changes made while investigating this were reverted before finishing — production `firestore.rules`/`firestore.indexes.json` are byte-identical to before this step. `EventActionButtons` therefore keeps its Step 26 design and doc comment (now noting this investigation): actionable, never claiming a false "not selected"/"not joined" state, showing only what the viewer taps within the current session — the "state-neutral" fallback the Step 26.1 spec itself sanctioned for exactly this outcome.
 
+## Event/Activity Detail — visual reconstruction (Step 29)
+
+Event and Activity detail (`src/app/(app)/content/[contentId].tsx` → `EventDetail`/`ActivityDetail`) are now media-first: a full-bleed `DetailHero` (shared by both) instead of the old plain header-bar-then-text-block layout. Post detail is completely untouched — it still renders inside the original `HeaderScreenLayout`, unchanged in structure, per this step's explicit scope.
+
+### Hierarchy
+
+Hero (media/fallback + title + category, overlaid) → date/time → Place → Interested/Going (Event) or Join/Leave + participant count (Activity) → description → creator → real engagement (likes) + comments, in that order. The one deliberate deviation from the spec's literal numbered list: "real engagement" (like count) and "comments" are the same pre-existing `EngagementSection` component with its own single real fetch — mounting it twice to place a stats-only view near the top and the full comment thread at the bottom would mean reading the same like/comment data twice per page visit. It's mounted once, at the end, rather than duplicate a read for a purely visual split.
+
+### Hero
+
+`DetailHero` (new, shared by Event and Activity) — the Step 26 `MediaCard` gradient/glow fallback with the item's real category emoji (no real event/activity media field exists, so no image is ever fabricated), a top scrim holding the only two hero actions (Back, and More — real Report/Block, only shown for other people's content, exactly as before), and a bottom scrim holding the real category + title. A `LIVE` pill (reusing the exact `isHappeningNow` check `EventCard` already uses) or an `Ended` pill appears only when genuinely true — never both, never invented.
+
+### Interested/Going and Join/Leave
+
+Unchanged backend and semantics — `EventDetail` still owns the real `setEventResponse`/`removeEventResponse` + `fetchEventResponseCounts` calls, `ActivityDetail` still owns real `joinActivity`/`leaveActivity` + `fetchActivityParticipants`. Only the buttons' visual language changed, to the same star/checkmark pill style `EventActionButtons` already uses on discovery cards (Step 26) — plus real counts next to each, since the detail screen (unlike a discovery card) already fetches them efficiently, once per visit.
+
+### Event vs Activity — kept semantically distinct
+
+Interested/Going (a lightweight RSVP) and Join/Leave (real membership, with a participant list and a `maxParticipants` cap) are genuinely different relationships, not a styling choice — `ActivityDetail` was not collapsed into `EventDetail`'s shape. They share the hero, the date/time/place rows, description, creator, and `EngagementSection` layout only.
+
+### "Tagged at {Place}" — future architecture, not built
+
+The reference screenshot's "Tagged at Nöjesfabriken" Reel rail is a real, locked-in **future** product concept, not a Step 29 deliverable: the Reels shown there would be **ordinary user-generated Reels from the normal Home feed** that happen to be tagged to the same Place/venue as the Event — never a special "Event Reel" content type, and Events/Reels remain two separate data models. `Reel` has no `placeId`/`eventId`/`businessId` field today, and Step 29 does not add one (no schema change, per the explicit constraint). A new `TaggedReelsSection` component exists (`src/components/TaggedReelsSection.tsx`) — it accepts a real `Reel[]` and a Place name, renders `Tagged at {name}`, and returns `null` for an empty array — but it is **not mounted anywhere in production**, since no real caller can ever produce a non-empty array yet. The intended future insertion point (right after the creator row in `EventDetail`) is marked with a comment.
+
+### Loading/error
+
+Shape-aware skeleton (hero-sized block + two text-line blocks) replaces the old plain "Loading…" text for the not-yet-typed loading state (content type isn't known until the fetch resolves, so this same skeleton briefly appears before either the media-first or the Post layout mounts). `ErrorState` (Step 24) replaces the ad hoc error panel; retry re-runs the real fetch.
+
+### Firebase/security
+
+No changes. No new Firestore rules, indexes, schema fields, or Storage rules — every real value shown was already being read before this step.
+
 ## Inbox — visual reconstruction (Step 28)
 
 Inbox keeps its exact real information architecture — **Activity** (notifications) and **Messages** (1-to-1 conversations) — restyled into the Step 24/26/27 visual language. Never renamed to "Primary"/"Groups" from the reference screenshot: Groups (group chats) doesn't exist in this app, and relabeling around a feature that isn't there would misdescribe what the tab actually shows.

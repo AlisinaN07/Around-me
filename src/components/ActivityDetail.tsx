@@ -7,7 +7,6 @@ import { Avatar } from '@/components/Avatar';
 import { AuthorLink } from '@/components/AuthorLink';
 import { Button } from '@/components/Button';
 import { EngagementSection } from '@/components/EngagementSection';
-import { INTERESTS } from '@/constants/interests';
 import { Colors, Radius, Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
 import { fetchActivityParticipants, getActivityParticipation, joinActivity, leaveActivity } from '@/services/engagement';
@@ -16,6 +15,18 @@ import { formatEventTime } from '@/utils/timeFormat';
 
 type LoadStatus = 'loading' | 'loaded' | 'error';
 
+/**
+ * Activity detail body (Step 29 visual reconstruction) — same shared
+ * visual language and section order as EventDetail (date/time -> place
+ * -> action -> description -> creator -> real engagement/comments), but
+ * semantically distinct where it matters: the action is Join/Leave (not
+ * Interested/Going), and there's a real participant count + list instead
+ * of Event's Interested/Going counts — those are genuinely different
+ * relationships (membership vs. RSVP), not just a visual choice, so they
+ * are not collapsed into one shared component. Title/category/media are
+ * rendered by the shared `DetailHero`, not here — see
+ * content/[contentId].tsx.
+ */
 export function ActivityDetail({ content }: { content: ActivityContent }) {
   const { user } = useAuth();
   const [status, setStatus] = useState<LoadStatus>('loading');
@@ -50,7 +61,6 @@ export function ActivityDetail({ content }: { content: ActivityContent }) {
   }, [load]);
 
   const isFull = content.maxParticipants !== undefined && participantCount >= content.maxParticipants && !isJoined;
-  const category = INTERESTS.find((interest) => interest.id === content.categoryId);
 
   const handleJoin = async () => {
     if (!user || isSubmitting) return;
@@ -80,24 +90,12 @@ export function ActivityDetail({ content }: { content: ActivityContent }) {
 
   return (
     <View style={styles.container}>
-      <View style={styles.metaRow}>
-        {category && (
-          <View style={styles.categoryPill}>
-            <Text style={styles.categoryText}>
-              {category.emoji} {category.label}
-            </Text>
-          </View>
-        )}
+      <View style={styles.infoRow}>
+        <Ionicons name="time-outline" size={16} color={Colors.textSecondary} />
+        <Text style={styles.infoText}>
+          {formatEventTime(content.startsAt.toDate())} – {content.endsAt.toDate().toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })}
+        </Text>
       </View>
-
-      <Text style={styles.title}>{content.title}</Text>
-
-      <AuthorLink uid={content.authorUid} style={styles.authorRow}>
-        <Text style={styles.authorName}>{content.authorDisplayName}</Text>
-        <Text style={styles.username}>@{content.authorUsername}</Text>
-      </AuthorLink>
-
-      <Text style={styles.description}>{content.description}</Text>
 
       {content.placeId ? (
         <Pressable
@@ -115,14 +113,9 @@ export function ActivityDetail({ content }: { content: ActivityContent }) {
           <Text style={styles.infoText}>{content.placeName}</Text>
         </View>
       )}
-      <View style={styles.infoRow}>
-        <Ionicons name="time-outline" size={16} color={Colors.textSecondary} />
-        <Text style={styles.infoText}>
-          {formatEventTime(content.startsAt.toDate())} – {content.endsAt.toDate().toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })}
-        </Text>
-      </View>
 
       <View style={styles.countCard}>
+        <Ionicons name="people" size={16} color={Colors.textSecondary} />
         <Text style={styles.countText}>
           {participantCount}
           {content.maxParticipants ? ` / ${content.maxParticipants}` : ''} joined
@@ -148,28 +141,37 @@ export function ActivityDetail({ content }: { content: ActivityContent }) {
         <Button label="Join activity" onPress={handleJoin} loading={isSubmitting} />
       )}
 
-      <View style={styles.participantsSection}>
-        <Text style={styles.participantsTitle}>Participants</Text>
-        {status !== 'loaded' ? null : participants.length === 0 ? (
-          <Text style={styles.emptyText}>No one has joined yet.</Text>
-        ) : (
-          <View style={styles.participantsList}>
-            {participants.map((participant) => (
-              <View key={participant.uid} style={styles.participantRow}>
-                <Avatar name={participant.displayName} size={36} />
-                <View style={styles.participantText}>
-                  <Text style={styles.participantName} numberOfLines={1}>
-                    {participant.displayName}
-                  </Text>
-                  <Text style={styles.participantUsername} numberOfLines={1}>
-                    @{participant.username}
-                  </Text>
+      {status === 'loaded' ? (
+        <View style={styles.participantsSection}>
+          <Text style={styles.participantsTitle}>Participants</Text>
+          {participants.length === 0 ? (
+            <Text style={styles.emptyText}>No one has joined yet.</Text>
+          ) : (
+            <View style={styles.participantsList}>
+              {participants.map((participant) => (
+                <View key={participant.uid} style={styles.participantRow}>
+                  <Avatar name={participant.displayName} size={36} />
+                  <View style={styles.participantText}>
+                    <Text style={styles.participantName} numberOfLines={1}>
+                      {participant.displayName}
+                    </Text>
+                    <Text style={styles.participantUsername} numberOfLines={1}>
+                      @{participant.username}
+                    </Text>
+                  </View>
                 </View>
-              </View>
-            ))}
-          </View>
-        )}
-      </View>
+              ))}
+            </View>
+          )}
+        </View>
+      ) : null}
+
+      <Text style={styles.description}>{content.description}</Text>
+
+      <AuthorLink uid={content.authorUid} style={styles.authorRow}>
+        <Text style={styles.authorName}>{content.authorDisplayName}</Text>
+        <Text style={styles.username}>@{content.authorUsername}</Text>
+      </AuthorLink>
 
       <EngagementSection contentId={content.contentId} />
     </View>
@@ -178,48 +180,7 @@ export function ActivityDetail({ content }: { content: ActivityContent }) {
 
 const styles = StyleSheet.create({
   container: {
-    gap: Spacing.sm,
-  },
-  metaRow: {
-    flexDirection: 'row',
-  },
-  categoryPill: {
-    borderRadius: Radius.full,
-    backgroundColor: Colors.surface,
-    borderWidth: 1,
-    borderColor: Colors.border,
-    paddingHorizontal: Spacing.sm,
-    paddingVertical: 4,
-  },
-  categoryText: {
-    color: Colors.accent,
-    fontSize: 12,
-    fontWeight: '700',
-  },
-  title: {
-    color: Colors.text,
-    fontSize: 24,
-    fontWeight: '800',
-  },
-  authorRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-  },
-  authorName: {
-    color: Colors.text,
-    fontSize: 14,
-    fontWeight: '700',
-  },
-  username: {
-    color: Colors.textSecondary,
-    fontSize: 13,
-  },
-  description: {
-    color: Colors.textSecondary,
-    fontSize: 15,
-    lineHeight: 21,
-    marginTop: Spacing.xs,
+    gap: Spacing.md,
   },
   infoRow: {
     flexDirection: 'row',
@@ -236,14 +197,16 @@ const styles = StyleSheet.create({
     fontWeight: '600',
   },
   countCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
     borderRadius: Radius.md,
     backgroundColor: Colors.surface,
     borderWidth: 1,
     borderColor: Colors.border,
     paddingVertical: Spacing.sm,
     paddingHorizontal: Spacing.md,
-    alignItems: 'center',
-    marginTop: Spacing.xs,
   },
   countText: {
     color: Colors.text,
@@ -256,7 +219,6 @@ const styles = StyleSheet.create({
     textAlign: 'center',
   },
   participantsSection: {
-    marginTop: Spacing.lg,
     gap: Spacing.sm,
   },
   participantsTitle: {
@@ -287,5 +249,24 @@ const styles = StyleSheet.create({
   participantUsername: {
     color: Colors.textSecondary,
     fontSize: 12,
+  },
+  description: {
+    color: Colors.textSecondary,
+    fontSize: 15,
+    lineHeight: 21,
+  },
+  authorRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  authorName: {
+    color: Colors.text,
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  username: {
+    color: Colors.textSecondary,
+    fontSize: 13,
   },
 });

@@ -5,7 +5,6 @@ import { Pressable, StyleSheet, Text, View } from 'react-native';
 
 import { AuthorLink } from '@/components/AuthorLink';
 import { EngagementSection } from '@/components/EngagementSection';
-import { INTERESTS } from '@/constants/interests';
 import { Colors, Radius, Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
 import {
@@ -20,6 +19,22 @@ import { formatEventTime } from '@/utils/timeFormat';
 
 type LoadStatus = 'loading' | 'loaded' | 'error';
 
+/**
+ * Event detail body (Step 29 visual reconstruction) — rendered below the
+ * shared `DetailHero` (title/category/media are shown there, not here —
+ * see content/[contentId].tsx). Section order follows the spec's target
+ * hierarchy: date/time -> place -> Interested/Going -> description ->
+ * creator -> real engagement/comments. `EngagementSection` (real like
+ * count + real comment thread) is mounted exactly once, at the end,
+ * combining the spec's separate "real engagement" and "comments" hierarchy
+ * items — it's one self-contained real-data component with its own
+ * fetch, and mounting it twice to split those items apart would mean a
+ * duplicate read of the same data, which Step 29 explicitly forbids.
+ *
+ * A future `TaggedReelsSection` (real Reels tagged at this Event's Place)
+ * belongs after the creator row — see the comment near the bottom of this
+ * file and README "Tagged at {Place}" for why it isn't wired in yet.
+ */
 export function EventDetail({ content }: { content: EventContent }) {
   const { user } = useAuth();
   const [status, setStatus] = useState<LoadStatus>('loading');
@@ -51,8 +66,6 @@ export function EventDetail({ content }: { content: EventContent }) {
     load();
   }, [load]);
 
-  const category = INTERESTS.find((interest) => interest.id === content.categoryId);
-
   const handleTap = async (tapped: EventResponseStatus) => {
     if (!user || isSubmitting) return;
     setIsSubmitting(true);
@@ -70,24 +83,12 @@ export function EventDetail({ content }: { content: EventContent }) {
 
   return (
     <View style={styles.container}>
-      {category && (
-        <View style={styles.metaRow}>
-          <View style={styles.categoryPill}>
-            <Text style={styles.categoryText}>
-              {category.emoji} {category.label}
-            </Text>
-          </View>
-        </View>
-      )}
-
-      <Text style={styles.title}>{content.title}</Text>
-
-      <AuthorLink uid={content.authorUid} style={styles.authorRow}>
-        <Text style={styles.authorName}>{content.authorDisplayName}</Text>
-        <Text style={styles.username}>@{content.authorUsername}</Text>
-      </AuthorLink>
-
-      <Text style={styles.description}>{content.description}</Text>
+      <View style={styles.infoRow}>
+        <Ionicons name="time-outline" size={16} color={Colors.textSecondary} />
+        <Text style={styles.infoText}>
+          {formatEventTime(content.startsAt.toDate())} – {content.endsAt.toDate().toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })}
+        </Text>
+      </View>
 
       {content.placeId ? (
         <Pressable
@@ -105,12 +106,6 @@ export function EventDetail({ content }: { content: EventContent }) {
           <Text style={styles.infoText}>{content.placeName}</Text>
         </View>
       )}
-      <View style={styles.infoRow}>
-        <Ionicons name="time-outline" size={16} color={Colors.textSecondary} />
-        <Text style={styles.infoText}>
-          {formatEventTime(content.startsAt.toDate())} – {content.endsAt.toDate().toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })}
-        </Text>
-      </View>
 
       {hasEnded ? <Text style={styles.endedText}>This event has ended.</Text> : null}
 
@@ -127,6 +122,8 @@ export function EventDetail({ content }: { content: EventContent }) {
 
           <View style={styles.responseRow}>
             <ResponseButton
+              icon="star-outline"
+              activeIcon="star"
               label="Interested"
               count={counts.interestedCount}
               selected={myResponse?.status === 'interested'}
@@ -134,6 +131,8 @@ export function EventDetail({ content }: { content: EventContent }) {
               onPress={() => handleTap('interested')}
             />
             <ResponseButton
+              icon="checkmark-circle-outline"
+              activeIcon="checkmark-circle"
               label="Going"
               count={counts.goingCount}
               selected={myResponse?.status === 'going'}
@@ -144,12 +143,26 @@ export function EventDetail({ content }: { content: EventContent }) {
         </>
       )}
 
+      <Text style={styles.description}>{content.description}</Text>
+
+      <AuthorLink uid={content.authorUid} style={styles.authorRow}>
+        <Text style={styles.authorName}>{content.authorDisplayName}</Text>
+        <Text style={styles.username}>@{content.authorUsername}</Text>
+      </AuthorLink>
+
+      {/* Future: <TaggedReelsSection placeName={content.placeName} reels={...} />
+          once a Reel can carry a real placeId — see README "Tagged at {Place}"
+          and src/components/TaggedReelsSection.tsx. Not wired in today: there
+          is no real tagged-Reel data source, and this step doesn't add one. */}
+
       <EngagementSection contentId={content.contentId} />
     </View>
   );
 }
 
 type ResponseButtonProps = {
+  icon: keyof typeof Ionicons.glyphMap;
+  activeIcon: keyof typeof Ionicons.glyphMap;
   label: string;
   count: number;
   selected: boolean;
@@ -157,7 +170,8 @@ type ResponseButtonProps = {
   onPress: () => void;
 };
 
-function ResponseButton({ label, count, selected, disabled, onPress }: ResponseButtonProps) {
+/** Same star/checkmark pill language as EventActionButtons on discovery cards (Step 26) — plus real counts, which only the detail screen can show efficiently. */
+function ResponseButton({ icon, activeIcon, label, count, selected, disabled, onPress }: ResponseButtonProps) {
   return (
     <Pressable
       onPress={onPress}
@@ -166,6 +180,7 @@ function ResponseButton({ label, count, selected, disabled, onPress }: ResponseB
       accessibilityRole="button"
       accessibilityState={{ selected, disabled }}
     >
+      <Ionicons name={selected ? activeIcon : icon} size={18} color={selected ? Colors.background : Colors.accent} />
       <Text style={[styles.responseLabel, selected && styles.responseLabelSelected]}>{label}</Text>
       <Text style={[styles.responseCount, selected && styles.responseLabelSelected]}>{count}</Text>
     </Pressable>
@@ -174,48 +189,7 @@ function ResponseButton({ label, count, selected, disabled, onPress }: ResponseB
 
 const styles = StyleSheet.create({
   container: {
-    gap: Spacing.sm,
-  },
-  metaRow: {
-    flexDirection: 'row',
-  },
-  categoryPill: {
-    borderRadius: Radius.full,
-    backgroundColor: Colors.surface,
-    borderWidth: 1,
-    borderColor: Colors.border,
-    paddingHorizontal: Spacing.sm,
-    paddingVertical: 4,
-  },
-  categoryText: {
-    color: Colors.accent,
-    fontSize: 12,
-    fontWeight: '700',
-  },
-  title: {
-    color: Colors.text,
-    fontSize: 24,
-    fontWeight: '800',
-  },
-  authorRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-  },
-  authorName: {
-    color: Colors.text,
-    fontSize: 14,
-    fontWeight: '700',
-  },
-  username: {
-    color: Colors.textSecondary,
-    fontSize: 13,
-  },
-  description: {
-    color: Colors.textSecondary,
-    fontSize: 15,
-    lineHeight: 21,
-    marginTop: Spacing.xs,
+    gap: Spacing.md,
   },
   infoRow: {
     flexDirection: 'row',
@@ -254,23 +228,23 @@ const styles = StyleSheet.create({
   },
   responseButton: {
     flex: 1,
-    borderRadius: Radius.md,
-    borderWidth: 1,
-    borderColor: Colors.border,
-    backgroundColor: Colors.surface,
-    paddingVertical: Spacing.md,
+    flexDirection: 'row',
     alignItems: 'center',
-    gap: 2,
+    justifyContent: 'center',
+    gap: 6,
+    borderRadius: Radius.full,
+    borderWidth: 1,
+    borderColor: Colors.accent,
+    paddingVertical: Spacing.md,
   },
   responseButtonSelected: {
-    borderColor: Colors.accent,
     backgroundColor: Colors.accent,
   },
   responseButtonDisabled: {
     opacity: 0.5,
   },
   responseLabel: {
-    color: Colors.text,
+    color: Colors.accent,
     fontSize: 15,
     fontWeight: '700',
   },
@@ -278,8 +252,27 @@ const styles = StyleSheet.create({
     color: Colors.background,
   },
   responseCount: {
-    color: Colors.textSecondary,
+    color: Colors.accent,
     fontSize: 13,
     fontWeight: '600',
+  },
+  description: {
+    color: Colors.textSecondary,
+    fontSize: 15,
+    lineHeight: 21,
+  },
+  authorRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  authorName: {
+    color: Colors.text,
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  username: {
+    color: Colors.textSecondary,
+    fontSize: 13,
   },
 });
