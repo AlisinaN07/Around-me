@@ -4,12 +4,13 @@ import * as ImagePicker from 'expo-image-picker';
 import { router, useFocusEffect } from 'expo-router';
 import { useVideoPlayer, VideoView } from 'expo-video';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, Platform, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
+import { ActivityIndicator, Platform, Pressable, StyleSheet, Text, View } from 'react-native';
 
 import { Button } from '@/components/Button';
 import { CategorySelector } from '@/components/CategorySelector';
+import { FormField } from '@/components/FormField';
 import { HeaderScreenLayout } from '@/components/HeaderScreenLayout';
-import { Colors, Radius, Spacing } from '@/constants/theme';
+import { Colors, IconSize, Radius, Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
 import {
   createReelDraft,
@@ -276,9 +277,7 @@ export default function CreateReelScreen() {
   const canPublish = !!video && !isBusy;
 
   return (
-    <HeaderScreenLayout title="Create reel">
-      <Text style={styles.subtitle}>Show what is happening right now.</Text>
-
+    <HeaderScreenLayout title="Create reel" subtitle="Share what's happening around you.">
       {isResolvingCameraVideo ? (
         <View style={styles.picker}>
           <ActivityIndicator color={Colors.textSecondary} />
@@ -312,13 +311,17 @@ export default function CreateReelScreen() {
         <View style={styles.pickChoiceGroup}>
           {Platform.OS !== 'web' ? (
             <Pressable style={styles.pickChoice} onPress={handleRecordVideo} accessibilityRole="button">
-              <Ionicons name="videocam-outline" size={32} color={Colors.accent} />
+              <View style={styles.pickChoiceIconWrap}>
+                <Ionicons name="videocam" size={IconSize.xl} color={Colors.accent} />
+              </View>
               <Text style={styles.pickChoiceTitle}>Record video</Text>
               <Text style={styles.pickChoiceHint}>Up to 60 seconds</Text>
             </Pressable>
           ) : null}
           <Pressable style={styles.pickChoice} onPress={handleChooseVideo} accessibilityRole="button">
-            <Ionicons name="images-outline" size={32} color={Colors.accent} />
+            <View style={styles.pickChoiceIconWrap}>
+              <Ionicons name="images" size={IconSize.xl} color={Colors.accent} />
+            </View>
             <Text style={styles.pickChoiceTitle}>Choose from library</Text>
             <Text style={styles.pickChoiceHint}>Up to 60 seconds, under 50 MB</Text>
           </Pressable>
@@ -326,15 +329,16 @@ export default function CreateReelScreen() {
       )}
 
       <View>
-        <TextInput
-          style={styles.captionInput}
-          placeholder="Add a caption (optional)"
-          placeholderTextColor={Colors.textSecondary}
+        <FormField
+          label="Caption (optional)"
+          placeholder="Add a caption..."
           value={caption}
           onChangeText={setCaption}
           multiline
+          numberOfLines={3}
           maxLength={REEL_CAPTION_MAX_LENGTH}
           editable={!isBusy}
+          style={styles.captionInput}
         />
         <Text style={styles.charCount}>
           {caption.length}/{REEL_CAPTION_MAX_LENGTH}
@@ -367,19 +371,26 @@ export default function CreateReelScreen() {
       ) : null}
 
       {isBusy ? (
-        <View style={styles.progressRow}>
-          <Text style={styles.progressText}>
-            {stage === 'creating'
-              ? 'Creating Reel…'
-              : stage === 'publishing'
-                ? 'Publishing…'
-                : `Uploading ${progress}%`}
-          </Text>
-          {stage === 'uploading' && (
-            <Pressable onPress={handleCancelUpload} accessibilityRole="button">
-              <Text style={styles.cancelText}>Cancel</Text>
-            </Pressable>
-          )}
+        <View style={styles.progressBlock}>
+          <View style={styles.progressRow}>
+            <Text style={styles.progressText}>
+              {stage === 'creating'
+                ? 'Creating Reel…'
+                : stage === 'publishing'
+                  ? 'Publishing…'
+                  : `Uploading ${progress}%`}
+            </Text>
+            {stage === 'uploading' && (
+              <Pressable onPress={handleCancelUpload} accessibilityRole="button">
+                <Text style={styles.cancelText}>Cancel</Text>
+              </Pressable>
+            )}
+          </View>
+          {stage === 'uploading' ? (
+            <View style={styles.progressTrack}>
+              <View style={[styles.progressFill, { width: `${progress}%` }]} />
+            </View>
+          ) : null}
         </View>
       ) : null}
 
@@ -404,12 +415,6 @@ export default function CreateReelScreen() {
 }
 
 const styles = StyleSheet.create({
-  subtitle: {
-    color: Colors.textSecondary,
-    fontSize: 15,
-    lineHeight: 21,
-    marginTop: -Spacing.sm,
-  },
   pickChoiceGroup: {
     flexDirection: 'row',
     gap: Spacing.sm,
@@ -420,18 +425,24 @@ const styles = StyleSheet.create({
     borderRadius: Radius.lg,
     borderWidth: 1,
     borderColor: Colors.border,
-    borderStyle: 'dashed',
-    backgroundColor: Colors.surface,
+    backgroundColor: Colors.surfaceElevated,
     alignItems: 'center',
     justifyContent: 'center',
-    gap: Spacing.xs,
+    gap: Spacing.sm,
     padding: Spacing.md,
+  },
+  pickChoiceIconWrap: {
+    width: 56,
+    height: 56,
+    borderRadius: Radius.full,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: Colors.accentMuted,
   },
   pickChoiceTitle: {
     color: Colors.text,
     fontSize: 15,
     fontWeight: '700',
-    marginTop: Spacing.xs,
     textAlign: 'center',
   },
   pickChoiceHint: {
@@ -457,10 +468,12 @@ const styles = StyleSheet.create({
   },
   previewWrap: {
     aspectRatio: 9 / 14,
-    maxHeight: 360,
+    maxHeight: 380,
     borderRadius: Radius.lg,
     overflow: 'hidden',
     backgroundColor: Colors.surface,
+    borderWidth: 1,
+    borderColor: Colors.accent,
   },
   preview: {
     flex: 1,
@@ -495,15 +508,8 @@ const styles = StyleSheet.create({
   },
   captionInput: {
     minHeight: 70,
-    borderWidth: 1,
-    borderColor: Colors.border,
-    borderRadius: Radius.md,
-    backgroundColor: Colors.surface,
-    color: Colors.text,
-    fontSize: 15,
-    paddingHorizontal: Spacing.md,
-    paddingVertical: Spacing.sm,
     textAlignVertical: 'top',
+    paddingTop: Spacing.sm,
   },
   charCount: {
     alignSelf: 'flex-end',
@@ -536,6 +542,9 @@ const styles = StyleSheet.create({
   failureActionButton: {
     flex: 1,
   },
+  progressBlock: {
+    gap: Spacing.xs,
+  },
   progressRow: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -544,6 +553,17 @@ const styles = StyleSheet.create({
   progressText: {
     color: Colors.textSecondary,
     fontSize: 13,
+  },
+  progressTrack: {
+    height: 4,
+    borderRadius: Radius.full,
+    backgroundColor: Colors.surfaceElevated,
+    overflow: 'hidden',
+  },
+  progressFill: {
+    height: '100%',
+    borderRadius: Radius.full,
+    backgroundColor: Colors.accent,
   },
   cancelText: {
     color: Colors.error,

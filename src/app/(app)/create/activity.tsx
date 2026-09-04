@@ -124,9 +124,10 @@ export default function CreateActivityScreen() {
   };
 
   return (
-    <HeaderScreenLayout title="Create activity">
-      <Text style={styles.subtitle}>Find people nearby to do something together — they join directly, no RSVP.</Text>
-
+    <HeaderScreenLayout
+      title="Create activity"
+      subtitle="Find people nearby to do something together — they join directly, no RSVP."
+    >
       <FormField
         label="Title"
         placeholder="Football tonight ⚽"
@@ -216,12 +217,6 @@ export default function CreateActivityScreen() {
 }
 
 const styles = StyleSheet.create({
-  subtitle: {
-    color: Colors.textSecondary,
-    fontSize: 15,
-    lineHeight: 21,
-    marginTop: -Spacing.sm,
-  },
   multilineInput: {
     minHeight: 96,
     textAlignVertical: 'top',

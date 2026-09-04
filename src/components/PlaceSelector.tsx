@@ -73,6 +73,7 @@ export function PlaceSelector({ label, cityKey, cityLabel, value, onChange, erro
       <View style={styles.container}>
         <Text style={styles.label}>{label}</Text>
         <View style={[styles.customInputRow, error && styles.inputError]}>
+          <Ionicons name="create-outline" size={18} color={Colors.textSecondary} />
           <TextInput
             style={styles.customInput}
             value={value.placeName}
@@ -82,6 +83,10 @@ export function PlaceSelector({ label, cityKey, cityLabel, value, onChange, erro
             maxLength={PLACE_NAME_MAX_LENGTH}
           />
         </View>
+        {/* Manual text, not a saved Place — visually distinct from the pin
+            icon + accent border a known Place gets below, so it never
+            reads as a verified/pinned location (Step 31). */}
+        <Text style={styles.customHint}>Typed manually — not a saved place.</Text>
         <Pressable onPress={switchToKnown} accessibilityRole="button">
           <Text style={styles.linkText}>Choose from known places instead</Text>
         </Pressable>
@@ -90,19 +95,22 @@ export function PlaceSelector({ label, cityKey, cityLabel, value, onChange, erro
     );
   }
 
+  const hasKnownPlace = !!value.placeId;
+
   return (
     <View style={styles.container}>
       <Text style={styles.label}>{label}</Text>
       <Pressable
-        style={[styles.trigger, error && styles.inputError]}
+        style={[styles.trigger, hasKnownPlace && styles.triggerSelected, error && styles.inputError]}
         onPress={() => setIsModalOpen(true)}
         accessibilityRole="button"
         accessibilityLabel={`Search places in ${cityLabel}`}
       >
-        <Ionicons name="location-outline" size={18} color={Colors.textSecondary} />
+        <Ionicons name={hasKnownPlace ? 'location' : 'location-outline'} size={18} color={hasKnownPlace ? Colors.accent : Colors.textSecondary} />
         <Text style={value.placeName ? styles.triggerValue : styles.triggerPlaceholder} numberOfLines={1}>
           {value.placeName || `Search places in ${cityLabel}`}
         </Text>
+        {hasKnownPlace ? <Ionicons name="checkmark-circle" size={16} color={Colors.accent} /> : null}
       </Pressable>
       {error ? <Text style={styles.errorText}>{error}</Text> : null}
 
@@ -209,6 +217,9 @@ const styles = StyleSheet.create({
     color: Colors.textSecondary,
     fontSize: 16,
   },
+  triggerSelected: {
+    borderColor: Colors.accent,
+  },
   inputError: {
     borderColor: Colors.error,
   },
@@ -217,6 +228,9 @@ const styles = StyleSheet.create({
     fontSize: 12,
   },
   customInputRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Spacing.sm,
     borderWidth: 1,
     borderColor: Colors.border,
     borderRadius: Radius.md,
@@ -224,9 +238,14 @@ const styles = StyleSheet.create({
     paddingHorizontal: Spacing.md,
   },
   customInput: {
+    flex: 1,
     color: Colors.text,
     fontSize: 16,
     paddingVertical: Spacing.md,
+  },
+  customHint: {
+    color: Colors.textMuted,
+    fontSize: 11,
   },
   linkText: {
     color: Colors.accent,

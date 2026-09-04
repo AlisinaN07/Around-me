@@ -131,11 +131,10 @@ export default function CreateEventScreen() {
   }
 
   return (
-    <HeaderScreenLayout title="Create event">
-      <Text style={styles.subtitle}>
-        Share something happening in the city. People can mark themselves Interested or Going.
-      </Text>
-
+    <HeaderScreenLayout
+      title="Create event"
+      subtitle="Share something happening in the city. People can mark themselves Interested or Going."
+    >
       <FormField
         label="Title"
         placeholder="Live music tonight"
@@ -229,12 +228,6 @@ const styles = StyleSheet.create({
     fontSize: 14,
     textAlign: 'center',
     lineHeight: 20,
-  },
-  subtitle: {
-    color: Colors.textSecondary,
-    fontSize: 15,
-    lineHeight: 21,
-    marginTop: -Spacing.sm,
   },
   multilineInput: {
     minHeight: 96,

@@ -74,9 +74,7 @@ export default function CreatePostScreen() {
   };
 
   return (
-    <HeaderScreenLayout title="Create post">
-      <Text style={styles.subtitle}>Share something with people in your city.</Text>
-
+    <HeaderScreenLayout title="Create post" subtitle="Share something with people in your city.">
       <View>
         <FormField
           label="What's happening?"
@@ -122,12 +120,6 @@ export default function CreatePostScreen() {
 }
 
 const styles = StyleSheet.create({
-  subtitle: {
-    color: Colors.textSecondary,
-    fontSize: 15,
-    lineHeight: 21,
-    marginTop: -Spacing.sm,
-  },
   multilineInput: {
     minHeight: 120,
     textAlignVertical: 'top',

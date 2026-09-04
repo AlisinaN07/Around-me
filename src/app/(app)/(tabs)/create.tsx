@@ -1,10 +1,10 @@
 import { Ionicons } from '@expo/vector-icons';
+import { LinearGradient } from 'expo-linear-gradient';
 import { router, type Href } from 'expo-router';
-import { useMemo } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
-import { Colors, Layout, Radius, Spacing } from '@/constants/theme';
+import { Colors, Gradients, Layout, Radius, Spacing, Typography } from '@/constants/theme';
 import { useProfile } from '@/hooks/useProfile';
 import { useCity } from '@/providers/CityProvider';
 import { canCreateEvent } from '@/utils/accountCapabilities';
@@ -14,61 +14,37 @@ type CreateOption = {
   icon: keyof typeof Ionicons.glyphMap;
   label: string;
   description: string;
-  href: Href | null;
+  href: Href;
 };
 
-const ALWAYS_AVAILABLE_OPTIONS: CreateOption[] = [
-  {
-    id: 'activity',
-    icon: 'people-outline',
-    label: 'Activity',
-    description: 'Find people nearby to do something together.',
-    href: '/create/activity',
-  },
-  {
-    id: 'post',
-    icon: 'create-outline',
-    label: 'Post',
-    description: 'Share with people around you.',
-    href: '/create/post',
-  },
-  {
-    id: 'reel',
-    icon: 'videocam-outline',
-    label: 'Reel',
-    description: 'Show what is happening right now.',
-    href: '/create/reel',
-  },
+// Home is a Reel-first social feed (Step 25), so Reel is the visually
+// strongest option here too — a large hero card above the secondary list,
+// not just another row in a flat menu.
+const SECONDARY_OPTIONS: CreateOption[] = [
+  { id: 'post', icon: 'create-outline', label: 'Post', description: 'Share something with your city.', href: '/create/post' },
+  { id: 'activity', icon: 'people-outline', label: 'Activity', description: 'Create something people can join.', href: '/create/activity' },
 ];
 
 /**
  * Event creation is Business-only (Step 30 core rule: Business = Personal
  * + the ability to create Events). Personal accounts simply never see
- * this option — no disabled "Coming soon" card, since it isn't a
- * temporarily-missing feature, it's a real capability the account doesn't
- * have. The real guarantee is firestore.rules' Event-create check, not
- * this filter — see /create/event's own capability guard for what happens
- * if a Personal account navigates there directly.
+ * this option — no disabled "Coming soon" card, no badge on the account
+ * that does see it. The real guarantee is firestore.rules' Event-create
+ * check, not this filter — see /create/event's own capability guard for
+ * what happens if a Personal account navigates there directly.
  */
 const EVENT_OPTION: CreateOption = {
   id: 'event',
   icon: 'calendar-outline',
   label: 'Event',
-  description: 'Share something happening in the city.',
+  description: 'Publish an event.',
   href: '/create/event',
 };
 
 export default function CreateScreen() {
   const { homeCity, activeCity, isExploringAnotherCity } = useCity();
   const { profile } = useProfile();
-
-  const createOptions = useMemo(() => {
-    const options = [...ALWAYS_AVAILABLE_OPTIONS];
-    if (canCreateEvent(profile)) {
-      options.splice(1, 0, EVENT_OPTION);
-    }
-    return options;
-  }, [profile]);
+  const showEvent = canCreateEvent(profile);
 
   return (
     <SafeAreaView style={styles.safeArea}>
@@ -79,42 +55,61 @@ export default function CreateScreen() {
           <View style={styles.exploringBanner}>
             <Ionicons name="information-circle-outline" size={18} color={Colors.textSecondary} />
             <Text style={styles.exploringBannerText}>
-              You&apos;re exploring {activeCity.cityName}. Your posts are published to your home city, {homeCity.cityName}.
+              You&apos;re exploring {activeCity.cityName}. New content publishes to your home city, {homeCity.cityName}.
             </Text>
           </View>
         ) : null}
 
+        <Pressable
+          style={({ pressed }) => [styles.reelHero, pressed && styles.pressed]}
+          onPress={() => router.push('/create/reel')}
+          accessibilityRole="button"
+          accessibilityLabel="Reel"
+        >
+          <LinearGradient
+            colors={Gradients.accent}
+            start={{ x: 0, y: 0 }}
+            end={{ x: 1, y: 1 }}
+            style={StyleSheet.absoluteFill}
+          />
+          <View style={styles.reelIconWrap}>
+            <Ionicons name="videocam" size={26} color={Colors.text} />
+          </View>
+          <View style={styles.reelHeroText}>
+            <Text style={styles.reelHeroTitle}>Reel</Text>
+            <Text style={styles.reelHeroDescription}>Share what&apos;s happening around you.</Text>
+          </View>
+          <Ionicons name="chevron-forward" size={20} color={Colors.text} />
+        </Pressable>
+
         <View style={styles.list}>
-          {createOptions.map((option) => (
-            <Pressable
-              key={option.id}
-              style={({ pressed }) => [styles.option, pressed && option.href && styles.optionPressed]}
-              onPress={() => option.href && router.push(option.href)}
-              disabled={!option.href}
-              accessibilityRole="button"
-              accessibilityLabel={option.label}
-              accessibilityState={{ disabled: !option.href }}
-            >
-              <View style={styles.iconWrap}>
-                <Ionicons name={option.icon} size={22} color={Colors.accent} />
-              </View>
-              <View style={styles.optionText}>
-                <View style={styles.optionHeaderRow}>
-                  <Text style={styles.optionLabel}>{option.label}</Text>
-                  {!option.href && (
-                    <View style={styles.comingSoonBadge}>
-                      <Text style={styles.comingSoonText}>Coming soon</Text>
-                    </View>
-                  )}
-                </View>
-                <Text style={styles.optionDescription}>{option.description}</Text>
-              </View>
-              {option.href && <Ionicons name="chevron-forward" size={18} color={Colors.textSecondary} />}
-            </Pressable>
+          {SECONDARY_OPTIONS.map((option) => (
+            <OptionRow key={option.id} option={option} />
           ))}
+          {showEvent ? <OptionRow option={EVENT_OPTION} /> : null}
         </View>
       </View>
     </SafeAreaView>
+  );
+}
+
+function OptionRow({ option }: { option: CreateOption }) {
+  return (
+    <Pressable
+      style={({ pressed }) => [styles.option, pressed && styles.optionPressed]}
+      onPress={() => router.push(option.href)}
+      accessibilityRole="button"
+      accessibilityLabel={option.label}
+    >
+      <View style={styles.iconWrap}>
+        <Ionicons name={option.icon} size={22} color={Colors.accent} />
+      </View>
+      <View style={styles.optionText}>
+        <Text style={styles.optionLabel}>{option.label}</Text>
+        <Text style={styles.optionDescription}>{option.description}</Text>
+      </View>
+      <Ionicons name="chevron-forward" size={18} color={Colors.textSecondary} />
+    </Pressable>
   );
 }
 
@@ -132,8 +127,7 @@ const styles = StyleSheet.create({
   },
   title: {
     color: Colors.text,
-    fontSize: 26,
-    fontWeight: '800',
+    ...Typography.screenTitle,
     marginTop: Spacing.lg,
     marginBottom: Spacing.xl,
   },
@@ -152,6 +146,44 @@ const styles = StyleSheet.create({
   exploringBannerText: {
     flex: 1,
     color: Colors.textSecondary,
+    fontSize: 13,
+    lineHeight: 18,
+  },
+  reelHero: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Spacing.md,
+    borderRadius: Radius.lg,
+    padding: Spacing.lg,
+    marginBottom: Spacing.md,
+    overflow: 'hidden',
+    shadowColor: Colors.accent,
+    shadowOpacity: 0.35,
+    shadowRadius: 12,
+    shadowOffset: { width: 0, height: 4 },
+  },
+  pressed: {
+    opacity: 0.9,
+  },
+  reelIconWrap: {
+    width: 52,
+    height: 52,
+    borderRadius: Radius.md,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(255, 255, 255, 0.2)',
+  },
+  reelHeroText: {
+    flex: 1,
+    gap: 2,
+  },
+  reelHeroTitle: {
+    color: Colors.text,
+    fontSize: 19,
+    fontWeight: '800',
+  },
+  reelHeroDescription: {
+    color: 'rgba(255, 255, 255, 0.85)',
     fontSize: 13,
     lineHeight: 18,
   },
@@ -183,33 +215,12 @@ const styles = StyleSheet.create({
     flex: 1,
     gap: 2,
   },
-  optionHeaderRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-  },
   optionLabel: {
     color: Colors.text,
-    fontSize: 16,
-    fontWeight: '700',
+    ...Typography.cardTitle,
   },
   optionDescription: {
     color: Colors.textSecondary,
-    fontSize: 13,
-    lineHeight: 18,
-  },
-  comingSoonBadge: {
-    borderRadius: Radius.full,
-    backgroundColor: Colors.background,
-    borderWidth: 1,
-    borderColor: Colors.border,
-    paddingHorizontal: Spacing.sm,
-    paddingVertical: 2,
-  },
-  comingSoonText: {
-    color: Colors.textSecondary,
-    fontSize: 10,
-    fontWeight: '700',
-    textTransform: 'uppercase',
+    ...Typography.bodySecondary,
   },
 });

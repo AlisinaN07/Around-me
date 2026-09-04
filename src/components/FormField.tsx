@@ -14,9 +14,10 @@ type FormFieldProps = TextInputProps & {
 
 export function FormField({ label, error, secureToggle, prefix, style, ...rest }: FormFieldProps) {
   const [isRevealed, setIsRevealed] = useState(false);
+  const isDisabled = rest.editable === false;
 
   return (
-    <View style={styles.container}>
+    <View style={[styles.container, isDisabled && styles.containerDisabled]}>
       <Text style={styles.label}>{label}</Text>
       <View style={[styles.inputRow, error && styles.inputRowError]}>
         {prefix ? <Text style={styles.prefix}>{prefix}</Text> : null}
@@ -45,6 +46,9 @@ export function FormField({ label, error, secureToggle, prefix, style, ...rest }
 const styles = StyleSheet.create({
   container: {
     gap: Spacing.xs,
+  },
+  containerDisabled: {
+    opacity: 0.5,
   },
   label: {
     color: Colors.textSecondary,

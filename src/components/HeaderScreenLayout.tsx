@@ -4,17 +4,19 @@ import type { ReactNode } from 'react';
 import { KeyboardAvoidingView, Platform, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
-import { Colors, Layout, Spacing } from '@/constants/theme';
+import { Colors, Layout, Spacing, Typography } from '@/constants/theme';
 
 type HeaderScreenLayoutProps = {
   title: string;
+  /** Short one-line description rendered under the header, above the form — shared by every Create screen instead of each one styling its own. */
+  subtitle?: string;
   children: ReactNode;
   /** Replaces the default right-side spacer — e.g. a small overflow/options button. Falls back to a plain spacer (keeping the title centered) when omitted. */
   headerRight?: ReactNode;
 };
 
 /** Shared chrome for the Post/Activity/Event creation screens: back button, title, keyboard-avoiding scroll body. */
-export function HeaderScreenLayout({ title, children, headerRight }: HeaderScreenLayoutProps) {
+export function HeaderScreenLayout({ title, subtitle, children, headerRight }: HeaderScreenLayoutProps) {
   return (
     <SafeAreaView style={styles.safeArea} edges={['top', 'bottom']}>
       <View style={styles.header}>
@@ -37,7 +39,10 @@ export function HeaderScreenLayout({ title, children, headerRight }: HeaderScree
           keyboardDismissMode="on-drag"
           showsVerticalScrollIndicator={false}
         >
-          <View style={styles.content}>{children}</View>
+          <View style={styles.content}>
+            {subtitle ? <Text style={styles.subtitle}>{subtitle}</Text> : null}
+            {children}
+          </View>
         </ScrollView>
       </KeyboardAvoidingView>
     </SafeAreaView>
@@ -68,11 +73,16 @@ const styles = StyleSheet.create({
     flex: 1,
     textAlign: 'center',
     color: Colors.text,
+    ...Typography.cardTitle,
     fontSize: 17,
-    fontWeight: '700',
   },
   headerSpacer: {
     width: 40,
+  },
+  subtitle: {
+    color: Colors.textSecondary,
+    ...Typography.body,
+    marginTop: -Spacing.sm,
   },
   scrollContent: {
     flexGrow: 1,

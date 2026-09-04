@@ -172,11 +172,34 @@ There is no separate business application, no verification, no subscriptions, no
 - **Social graph, messaging, Reels, likes, comments, following** are identical and shared between the two account types — there is no second social graph, and no visual Business/Verified badge anywhere in this step. Personal and Business profiles render through the exact same Step 27 profile visual system.
 - **Existing accounts.** No production account was migrated or backfilled for this step — every account created before Step 30 was already `accountType: 'personal'` from the original onboarding transaction, and no existing Event content (regardless of who authored it) was touched, hidden, or deleted.
 
-## Create flow
+## Create flow — visual reconstruction (Step 31)
 
-Create → choose Post/Activity/Event (Event only offered to Business accounts — see "Personal and Business accounts" above) → fill in the form → Publish calls the matching `create*` function in `src/services/content.ts` directly (screens never write to Firestore themselves). On success the app navigates back to Home; Home refetches on every focus (`useFocusEffect`, still a one-shot query, not a realtime listener), so newly-published content shows up without an app restart. Reel is a separate flow with its own two-phase upload lifecycle — see the Reels section below.
+The Create hub (`src/app/(app)/(tabs)/create.tsx`) hierarchy:
+
+- **Personal** sees: **Reel** (primary, large hero card) → **Post**, **Activity** (secondary rows).
+- **Business** sees the same, plus **Event** as a third secondary row — same capability model as Step 30, no new visual treatment (no "Business" badge, no "Verified", no "Pro"). Event is simply omitted for Personal, never shown disabled.
+
+Reel is deliberately the visually strongest option — a full-width gradient hero card above the secondary list — because Home is a Reel-first social feed (Step 25); Post and Activity remain fully supported, just visually secondary on this one screen.
+
+**Home City publication rule**, unchanged from Step 21: content always publishes to the signed-in user's **Home City**, never their **Active City** (the city they're currently browsing). The Create hub shows an informational banner when the two differ ("You're exploring X. New content publishes to your home city, Y.") — this is normal, not an error state, and there's no way to override it from Create.
+
+**Post** — a general-purpose "share something with your city" post. It is no longer part of the main Home feed (Home is Reel-first as of Step 25); Post content surfaces on profiles and via direct content links. Its long-term product role is intentionally left open for a future audit — this step only redesigns its visual chrome, not its product placement.
+
+**Activity** — "something people can join" — joining is direct and immediate (no RSVP/approval step), which the screen's own subtitle makes explicit.
+
+**Event** — Business-only — "something people can respond to": viewers mark themselves Interested or Going rather than joining outright. No event image, ticket URL, price, or organizer-verification field exists yet; Event still has no media of its own (Storage/backend support for it doesn't exist).
+
+Create Reel (`src/app/(app)/create/reel/index.tsx`) offers two real actions — record or choose from library — restyled as larger, filled (not dashed) media-first controls. The video preview stage dominates the screen once a video is selected, with a thin accent border signaling the "ready to publish" state; caption now uses the same shared `FormField` component as every other text field in the app (previously a separately-styled raw `TextInput`). The publish flow's three real stages (Creating → Uploading → Publishing) are unchanged; Uploading now also renders a slim progress bar under the existing percentage text, using the real upload-progress value — no fabricated progress is ever shown for stages where only a phase, not a percentage, is known. No music/filters/effects/templates/duet/stitch, no Place/Event/Business tagging (documented as future architecture only, not built) — same restrictions as Step 20/29.
+
+The camera recording screen (`src/app/(app)/create/reel/camera.tsx`) and its permission-denied states were already at the target visual bar from Step 20 and are unchanged in this step — full-bleed camera, translucent pill overlays, real "Try again"/"Choose from library" actions, no dead buttons.
+
+Every Post/Activity/Event/Reel creation screen now shares one subtitle style via `HeaderScreenLayout`'s new optional `subtitle` prop (previously each screen duplicated its own identical subtitle `Text`/style), and `FormField` gained a real disabled visual state (dimmed) for whenever a field is marked `editable={false}` during a busy/submitting state.
+
+`PlaceSelector` now visually distinguishes a selected known Place (accent-colored pin icon + checkmark + accent border) from manually-typed text (a "Typed manually — not a saved place." hint, since a manually-typed place name is never a verified location). `DateTimeField`'s Start/End pills gained small calendar/clock icons for clarity — the underlying native date/time picker behavior (iOS inline spinner, Android imperative dialog, web HTML inputs) is unchanged.
 
 Date/time fields use `@react-native-community/datetimepicker` on iOS/Android (`src/components/DateTimeField.tsx`) and plain HTML `date`/`time` inputs on web (`DateTimeField.web.tsx`, picked automatically by Metro's platform file resolution) — the picker package has no web support of its own.
+
+Publish still calls the matching `create*` function in `src/services/content.ts` directly (screens never write to Firestore themselves); on success the app navigates back to Home, which refetches on every focus. Reel keeps its own two-phase upload lifecycle — see the Reels section below. None of this step touches Firestore rules, indexes, Storage rules, or the account-capability model — Personal/Business enforcement is exactly as Step 30 left it.
 
 ## Engagement (Activity join/leave, Event Interested/Going)
 

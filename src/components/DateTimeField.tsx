@@ -1,3 +1,4 @@
+import { Ionicons } from '@expo/vector-icons';
 import DateTimePicker, { DateTimePickerAndroid } from '@react-native-community/datetimepicker';
 import { useState } from 'react';
 import { Platform, Pressable, StyleSheet, Text, View } from 'react-native';
@@ -78,6 +79,7 @@ export function DateTimeField({ label, value, onChange, minimumDate, error }: Da
           accessibilityRole="button"
           accessibilityLabel={`${label} date, ${formatDatePill(value)}`}
         >
+          <Ionicons name="calendar-outline" size={15} color={Colors.textSecondary} />
           <Text style={styles.pillText}>{formatDatePill(value)}</Text>
         </Pressable>
         <Pressable
@@ -86,6 +88,7 @@ export function DateTimeField({ label, value, onChange, minimumDate, error }: Da
           accessibilityRole="button"
           accessibilityLabel={`${label} time, ${formatTimePill(value)}`}
         >
+          <Ionicons name="time-outline" size={15} color={Colors.textSecondary} />
           <Text style={styles.pillText}>{formatTimePill(value)}</Text>
         </Pressable>
       </View>
@@ -129,13 +132,16 @@ const styles = StyleSheet.create({
   },
   pill: {
     flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: Spacing.xs,
     borderWidth: 1,
     borderColor: Colors.border,
     borderRadius: Radius.md,
     backgroundColor: Colors.surface,
     paddingHorizontal: Spacing.md,
     paddingVertical: Spacing.md,
-    alignItems: 'center',
   },
   pillError: {
     borderColor: Colors.error,
