@@ -312,6 +312,42 @@ All discovery reads (Happening Now, Today/Tonight, Upcoming, `/events`) use `act
 
 No fake accounts, no fake attendance/RSVP counts, no fake distance, and no synthetic Karlstad "residents." Test accounts created for verification are disposable and deleted by exact ID immediately after (see Cleanup below).
 
+## Home vs Events — core product separation (Step 25)
+
+Around Me has two clearly separated primary experiences, locked in as of Step 25:
+
+- **Home** (`src/app/(app)/(tabs)/index.tsx`) — the local, user-generated social/Reel feed. TikTok/Instagram-style vertical video, local-first. Home renders exactly one thing: Reels. It is **not** an event calendar, an event rail, an organizer feed, or a business directory — the Happening Now/Today/Upcoming/Around-feed sections that used to live here (Steps 21–22) moved to the Events tab; nothing about `fetchDiscoverySections`/`dateWindows.ts`/`EventCard` was touched, only Home's own use of them was removed.
+- **Events** (`src/app/(app)/(tabs)/events.tsx`) — Event/Activity discovery, unchanged this step. Official/local Events and Activities, whoever publishes them.
+
+Ordinary text Posts also no longer appear on Home — they still exist (`content/{contentId}`, `type: 'post'`) and remain visible on a user's own/public profile and via direct `/content/{contentId}` links, just not woven into a Home feed anymore.
+
+### Home's two modes
+
+- **For You** — every published Reel in Active City, newest-first (`fetchCityReels`). This is a plain reverse-chronological query, **not** a personalized ranking — no interest-based, like-based, or watch-time-based ordering exists.
+- **Following** — published Reels in Active City from people the viewer follows (`fetchFollowingReels`, new this step). City-aware by the same rule as every other Following surface in this app (Step 21): if Home City is Karlstad but Active City is Stockholm, Following shows followed creators' Stockholm Reels, not Karlstad's.
+
+Default tab is **For You**; the choice isn't persisted across a fresh mount (same non-persistence as the old Around/Following toggle it replaces).
+
+### Following Reels — query design
+
+`fetchFollowingReels` (`src/services/reels.ts`) mirrors `fetchFollowingFeed` in `content.ts` exactly: resolve followed uids (capped at 30) → chunk into groups of 10 → one `where('authorUid','in',chunk) + where('cityKey','==',...) + where('status','==','published')` query per chunk → merge, dedupe by `reelId`, sort by `publishedAt`, cap to the page limit. This needed exactly one new composite index — `reels` on `(cityKey, status, authorUid, publishedAt DESC)` — the only Firestore change this step made; no rules changes.
+
+### Shared Reel feed component
+
+`src/components/ReelFeed.tsx` is the one real feed implementation behind both Home and the standalone `/reels` route (`src/app/(app)/reels.tsx`, kept for direct navigation/compatibility — e.g. Home's future deep links — after Home itself became the primary Reel surface). It owns paging, active-item-only playback, the ±1-neighbor preload window, the options/report/block/share flow, and empty/loading/error rendering; callers only supply the fetched `reels`/`status` and a `topOverlay` (Home's city+tabs+filter row, or `/reels`' simpler back+city row). Paging/playback/engagement never exist as two drifting copies.
+
+### Category filter
+
+A lightweight bottom sheet (`ReelCategoryFilterSheet.tsx`) offering "All" + the existing stable `interests.ts` category ids, applied as a client-side filter over the already-bounded fetched list — not a new query parameter, not a personalization/preferences system.
+
+### Right action rail — only real actions
+
+Creator avatar (→ profile), like (real count, optimistic + rollback), comment (real count, → `/reel/{id}`), share (existing native share / copy-link). No bookmark/save icon (no Saved backend exists yet) and no share-count number (never tracked) — both deliberately omitted rather than faked.
+
+### Deliberately not implemented this step
+
+Saved/bookmarks, music/audio metadata, hashtag parsing, Reel place tagging, Reel event tagging, an inline follow-toggle on the avatar (existing Follow flow lives on the profile screen only), and any personalization/ranking signal. Reel place/event tagging is documented here as **future architecture only**: once a Reel can carry a `placeId`, an Event/Place detail page could show "Tagged at {Place}" using real linked Reels — not built now.
+
 ## Reels (Cloud Storage — Step 18)
 
 Reels are short (≤60s), video-only posts with vertical, city-scoped playback — the first feature in this app to use Cloud Storage rather than Firestore alone. They live in their own root collection, `reels/{reelId}`, separate from `content/{contentId}` (posts/activities/events): a Reel has a media-upload lifecycle and Storage metadata that the other content types never had, and folding it into `content` would have meant giving every Post/Activity/Event query an upload-status field it never needs.

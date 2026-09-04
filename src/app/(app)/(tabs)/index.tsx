@@ -1,518 +1,259 @@
 import { Ionicons } from '@expo/vector-icons';
 import { router, useFocusEffect } from 'expo-router';
 import { useCallback, useMemo, useState } from 'react';
-import { Platform, Pressable, RefreshControl, ScrollView, StyleSheet, Text, View } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
+import { Pressable, StyleSheet, Text, View } from 'react-native';
 
 import { Button } from '@/components/Button';
-import { CategoryChip } from '@/components/CategoryChip';
-import { ContentCard } from '@/components/ContentCard';
-import { ErrorState } from '@/components/ErrorState';
-import { EventCard } from '@/components/EventCard';
-import { FollowingFeed } from '@/components/FollowingFeed';
-import { SectionHeader } from '@/components/SectionHeader';
-import { SegmentedControl } from '@/components/SegmentedControl';
-import { CATEGORY_FILTERS, isMetaCategoryFilter } from '@/constants/categoryFilters';
-import { Colors, Layout, Radius, Spacing } from '@/constants/theme';
+import { EmptyState } from '@/components/EmptyState';
+import { ReelCategoryFilterSheet } from '@/components/ReelCategoryFilterSheet';
+import { ReelFeed } from '@/components/ReelFeed';
+import { Colors, Typography } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
 import { useCity } from '@/providers/CityProvider';
 import { fetchMyBlockedUserIds } from '@/services/blocks';
-import { fetchCityFeed, fetchDiscoverySections } from '@/services/content';
-import type { ActivityContent, Content, EventContent } from '@/types/content';
+import { fetchCityReels, fetchFollowingReels } from '@/services/reels';
+import type { Reel } from '@/types/reel';
 
 type LoadStatus = 'loading' | 'loaded' | 'error';
+type HomeMode = 'forYou' | 'following';
 
-type HomeMode = 'around' | 'following';
-
-const HOME_MODE_OPTIONS: { id: HomeMode; label: string }[] = [
-  { id: 'around', label: 'Around' },
-  { id: 'following', label: 'Following' },
-];
-
+/**
+ * Home — the local user-generated social/Reel feed (Step 25). Deliberately
+ * NOT an event calendar: Happening Now/Today/Upcoming/Around-feed rails
+ * live on the Events tab now (see src/app/(app)/(tabs)/events.tsx), which
+ * still uses the exact same fetchDiscoverySections/dateWindows services —
+ * nothing about that architecture was touched, only Home's own usage of it
+ * was removed. Home renders exactly one thing: the vertical Reel feed,
+ * via the shared ReelFeed component also used by the standalone /reels
+ * route (src/app/(app)/reels.tsx), so paging/playback/engagement never
+ * drift into two implementations.
+ */
 export default function HomeScreen() {
   const { user } = useAuth();
-  const { activeCity, isExploringAnotherCity, isReady: isCityReady } = useCity();
-  // In-session only — not persisted to Firestore. Resets to "Around" (the
-  // default) every time this screen mounts fresh; trivially preserved for
-  // the rest of a session because it's just ordinary component state.
-  const [homeMode, setHomeMode] = useState<HomeMode>('around');
-  const [selectedCategory, setSelectedCategory] = useState('all');
-  const [feedItems, setFeedItems] = useState<Content[]>([]);
-  const [happeningItems, setHappeningItems] = useState<(ActivityContent | EventContent)[]>([]);
-  const [todayItems, setTodayItems] = useState<(ActivityContent | EventContent)[]>([]);
-  const [todayLabel, setTodayLabel] = useState<'Today' | 'Tonight'>('Today');
-  const [upcomingItems, setUpcomingItems] = useState<(ActivityContent | EventContent)[]>([]);
-  const [status, setStatus] = useState<LoadStatus>('loading');
-  const [isRefreshing, setIsRefreshing] = useState(false);
+  const { activeCity, homeCity, isExploringAnotherCity, isReady: isCityReady } = useCity();
 
-  const cityLabel = activeCity?.cityName ?? 'you';
+  // In-session only, resets to "For You" (the default) on fresh mount —
+  // same non-persisted pattern the old Around/Following toggle used.
+  const [mode, setMode] = useState<HomeMode>('forYou');
+  const [categoryFilter, setCategoryFilter] = useState<string | null>(null);
+  const [isFilterOpen, setIsFilterOpen] = useState(false);
 
-  const loadFeed = useCallback(
-    async (isRefresh = false) => {
-      if (!activeCity) return;
-      if (isRefresh) {
-        setIsRefreshing(true);
-      } else {
-        setStatus('loading');
-        // Clears any previous city's results immediately, before the new
-        // city's fetch even starts — otherwise the loading-skeleton branch
-        // below (which only triggers when the list is empty) would be
-        // skipped and stale content from the prior city would render
-        // under the new city's header for the duration of the fetch.
-        setFeedItems([]);
-        setHappeningItems([]);
-        setTodayItems([]);
-        setUpcomingItems([]);
-      }
-      try {
-        const [feed, discovery, blockedUids] = await Promise.all([
-          fetchCityFeed(activeCity.cityKey),
-          fetchDiscoverySections(activeCity.cityKey),
-          // Client-side only: this does NOT make blocked users' published
-          // content inaccessible (see the Step 17 MVP boundary in
-          // firestore.rules) — it just keeps them out of MY OWN Around/
-          // discovery-rail view. A single one-shot fetch per load, not a
-          // query per blocked user.
-          user ? fetchMyBlockedUserIds(user.uid) : Promise.resolve<string[]>([]),
-        ]);
-        const blockedSet = new Set(blockedUids);
-        const dropBlocked = <T extends { authorUid: string }>(items: T[]) =>
-          blockedSet.size > 0 ? items.filter((item) => !blockedSet.has(item.authorUid)) : items;
-        setFeedItems(dropBlocked(feed));
-        setHappeningItems(dropBlocked(discovery.happeningNow));
-        setTodayItems(dropBlocked(discovery.today));
-        setTodayLabel(discovery.todayLabel);
-        setUpcomingItems(dropBlocked(discovery.upcoming));
-        setStatus('loaded');
-      } catch {
-        setStatus('error');
-      } finally {
-        setIsRefreshing(false);
-      }
-    },
-    [activeCity, user]
-  );
+  const [forYouReels, setForYouReels] = useState<Reel[]>([]);
+  const [forYouStatus, setForYouStatus] = useState<LoadStatus>('loading');
 
-  // Home refetches every time it regains focus (covers first mount, tab
-  // switches back to Home, and returning here after a successful publish
-  // from Create — no realtime listener, still a one-shot query per visit)
-  // AND every time Active City changes, so switching cities in the
-  // explorer refreshes this screen without a manual pull-to-refresh.
+  const [followingReels, setFollowingReels] = useState<Reel[]>([]);
+  const [followsAnyone, setFollowsAnyone] = useState(true);
+  const [followingStatus, setFollowingStatus] = useState<LoadStatus>('loading');
+
+  const cityLabel = activeCity?.cityName ?? 'your city';
+
+  const loadForYou = useCallback(async () => {
+    if (!activeCity) return;
+    setForYouStatus('loading');
+    // Clears the previous city's Reels immediately — otherwise the empty
+    // state (which only shows when the list is already empty) would be
+    // skipped and a stale city's video would render under the new city's
+    // header for the duration of the fetch (same city-switch rule as
+    // every other discovery surface in this app).
+    setForYouReels([]);
+    try {
+      const [cityReels, blockedUids] = await Promise.all([
+        fetchCityReels(activeCity.cityKey),
+        user ? fetchMyBlockedUserIds(user.uid) : Promise.resolve<string[]>([]),
+      ]);
+      const blockedSet = new Set(blockedUids);
+      setForYouReels(blockedSet.size > 0 ? cityReels.filter((reel) => !blockedSet.has(reel.authorUid)) : cityReels);
+      setForYouStatus('loaded');
+    } catch {
+      setForYouStatus('error');
+    }
+  }, [activeCity, user]);
+
+  const loadFollowing = useCallback(async () => {
+    if (!activeCity || !user) return;
+    setFollowingStatus('loading');
+    setFollowingReels([]);
+    try {
+      const [result, blockedUids] = await Promise.all([
+        fetchFollowingReels({ currentUid: user.uid, cityKey: activeCity.cityKey }),
+        fetchMyBlockedUserIds(user.uid),
+      ]);
+      const blockedSet = new Set(blockedUids);
+      setFollowingReels(blockedSet.size > 0 ? result.reels.filter((reel) => !blockedSet.has(reel.authorUid)) : result.reels);
+      setFollowsAnyone(result.followsAnyone);
+      setFollowingStatus('loaded');
+    } catch {
+      setFollowingStatus('error');
+    }
+  }, [activeCity, user]);
+
+  // Reloads whenever Home regains focus, Active City changes, or the
+  // visible mode changes — same one-shot-per-visit pattern the rest of
+  // this app's discovery surfaces use, no realtime listener.
   useFocusEffect(
     useCallback(() => {
       if (!isCityReady) return;
-      loadFeed();
+      if (mode === 'forYou') {
+        loadForYou();
+      } else {
+        loadFollowing();
+      }
       // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [activeCity?.cityKey, isCityReady])
+    }, [activeCity?.cityKey, isCityReady, mode])
   );
 
-  const visibleItems = useMemo(() => {
-    switch (selectedCategory) {
-      case 'all':
-        return feedItems;
-      case 'happening-now':
-        return happeningItems;
-      case 'events':
-        return feedItems.filter((item) => item.type === 'event');
-      case 'activities':
-        return feedItems.filter((item) => item.type === 'activity');
-      default:
-        return feedItems.filter((item) => item.categoryId === selectedCategory);
-    }
-  }, [selectedCategory, feedItems, happeningItems]);
-
-  // The 'all'/'happening-now'/'events'/'activities' chips are Around-feed
-  // VIEW MODES (handled above); a real categoryId (e.g. 'sports') instead
-  // filters the time-based discovery rails too, so tapping "Sports" shows
-  // Sports content consistently everywhere on Home, not just in the feed.
-  const isRealCategory = !isMetaCategoryFilter(selectedCategory);
-  const visibleHappeningItems = useMemo(
-    () => (isRealCategory ? happeningItems.filter((item) => item.categoryId === selectedCategory) : happeningItems),
-    [isRealCategory, happeningItems, selectedCategory]
+  const visibleForYouReels = useMemo(
+    () => (categoryFilter ? forYouReels.filter((reel) => reel.categoryId === categoryFilter) : forYouReels),
+    [forYouReels, categoryFilter]
   );
-  const visibleTodayItems = useMemo(
-    () => (isRealCategory ? todayItems.filter((item) => item.categoryId === selectedCategory) : todayItems),
-    [isRealCategory, todayItems, selectedCategory]
-  );
-  const visibleUpcomingItems = useMemo(
-    () => (isRealCategory ? upcomingItems.filter((item) => item.categoryId === selectedCategory) : upcomingItems),
-    [isRealCategory, upcomingItems, selectedCategory]
+  const visibleFollowingReels = useMemo(
+    () => (categoryFilter ? followingReels.filter((reel) => reel.categoryId === categoryFilter) : followingReels),
+    [followingReels, categoryFilter]
   );
 
-  return (
-    <SafeAreaView style={styles.safeArea} edges={['top']}>
-      <View style={styles.topBar}>
-        <View style={styles.page}>
-          <View style={styles.header}>
-            <Pressable onPress={() => router.push('/cities')} style={styles.headerTextGroup} accessibilityRole="button" accessibilityLabel="Change city">
-              <View style={styles.cityRow}>
-                <Text style={styles.title}>Around {cityLabel}</Text>
-                <Ionicons name="chevron-down" size={18} color={Colors.text} />
-              </View>
-              {isExploringAnotherCity ? <Text style={styles.exploringLabel}>Exploring {cityLabel}</Text> : null}
-            </Pressable>
-            <View style={styles.headerActions}>
-              {Platform.OS === 'web' && homeMode === 'around' && (
-                <Pressable
-                  onPress={() => loadFeed(true)}
-                  hitSlop={8}
-                  accessibilityRole="button"
-                  accessibilityLabel="Refresh"
-                  style={styles.headerButton}
-                >
-                  <Ionicons name={isRefreshing ? 'sync' : 'refresh-outline'} size={20} color={Colors.text} />
-                </Pressable>
-              )}
-              <Pressable
-                onPress={() => {}}
-                hitSlop={8}
-                accessibilityRole="button"
-                accessibilityLabel="Search"
-                style={styles.headerButton}
-              >
-                <Ionicons name="search-outline" size={22} color={Colors.text} />
-              </Pressable>
-              <Pressable
-                onPress={() => {}}
-                hitSlop={8}
-                accessibilityRole="button"
-                accessibilityLabel="Notifications"
-                style={styles.headerButton}
-              >
-                <Ionicons name="notifications-outline" size={22} color={Colors.text} />
-              </Pressable>
-            </View>
-          </View>
+  const topOverlay = (
+    <View style={styles.overlayRow}>
+      <Pressable onPress={() => router.push('/cities')} style={styles.cityButton} accessibilityRole="button" accessibilityLabel="Change city">
+        <Text style={styles.cityButtonText} numberOfLines={1}>
+          {cityLabel}
+        </Text>
+        <Ionicons name="chevron-down" size={16} color={Colors.text} />
+      </Pressable>
 
-          <View style={styles.modeSwitch}>
-            <SegmentedControl options={HOME_MODE_OPTIONS} value={homeMode} onChange={setHomeMode} />
-          </View>
-        </View>
+      <View style={styles.modeTabs}>
+        <ModeTab label="Following" active={mode === 'following'} onPress={() => setMode('following')} />
+        <ModeTab label="For You" active={mode === 'forYou'} onPress={() => setMode('forYou')} />
       </View>
 
-      {homeMode === 'following' ? (
-        user && activeCity ? (
-          <FollowingFeed
-            currentUid={user.uid}
-            cityKey={activeCity.cityKey}
-            cityLabel={cityLabel}
-            onExploreAround={() => setHomeMode('around')}
-          />
-        ) : null
-      ) : (
-        <ScrollView
-          style={styles.scroll}
-          contentContainerStyle={styles.scrollContent}
-          showsVerticalScrollIndicator={false}
-          refreshControl={
-            Platform.OS === 'web' ? undefined : (
-              <RefreshControl refreshing={isRefreshing} onRefresh={() => loadFeed(true)} tintColor={Colors.accent} />
+      <Pressable onPress={() => setIsFilterOpen(true)} style={styles.filterButton} accessibilityRole="button" accessibilityLabel="Filter by category">
+        <Ionicons name="options-outline" size={20} color={Colors.text} />
+      </Pressable>
+    </View>
+  );
+
+  if (mode === 'following') {
+    return (
+      <>
+        <ReelFeed
+          reels={visibleFollowingReels}
+          status={followingStatus}
+          errorTitle={`Couldn't load Reels in ${cityLabel}`}
+          onReload={loadFollowing}
+          topOverlay={topOverlay}
+          emptyState={
+            !followsAnyone ? (
+              <EmptyState
+                bare
+                icon="people-outline"
+                title="Your Following feed is empty"
+                body={`Follow people in ${cityLabel} to see their Reels here.`}
+              />
+            ) : (
+              <EmptyState bare icon="videocam-outline" title={`No new Reels from people you follow in ${cityLabel}.`} />
             )
           }
-        >
-          <View style={styles.page}>
-            <ScrollView
-              horizontal
-              showsHorizontalScrollIndicator={false}
-              style={styles.horizontalScroll}
-              contentContainerStyle={styles.chipsRow}
-            >
-              {CATEGORY_FILTERS.map((category) => (
-                <CategoryChip
-                  key={category.id}
-                  label={category.label}
-                  icon={category.icon}
-                  selected={selectedCategory === category.id}
-                  onPress={() => setSelectedCategory(category.id)}
-                />
-              ))}
-            </ScrollView>
+        />
+        <ReelCategoryFilterSheet
+          visible={isFilterOpen}
+          selectedCategoryId={categoryFilter}
+          onSelect={setCategoryFilter}
+          onClose={() => setIsFilterOpen(false)}
+        />
+      </>
+    );
+  }
 
-            {status === 'error' ? (
-              <View style={styles.errorStateWrap}>
-                <ErrorState title={`Couldn't load what's happening in ${cityLabel}.`} onRetry={() => loadFeed()} />
-              </View>
-            ) : (
+  return (
+    <>
+      <ReelFeed
+        reels={visibleForYouReels}
+        status={forYouStatus}
+        errorTitle={`Couldn't load Reels in ${cityLabel}`}
+        onReload={loadForYou}
+        topOverlay={topOverlay}
+        emptyState={
+          <EmptyState
+            bare
+            icon="videocam-outline"
+            title={`No Reels in ${cityLabel} yet`}
+            body="Be the first to show what's happening."
+            action={
               <>
-                <View style={styles.section}>
-                  <SectionHeader title="Happening Now 🔥" actionLabel="See all" onActionPress={() => router.push('/events')} />
-                  {status === 'loading' && happeningItems.length === 0 ? (
-                    <ScrollView
-                      horizontal
-                      showsHorizontalScrollIndicator={false}
-                      style={styles.horizontalScroll}
-                      contentContainerStyle={styles.horizontalListContent}
-                    >
-                      <SkeletonBlock width={188} height={148} />
-                      <SkeletonBlock width={188} height={148} />
-                    </ScrollView>
-                  ) : visibleHappeningItems.length === 0 ? (
-                    <View style={styles.emptyPanel}>
-                      <Text style={styles.emptyPanelTitle}>Nothing happening right now in {cityLabel}</Text>
-                      <Text style={styles.emptyPanelBody}>Check Activities and Events coming up soon.</Text>
-                    </View>
-                  ) : (
-                    <ScrollView
-                      horizontal
-                      showsHorizontalScrollIndicator={false}
-                      style={styles.horizontalScroll}
-                      contentContainerStyle={styles.horizontalListContent}
-                    >
-                      {visibleHappeningItems.map((item) => (
-                        <EventCard key={item.contentId} item={item} />
-                      ))}
-                    </ScrollView>
-                  )}
-                </View>
-
-                <View style={styles.section}>
-                  <SectionHeader title={`${todayLabel} in ${cityLabel}`} actionLabel="See all" onActionPress={() => router.push('/events')} />
-                  {status === 'loading' && todayItems.length === 0 ? (
-                    <ScrollView
-                      horizontal
-                      showsHorizontalScrollIndicator={false}
-                      style={styles.horizontalScroll}
-                      contentContainerStyle={styles.horizontalListContent}
-                    >
-                      <SkeletonBlock width={188} height={148} />
-                      <SkeletonBlock width={188} height={148} />
-                    </ScrollView>
-                  ) : visibleTodayItems.length === 0 ? (
-                    <View style={styles.emptyPanel}>
-                      <Text style={styles.emptyPanelBody}>Nothing else lined up for {todayLabel.toLowerCase()} yet.</Text>
-                    </View>
-                  ) : (
-                    <ScrollView
-                      horizontal
-                      showsHorizontalScrollIndicator={false}
-                      style={styles.horizontalScroll}
-                      contentContainerStyle={styles.horizontalListContent}
-                    >
-                      {visibleTodayItems.map((item) => (
-                        <EventCard key={item.contentId} item={item} />
-                      ))}
-                    </ScrollView>
-                  )}
-                </View>
-
-                <View style={styles.section}>
-                  <SectionHeader title="Coming up this week" actionLabel="See all" onActionPress={() => router.push('/events')} />
-                  {status === 'loading' && upcomingItems.length === 0 ? (
-                    <ScrollView
-                      horizontal
-                      showsHorizontalScrollIndicator={false}
-                      style={styles.horizontalScroll}
-                      contentContainerStyle={styles.horizontalListContent}
-                    >
-                      <SkeletonBlock width={188} height={148} />
-                      <SkeletonBlock width={188} height={148} />
-                    </ScrollView>
-                  ) : visibleUpcomingItems.length === 0 ? (
-                    <View style={styles.emptyPanel}>
-                      <Text style={styles.emptyPanelBody}>Nothing coming up in {cityLabel} yet.</Text>
-                    </View>
-                  ) : (
-                    <ScrollView
-                      horizontal
-                      showsHorizontalScrollIndicator={false}
-                      style={styles.horizontalScroll}
-                      contentContainerStyle={styles.horizontalListContent}
-                    >
-                      {visibleUpcomingItems.map((item) => (
-                        <EventCard key={item.contentId} item={item} />
-                      ))}
-                    </ScrollView>
-                  )}
-                </View>
-
-                <View style={styles.section}>
-                  <SectionHeader title="Local Reels" actionLabel="See all" onActionPress={() => router.push('/reels')} />
-                  <Pressable style={styles.reelsEmptyPanel} onPress={() => router.push('/reels')} accessibilityRole="button">
-                    <Ionicons name="videocam-outline" size={22} color={Colors.textSecondary} />
-                    <Text style={styles.emptyPanelBody}>
-                      Local videos will appear here as people start sharing what&apos;s happening around the city.
-                    </Text>
-                  </Pressable>
-                </View>
-
-                <View style={styles.section}>
-                  <SectionHeader title="Around You" />
-                  {status === 'loading' && feedItems.length === 0 ? (
-                    <>
-                      <SkeletonBlock width="100%" height={110} style={styles.feedSkeleton} />
-                      <SkeletonBlock width="100%" height={110} style={styles.feedSkeleton} />
-                    </>
-                  ) : feedItems.length === 0 ? (
-                    <View style={styles.emptyCityPanel}>
-                      {isExploringAnotherCity ? (
-                        <>
-                          <Text style={styles.emptyPanelTitle}>Not much happening in {cityLabel} yet.</Text>
-                          <Text style={styles.emptyPanelBody}>Explore another city or check back later.</Text>
-                          <Button label="Explore another city" variant="secondary" onPress={() => router.push('/cities')} />
-                        </>
-                      ) : (
-                        <>
-                          <Text style={styles.emptyPanelTitle}>Nothing happening here yet.</Text>
-                          <Text style={styles.emptyPanelBody}>Be one of the first people to post in {cityLabel}.</Text>
-                          <Button label="Create something" onPress={() => router.push('/create')} />
-                        </>
-                      )}
-                    </View>
-                  ) : visibleItems.length === 0 ? (
-                    <View style={styles.emptyCityPanel}>
-                      <Text style={styles.emptyPanelBody}>Nothing matches this filter yet.</Text>
-                    </View>
-                  ) : (
-                    visibleItems.map((item) => <ContentCard key={item.contentId} item={item} currentUid={user?.uid ?? null} />)
-                  )}
-                </View>
+                <Button label="Create Reel" onPress={() => router.push('/create/reel')} />
+                {isExploringAnotherCity && homeCity ? (
+                  <Text style={styles.exploringHint}>Reels you create publish to your home city, {homeCity.cityName}.</Text>
+                ) : null}
               </>
-            )}
-          </View>
-        </ScrollView>
-      )}
-    </SafeAreaView>
+            }
+          />
+        }
+      />
+      <ReelCategoryFilterSheet
+        visible={isFilterOpen}
+        selectedCategoryId={categoryFilter}
+        onSelect={setCategoryFilter}
+        onClose={() => setIsFilterOpen(false)}
+      />
+    </>
   );
 }
 
-function SkeletonBlock({ width, height, style }: { width: number | `${number}%`; height: number; style?: object }) {
-  return <View style={[styles.skeleton, { width, height }, style]} />;
+function ModeTab({ label, active, onPress }: { label: string; active: boolean; onPress: () => void }) {
+  return (
+    <Pressable onPress={onPress} style={styles.modeTab} accessibilityRole="tab" accessibilityState={{ selected: active }}>
+      <Text style={[styles.modeTabText, active && styles.modeTabTextActive]}>{label}</Text>
+      {active ? <View style={styles.modeTabIndicator} /> : null}
+    </Pressable>
+  );
 }
 
 const styles = StyleSheet.create({
-  safeArea: {
-    flex: 1,
-    backgroundColor: Colors.background,
-  },
-  scroll: {
-    flex: 1,
-  },
-  scrollContent: {
-    alignItems: 'center',
-    paddingBottom: Spacing.xxl,
-  },
-  topBar: {
-    alignItems: 'center',
-  },
-  page: {
-    width: '100%',
-    maxWidth: Layout.maxContentWidth,
-  },
-  modeSwitch: {
-    paddingHorizontal: Spacing.lg,
-    paddingBottom: Spacing.md,
-  },
-  header: {
+  overlayRow: {
     flexDirection: 'row',
-    alignItems: 'flex-start',
+    alignItems: 'center',
     justifyContent: 'space-between',
-    paddingHorizontal: Spacing.lg,
-    paddingTop: Spacing.sm,
-    paddingBottom: Spacing.md,
   },
-  headerTextGroup: {
+  cityButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 2,
     flexShrink: 1,
-    gap: 2,
   },
-  cityRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 2,
-  },
-  exploringLabel: {
-    color: Colors.accent,
-    fontSize: 12,
-    fontWeight: '600',
-  },
-  title: {
+  cityButtonText: {
     color: Colors.text,
-    fontSize: 26,
-    fontWeight: '800',
+    ...Typography.cardTitle,
   },
-  headerActions: {
+  modeTabs: {
     flexDirection: 'row',
-    gap: Spacing.sm,
+    gap: 18,
   },
-  headerButton: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
+  modeTab: {
     alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: Colors.surface,
-    borderWidth: 1,
-    borderColor: Colors.border,
-  },
-  horizontalScroll: {
-    flexGrow: 0,
-    flexShrink: 0,
-  },
-  chipsRow: {
-    gap: Spacing.sm,
-    paddingHorizontal: Spacing.lg,
-    paddingBottom: Spacing.md,
-  },
-  section: {
-    marginTop: Spacing.lg,
-  },
-  horizontalListContent: {
-    gap: Spacing.md,
-    paddingHorizontal: Spacing.lg,
-  },
-  emptyPanel: {
-    marginHorizontal: Spacing.lg,
-    borderRadius: Radius.lg,
-    backgroundColor: Colors.surface,
-    borderWidth: 1,
-    borderColor: Colors.border,
-    padding: Spacing.lg,
     gap: 4,
+    paddingVertical: 2,
   },
-  emptyPanelTitle: {
-    color: Colors.text,
+  modeTabText: {
+    color: Colors.textMuted,
     fontSize: 15,
     fontWeight: '700',
   },
-  emptyPanelBody: {
+  modeTabTextActive: {
+    color: Colors.text,
+  },
+  modeTabIndicator: {
+    width: 18,
+    height: 2,
+    borderRadius: 1,
+    backgroundColor: Colors.text,
+  },
+  filterButton: {
+    width: 32,
+    alignItems: 'flex-end',
+  },
+  exploringHint: {
     color: Colors.textSecondary,
-    fontSize: 13,
-    lineHeight: 18,
-  },
-  reelsEmptyPanel: {
-    marginHorizontal: Spacing.lg,
-    borderRadius: Radius.lg,
-    backgroundColor: Colors.surface,
-    borderWidth: 1,
-    borderColor: Colors.border,
-    borderStyle: 'dashed',
-    padding: Spacing.lg,
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: Spacing.sm,
-  },
-  emptyCityPanel: {
-    marginHorizontal: Spacing.lg,
-    borderRadius: Radius.lg,
-    backgroundColor: Colors.surface,
-    borderWidth: 1,
-    borderColor: Colors.border,
-    padding: Spacing.xl,
-    alignItems: 'center',
-    gap: Spacing.sm,
-  },
-  errorStateWrap: {
-    marginHorizontal: Spacing.lg,
-    marginTop: Spacing.xl,
-  },
-  skeleton: {
-    borderRadius: Radius.lg,
-    backgroundColor: Colors.surface,
-    borderWidth: 1,
-    borderColor: Colors.border,
-    opacity: 0.5,
-  },
-  feedSkeleton: {
-    marginHorizontal: Spacing.lg,
-    marginBottom: Spacing.md,
+    fontSize: 12,
+    textAlign: 'center',
+    marginTop: 4,
   },
 });

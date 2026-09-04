@@ -40,6 +40,7 @@ import {
   type Reel,
 } from '@/types/reel';
 
+import { fetchFollowingUids } from './following';
 import { firestore } from './firestore';
 import { storage } from './storage';
 import { fetchUserProfile } from './userProfile';
@@ -48,6 +49,13 @@ const REELS_COLLECTION = 'reels';
 const DEFAULT_FEED_LIMIT = 20;
 const DEFAULT_PROFILE_REEL_LIMIT = 30;
 const VALID_CATEGORY_IDS = new Set(INTERESTS.map((interest) => interest.id));
+
+// Same MVP caps as fetchFollowingFeed in src/services/content.ts — a page
+// covers everyone in the caller's Following list before pagination is
+// needed, chunked well under the JS SDK's 30-value `in` limit.
+const MAX_FOLLOWED_UIDS_PER_FEED_PAGE = 30;
+const FOLLOWING_UID_CHUNK_SIZE = 10;
+const DEFAULT_FOLLOWING_FEED_LIMIT = 20;
 
 /** Exported so reelEngagement.ts can reference the same document without a second constant. */
 export function reelRef(reelId: string) {
@@ -319,6 +327,89 @@ export async function fetchCityReels(cityKey: string, limitCount = DEFAULT_FEED_
   );
   const snapshot = await getDocs(feedQuery);
   return snapshot.docs.map((docSnapshot) => docSnapshot.data() as Reel);
+}
+
+function chunkArray<T>(items: T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let i = 0; i < items.length; i += size) {
+    chunks.push(items.slice(i, i + size));
+  }
+  return chunks;
+}
+
+export type FetchFollowingReelsInput = {
+  currentUid: string;
+  /** The city to scope the feed to — Active City, passed explicitly (same pattern as fetchFollowingFeed in content.ts). */
+  cityKey: string;
+  limit?: number;
+};
+
+export type FollowingReelsResult = {
+  reels: Reel[];
+  /**
+   * Whether the caller follows anyone at all — lets the UI distinguish
+   * "you don't follow anyone yet" from "you follow people, but none of
+   * them have Reels in this city" without a second, duplicate
+   * fetchFollowingUids call (this function already makes exactly one).
+   */
+  followsAnyone: boolean;
+};
+
+/**
+ * Published Reels, in one city, from people `currentUid` follows —
+ * chronological (newest publishedAt first). Mirrors fetchFollowingFeed in
+ * src/services/content.ts exactly: resolves followed uids first, then
+ * queries Reels directly by those uids in chunks of
+ * FOLLOWING_UID_CHUNK_SIZE (10, well under the JS SDK's 30-value `in`
+ * cap), each chunk further scoped by cityKey + status so this never
+ * fetches a followed author's Reels from OTHER cities only to discard them
+ * client-side. Results are merged, deduplicated by reelId, globally
+ * re-sorted by publishedAt, and capped to the requested limit. Uses the
+ * dedicated (cityKey, status, authorUid, publishedAt DESC) composite index
+ * — the only new index this step adds.
+ */
+export async function fetchFollowingReels({
+  currentUid,
+  cityKey,
+  limit: limitCount = DEFAULT_FOLLOWING_FEED_LIMIT,
+}: FetchFollowingReelsInput): Promise<FollowingReelsResult> {
+  if (!firestore) return { reels: [], followsAnyone: false };
+  const db = firestore;
+
+  const followedUids = await fetchFollowingUids(currentUid, MAX_FOLLOWED_UIDS_PER_FEED_PAGE);
+  if (followedUids.length === 0) {
+    return { reels: [], followsAnyone: false };
+  }
+
+  const chunks = chunkArray(followedUids, FOLLOWING_UID_CHUNK_SIZE);
+  const chunkResults = await Promise.all(
+    chunks.map((chunk) =>
+      getDocs(
+        query(
+          collection(db, REELS_COLLECTION),
+          where('authorUid', 'in', chunk),
+          where('cityKey', '==', cityKey),
+          where('status', '==', 'published'),
+          orderBy('publishedAt', 'desc'),
+          limit(limitCount)
+        )
+      )
+    )
+  );
+
+  const seenReelIds = new Set<string>();
+  const merged: Reel[] = [];
+  for (const snapshot of chunkResults) {
+    for (const docSnapshot of snapshot.docs) {
+      const reel = docSnapshot.data() as Reel;
+      if (seenReelIds.has(reel.reelId)) continue;
+      seenReelIds.add(reel.reelId);
+      merged.push(reel);
+    }
+  }
+
+  merged.sort((a, b) => (b.publishedAt?.toMillis() ?? 0) - (a.publishedAt?.toMillis() ?? 0));
+  return { reels: merged.slice(0, limitCount), followsAnyone: true };
 }
 
 /**
