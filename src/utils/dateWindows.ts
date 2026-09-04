@@ -122,6 +122,34 @@ export function getUpcomingWindow(afterWindowEnd: Date, days = 7): DateWindow {
   return { start: afterWindowEnd, end: new Date(afterWindowEnd.getTime() + days * 24 * 60 * 60 * 1000) };
 }
 
+/**
+ * The real local weekend (Saturday 00:00 through Monday 00:00, exclusive)
+ * in `timeZone` — Step 26 Section 18: weekend means Saturday+Sunday only,
+ * never Friday. If `now` already falls on a Saturday or Sunday, the window
+ * starts at the beginning of today rather than next week's Saturday, so an
+ * in-progress weekend isn't skipped. Deliberately pure date math with no
+ * query of its own — callers filter an already-fetched Upcoming list
+ * against this window client-side (see events.tsx), so no new Firestore
+ * query or index is introduced by "This Weekend" as a concept.
+ */
+export function getWeekendWindow(now: Date = new Date(), timeZone: string = CITY_TIMEZONE): DateWindow {
+  const { year, month, day } = getZonedParts(now, timeZone);
+  // JS getDay()-style weekday (0=Sun..6=Sat), derived from the same Y-M-D
+  // triple via a UTC anchor so it reflects the zoned calendar date, not the
+  // machine's local date.
+  const weekdayIndex = new Date(Date.UTC(year, month - 1, day)).getUTCDay();
+  // Offset (in days, possibly negative) from today to "this weekend"'s
+  // Saturday: 0 if today already is Saturday, -1 if today is Sunday
+  // (Saturday was yesterday), otherwise however many days until the next
+  // Saturday.
+  const saturdayOffset = weekdayIndex === 6 ? 0 : weekdayIndex === 0 ? -1 : 6 - weekdayIndex;
+  const saturday = addCalendarDays(year, month, day, saturdayOffset);
+  const start = zonedTimeToUtc(saturday.year, saturday.month, saturday.day, 0, 0, 0, timeZone);
+  const mondayAfter = addCalendarDays(saturday.year, saturday.month, saturday.day, 2);
+  const end = zonedTimeToUtc(mondayAfter.year, mondayAfter.month, mondayAfter.day, 0, 0, 0, timeZone);
+  return { start, end };
+}
+
 /** startsAt <= now AND endsAt >= now — the exact Happening Now definition (Step 22 Section 4). */
 export function isHappeningNow(item: { startsAt: { toMillis(): number }; endsAt: { toMillis(): number } }, now: Date = new Date()): boolean {
   const nowMs = now.getTime();

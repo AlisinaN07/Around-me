@@ -317,7 +317,7 @@ No fake accounts, no fake attendance/RSVP counts, no fake distance, and no synth
 Around Me has two clearly separated primary experiences, locked in as of Step 25:
 
 - **Home** (`src/app/(app)/(tabs)/index.tsx`) — the local, user-generated social/Reel feed. TikTok/Instagram-style vertical video, local-first. Home renders exactly one thing: Reels. It is **not** an event calendar, an event rail, an organizer feed, or a business directory — the Happening Now/Today/Upcoming/Around-feed sections that used to live here (Steps 21–22) moved to the Events tab; nothing about `fetchDiscoverySections`/`dateWindows.ts`/`EventCard` was touched, only Home's own use of them was removed.
-- **Events** (`src/app/(app)/(tabs)/events.tsx`) — Event/Activity discovery, unchanged this step. Official/local Events and Activities, whoever publishes them.
+- **Events** (`src/app/(app)/(tabs)/events.tsx`) — Event/Activity discovery. Official/local Events and Activities, whoever publishes them (see the Events visual reconstruction section below, Step 26).
 
 Ordinary text Posts also no longer appear on Home — they still exist (`content/{contentId}`, `type: 'post'`) and remain visible on a user's own/public profile and via direct `/content/{contentId}` links, just not woven into a Home feed anymore.
 
@@ -347,6 +347,42 @@ Creator avatar (→ profile), like (real count, optimistic + rollback), comment 
 ### Deliberately not implemented this step
 
 Saved/bookmarks, music/audio metadata, hashtag parsing, Reel place tagging, Reel event tagging, an inline follow-toggle on the avatar (existing Follow flow lives on the profile screen only), and any personalization/ranking signal. Reel place/event tagging is documented here as **future architecture only**: once a Reel can carry a `placeId`, an Event/Place detail page could show "Tagged at {Place}" using real linked Reels — not built now.
+
+## Events discovery — visual reconstruction (Step 26)
+
+Rebuilds the Events tab's layout/visual language on top of the exact same Step 22 discovery architecture (`fetchDiscoverySections`, `dateWindows.ts`, `content.ts`'s existing indexes) — no new query shapes, no new Firestore indexes, no rules changes. Home is untouched and remains the Reel-only surface (see above).
+
+### Hierarchy
+
+**Happening Now** (horizontal hero rail) → **Today/Tonight** (compact rows) → **This Weekend** (real Saturday+Sunday split, only shown when something in the current Upcoming window actually falls on one) → **Coming Up** (everything else in the same bounded Upcoming window). All four come from one `fetchDiscoverySections` call; "This Weekend" is a client-side filter of the already-fetched `upcoming` array by `getWeekendWindow()` (`src/utils/dateWindows.ts`) — not a second query. If nothing upcoming falls on the real Saturday/Sunday window right now, "This Weekend" is omitted entirely rather than shown empty or mislabeled onto a 7-day range.
+
+### Header
+
+Active City selector (left, → `/cities`, same as every other discovery surface), "Events" title (center), filter icon (right, opens `EventFilterSheet`) — deliberately does **not** carry a For You/Following toggle: that distinction belongs to Home's two Reel modes only (Step 25's locked-in product rule), even though an earlier reference screenshot showed similar-looking tabs.
+
+### Filter
+
+`EventFilterSheet` (`src/components/EventFilterSheet.tsx`) moves the exact same two real filters — All/Events/Activities, and the Karlstad launch category shortlist — behind the header's filter icon instead of permanent inline chrome, so the screen itself stays visual/scannable. No speculative filters (price/distance/popularity/ticket availability) — none of that data exists.
+
+### Event vs Activity actions, directly on discovery cards
+
+`EventActionButtons` (`src/components/EventActionButtons.tsx`) calls the exact same `src/services/engagement.ts` functions the detail screen uses (`setEventResponse`/`joinActivity`/`leaveActivity`) — Interested/Going for Events, Join/Joined for Activities, never both sets on the same card. It deliberately does **not** fetch the viewer's existing response/participation on mount: reading that once per visible card, on a screen that renders many cards, is the same N+1 read pattern real counts are excluded from (see below) — so the "selected" look is session-local optimism (what you just tapped), not a persisted read. The real, authoritative selected state and real counts still live on `EventDetail`/`ActivityDetail`, fetched once per screen visit, unchanged.
+
+### Media fallback (no image field exists yet)
+
+`content/{contentId}` still has no image field for Post/Activity/Event. `MediaCard` (`src/components/MediaCard.tsx`, extended this step) renders a dark gradient + soft accent glow + the item's real category emoji (from `interests.ts`) instead of a placeholder stock photo or an invented URL. `source`/real media stay fully optional on the component's props for future wiring — nothing is persisted now.
+
+### Counts — real only, never per-card
+
+No attendance/participant/interested/going numbers appear on any discovery card (hero, row, or upcoming) — `fetchEventResponseCounts`/`getActivityParticipation` are real aggregation reads that only make sense fetched once per detail-screen visit; fetching them for every card in a list would be exactly the N+1 read pattern this app avoids everywhere else (Reels' like/comment counts are the one precedent for small per-visible-item reads, and even there the list is capped and windowed to ~3 mounted items at once — the Events grid is not virtualized the same way, so the same tradeoff doesn't apply here).
+
+### No fake anything
+
+No Saved/bookmark icon (no Saved backend exists), no invented attendee counts, no "Verified"/"Official"/"Business" badges (current event authors are ordinary onboarded accounts — that distinction is real future work, not built now), no reference-screenshot content (no Vänerparken/342/27/64/Lund–Sommartider/sunset-photo placeholders were copied in).
+
+### Future direction (documented, not built)
+
+The product direction is for Events to eventually be published primarily by companies/venues/organizers/clubs rather than personal accounts — `content/{contentId}`'s existing author-snapshot pattern doesn't block a future `business`/`organizer` account type from publishing the same way a personal account does today, but no such account type, verification badge, or onboarding flow exists yet.
 
 ## Reels (Cloud Storage — Step 18)
 

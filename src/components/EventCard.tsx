@@ -1,8 +1,11 @@
 import { Ionicons } from '@expo/vector-icons';
 import { router } from 'expo-router';
-import { Pressable, StyleSheet, Text, View } from 'react-native';
+import { Pressable, StyleSheet, Text, View, type StyleProp, type TextStyle } from 'react-native';
 
 import { AuthorLink } from '@/components/AuthorLink';
+import { DateBadge } from '@/components/DateBadge';
+import { EventActionButtons } from '@/components/EventActionButtons';
+import { MediaCard } from '@/components/MediaCard';
 import { Pill } from '@/components/Pill';
 import { INTERESTS } from '@/constants/interests';
 import { Colors, Radius, Spacing, Typography } from '@/constants/theme';
@@ -10,18 +13,28 @@ import type { ActivityContent, EventContent } from '@/types/content';
 import { getCityDayWindow, isHappeningNow } from '@/utils/dateWindows';
 import { formatEventTime, formatTimePill } from '@/utils/timeFormat';
 
+type EventCardVariant = 'compact' | 'hero' | 'row' | 'upcoming';
+
 type EventCardProps = {
   item: ActivityContent | EventContent;
   /** Defaults to `new Date()` — only ever overridden by tests. */
   now?: Date;
   onPress?: () => void;
+  /**
+   * 'compact' (default) is the original discovery-rail/grid card used by
+   * Place detail's "Happening now"/"Upcoming" rails — kept pixel-identical
+   * so that screen needs zero changes for Step 26. 'hero'/'row'/'upcoming'
+   * are the new Events-tab layouts (Happening Now / Today-or-Tonight /
+   * This Weekend & Coming Up).
+   */
+  variant?: EventCardVariant;
 };
 
 type Badge = { label: string; tone: 'now' | 'soon' };
 
-function getBadge(item: ActivityContent | EventContent, now: Date): Badge | null {
+function getBadge(item: ActivityContent | EventContent, now: Date, liveLabel: string): Badge | null {
   if (isHappeningNow(item, now)) {
-    return { label: 'NOW', tone: 'now' };
+    return { label: liveLabel, tone: 'now' };
   }
   const startMs = item.startsAt.toMillis();
   const today = getCityDayWindow(now);
@@ -31,16 +44,202 @@ function getBadge(item: ActivityContent | EventContent, now: Date): Badge | null
   return null;
 }
 
+export function EventCard({ item, now = new Date(), onPress, variant = 'compact' }: EventCardProps) {
+  if (variant === 'hero') return <HeroCard item={item} now={now} onPress={onPress} />;
+  if (variant === 'row') return <RowCard item={item} now={now} onPress={onPress} />;
+  if (variant === 'upcoming') return <UpcomingCard item={item} now={now} onPress={onPress} />;
+  return <CompactCard item={item} now={now} onPress={onPress} />;
+}
+
+type VariantCardProps = { item: ActivityContent | EventContent; now: Date; onPress?: () => void };
+
 /**
- * Reusable discovery card for Activities and Events (Happening Now/Today/
- * Upcoming rails, the /events screen). Deliberately shows no invented
- * attendance/popularity/price — real RSVP and participant counts only
- * exist on the detail screen (see EventDetail/ActivityDetail), fetched
+ * Happening Now — large horizontal card. Media on top (real fallback, no
+ * stock imagery), LIVE pill overlaid only when the item is genuinely
+ * happening now, then category/title/place/real actions below.
+ */
+function HeroCard({ item, now, onPress }: VariantCardProps) {
+  const category = INTERESTS.find((interest) => interest.id === item.categoryId);
+  const badge = getBadge(item, now, 'LIVE');
+  const isActivity = item.type === 'activity';
+
+  return (
+    <Pressable
+      style={styles.heroCard}
+      onPress={onPress ?? (() => router.push(`/content/${item.contentId}`))}
+      accessibilityRole="button"
+      accessibilityLabel={`${isActivity ? 'Activity' : 'Event'}: ${item.title}`}
+    >
+      <MediaCard emoji={category?.emoji} height={128} radius={Radius.lg}>
+        {badge ? (
+          <View style={styles.heroBadgeOverlay}>
+            <Pill label={badge.label} tone={badge.tone === 'now' ? 'live' : 'neutral'} />
+          </View>
+        ) : null}
+      </MediaCard>
+
+      <View style={styles.heroBody}>
+        <View style={styles.heroMetaRow}>
+          <View style={[styles.typeBadge, isActivity ? styles.typeBadgeActivity : styles.typeBadgeEvent]}>
+            <Ionicons name={isActivity ? 'people-outline' : 'calendar-outline'} size={10} color={Colors.background} />
+            <Text style={styles.typeBadgeText}>{isActivity ? 'Activity' : 'Event'}</Text>
+          </View>
+          {category ? <Text style={styles.heroCategory}>{category.emoji} {category.label}</Text> : null}
+        </View>
+
+        <Text style={styles.heroTitle} numberOfLines={2}>
+          {item.title}
+        </Text>
+
+        <View style={styles.metaLine}>
+          <Ionicons name="time-outline" size={12} color={Colors.textSecondary} />
+          <Text style={styles.metaText} numberOfLines={1}>
+            {badge ? formatTimePill(item.startsAt.toDate()) : formatEventTime(item.startsAt.toDate(), now)}
+          </Text>
+        </View>
+
+        <PlaceRow item={item} textStyle={styles.metaText} linkStyle={styles.metaLink} iconSize={12} />
+
+        <View style={styles.heroActions}>
+          <EventActionButtons item={item} direction="row" />
+        </View>
+      </View>
+    </Pressable>
+  );
+}
+
+/**
+ * Today/Tonight — compact horizontal row. Left thumbnail, middle
+ * time/title/place/category, right real action(s) (two stacked pills for
+ * an Event, one for an Activity — narrow row width can't fit two
+ * side-by-side Event pills legibly).
+ */
+function RowCard({ item, now, onPress }: VariantCardProps) {
+  const category = INTERESTS.find((interest) => interest.id === item.categoryId);
+  const badge = getBadge(item, now, 'LIVE');
+  const isActivity = item.type === 'activity';
+
+  return (
+    <Pressable
+      style={styles.rowCard}
+      onPress={onPress ?? (() => router.push(`/content/${item.contentId}`))}
+      accessibilityRole="button"
+      accessibilityLabel={`${isActivity ? 'Activity' : 'Event'}: ${item.title}`}
+    >
+      <MediaCard emoji={category?.emoji} height={64} radius={Radius.md} />
+
+      <View style={styles.rowBody}>
+        <Text style={styles.rowTime} numberOfLines={1}>
+          {badge ? badge.label : formatTimePill(item.startsAt.toDate())}
+        </Text>
+        <Text style={styles.rowTitle} numberOfLines={1}>
+          {item.title}
+        </Text>
+        <PlaceRow item={item} textStyle={styles.rowMetaText} linkStyle={styles.rowMetaLink} iconSize={11} />
+        {category ? (
+          <Text style={styles.rowCategory} numberOfLines={1}>
+            {category.emoji} {category.label}
+          </Text>
+        ) : null}
+      </View>
+
+      <EventActionButtons item={item} direction="column" compact />
+    </Pressable>
+  );
+}
+
+/**
+ * This Weekend / Coming Up — two-column card. Media with a date badge
+ * overlay, title/place/category, real action below.
+ */
+function UpcomingCard({ item, now, onPress }: VariantCardProps) {
+  const category = INTERESTS.find((interest) => interest.id === item.categoryId);
+  const isActivity = item.type === 'activity';
+
+  return (
+    <Pressable
+      style={styles.upcomingCard}
+      onPress={onPress ?? (() => router.push(`/content/${item.contentId}`))}
+      accessibilityRole="button"
+      accessibilityLabel={`${isActivity ? 'Activity' : 'Event'}: ${item.title}`}
+    >
+      <MediaCard emoji={category?.emoji} height={90} radius={Radius.lg}>
+        <View style={styles.upcomingDateOverlay}>
+          <DateBadge date={item.startsAt.toDate()} />
+        </View>
+      </MediaCard>
+
+      <Text style={styles.upcomingTitle} numberOfLines={2}>
+        {item.title}
+      </Text>
+      <Text style={styles.metaText} numberOfLines={1}>
+        {formatEventTime(item.startsAt.toDate(), now)}
+      </Text>
+      <PlaceRow item={item} textStyle={styles.metaText} linkStyle={styles.metaLink} iconSize={12} />
+      {category ? (
+        <Text style={styles.rowCategory} numberOfLines={1}>
+          {category.emoji} {category.label}
+        </Text>
+      ) : null}
+
+      <View style={styles.upcomingActions}>
+        <EventActionButtons item={item} direction="row" compact />
+      </View>
+    </Pressable>
+  );
+}
+
+function PlaceRow({
+  item,
+  textStyle,
+  linkStyle,
+  iconSize,
+}: {
+  item: ActivityContent | EventContent;
+  textStyle: StyleProp<TextStyle>;
+  linkStyle: StyleProp<TextStyle>;
+  iconSize: number;
+}) {
+  if (item.placeId) {
+    return (
+      <Pressable
+        onPress={(event) => {
+          event.stopPropagation();
+          router.push(`/place/${item.placeId}`);
+        }}
+        hitSlop={4}
+        style={styles.placeRow}
+        accessibilityRole="button"
+        accessibilityLabel={`View ${item.placeName}`}
+      >
+        <Ionicons name="location" size={iconSize} color={Colors.accent} />
+        <Text style={linkStyle} numberOfLines={1}>
+          {item.placeName}
+        </Text>
+      </Pressable>
+    );
+  }
+  return (
+    <View style={styles.placeRow}>
+      <Ionicons name="location-outline" size={iconSize} color={Colors.textSecondary} />
+      <Text style={textStyle} numberOfLines={1}>
+        {item.placeName}
+      </Text>
+    </View>
+  );
+}
+
+/**
+ * Reusable discovery card for Activities and Events — the original Step 22
+ * design, used unchanged by Place detail's "Happening now"/"Upcoming"
+ * rails (src/app/(app)/place/[placeId].tsx). Deliberately shows no
+ * invented attendance/popularity/price — real RSVP and participant counts
+ * only exist on the detail screen (see EventDetail/ActivityDetail), fetched
  * once per screen rather than once per card in a list.
  */
-export function EventCard({ item, now = new Date(), onPress }: EventCardProps) {
+function CompactCard({ item, now, onPress }: VariantCardProps) {
   const category = INTERESTS.find((interest) => interest.id === item.categoryId);
-  const badge = getBadge(item, now);
+  const badge = getBadge(item, now, 'NOW');
   const isActivity = item.type === 'activity';
 
   return (
@@ -69,30 +268,7 @@ export function EventCard({ item, now = new Date(), onPress }: EventCardProps) {
         {badge ? formatTimePill(item.startsAt.toDate()) : formatEventTime(item.startsAt.toDate(), now)}
       </Text>
 
-      {item.placeId ? (
-        <Pressable
-          onPress={(event) => {
-            event.stopPropagation();
-            router.push(`/place/${item.placeId}`);
-          }}
-          hitSlop={4}
-          style={styles.placeRow}
-          accessibilityRole="button"
-          accessibilityLabel={`View ${item.placeName}`}
-        >
-          <Ionicons name="location" size={12} color={Colors.accent} />
-          <Text style={styles.placeLinkText} numberOfLines={1}>
-            {item.placeName}
-          </Text>
-        </Pressable>
-      ) : (
-        <View style={styles.placeRow}>
-          <Ionicons name="location-outline" size={12} color={Colors.textSecondary} />
-          <Text style={styles.placeText} numberOfLines={1}>
-            {item.placeName}
-          </Text>
-        </View>
-      )}
+      <PlaceRow item={item} textStyle={styles.placeText} linkStyle={styles.placeLinkText} iconSize={12} />
 
       <View style={styles.bottomRow}>
         <AuthorLink uid={item.authorUid} style={styles.authorLink}>
@@ -119,6 +295,7 @@ export function EventCard({ item, now = new Date(), onPress }: EventCardProps) {
 const CARD_WIDTH = 188;
 
 const styles = StyleSheet.create({
+  // ---- compact (original, Place detail) ----
   card: {
     width: CARD_WIDTH,
     borderRadius: Radius.lg,
@@ -212,5 +389,126 @@ const styles = StyleSheet.create({
     color: Colors.accent,
     fontSize: 10,
     fontWeight: '700',
+  },
+
+  // ---- shared meta text (new variants) ----
+  metaLine: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 3,
+  },
+  metaText: {
+    color: Colors.textSecondary,
+    fontSize: 12,
+    flexShrink: 1,
+  },
+  metaLink: {
+    color: Colors.accent,
+    fontSize: 12,
+    fontWeight: '600',
+    flexShrink: 1,
+  },
+
+  // ---- hero (Happening Now) ----
+  heroCard: {
+    width: 260,
+    borderRadius: Radius.lg,
+    backgroundColor: Colors.surface,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    overflow: 'hidden',
+  },
+  heroBadgeOverlay: {
+    position: 'absolute',
+    top: Spacing.sm,
+    left: Spacing.sm,
+  },
+  heroBody: {
+    padding: Spacing.sm,
+    gap: 4,
+  },
+  heroMetaRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  heroCategory: {
+    color: Colors.textSecondary,
+    fontSize: 11,
+    fontWeight: '600',
+  },
+  heroTitle: {
+    color: Colors.text,
+    ...Typography.cardTitle,
+    fontSize: 15,
+  },
+  heroActions: {
+    marginTop: Spacing.xs,
+  },
+
+  // ---- row (Today/Tonight) ----
+  rowCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Spacing.sm,
+    paddingVertical: Spacing.sm,
+    borderBottomWidth: 1,
+    borderBottomColor: Colors.border,
+  },
+  rowBody: {
+    flex: 1,
+    gap: 2,
+  },
+  rowTime: {
+    color: Colors.accent,
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  rowTitle: {
+    color: Colors.text,
+    ...Typography.cardTitle,
+    fontSize: 14,
+  },
+  rowMetaText: {
+    color: Colors.textSecondary,
+    fontSize: 12,
+    flexShrink: 1,
+  },
+  rowMetaLink: {
+    color: Colors.accent,
+    fontSize: 12,
+    fontWeight: '600',
+    flexShrink: 1,
+  },
+  rowCategory: {
+    color: Colors.textMuted,
+    fontSize: 11,
+    fontWeight: '600',
+  },
+
+  // ---- upcoming (This Weekend / Coming Up) ----
+  upcomingCard: {
+    flexBasis: '48%',
+    flexGrow: 1,
+    borderRadius: Radius.lg,
+    backgroundColor: Colors.surface,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    padding: Spacing.sm,
+    gap: 4,
+  },
+  upcomingDateOverlay: {
+    position: 'absolute',
+    top: Spacing.xs,
+    left: Spacing.xs,
+  },
+  upcomingTitle: {
+    color: Colors.text,
+    ...Typography.cardTitle,
+    fontSize: 14,
+    marginTop: 2,
+  },
+  upcomingActions: {
+    marginTop: 2,
   },
 });

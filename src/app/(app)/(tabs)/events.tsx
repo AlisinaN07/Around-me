@@ -1,57 +1,64 @@
+import { Ionicons } from '@expo/vector-icons';
 import { router, useFocusEffect } from 'expo-router';
 import { useCallback, useMemo, useState } from 'react';
-import { ScrollView, StyleSheet, Text, View } from 'react-native';
+import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { Button } from '@/components/Button';
-import { CategoryChip } from '@/components/CategoryChip';
 import { EmptyState } from '@/components/EmptyState';
 import { ErrorState } from '@/components/ErrorState';
 import { EventCard } from '@/components/EventCard';
+import { EventFilterSheet, type EventTypeFilter } from '@/components/EventFilterSheet';
 import { LoadingState } from '@/components/LoadingState';
-import { SegmentedControl } from '@/components/SegmentedControl';
-import { KARLSTAD_LAUNCH_CATEGORIES } from '@/constants/launchCategories';
-import { Colors, Layout, Spacing, Typography } from '@/constants/theme';
+import { Pill } from '@/components/Pill';
+import { SectionHeader } from '@/components/SectionHeader';
+import { Colors, Layout, Radius, Spacing, Typography } from '@/constants/theme';
 import { useCity } from '@/providers/CityProvider';
-import { fetchDiscoverySections } from '@/services/content';
+import { fetchDiscoverySections, type DiscoverySections } from '@/services/content';
 import type { ActivityContent, EventContent } from '@/types/content';
+import { getWeekendWindow } from '@/utils/dateWindows';
 
 type LoadStatus = 'loading' | 'loaded' | 'error';
-type TypeFilter = 'all' | 'events' | 'activities';
-
-const TYPE_FILTER_OPTIONS: { id: TypeFilter; label: string }[] = [
-  { id: 'all', label: 'All' },
-  { id: 'events', label: 'Events' },
-  { id: 'activities', label: 'Activities' },
-];
 
 // Bounded per section (happening/today/upcoming), matching the "30
 // initial, no infinite scroll" recommendation for this screen — see
 // Section 43 of the Step 22 spec. Three sections at 15 each caps the
-// total at 45 real Firestore reads per visit, close to that figure
-// without an extra client-side truncation step that could otherwise hide
-// results a filter would have matched further down an unsliced list.
+// total at 45 real Firestore reads per visit. Step 26 only changes how
+// this same bounded result set is laid out and split (This Weekend vs.
+// Coming Up is a client-side split of `upcoming`, not a new query).
 const SECTION_LIMIT = 15;
 
+/**
+ * Events — official/local Event & Activity discovery (Step 26 visual
+ * reconstruction). Deliberately the ONLY place in the app that shows
+ * event-style discovery content; Home is the separate user-generated Reel
+ * feed (see src/app/(app)/(tabs)/index.tsx and the Step 25 product-
+ * separation rule). Still backed entirely by the unchanged
+ * fetchDiscoverySections/dateWindows architecture from Step 22 — this step
+ * only redesigns layout, adds a real "This Weekend" split of the existing
+ * Upcoming window, and moves Interested/Going/Join actions onto the
+ * discovery cards themselves.
+ */
 export default function EventsScreen() {
   const { activeCity, homeCity, isExploringAnotherCity, isReady: isCityReady } = useCity();
   const [status, setStatus] = useState<LoadStatus>('loading');
-  const [items, setItems] = useState<(ActivityContent | EventContent)[]>([]);
-  const [typeFilter, setTypeFilter] = useState<TypeFilter>('all');
+  const [sections, setSections] = useState<DiscoverySections | null>(null);
+  const [typeFilter, setTypeFilter] = useState<EventTypeFilter>('all');
   const [categoryFilter, setCategoryFilter] = useState<string | null>(null);
+  const [isFilterOpen, setIsFilterOpen] = useState(false);
 
   const cityLabel = activeCity?.cityName ?? 'your city';
 
   const load = useCallback(async () => {
     if (!activeCity) return;
     setStatus('loading');
-    setItems([]);
+    // Clears the previous city's sections immediately so a city switch
+    // never leaves a stale city's cards on screen during the fetch (same
+    // rule every other discovery surface in this app follows).
+    setSections(null);
     try {
-      const sections = await fetchDiscoverySections(activeCity.cityKey, SECTION_LIMIT);
-      // Already time-ordered within each bucket (see fetchDiscoverySections);
-      // concatenating in this order satisfies "happening now first, then
-      // startsAt ascending" (Section 23) without a second sort pass.
-      setItems([...sections.happeningNow, ...sections.today, ...sections.upcoming]);
+      const result = await fetchDiscoverySections(activeCity.cityKey, SECTION_LIMIT);
+      setSections(result);
       setStatus('loaded');
     } catch {
       setStatus('error');
@@ -66,83 +73,146 @@ export default function EventsScreen() {
     }, [activeCity?.cityKey, isCityReady])
   );
 
-  const filteredItems = useMemo(() => {
-    return items.filter((item) => {
+  const matchesFilters = useCallback(
+    (item: ActivityContent | EventContent) => {
       if (typeFilter === 'events' && item.type !== 'event') return false;
       if (typeFilter === 'activities' && item.type !== 'activity') return false;
       if (categoryFilter && item.categoryId !== categoryFilter) return false;
       return true;
-    });
-  }, [items, typeFilter, categoryFilter]);
+    },
+    [typeFilter, categoryFilter]
+  );
 
+  const happeningNow = useMemo(() => (sections ? sections.happeningNow.filter(matchesFilters) : []), [sections, matchesFilters]);
+  const today = useMemo(() => (sections ? sections.today.filter(matchesFilters) : []), [sections, matchesFilters]);
+  const upcomingAll = useMemo(() => (sections ? sections.upcoming.filter(matchesFilters) : []), [sections, matchesFilters]);
+
+  // "This Weekend" is a real (Sat+Sun, Europe/Stockholm) client-side split
+  // of the already-fetched Upcoming window — see getWeekendWindow. If
+  // nothing in the current Upcoming page happens to fall on a real
+  // weekend right now, the section is simply omitted (never mislabeled) and
+  // everything renders under "Coming Up" instead (Step 26 Section 17).
+  const weekendSplit = useMemo(() => {
+    const weekend = getWeekendWindow();
+    const weekendIds = new Set(
+      upcomingAll
+        .filter((item) => {
+          const startMs = item.startsAt.toMillis();
+          return startMs >= weekend.start.getTime() && startMs < weekend.end.getTime();
+        })
+        .map((item) => item.contentId)
+    );
+    const thisWeekend = upcomingAll.filter((item) => weekendIds.has(item.contentId));
+    const comingUp = weekendIds.size > 0 ? upcomingAll.filter((item) => !weekendIds.has(item.contentId)) : upcomingAll;
+    return { thisWeekend, comingUp };
+  }, [upcomingAll]);
+  const thisWeekend = weekendSplit.thisWeekend;
+  const comingUp = weekendSplit.comingUp;
+
+  const totalRealItems = sections ? sections.happeningNow.length + sections.today.length + sections.upcoming.length : 0;
+  const totalFilteredItems = happeningNow.length + today.length + upcomingAll.length;
   const canCreateHere = !!homeCity && !isExploringAnotherCity;
+  const isFilterActive = typeFilter !== 'all' || categoryFilter !== null;
 
   return (
     <SafeAreaView style={styles.safeArea} edges={['top']}>
       <View style={styles.header}>
-        <Text style={styles.title} numberOfLines={1}>
-          Events in {cityLabel}
+        <Pressable onPress={() => router.push('/cities')} style={styles.cityButton} accessibilityRole="button" accessibilityLabel="Change city">
+          <Text style={styles.cityButtonText} numberOfLines={1}>
+            {cityLabel}
+          </Text>
+          <Ionicons name="chevron-down" size={16} color={Colors.text} />
+        </Pressable>
+
+        <Text style={styles.headerTitle} numberOfLines={1}>
+          Events
         </Text>
+
+        <Pressable onPress={() => setIsFilterOpen(true)} style={styles.filterButton} accessibilityRole="button" accessibilityLabel="Filter events">
+          <Ionicons name="options-outline" size={20} color={Colors.text} />
+          {isFilterActive ? <View style={styles.filterDot} /> : null}
+        </Pressable>
       </View>
 
       <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.scrollContent}>
         <View style={styles.page}>
-          <SegmentedControl options={TYPE_FILTER_OPTIONS} value={typeFilter} onChange={setTypeFilter} />
-
-          <ScrollView
-            horizontal
-            showsHorizontalScrollIndicator={false}
-            style={styles.horizontalScroll}
-            contentContainerStyle={styles.chipsRow}
-          >
-            <CategoryChip
-              label="All categories"
-              icon="apps-outline"
-              selected={categoryFilter === null}
-              onPress={() => setCategoryFilter(null)}
-            />
-            {KARLSTAD_LAUNCH_CATEGORIES.map((category) => (
-              <CategoryChip
-                key={category.interestId}
-                label={category.label}
-                icon="pricetag-outline"
-                selected={categoryFilter === category.interestId}
-                onPress={() => setCategoryFilter(category.interestId)}
-              />
-            ))}
-          </ScrollView>
-
           {status === 'error' ? (
-            <ErrorState title={`Couldn't load events in ${cityLabel}.`} onRetry={load} />
+            <View style={styles.statusPad}>
+              <ErrorState title={`Couldn't load events in ${cityLabel}.`} onRetry={load} />
+            </View>
           ) : status === 'loading' ? (
-            <LoadingState />
-          ) : filteredItems.length === 0 ? (
-            items.length === 0 ? (
-              isExploringAnotherCity ? (
+            <LoadingState size="large" />
+          ) : totalRealItems === 0 ? (
+            <View style={styles.statusPad}>
+              {isExploringAnotherCity ? (
                 <EmptyState
+                  icon="calendar-outline"
                   title={`No upcoming events in ${cityLabel} yet.`}
                   body="Explore another city or check back later."
                   action={<Button label="Explore another city" variant="secondary" onPress={() => router.push('/cities')} />}
                 />
               ) : (
                 <EmptyState
+                  icon="calendar-outline"
                   title={`No upcoming events in ${cityLabel} yet.`}
                   body="Know something happening? Create an event."
                   action={<Button label="Create event" onPress={() => router.push('/create/event')} />}
                 />
-              )
-            ) : (
-              <EmptyState title="Nothing matches this filter yet." />
-            )
-          ) : (
-            <View style={styles.grid}>
-              {filteredItems.map((item) => (
-                <EventCard key={item.contentId} item={item} />
-              ))}
+              )}
             </View>
+          ) : totalFilteredItems === 0 ? (
+            <View style={styles.statusPad}>
+              <EmptyState icon="options-outline" title="Nothing matches this filter yet." />
+            </View>
+          ) : (
+            <>
+              {happeningNow.length > 0 ? (
+                <View style={styles.section}>
+                  <SectionHeader title="Happening Now" badge={<Pill label="LIVE" tone="live" />} />
+                  <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.heroRail} style={styles.heroRailScroll}>
+                    {happeningNow.map((item) => (
+                      <EventCard key={item.contentId} item={item} variant="hero" />
+                    ))}
+                  </ScrollView>
+                </View>
+              ) : null}
+
+              {today.length > 0 ? (
+                <View style={styles.section}>
+                  <SectionHeader title={sections?.todayLabel ?? 'Today'} />
+                  <View style={styles.rowList}>
+                    {today.map((item) => (
+                      <EventCard key={item.contentId} item={item} variant="row" />
+                    ))}
+                  </View>
+                </View>
+              ) : null}
+
+              {thisWeekend.length > 0 ? (
+                <View style={styles.section}>
+                  <SectionHeader title="This Weekend" />
+                  <View style={styles.grid}>
+                    {thisWeekend.map((item) => (
+                      <EventCard key={item.contentId} item={item} variant="upcoming" />
+                    ))}
+                  </View>
+                </View>
+              ) : null}
+
+              {comingUp.length > 0 ? (
+                <View style={styles.section}>
+                  <SectionHeader title="Coming Up" />
+                  <View style={styles.grid}>
+                    {comingUp.map((item) => (
+                      <EventCard key={item.contentId} item={item} variant="upcoming" />
+                    ))}
+                  </View>
+                </View>
+              ) : null}
+            </>
           )}
 
-          {status === 'loaded' && items.length > 0 ? (
+          {status === 'loaded' && totalRealItems > 0 ? (
             <View style={styles.createFooter}>
               <Button
                 label={canCreateHere ? 'Create event' : `Create in ${homeCity?.cityName ?? 'your home city'}`}
@@ -156,6 +226,15 @@ export default function EventsScreen() {
           ) : null}
         </View>
       </ScrollView>
+
+      <EventFilterSheet
+        visible={isFilterOpen}
+        typeFilter={typeFilter}
+        onChangeTypeFilter={setTypeFilter}
+        categoryFilter={categoryFilter}
+        onChangeCategoryFilter={setCategoryFilter}
+        onClose={() => setIsFilterOpen(false)}
+      />
     </SafeAreaView>
   );
 }
@@ -166,13 +245,41 @@ const styles = StyleSheet.create({
     backgroundColor: Colors.background,
   },
   header: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
     paddingHorizontal: Spacing.lg,
     paddingTop: Spacing.sm,
     paddingBottom: Spacing.md,
   },
-  title: {
+  cityButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 2,
+    flexShrink: 1,
+  },
+  cityButtonText: {
     color: Colors.text,
-    ...Typography.screenTitle,
+    ...Typography.cardTitle,
+  },
+  headerTitle: {
+    color: Colors.text,
+    ...Typography.sectionTitle,
+  },
+  filterButton: {
+    width: 32,
+    height: 32,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  filterDot: {
+    position: 'absolute',
+    top: 4,
+    right: 4,
+    width: 7,
+    height: 7,
+    borderRadius: Radius.full,
+    backgroundColor: Colors.accent,
   },
   scrollContent: {
     alignItems: 'center',
@@ -181,28 +288,41 @@ const styles = StyleSheet.create({
   page: {
     width: '100%',
     maxWidth: Layout.maxContentWidth,
-    paddingHorizontal: Spacing.lg,
-    gap: Spacing.md,
+    gap: Spacing.lg,
   },
-  horizontalScroll: {
+  section: {
+    gap: Spacing.sm,
+  },
+  statusPad: {
+    paddingHorizontal: Spacing.lg,
+    paddingTop: Spacing.lg,
+  },
+  // SectionHeader carries its own paddingHorizontal: Spacing.lg (see
+  // SectionHeader.tsx) and this screen's `page` has none of its own — so
+  // every direct content wrapper below repeats that same Spacing.lg inset
+  // itself, keeping card rows/grids flush with their section title above
+  // them rather than double- or under-indented.
+  heroRailScroll: {
     flexGrow: 0,
     flexShrink: 0,
-    marginHorizontal: -Spacing.lg,
   },
-  chipsRow: {
-    gap: Spacing.sm,
+  heroRail: {
+    gap: Spacing.md,
+    paddingHorizontal: Spacing.lg,
+  },
+  rowList: {
     paddingHorizontal: Spacing.lg,
   },
   grid: {
     gap: Spacing.md,
     flexDirection: 'row',
     flexWrap: 'wrap',
-    justifyContent: 'space-between',
+    paddingHorizontal: Spacing.lg,
   },
   createFooter: {
-    marginTop: Spacing.md,
     alignItems: 'center',
     gap: 4,
+    paddingHorizontal: Spacing.lg,
   },
   createFooterHint: {
     color: Colors.textSecondary,
