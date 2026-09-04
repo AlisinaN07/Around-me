@@ -1,15 +1,17 @@
-import { Ionicons } from '@expo/vector-icons';
 import { router, useFocusEffect } from 'expo-router';
 import { useCallback, useMemo, useState } from 'react';
-import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { ScrollView, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { Button } from '@/components/Button';
 import { CategoryChip } from '@/components/CategoryChip';
+import { EmptyState } from '@/components/EmptyState';
+import { ErrorState } from '@/components/ErrorState';
 import { EventCard } from '@/components/EventCard';
+import { LoadingState } from '@/components/LoadingState';
 import { SegmentedControl } from '@/components/SegmentedControl';
 import { KARLSTAD_LAUNCH_CATEGORIES } from '@/constants/launchCategories';
-import { Colors, Layout, Radius, Spacing } from '@/constants/theme';
+import { Colors, Layout, Spacing, Typography } from '@/constants/theme';
 import { useCity } from '@/providers/CityProvider';
 import { fetchDiscoverySections } from '@/services/content';
 import type { ActivityContent, EventContent } from '@/types/content';
@@ -78,13 +80,9 @@ export default function EventsScreen() {
   return (
     <SafeAreaView style={styles.safeArea} edges={['top']}>
       <View style={styles.header}>
-        <Pressable onPress={() => router.back()} hitSlop={8} accessibilityRole="button" accessibilityLabel="Back" style={styles.backButton}>
-          <Ionicons name="chevron-back" size={24} color={Colors.text} />
-        </Pressable>
         <Text style={styles.title} numberOfLines={1}>
           Events in {cityLabel}
         </Text>
-        <View style={styles.headerSpacer} />
       </View>
 
       <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.scrollContent}>
@@ -115,35 +113,27 @@ export default function EventsScreen() {
           </ScrollView>
 
           {status === 'error' ? (
-            <View style={styles.emptyPanel}>
-              <Ionicons name="cloud-offline-outline" size={28} color={Colors.textSecondary} />
-              <Text style={styles.emptyTitle}>Couldn&apos;t load events in {cityLabel}.</Text>
-              <Button label="Try again" onPress={load} />
-            </View>
+            <ErrorState title={`Couldn't load events in ${cityLabel}.`} onRetry={load} />
           ) : status === 'loading' ? (
-            <View style={styles.emptyPanel}>
-              <Text style={styles.emptyBody}>Loading…</Text>
-            </View>
+            <LoadingState />
           ) : filteredItems.length === 0 ? (
-            <View style={styles.emptyPanel}>
-              {items.length === 0 ? (
-                isExploringAnotherCity ? (
-                  <>
-                    <Text style={styles.emptyTitle}>No upcoming events in {cityLabel} yet.</Text>
-                    <Text style={styles.emptyBody}>Explore another city or check back later.</Text>
-                    <Button label="Explore another city" variant="secondary" onPress={() => router.push('/cities')} />
-                  </>
-                ) : (
-                  <>
-                    <Text style={styles.emptyTitle}>No upcoming events in {cityLabel} yet.</Text>
-                    <Text style={styles.emptyBody}>Know something happening? Create an event.</Text>
-                    <Button label="Create event" onPress={() => router.push('/create/event')} />
-                  </>
-                )
+            items.length === 0 ? (
+              isExploringAnotherCity ? (
+                <EmptyState
+                  title={`No upcoming events in ${cityLabel} yet.`}
+                  body="Explore another city or check back later."
+                  action={<Button label="Explore another city" variant="secondary" onPress={() => router.push('/cities')} />}
+                />
               ) : (
-                <Text style={styles.emptyBody}>Nothing matches this filter yet.</Text>
-              )}
-            </View>
+                <EmptyState
+                  title={`No upcoming events in ${cityLabel} yet.`}
+                  body="Know something happening? Create an event."
+                  action={<Button label="Create event" onPress={() => router.push('/create/event')} />}
+                />
+              )
+            ) : (
+              <EmptyState title="Nothing matches this filter yet." />
+            )
           ) : (
             <View style={styles.grid}>
               {filteredItems.map((item) => (
@@ -176,26 +166,13 @@ const styles = StyleSheet.create({
     backgroundColor: Colors.background,
   },
   header: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: Spacing.md,
-    paddingBottom: Spacing.sm,
-  },
-  backButton: {
-    width: 40,
-    height: 40,
-    alignItems: 'center',
-    justifyContent: 'center',
+    paddingHorizontal: Spacing.lg,
+    paddingTop: Spacing.sm,
+    paddingBottom: Spacing.md,
   },
   title: {
-    flex: 1,
-    textAlign: 'center',
     color: Colors.text,
-    fontSize: 17,
-    fontWeight: '700',
-  },
-  headerSpacer: {
-    width: 40,
+    ...Typography.screenTitle,
   },
   scrollContent: {
     alignItems: 'center',
@@ -221,27 +198,6 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     flexWrap: 'wrap',
     justifyContent: 'space-between',
-  },
-  emptyPanel: {
-    borderRadius: Radius.lg,
-    backgroundColor: Colors.surface,
-    borderWidth: 1,
-    borderColor: Colors.border,
-    padding: Spacing.xl,
-    alignItems: 'center',
-    gap: Spacing.sm,
-  },
-  emptyTitle: {
-    color: Colors.text,
-    fontSize: 15,
-    fontWeight: '700',
-    textAlign: 'center',
-  },
-  emptyBody: {
-    color: Colors.textSecondary,
-    fontSize: 13,
-    textAlign: 'center',
-    lineHeight: 18,
   },
   createFooter: {
     marginTop: Spacing.md,

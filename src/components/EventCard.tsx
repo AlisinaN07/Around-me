@@ -3,8 +3,9 @@ import { router } from 'expo-router';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 
 import { AuthorLink } from '@/components/AuthorLink';
+import { Pill } from '@/components/Pill';
 import { INTERESTS } from '@/constants/interests';
-import { Colors, Radius, Spacing } from '@/constants/theme';
+import { Colors, Radius, Spacing, Typography } from '@/constants/theme';
 import type { ActivityContent, EventContent } from '@/types/content';
 import { getCityDayWindow, isHappeningNow } from '@/utils/dateWindows';
 import { formatEventTime, formatTimePill } from '@/utils/timeFormat';
@@ -54,11 +55,7 @@ export function EventCard({ item, now = new Date(), onPress }: EventCardProps) {
           <Ionicons name={isActivity ? 'people-outline' : 'calendar-outline'} size={11} color={Colors.background} />
           <Text style={styles.typeBadgeText}>{isActivity ? 'Activity' : 'Event'}</Text>
         </View>
-        {badge ? (
-          <View style={[styles.timeBadge, badge.tone === 'now' && styles.timeBadgeNow]}>
-            <Text style={styles.timeBadgeText}>{badge.label}</Text>
-          </View>
-        ) : null}
+        {badge ? <Pill label={badge.label} tone={badge.tone === 'now' ? 'live' : 'neutral'} /> : null}
       </View>
 
       <Text style={styles.title} numberOfLines={2}>
@@ -156,33 +153,15 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     textTransform: 'uppercase',
   },
-  timeBadge: {
-    borderRadius: Radius.full,
-    backgroundColor: Colors.background,
-    borderWidth: 1,
-    borderColor: Colors.border,
-    paddingHorizontal: Spacing.sm,
-    paddingVertical: 2,
-  },
-  timeBadgeNow: {
-    backgroundColor: Colors.error,
-    borderColor: Colors.error,
-  },
-  timeBadgeText: {
-    color: Colors.text,
-    fontSize: 10,
-    fontWeight: '700',
-  },
   title: {
     color: Colors.text,
+    ...Typography.cardTitle,
     fontSize: 14,
-    fontWeight: '700',
     marginTop: 2,
   },
   time: {
     color: Colors.textSecondary,
-    fontSize: 12,
-    fontWeight: '600',
+    ...Typography.caption,
   },
   placeRow: {
     flexDirection: 'row',

@@ -1,6 +1,7 @@
+import { LinearGradient } from 'expo-linear-gradient';
 import { ActivityIndicator, Pressable, StyleSheet, Text } from 'react-native';
 
-import { Colors, Radius, Spacing } from '@/constants/theme';
+import { Colors, ControlHeight, Gradients, Radius, Spacing, Typography } from '@/constants/theme';
 
 type ButtonVariant = 'primary' | 'secondary';
 
@@ -12,8 +13,33 @@ type ButtonProps = {
   disabled?: boolean;
 };
 
+/**
+ * Primary button uses the app's one accent gradient (Step 24 visual
+ * direction) — matches the pill-shaped "Going"/CTA buttons in the approved
+ * reference screenshots. Secondary stays a flat outlined pill.
+ */
 export function Button({ label, onPress, variant = 'primary', loading = false, disabled = false }: ButtonProps) {
   const isDisabled = disabled || loading;
+
+  const content = loading ? (
+    <ActivityIndicator color={variant === 'primary' ? Colors.text : Colors.text} />
+  ) : (
+    <Text style={variant === 'primary' ? styles.primaryLabel : styles.secondaryLabel}>{label}</Text>
+  );
+
+  if (variant === 'secondary') {
+    return (
+      <Pressable
+        onPress={onPress}
+        disabled={isDisabled}
+        accessibilityRole="button"
+        accessibilityState={{ disabled: isDisabled, busy: loading }}
+        style={({ pressed }) => [styles.base, styles.secondary, pressed && !isDisabled && styles.pressed, isDisabled && styles.disabled]}
+      >
+        {content}
+      </Pressable>
+    );
+  }
 
   return (
     <Pressable
@@ -21,32 +47,28 @@ export function Button({ label, onPress, variant = 'primary', loading = false, d
       disabled={isDisabled}
       accessibilityRole="button"
       accessibilityState={{ disabled: isDisabled, busy: loading }}
-      style={({ pressed }) => [
-        styles.base,
-        variant === 'primary' ? styles.primary : styles.secondary,
-        pressed && !isDisabled && styles.pressed,
-        isDisabled && styles.disabled,
-      ]}
+      style={({ pressed }) => [pressed && !isDisabled && styles.pressed, isDisabled && styles.disabled]}
     >
-      {loading ? (
-        <ActivityIndicator color={variant === 'primary' ? Colors.background : Colors.text} />
-      ) : (
-        <Text style={variant === 'primary' ? styles.primaryLabel : styles.secondaryLabel}>{label}</Text>
-      )}
+      <LinearGradient colors={Gradients.accent} start={{ x: 0, y: 0 }} end={{ x: 1, y: 0 }} style={[styles.base, styles.primary]}>
+        {content}
+      </LinearGradient>
     </Pressable>
   );
 }
 
 const styles = StyleSheet.create({
   base: {
-    minHeight: 52,
-    borderRadius: Radius.md,
+    minHeight: ControlHeight.lg,
+    borderRadius: Radius.full,
     alignItems: 'center',
     justifyContent: 'center',
     paddingHorizontal: Spacing.lg,
   },
   primary: {
-    backgroundColor: Colors.accent,
+    shadowColor: Colors.accent,
+    shadowOpacity: 0.3,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 3 },
   },
   secondary: {
     backgroundColor: 'transparent',
@@ -60,13 +82,11 @@ const styles = StyleSheet.create({
     opacity: 0.5,
   },
   primaryLabel: {
-    color: Colors.background,
-    fontSize: 16,
-    fontWeight: '700',
+    color: Colors.text,
+    ...Typography.button,
   },
   secondaryLabel: {
     color: Colors.text,
-    fontSize: 16,
-    fontWeight: '600',
+    ...Typography.button,
   },
 });

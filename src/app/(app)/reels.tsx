@@ -7,6 +7,8 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { Button } from '@/components/Button';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
+import { EmptyState } from '@/components/EmptyState';
+import { ErrorState } from '@/components/ErrorState';
 import { OptionsMenu, type OptionsMenuOption } from '@/components/OptionsMenu';
 import { ReelFeedItem } from '@/components/ReelFeedItem';
 import { ReportModal } from '@/components/ReportModal';
@@ -133,15 +135,27 @@ export default function ReelsScreen() {
 
   return (
     <SafeAreaView style={styles.safeArea} edges={['top']}>
-      <Pressable
-        style={styles.cityIndicator}
-        onPress={() => router.push('/cities')}
-        accessibilityRole="button"
-        accessibilityLabel="Change city"
-      >
-        <Text style={styles.cityIndicatorText}>{cityLabel}</Text>
-        <Ionicons name="chevron-down" size={14} color={Colors.text} />
-      </Pressable>
+      <View style={styles.topRow}>
+        <Pressable
+          onPress={() => router.back()}
+          hitSlop={8}
+          style={styles.backButton}
+          accessibilityRole="button"
+          accessibilityLabel="Back"
+        >
+          <Ionicons name="chevron-back" size={22} color={Colors.text} />
+        </Pressable>
+        <Pressable
+          style={styles.cityIndicator}
+          onPress={() => router.push('/cities')}
+          accessibilityRole="button"
+          accessibilityLabel="Change city"
+        >
+          <Text style={styles.cityIndicatorText}>{cityLabel}</Text>
+          <Ionicons name="chevron-down" size={14} color={Colors.text} />
+        </Pressable>
+        <View style={styles.backButtonSpacer} />
+      </View>
 
       <View
         style={styles.content}
@@ -158,19 +172,24 @@ export default function ReelsScreen() {
           </View>
         ) : status === 'error' ? (
           <View style={styles.centered}>
-            <Ionicons name="cloud-offline-outline" size={40} color={Colors.textSecondary} />
-            <Text style={styles.emptyTitle}>Couldn&apos;t load Reels in {cityLabel}</Text>
-            <Button label="Try again" onPress={load} />
+            <ErrorState bare title={`Couldn't load Reels in ${cityLabel}`} onRetry={load} />
           </View>
         ) : reels.length === 0 ? (
           <View style={styles.centered}>
-            <Ionicons name="videocam-outline" size={48} color={Colors.textSecondary} />
-            <Text style={styles.emptyTitle}>No Reels yet</Text>
-            <Text style={styles.emptyBody}>Be the first to show what&apos;s happening in {cityLabel}.</Text>
-            <Button label="Create Reel" onPress={() => router.push('/create/reel')} />
-            {isExploringAnotherCity && homeCity ? (
-              <Text style={styles.exploringHint}>Reels you create publish to your home city, {homeCity.cityName}.</Text>
-            ) : null}
+            <EmptyState
+              bare
+              icon="videocam-outline"
+              title="No Reels yet"
+              body={`Be the first to show what's happening in ${cityLabel}.`}
+              action={
+                <>
+                  <Button label="Create Reel" onPress={() => router.push('/create/reel')} />
+                  {isExploringAnotherCity && homeCity ? (
+                    <Text style={styles.exploringHint}>Reels you create publish to your home city, {homeCity.cityName}.</Text>
+                  ) : null}
+                </>
+              }
+            />
           </View>
         ) : containerHeight > 0 ? (
           <FlatList
@@ -251,29 +270,31 @@ const styles = StyleSheet.create({
     paddingHorizontal: Spacing.xl,
     gap: Spacing.sm,
   },
-  emptyTitle: {
-    color: Colors.text,
-    fontSize: 18,
-    fontWeight: '700',
-    textAlign: 'center',
-  },
-  emptyBody: {
-    color: Colors.textSecondary,
-    fontSize: 14,
-    textAlign: 'center',
-    lineHeight: 20,
-    marginBottom: Spacing.sm,
-  },
   exploringHint: {
     color: Colors.textSecondary,
     fontSize: 12,
     textAlign: 'center',
     marginTop: Spacing.xs,
   },
+  topRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: Spacing.sm,
+  },
+  backButton: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  backButtonSpacer: {
+    width: 36,
+  },
   cityIndicator: {
     flexDirection: 'row',
     alignItems: 'center',
-    alignSelf: 'center',
     gap: 4,
     paddingHorizontal: Spacing.md,
     paddingVertical: Spacing.xs,

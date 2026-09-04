@@ -1,6 +1,6 @@
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 
-import { Colors, Spacing } from '@/constants/theme';
+import { Colors, Spacing, Typography } from '@/constants/theme';
 
 type SectionHeaderProps = {
   title: string;
@@ -31,12 +31,10 @@ const styles = StyleSheet.create({
   },
   title: {
     color: Colors.text,
-    fontSize: 18,
-    fontWeight: '700',
+    ...Typography.sectionTitle,
   },
   action: {
     color: Colors.accent,
-    fontSize: 13,
-    fontWeight: '600',
+    ...Typography.caption,
   },
 });

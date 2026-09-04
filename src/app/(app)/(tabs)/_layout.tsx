@@ -1,17 +1,27 @@
 import { Ionicons } from '@expo/vector-icons';
+import { LinearGradient } from 'expo-linear-gradient';
 import { Tabs } from 'expo-router';
 import { Platform, StyleSheet, View } from 'react-native';
 
-import { Colors } from '@/constants/theme';
+import { Colors, Gradients, IconSize } from '@/constants/theme';
 
+/**
+ * Bottom tab bar (Step 24 visual foundation). Reels intentionally does NOT
+ * appear here anymore — the approved reference direction puts Events in
+ * the primary second slot, with Reels reached contextually (Home, Profile,
+ * a Reel's own share link) rather than as a persistent tab. The Reels
+ * screen/route/backend is fully preserved at `/reels`
+ * (src/app/(app)/reels.tsx) — only its place in the tab bar moved.
+ */
 export default function TabsLayout() {
   return (
     <Tabs
       screenOptions={{
         headerShown: false,
-        tabBarActiveTintColor: Colors.accent,
-        tabBarInactiveTintColor: Colors.textSecondary,
+        tabBarActiveTintColor: Colors.text,
+        tabBarInactiveTintColor: Colors.textMuted,
         tabBarStyle: styles.tabBar,
+        tabBarBackground: () => <View style={styles.tabBarBackground} />,
         tabBarLabelStyle: styles.tabBarLabel,
         tabBarItemStyle: styles.tabBarItem,
       }}
@@ -20,28 +30,28 @@ export default function TabsLayout() {
         name="index"
         options={{
           title: 'Home',
-          tabBarIcon: ({ color, size, focused }) => (
-            <Ionicons name={focused ? 'home' : 'home-outline'} size={size} color={color} />
+          tabBarIcon: ({ color, focused }) => (
+            <Ionicons name={focused ? 'home' : 'home-outline'} size={IconSize.lg} color={color} />
           ),
         }}
       />
       <Tabs.Screen
-        name="reels"
+        name="events"
         options={{
-          title: 'Reels',
-          tabBarIcon: ({ color, size, focused }) => (
-            <Ionicons name={focused ? 'play-circle' : 'play-circle-outline'} size={size} color={color} />
+          title: 'Events',
+          tabBarIcon: ({ color, focused }) => (
+            <Ionicons name={focused ? 'calendar' : 'calendar-outline'} size={IconSize.lg} color={color} />
           ),
         }}
       />
       <Tabs.Screen
         name="create"
         options={{
-          title: 'Create',
+          title: '',
           tabBarIcon: () => (
-            <View style={styles.createButton}>
-              <Ionicons name="add" size={24} color={Colors.background} />
-            </View>
+            <LinearGradient colors={Gradients.accent} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={styles.createButton}>
+              <Ionicons name="add" size={IconSize.xl} color={Colors.text} />
+            </LinearGradient>
           ),
         }}
       />
@@ -49,8 +59,8 @@ export default function TabsLayout() {
         name="inbox"
         options={{
           title: 'Inbox',
-          tabBarIcon: ({ color, size, focused }) => (
-            <Ionicons name={focused ? 'chatbubbles' : 'chatbubbles-outline'} size={size} color={color} />
+          tabBarIcon: ({ color, focused }) => (
+            <Ionicons name={focused ? 'chatbubbles' : 'chatbubbles-outline'} size={IconSize.lg} color={color} />
           ),
         }}
       />
@@ -58,8 +68,8 @@ export default function TabsLayout() {
         name="profile"
         options={{
           title: 'Profile',
-          tabBarIcon: ({ color, size, focused }) => (
-            <Ionicons name={focused ? 'person' : 'person-outline'} size={size} color={color} />
+          tabBarIcon: ({ color, focused }) => (
+            <Ionicons name={focused ? 'person' : 'person-outline'} size={IconSize.lg} color={color} />
           ),
         }}
       />
@@ -69,11 +79,21 @@ export default function TabsLayout() {
 
 const styles = StyleSheet.create({
   tabBar: {
-    backgroundColor: Colors.surface,
+    backgroundColor: 'transparent',
+    borderTopWidth: 0,
+    height: Platform.select({ ios: 88, default: 64 }),
+    paddingTop: 10,
+    elevation: 0,
+  },
+  tabBarBackground: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: 'rgba(10, 10, 13, 0.94)',
+    borderTopWidth: StyleSheet.hairlineWidth,
     borderTopColor: Colors.border,
-    borderTopWidth: 1,
-    height: Platform.select({ ios: 84, default: 64 }),
-    paddingTop: 8,
   },
   tabBarLabel: {
     fontSize: 11,
@@ -83,21 +103,19 @@ const styles = StyleSheet.create({
     paddingTop: 2,
   },
   createButton: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
+    width: 44,
+    height: 44,
+    borderRadius: 22,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: Colors.accent,
-    marginTop: -4,
-    elevation: 4,
+    marginTop: -6,
     ...Platform.select({
-      web: { boxShadow: `0 2px 6px ${Colors.accent}59` },
+      web: { boxShadow: `0 4px 14px ${Colors.accent}66` },
       default: {
         shadowColor: Colors.accent,
-        shadowOpacity: 0.35,
-        shadowRadius: 6,
-        shadowOffset: { width: 0, height: 2 },
+        shadowOpacity: 0.4,
+        shadowRadius: 8,
+        shadowOffset: { width: 0, height: 3 },
       },
     }),
   },

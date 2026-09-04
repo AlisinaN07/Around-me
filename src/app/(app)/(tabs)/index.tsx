@@ -7,6 +7,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { Button } from '@/components/Button';
 import { CategoryChip } from '@/components/CategoryChip';
 import { ContentCard } from '@/components/ContentCard';
+import { ErrorState } from '@/components/ErrorState';
 import { EventCard } from '@/components/EventCard';
 import { FollowingFeed } from '@/components/FollowingFeed';
 import { SectionHeader } from '@/components/SectionHeader';
@@ -228,10 +229,8 @@ export default function HomeScreen() {
             </ScrollView>
 
             {status === 'error' ? (
-              <View style={styles.errorState}>
-                <Ionicons name="cloud-offline-outline" size={32} color={Colors.textSecondary} />
-                <Text style={styles.errorTitle}>Couldn&apos;t load what&apos;s happening in {cityLabel}.</Text>
-                <Button label="Try again" onPress={() => loadFeed()} />
+              <View style={styles.errorStateWrap}>
+                <ErrorState title={`Couldn't load what's happening in ${cityLabel}.`} onRetry={() => loadFeed()} />
               </View>
             ) : (
               <>
@@ -327,13 +326,13 @@ export default function HomeScreen() {
                 </View>
 
                 <View style={styles.section}>
-                  <SectionHeader title="Local Reels" />
-                  <View style={styles.reelsEmptyPanel}>
+                  <SectionHeader title="Local Reels" actionLabel="See all" onActionPress={() => router.push('/reels')} />
+                  <Pressable style={styles.reelsEmptyPanel} onPress={() => router.push('/reels')} accessibilityRole="button">
                     <Ionicons name="videocam-outline" size={22} color={Colors.textSecondary} />
                     <Text style={styles.emptyPanelBody}>
                       Local videos will appear here as people start sharing what&apos;s happening around the city.
                     </Text>
-                  </View>
+                  </Pressable>
                 </View>
 
                 <View style={styles.section}>
@@ -501,22 +500,9 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: Spacing.sm,
   },
-  errorState: {
+  errorStateWrap: {
     marginHorizontal: Spacing.lg,
     marginTop: Spacing.xl,
-    borderRadius: Radius.lg,
-    backgroundColor: Colors.surface,
-    borderWidth: 1,
-    borderColor: Colors.border,
-    padding: Spacing.xl,
-    alignItems: 'center',
-    gap: Spacing.sm,
-  },
-  errorTitle: {
-    color: Colors.text,
-    fontSize: 15,
-    fontWeight: '700',
-    textAlign: 'center',
   },
   skeleton: {
     borderRadius: Radius.lg,
