@@ -34,7 +34,13 @@ service cloud.firestore {
         && request.resource.data.countryCode is string
         && request.resource.data.cityKey is string
         && request.resource.data.interests is list
-        && request.resource.data.accountType == 'personal'
+        // Step 30: Around Me supports exactly two account types, chosen
+        // once during onboarding — no arbitrary string (e.g. 'admin',
+        // 'organizer', 'verified_business') is ever accepted. This match
+        // block has no `allow update` at all, so accountType is already
+        // immutable after create — a client can never later rewrite
+        // personal -> business or back through a profile edit.
+        && (request.resource.data.accountType == 'personal' || request.resource.data.accountType == 'business')
         && request.resource.data.onboardingCompleted is bool
         && isServerTimestamp(request.resource.data.createdAt)
         && isServerTimestamp(request.resource.data.updatedAt)
@@ -268,7 +274,19 @@ service cloud.firestore {
           && isValidPlaceLink(data)
           && isServerTimestamp(data.createdAt)
           && isServerTimestamp(data.updatedAt)
-          && (isValidPostShape(data) || isValidActivityShape(data) || isValidEventShape(data));
+          // Step 30 core rule: Business = Personal + the ability to create
+          // Events. Post and Activity stay open to both account types —
+          // only the Event branch adds the accountType check, using the
+          // exact same cached `profile` this function already read once
+          // above (no extra get()). Personal accounts creating an Event
+          // fail this whole `&&` chain and are denied; every other
+          // Event validation (author/city snapshot, place link, shape)
+          // still applies in full — this is additive, not a bypass.
+          && (
+            isValidPostShape(data)
+            || isValidActivityShape(data)
+            || (isValidEventShape(data) && profile.accountType == 'business')
+          );
       }
 
       // Published content is readable by any signed-in user (this also

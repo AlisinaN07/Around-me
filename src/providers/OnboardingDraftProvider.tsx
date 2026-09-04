@@ -1,6 +1,10 @@
 import { createContext, useContext, useMemo, useState, type ReactNode } from 'react';
 
+import type { AccountType } from '@/types/user';
+
 export type OnboardingDraft = {
+  /** Chosen on the very first onboarding screen (Step 30) — null until then, and required before continuing past it. */
+  accountType: AccountType | null;
   displayName: string;
   username: string;
   cityName: string;
@@ -9,6 +13,7 @@ export type OnboardingDraft = {
 };
 
 const EMPTY_DRAFT: OnboardingDraft = {
+  accountType: null,
   displayName: '',
   username: '',
   cityName: '',
@@ -18,6 +23,7 @@ const EMPTY_DRAFT: OnboardingDraft = {
 
 type OnboardingDraftContextValue = {
   draft: OnboardingDraft;
+  setAccountType: (accountType: AccountType) => void;
   setNameAndUsername: (displayName: string, username: string) => void;
   setCity: (cityName: string, countryCode: string) => void;
   setInterests: (interests: string[]) => void;
@@ -26,10 +32,11 @@ type OnboardingDraftContextValue = {
 const OnboardingDraftContext = createContext<OnboardingDraftContextValue | undefined>(undefined);
 
 /**
- * In-memory-only draft for the 3 onboarding screens. Intentionally not
- * persisted — if the app is killed mid-onboarding, the draft restarts.
- * Scoped to the (onboarding) group's layout, so it resets whenever a user
- * enters onboarding fresh.
+ * In-memory-only draft for the 4 onboarding screens (account type, name/
+ * username, city, interests — Step 30 added account type as the new first
+ * step). Intentionally not persisted — if the app is killed mid-
+ * onboarding, the draft restarts. Scoped to the (onboarding) group's
+ * layout, so it resets whenever a user enters onboarding fresh.
  */
 export function OnboardingDraftProvider({ children }: { children: ReactNode }) {
   const [draft, setDraft] = useState<OnboardingDraft>(EMPTY_DRAFT);
@@ -37,6 +44,7 @@ export function OnboardingDraftProvider({ children }: { children: ReactNode }) {
   const value = useMemo<OnboardingDraftContextValue>(
     () => ({
       draft,
+      setAccountType: (accountType) => setDraft((prev) => ({ ...prev, accountType })),
       setNameAndUsername: (displayName, username) => setDraft((prev) => ({ ...prev, displayName, username })),
       setCity: (cityName, countryCode) => setDraft((prev) => ({ ...prev, cityName, countryCode })),
       setInterests: (interests) => setDraft((prev) => ({ ...prev, interests })),

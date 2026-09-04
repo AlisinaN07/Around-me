@@ -1,6 +1,7 @@
+import { Ionicons } from '@expo/vector-icons';
 import { router } from 'expo-router';
 import { useState } from 'react';
-import { StyleSheet, Text } from 'react-native';
+import { StyleSheet, Text, View } from 'react-native';
 
 import { Button } from '@/components/Button';
 import { CategorySelector } from '@/components/CategorySelector';
@@ -13,6 +14,7 @@ import { useAuth } from '@/hooks/useAuth';
 import { useProfile } from '@/hooks/useProfile';
 import { createEvent } from '@/services/content';
 import { DESCRIPTION_MAX_LENGTH, PLACE_NAME_MAX_LENGTH, TITLE_MAX_LENGTH } from '@/types/content';
+import { canCreateEvent } from '@/utils/accountCapabilities';
 import { formatCityDisplayName } from '@/utils/cityDisplay';
 import { addHours, roundUpToNextHalfHour } from '@/utils/timeFormat';
 
@@ -107,6 +109,27 @@ export default function CreateEventScreen() {
     router.replace('/');
   };
 
+  // Hiding Event from the Create hub isn't sufficient on its own — a
+  // Personal account could still navigate here directly. The real
+  // guarantee is firestore.rules' Event-create check (server-side,
+  // Section 15); this is a client-side safety net so a Personal account
+  // never even sees the creation form, and gets sent back to Create
+  // instead of hitting a confusing write failure after filling it out.
+  if (!canCreateEvent(profile)) {
+    return (
+      <HeaderScreenLayout title="Create event">
+        <View style={styles.blockedState}>
+          <Ionicons name="calendar-outline" size={32} color={Colors.textSecondary} />
+          <Text style={styles.blockedTitle}>Event creation is for Business accounts</Text>
+          <Text style={styles.blockedBody}>
+            Your account is Personal. You can still create Reels, Posts, and Activities.
+          </Text>
+          <Button label="Back to Create" variant="secondary" onPress={() => router.replace('/create')} />
+        </View>
+      </HeaderScreenLayout>
+    );
+  }
+
   return (
     <HeaderScreenLayout title="Create event">
       <Text style={styles.subtitle}>
@@ -190,6 +213,23 @@ export default function CreateEventScreen() {
 }
 
 const styles = StyleSheet.create({
+  blockedState: {
+    alignItems: 'center',
+    gap: Spacing.sm,
+    paddingTop: Spacing.xl,
+  },
+  blockedTitle: {
+    color: Colors.text,
+    fontSize: 16,
+    fontWeight: '700',
+    textAlign: 'center',
+  },
+  blockedBody: {
+    color: Colors.textSecondary,
+    fontSize: 14,
+    textAlign: 'center',
+    lineHeight: 20,
+  },
   subtitle: {
     color: Colors.textSecondary,
     fontSize: 15,

@@ -438,6 +438,25 @@ async function main() {
       await assertFails(setDoc(doc(carol, 'users', 'carol'), malformed));
     });
 
+    // --- DENY: accountType outside the two-value allowlist (Step 30). No
+    // arbitrary role string — admin/organizer/verified_business/etc. — is
+    // ever accepted, even though nothing in this codebase generates one. ---
+    await check('DENY: user profile with invalid accountType', async () => {
+      const dave = testEnv.authenticatedContext('dave').firestore();
+      const invalid = { ...validUserProfile('dave', 'dave_handle'), accountType: 'organizer' };
+      await assertFails(setDoc(doc(dave, 'users', 'dave'), invalid));
+    });
+
+    // --- DENY: accountType mutation after onboarding (Step 30). The
+    // users/{uid} match block has no `allow update` at all, so this is
+    // denied before any field-level check even runs — but the test asserts
+    // the outcome that actually matters: a Personal account can never
+    // rewrite itself to Business (or vice versa) after signup. ---
+    await check('DENY: user attempts to mutate their own accountType', async () => {
+      const alice = testEnv.authenticatedContext('alice').firestore();
+      await assertFails(updateDoc(doc(alice, 'users', 'alice'), { accountType: 'business' }));
+    });
+
     // --- DENY: listing the usernames collection (enumeration). ---
     await check('DENY: list usernames collection', async () => {
       const bob = testEnv.authenticatedContext('bob').firestore();
@@ -464,6 +483,18 @@ async function main() {
       cityKey: 'se:stockholm',
     });
 
+    // Alice was created as a Personal account above (testing the generic
+    // profile-create path, before any Event was involved). Promote her to
+    // Business here, admin-mode, so the Event-creation tests below — and
+    // every later test in this file that reuses event-alice-1 for
+    // responses/likes/comments — exercise a Business account, matching
+    // Step 30's business-only Event gate. Bob stays Personal throughout,
+    // which is what makes him the right fixture for the DENY case right
+    // below.
+    await testEnv.withSecurityRulesDisabled(async (adminContext) => {
+      await setDoc(doc(adminContext.firestore(), 'users', 'alice'), { accountType: 'business' }, { merge: true });
+    });
+
     const alice = testEnv.authenticatedContext('alice').firestore();
     const bob = testEnv.authenticatedContext('bob').firestore();
     const anon = testEnv.unauthenticatedContext().firestore();
@@ -483,7 +514,23 @@ async function main() {
       );
     });
 
-    await check('ALLOW: completed user creates a valid Event', async () => {
+    await check('ALLOW: Personal account creates a valid Activity', async () => {
+      await assertSucceeds(
+        setDoc(doc(bob, 'content', 'activity-bob-1'), validActivity('bob', 'Bob Bobsson', 'bob_handle', 'activity-bob-1'))
+      );
+    });
+
+    // --- DENY: Personal account creates an Event (Step 30 core rule —
+    // Business = Personal + the ability to create Events). Bob is Personal
+    // throughout this file, so this is a real accountType == 'personal'
+    // denial, not just a malformed-shape rejection. ---
+    await check('DENY: Personal account creates an Event', async () => {
+      await assertFails(
+        setDoc(doc(bob, 'content', 'event-bob-denied-1'), validEvent('bob', 'Bob Bobsson', 'bob_handle', 'event-bob-denied-1'))
+      );
+    });
+
+    await check('ALLOW: Business account creates a valid Event', async () => {
       await assertSucceeds(
         setDoc(doc(alice, 'content', 'event-alice-1'), validEvent('alice', 'Test User', 'alice_handle', 'event-alice-1'))
       );
@@ -591,6 +638,8 @@ async function main() {
       await assertFails(setDoc(doc(alice, 'content', 'activity-bad-times'), malformed));
     });
 
+    // Bob is Personal throughout this file, so this also doubles as the
+    // Step 30 matrix's "Personal account creates a Post -> ALLOW" case.
     await check('ALLOW: second author creates their own valid Post (setup for delete tests)', async () => {
       await assertSucceeds(
         setDoc(doc(bob, 'content', 'post-bob-1'), validPost('bob', 'Bob Bobsson', 'bob_handle', 'post-bob-1'))

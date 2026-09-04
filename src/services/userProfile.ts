@@ -6,7 +6,7 @@
 import { doc, getDoc, runTransaction, serverTimestamp, type WithFieldValue } from 'firebase/firestore';
 
 import type { PublicProfile } from '@/types/social';
-import type { UserProfile, UsernameReservation } from '@/types/user';
+import type { AccountType, UserProfile, UsernameReservation } from '@/types/user';
 import { buildCityKey } from '@/utils/cityKey';
 import { normalizeUsername } from '@/utils/username';
 
@@ -23,6 +23,8 @@ export type UsernameAvailabilityResult =
 export type CreateInitialProfileInput = {
   uid: string;
   email: string;
+  /** Chosen on the first onboarding screen (Step 30) — 'personal' or 'business', never anything else. */
+  accountType: AccountType;
   displayName: string;
   username: string;
   cityName: string;
@@ -134,7 +136,7 @@ export async function createInitialUserProfile(
         countryCode,
         cityKey,
         interests: input.interests,
-        accountType: 'personal',
+        accountType: input.accountType,
         onboardingCompleted: true,
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
@@ -153,7 +155,7 @@ export async function createInitialUserProfile(
         countryCode,
         cityKey,
         interests: input.interests,
-        accountType: 'personal',
+        accountType: input.accountType,
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       } satisfies WithFieldValue<PublicProfile>);

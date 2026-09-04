@@ -1,161 +1,169 @@
+import { Ionicons } from '@expo/vector-icons';
 import { router } from 'expo-router';
-import { useEffect, useState } from 'react';
-import { StyleSheet, Text, View } from 'react-native';
+import { useState } from 'react';
+import { Pressable, StyleSheet, Text, View } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { Button } from '@/components/Button';
-import { FormField } from '@/components/FormField';
-import { FormScreenLayout } from '@/components/FormScreenLayout';
 import { OnboardingProgress } from '@/components/OnboardingProgress';
-import { Colors, Spacing } from '@/constants/theme';
+import { Colors, Radius, Spacing } from '@/constants/theme';
 import { useOnboardingDraft } from '@/providers/OnboardingDraftProvider';
-import { checkUsernameAvailability } from '@/services/userProfile';
-import { normalizeUsername } from '@/utils/username';
+import type { AccountType } from '@/types/user';
 
-const MIN_NAME_LENGTH = 2;
-const MAX_NAME_LENGTH = 50;
-const AVAILABILITY_DEBOUNCE_MS = 600;
+type OptionConfig = {
+  id: AccountType;
+  icon: keyof typeof Ionicons.glyphMap;
+  title: string;
+  description: string;
+};
 
-type CheckResult = { username: string; status: 'available' | 'taken'; reason?: string };
+// Copy deliberately doesn't imply verification, and Business isn't
+// labeled "Official" anywhere — see README "Personal and Business
+// accounts" (Step 30). Business = Personal + the ability to create
+// Events; nothing else differs yet.
+const OPTIONS: OptionConfig[] = [
+  {
+    id: 'personal',
+    icon: 'person-outline',
+    title: 'Personal',
+    description: 'For people who want to discover their city, share Reels and connect locally.',
+  },
+  {
+    id: 'business',
+    icon: 'storefront-outline',
+    title: 'Business',
+    description: 'For businesses, venues and organizers that also want to publish Events.',
+  },
+];
 
-export default function NameUsernameScreen() {
-  const { draft, setNameAndUsername } = useOnboardingDraft();
-  const [displayName, setDisplayName] = useState(draft.displayName);
-  const [username, setUsername] = useState(draft.username);
-  const [nameError, setNameError] = useState<string | null>(null);
-  const [checkResult, setCheckResult] = useState<CheckResult | null>(null);
-
-  // Availability check only runs for the async result — the idle/invalid/
-  // checking states are all derived at render time below, so nothing here
-  // ever calls setState synchronously from the effect body itself.
-  useEffect(() => {
-    if (!normalizeUsername(username).valid) {
-      return;
-    }
-
-    let cancelled = false;
-    const timeout = setTimeout(async () => {
-      const result = await checkUsernameAvailability(username);
-      if (cancelled) return;
-      setCheckResult({
-        username,
-        status: result.available ? 'available' : 'taken',
-        reason: result.available ? undefined : result.reason,
-      });
-    }, AVAILABILITY_DEBOUNCE_MS);
-
-    return () => {
-      cancelled = true;
-      clearTimeout(timeout);
-    };
-  }, [username]);
-
-  const normalized = normalizeUsername(username);
-
-  let availability: 'idle' | 'invalid' | 'checking' | 'available' | 'taken';
-  let usernameMessage: string | null;
-
-  if (!username) {
-    availability = 'idle';
-    usernameMessage = null;
-  } else if (!normalized.valid) {
-    availability = 'invalid';
-    usernameMessage = normalized.reason;
-  } else if (checkResult?.username === username) {
-    availability = checkResult.status;
-    usernameMessage = checkResult.status === 'available' ? 'Available' : (checkResult.reason ?? 'Username already taken');
-  } else {
-    availability = 'checking';
-    usernameMessage = 'Checking…';
-  }
+/**
+ * Account type selection — the new first onboarding screen (Step 30).
+ * Chosen once here, persisted as `users/{uid}.accountType` at the end of
+ * onboarding (see interests.tsx), and immutable afterward (no update rule
+ * permits changing it — see firestore.rules). Both account types continue
+ * through the exact same name/city/interests steps after this one.
+ */
+export default function AccountTypeScreen() {
+  const { draft, setAccountType } = useOnboardingDraft();
+  const [selected, setSelected] = useState<AccountType | null>(draft.accountType);
 
   const handleContinue = () => {
-    const trimmedName = displayName.trim();
-    if (trimmedName.length < MIN_NAME_LENGTH || trimmedName.length > MAX_NAME_LENGTH) {
-      setNameError(`Enter a name between ${MIN_NAME_LENGTH} and ${MAX_NAME_LENGTH} characters.`);
-      return;
-    }
-    setNameError(null);
-
-    if (availability !== 'available') {
-      return;
-    }
-
-    setNameAndUsername(trimmedName, username.trim());
-    router.push('/city');
+    if (!selected) return;
+    setAccountType(selected);
+    router.push('/name');
   };
 
-  const canContinue = availability === 'available' && displayName.trim().length >= MIN_NAME_LENGTH;
-
   return (
-    <FormScreenLayout>
-      <OnboardingProgress step={1} total={3} />
+    <SafeAreaView style={styles.safeArea}>
+      <View style={styles.content}>
+        <OnboardingProgress step={1} total={4} />
 
-      <View style={styles.header}>
-        <Text style={styles.title}>What should people call you?</Text>
-      </View>
+        <View style={styles.header}>
+          <Text style={styles.title}>How will you use Around Me?</Text>
+          <Text style={styles.subtitle}>You can&apos;t change this later, so pick the one that fits.</Text>
+        </View>
 
-      <View style={styles.form}>
-        <FormField
-          label="Name"
-          value={displayName}
-          onChangeText={(value) => {
-            setDisplayName(value);
-            setNameError(null);
-          }}
-          placeholder="Ali"
-          autoCapitalize="words"
-          autoCorrect={false}
-          returnKeyType="next"
-          error={nameError ?? undefined}
-        />
-        <FormField
-          label="Username"
-          prefix="@"
-          value={username}
-          onChangeText={(value) => setUsername(value.trim())}
-          placeholder="ali97"
-          autoCapitalize="none"
-          autoCorrect={false}
-          returnKeyType="done"
-          onSubmitEditing={handleContinue}
-          error={availability === 'invalid' || availability === 'taken' ? (usernameMessage ?? undefined) : undefined}
-        />
-        {availability === 'checking' || availability === 'available' ? (
-          <Text style={availability === 'available' ? styles.available : styles.checking}>{usernameMessage}</Text>
-        ) : null}
-      </View>
+        <View style={styles.options}>
+          {OPTIONS.map((option) => {
+            const isSelected = selected === option.id;
+            return (
+              <Pressable
+                key={option.id}
+                onPress={() => setSelected(option.id)}
+                style={[styles.card, isSelected && styles.cardSelected]}
+                accessibilityRole="radio"
+                accessibilityState={{ selected: isSelected }}
+              >
+                <View style={[styles.iconWrap, isSelected && styles.iconWrapSelected]}>
+                  <Ionicons name={option.icon} size={24} color={isSelected ? Colors.background : Colors.accent} />
+                </View>
+                <View style={styles.cardText}>
+                  <Text style={styles.cardTitle}>{option.title}</Text>
+                  <Text style={styles.cardDescription}>{option.description}</Text>
+                </View>
+                <Ionicons
+                  name={isSelected ? 'radio-button-on' : 'radio-button-off'}
+                  size={22}
+                  color={isSelected ? Colors.accent : Colors.textSecondary}
+                />
+              </Pressable>
+            );
+          })}
+        </View>
 
-      <View style={styles.actions}>
-        <Button label="Continue" onPress={handleContinue} disabled={!canContinue} />
+        <View style={styles.actions}>
+          <Button label="Continue" onPress={handleContinue} disabled={!selected} />
+        </View>
       </View>
-    </FormScreenLayout>
+    </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
+  safeArea: {
+    flex: 1,
+    backgroundColor: Colors.background,
+  },
+  content: {
+    flex: 1,
+    padding: Spacing.xl,
+    gap: Spacing.xl,
+  },
   header: {
-    marginTop: Spacing.lg,
-    marginBottom: Spacing.lg,
+    gap: Spacing.xs,
   },
   title: {
     color: Colors.text,
     fontSize: 26,
     fontWeight: '800',
   },
-  form: {
+  subtitle: {
+    color: Colors.textSecondary,
+    fontSize: 15,
+    lineHeight: 21,
+  },
+  options: {
     gap: Spacing.md,
   },
-  checking: {
+  card: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Spacing.md,
+    borderRadius: Radius.lg,
+    backgroundColor: Colors.surface,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    padding: Spacing.lg,
+  },
+  cardSelected: {
+    borderColor: Colors.accent,
+  },
+  iconWrap: {
+    width: 48,
+    height: 48,
+    borderRadius: Radius.md,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: Colors.background,
+  },
+  iconWrapSelected: {
+    backgroundColor: Colors.accent,
+  },
+  cardText: {
+    flex: 1,
+    gap: 2,
+  },
+  cardTitle: {
+    color: Colors.text,
+    fontSize: 17,
+    fontWeight: '700',
+  },
+  cardDescription: {
     color: Colors.textSecondary,
     fontSize: 13,
-    marginTop: -Spacing.xs,
-  },
-  available: {
-    color: Colors.success,
-    fontSize: 13,
-    marginTop: -Spacing.xs,
+    lineHeight: 18,
   },
   actions: {
-    marginTop: Spacing.xl,
+    marginTop: 'auto',
   },
 });

@@ -70,7 +70,7 @@ export default function CityScreen() {
   return (
     <SafeAreaView style={styles.safeArea}>
       <View style={styles.content}>
-        <OnboardingProgress step={2} total={3} />
+        <OnboardingProgress step={3} total={4} />
 
         {mode === 'choose' && (
           <View style={styles.section}>

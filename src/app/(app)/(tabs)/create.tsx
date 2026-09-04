@@ -1,10 +1,13 @@
 import { Ionicons } from '@expo/vector-icons';
 import { router, type Href } from 'expo-router';
+import { useMemo } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { Colors, Layout, Radius, Spacing } from '@/constants/theme';
+import { useProfile } from '@/hooks/useProfile';
 import { useCity } from '@/providers/CityProvider';
+import { canCreateEvent } from '@/utils/accountCapabilities';
 
 type CreateOption = {
   id: string;
@@ -14,20 +17,13 @@ type CreateOption = {
   href: Href | null;
 };
 
-const CREATE_OPTIONS: CreateOption[] = [
+const ALWAYS_AVAILABLE_OPTIONS: CreateOption[] = [
   {
     id: 'activity',
     icon: 'people-outline',
     label: 'Activity',
     description: 'Find people nearby to do something together.',
     href: '/create/activity',
-  },
-  {
-    id: 'event',
-    icon: 'calendar-outline',
-    label: 'Event',
-    description: 'Share something happening in the city.',
-    href: '/create/event',
   },
   {
     id: 'post',
@@ -45,8 +41,34 @@ const CREATE_OPTIONS: CreateOption[] = [
   },
 ];
 
+/**
+ * Event creation is Business-only (Step 30 core rule: Business = Personal
+ * + the ability to create Events). Personal accounts simply never see
+ * this option — no disabled "Coming soon" card, since it isn't a
+ * temporarily-missing feature, it's a real capability the account doesn't
+ * have. The real guarantee is firestore.rules' Event-create check, not
+ * this filter — see /create/event's own capability guard for what happens
+ * if a Personal account navigates there directly.
+ */
+const EVENT_OPTION: CreateOption = {
+  id: 'event',
+  icon: 'calendar-outline',
+  label: 'Event',
+  description: 'Share something happening in the city.',
+  href: '/create/event',
+};
+
 export default function CreateScreen() {
   const { homeCity, activeCity, isExploringAnotherCity } = useCity();
+  const { profile } = useProfile();
+
+  const createOptions = useMemo(() => {
+    const options = [...ALWAYS_AVAILABLE_OPTIONS];
+    if (canCreateEvent(profile)) {
+      options.splice(1, 0, EVENT_OPTION);
+    }
+    return options;
+  }, [profile]);
 
   return (
     <SafeAreaView style={styles.safeArea}>
@@ -63,7 +85,7 @@ export default function CreateScreen() {
         ) : null}
 
         <View style={styles.list}>
-          {CREATE_OPTIONS.map((option) => (
+          {createOptions.map((option) => (
             <Pressable
               key={option.id}
               style={({ pressed }) => [styles.option, pressed && option.href && styles.optionPressed]}

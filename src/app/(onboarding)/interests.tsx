@@ -46,6 +46,11 @@ export default function InterestsScreen() {
     const result = await createInitialUserProfile({
       uid: user.uid,
       email: user.email ?? '',
+      // Chosen on the first onboarding screen (Step 30) — falls back to
+      // 'personal' only if the in-memory draft was somehow lost (e.g. the
+      // app was killed mid-onboarding and this screen was reached without
+      // walking through the earlier steps again), never left null.
+      accountType: draft.accountType ?? 'personal',
       displayName: draft.displayName,
       username: draft.username,
       cityName: draft.cityName,
@@ -71,7 +76,7 @@ export default function InterestsScreen() {
 
     if (result.error === 'username-taken') {
       setError('That username was just taken by someone else. Choose another to continue.');
-      router.replace('/');
+      router.replace('/name');
       return;
     }
 
@@ -81,7 +86,7 @@ export default function InterestsScreen() {
   return (
     <SafeAreaView style={styles.safeArea}>
       <View style={styles.content}>
-        <OnboardingProgress step={3} total={3} />
+        <OnboardingProgress step={4} total={4} />
 
         <View style={styles.header}>
           <Text style={styles.title}>What are you into?</Text>

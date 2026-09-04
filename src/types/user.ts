@@ -1,6 +1,13 @@
 import type { Timestamp } from 'firebase/firestore';
 
-export type AccountType = 'personal';
+/**
+ * Step 30 — Around Me supports two account types from signup, deliberately
+ * almost identical: `business` is `personal` plus the ability to create
+ * Events (see canCreateEvent in src/utils/accountCapabilities.ts). No
+ * separate business application, verification, subscription, or dashboard
+ * exists — see README "Personal and Business accounts".
+ */
+export type AccountType = 'personal' | 'business';
 
 /** users/{uid} — private to its owner. */
 export type UserProfile = {

@@ -13,9 +13,11 @@ import { LoadingState } from '@/components/LoadingState';
 import { Pill } from '@/components/Pill';
 import { SectionHeader } from '@/components/SectionHeader';
 import { Colors, Layout, Radius, Spacing, Typography } from '@/constants/theme';
+import { useProfile } from '@/hooks/useProfile';
 import { useCity } from '@/providers/CityProvider';
 import { fetchDiscoverySections, type DiscoverySections } from '@/services/content';
 import type { ActivityContent, EventContent } from '@/types/content';
+import { canCreateEvent } from '@/utils/accountCapabilities';
 import { getWeekendWindow } from '@/utils/dateWindows';
 
 type LoadStatus = 'loading' | 'loaded' | 'error';
@@ -41,6 +43,8 @@ const SECTION_LIMIT = 15;
  */
 export default function EventsScreen() {
   const { activeCity, homeCity, isExploringAnotherCity, isReady: isCityReady } = useCity();
+  const { profile } = useProfile();
+  const canCreateEventHere = canCreateEvent(profile);
   const [status, setStatus] = useState<LoadStatus>('loading');
   const [sections, setSections] = useState<DiscoverySections | null>(null);
   const [typeFilter, setTypeFilter] = useState<EventTypeFilter>('all');
@@ -151,13 +155,20 @@ export default function EventsScreen() {
                   body="Explore another city or check back later."
                   action={<Button label="Explore another city" variant="secondary" onPress={() => router.push('/cities')} />}
                 />
-              ) : (
+              ) : canCreateEventHere ? (
                 <EmptyState
                   icon="calendar-outline"
                   title={`No upcoming events in ${cityLabel} yet.`}
                   body="Know something happening? Create an event."
                   action={<Button label="Create event" onPress={() => router.push('/create/event')} />}
                 />
+              ) : (
+                // Event creation is Business-only (Step 30) — Personal
+                // accounts get an honest empty state with no CTA into a
+                // creation form they can't use, rather than a disabled
+                // button or an "Upgrade to Business" prompt that implies a
+                // conversion flow that doesn't exist yet.
+                <EmptyState icon="calendar-outline" title={`No upcoming events in ${cityLabel} yet.`} body="Check back later." />
               )}
             </View>
           ) : totalFilteredItems === 0 ? (
@@ -212,7 +223,7 @@ export default function EventsScreen() {
             </>
           )}
 
-          {status === 'loaded' && totalRealItems > 0 ? (
+          {status === 'loaded' && totalRealItems > 0 && canCreateEventHere ? (
             <View style={styles.createFooter}>
               <Button
                 label={canCreateHere ? 'Create event' : `Create in ${homeCity?.cityName ?? 'your home city'}`}
