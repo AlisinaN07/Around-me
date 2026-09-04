@@ -384,6 +384,29 @@ No Saved/bookmark icon (no Saved backend exists), no invented attendee counts, n
 
 The product direction is for Events to eventually be published primarily by companies/venues/organizers/clubs rather than personal accounts — `content/{contentId}`'s existing author-snapshot pattern doesn't block a future `business`/`organizer` account type from publishing the same way a personal account does today, but no such account type, verification badge, or onboarding flow exists yet.
 
+## Event card interaction state (Step 26.1)
+
+The Step 26 discovery cards' Interested/Going/Join buttons never fetch the viewer's prior response/participation, so on a fresh load they render outlined/unfilled regardless of what the viewer actually responded previously — Step 26.1 investigated replacing that with a real, batched, N+1-free read and concluded it isn't achievable in this Firebase project without a schema change.
+
+### What was tried
+
+`content/{contentId}/responses/{uid}` and `content/{contentId}/participants/{uid}` both already carry a `uid` field, so a single `collectionGroup('responses'|'participants').where('uid','==', viewerUid)` query per screen visit could in principle return the viewer's own state for every currently-displayed card at once — one query total, not one read per card. Firestore's existing `allow read` rules for both subcollections don't restrict by `uid`, so no rules change looked necessary at first (`get()`-checking only the parent Event/Activity's `type`/`status`, same for every reader).
+
+### What was found
+
+Empirically, every `collectionGroup()` read attempt against this production project returned `permission-denied`, including:
+- The intended query (`collectionGroup('responses').where('uid','==', viewer)`).
+- The same query with no `where` clause at all.
+- A `collectionGroup` query against a *different*, top-level collection (`publicProfiles`) with a trivially permissive rule (`allow read: if isSignedIn()`, no `get()` at all) — the exact same rule that lets a plain `collection()` query on that same collection succeed immediately.
+
+That last test isolates the cause to the query TYPE (`collectionGroup`), not this project's specific rule content for `responses`/`participants`, not a missing index (a bare, filterless, unordered `collectionGroup` query needs none), and not rules-deploy propagation delay (retested after redeploying and waiting). An `isOwner(uid)`-based rule addition (self-contained, no `get()`) was also tried as a more Firestore-friendly rule shape for list safety-checking and made no difference. Enabling collection-group scope for the `uid` field via `firestore.indexes.json`'s `fieldOverrides` (confirmed live via `firebase firestore:indexes`) also made no difference.
+
+### Decision
+
+Collection-group querying is not usable in this project for this purpose without further platform-level investigation outside this step's scope. The only architecture that would deliver real batched state without collection-group queries is denormalizing membership directly onto `content/{contentId}` (e.g. a `respondedUids`/`goingUids`/`joinedUids` field, updated atomically alongside the existing subcollection writes) so the check becomes free — it comes for free with the discovery fetch already happening. That requires a schema change and new write-path invariants, which this step was explicitly told not to do, so it's documented here as **future architecture, not built now**, for the owner to decide on explicitly.
+
+All rules/index changes made while investigating this were reverted before finishing — production `firestore.rules`/`firestore.indexes.json` are byte-identical to before this step. `EventActionButtons` therefore keeps its Step 26 design and doc comment (now noting this investigation): actionable, never claiming a false "not selected"/"not joined" state, showing only what the viewer taps within the current session — the "state-neutral" fallback the Step 26.1 spec itself sanctioned for exactly this outcome.
+
 ## Reels (Cloud Storage — Step 18)
 
 Reels are short (≤60s), video-only posts with vertical, city-scoped playback — the first feature in this app to use Cloud Storage rather than Firestore alone. They live in their own root collection, `reels/{reelId}`, separate from `content/{contentId}` (posts/activities/events): a Reel has a media-upload lifecycle and Storage metadata that the other content types never had, and folding it into `content` would have meant giving every Post/Activity/Event query an upload-status field it never needs.

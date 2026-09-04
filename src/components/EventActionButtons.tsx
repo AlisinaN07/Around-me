@@ -30,6 +30,23 @@ type EventActionButtonsProps = {
  * selected/joined state and real counts still live on the detail screen
  * (EventDetail/ActivityDetail), which already fetches them once per visit,
  * not once per card.
+ *
+ * Step 26.1 investigated replacing this with a real batched read — one
+ * `collectionGroup('responses'|'participants').where('uid','==', viewer)`
+ * query per screen visit covering every displayed card at once, using the
+ * `uid` field each of those subcollection documents already carries.
+ * Empirically confirmed against production (see README "Event card
+ * interaction state" section) that collectionGroup query requests are
+ * denied outright in this Firebase project regardless of rule content —
+ * reproduced even with a trivial, get()-free rule on an unrelated
+ * top-level collection, so it isn't specific to these two subcollections
+ * or their get()-based ownership checks. No rules or index change makes
+ * this viable without a schema change (denormalizing membership onto
+ * `content/{contentId}` itself), which Step 26.1 was explicitly told not
+ * to do. The buttons below stay outlined/unfilled — never a confident
+ * "not selected"/"not joined" claim, just an actionable default — until
+ * the viewer taps one this session, exactly the "state-neutral" fallback
+ * the Step 26.1 spec sanctioned for this scenario.
  */
 export function EventActionButtons({ item, direction = 'row', compact = false }: EventActionButtonsProps) {
   const { user } = useAuth();
