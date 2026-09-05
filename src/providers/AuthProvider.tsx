@@ -1,6 +1,9 @@
 import {
   createUserWithEmailAndPassword,
+  deleteUser,
+  EmailAuthProvider,
   onAuthStateChanged,
+  reauthenticateWithCredential,
   sendPasswordResetEmail,
   signInWithEmailAndPassword,
   signOut as firebaseSignOut,
@@ -25,6 +28,21 @@ type AuthContextValue = {
    * other caller keeps using getAuthErrorMessage() the normal way.
    */
   resetPassword: (email: string) => Promise<void>;
+  /**
+   * Step 34.3 — required immediately before account deletion. Throws the
+   * raw Firebase error (not wrapped) so the Delete Account screen can
+   * distinguish a wrong password from a network problem and react
+   * differently to each; never logs or persists the password itself.
+   */
+  reauthenticateWithPassword: (password: string) => Promise<void>;
+  /**
+   * Step 34.3 — deletes the Firebase Auth user itself. Must only ever be
+   * called AFTER the trusted backend (deleteMyAccountData) has already
+   * completed and immediately after a successful reauthentication, so
+   * Firebase's "recent login" requirement is satisfied — see
+   * src/components/DeleteAccountFlow.tsx for the enforced ordering.
+   */
+  deleteCurrentUser: () => Promise<void>;
 };
 
 const AuthContext = createContext<AuthContextValue | undefined>(undefined);
@@ -83,6 +101,19 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           throw new Error('Firebase Auth is not available.');
         }
         await sendPasswordResetEmail(auth, email);
+      },
+      reauthenticateWithPassword: async (password) => {
+        if (!auth || !auth.currentUser || !auth.currentUser.email) {
+          throw new Error('No authenticated user with an email is available.');
+        }
+        const credential = EmailAuthProvider.credential(auth.currentUser.email, password);
+        await reauthenticateWithCredential(auth.currentUser, credential);
+      },
+      deleteCurrentUser: async () => {
+        if (!auth || !auth.currentUser) {
+          throw new Error('No authenticated user is available.');
+        }
+        await deleteUser(auth.currentUser);
       },
     }),
     [user, isLoading]

@@ -1,11 +1,26 @@
 import { router } from 'expo-router';
+import { useEffect, useState } from 'react';
 import { StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { Button } from '@/components/Button';
-import { Colors, Spacing } from '@/constants/theme';
+import { Colors, Radius, Spacing } from '@/constants/theme';
+import { consumePostDeletionNotice } from '@/utils/postDeletionNotice';
 
 export default function WelcomeScreen() {
+  const [showDeletedNotice, setShowDeletedNotice] = useState(false);
+
+  useEffect(() => {
+    // One-shot — set right before the final Auth-deletion call in
+    // DeleteAccountFlow. This welcome screen (not Login) is what
+    // expo-router actually lands on once the (auth) group's stack resets
+    // after a session ends, so the notice is consumed (read + cleared)
+    // here rather than on Login, which never remounts in that transition.
+    consumePostDeletionNotice().then((wasSet) => {
+      if (wasSet) setShowDeletedNotice(true);
+    });
+  }, []);
+
   return (
     <SafeAreaView style={styles.safeArea}>
       <View style={styles.content}>
@@ -13,6 +28,12 @@ export default function WelcomeScreen() {
           <Text style={styles.title}>Around Me</Text>
           <Text style={styles.tagline}>See what&apos;s happening around you, right now.</Text>
         </View>
+
+        {showDeletedNotice ? (
+          <View style={styles.deletedNotice}>
+            <Text style={styles.deletedNoticeText}>Your account has been deleted.</Text>
+          </View>
+        ) : null}
 
         <View style={styles.actions}>
           <Button label="Get started" onPress={() => router.push('/signup')} />
@@ -59,5 +80,18 @@ const styles = StyleSheet.create({
     fontSize: 12,
     textAlign: 'center',
     marginTop: Spacing.xs,
+  },
+  deletedNotice: {
+    borderRadius: Radius.md,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    backgroundColor: Colors.surface,
+    padding: Spacing.md,
+    marginBottom: Spacing.md,
+  },
+  deletedNoticeText: {
+    color: Colors.textSecondary,
+    fontSize: 13,
+    textAlign: 'center',
   },
 });

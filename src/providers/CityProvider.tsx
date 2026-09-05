@@ -36,6 +36,11 @@ function storageKeyForUid(uid: string): string {
   return `aroundme.activeCity.${uid}`;
 }
 
+/** Removes one uid's stored Active City preference — used by account deletion to clean up exactly the deleted user's local state, never anyone else's. */
+export async function clearStoredActiveCityForUid(uid: string): Promise<void> {
+  await AsyncStorage.removeItem(storageKeyForUid(uid));
+}
+
 type CityContextValue = {
   /** The user's permanent profile city, or null before their profile has loaded. */
   homeCity: City | null;

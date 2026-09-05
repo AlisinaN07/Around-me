@@ -166,9 +166,21 @@ export default function ChatScreen() {
               </Text>
             </View>
           </Pressable>
+        ) : profileStatus === 'error' ? (
+          // No publicProfile for this uid overwhelmingly means the account
+          // was deleted (see README "Account deletion — DM retention") —
+          // this conversation is retained by locked policy, so it must
+          // still render safely rather than crash, and there's no real
+          // profile left to navigate to.
+          <View style={styles.headerIdentity}>
+            <Avatar name="Deleted user" size={32} />
+            <Text style={styles.headerName} numberOfLines={1}>
+              Deleted user
+            </Text>
+          </View>
         ) : (
           <View style={styles.headerIdentity}>
-            <Text style={styles.headerName}>{profileStatus === 'error' ? "Couldn't load profile" : 'Loading…'}</Text>
+            <Text style={styles.headerName}>Loading…</Text>
           </View>
         )}
         <Pressable
@@ -233,6 +245,14 @@ export default function ChatScreen() {
           <View style={styles.blockedBar}>
             <Text style={styles.blockedBarText}>You blocked this user.</Text>
             <Button label="Unblock" variant="secondary" onPress={handleUnblock} loading={isBlockSubmitting} />
+          </View>
+        ) : profileStatus === 'error' ? (
+          // Retained conversation whose other participant's account was
+          // deleted — messaging can never succeed (sendMessage itself
+          // requires the target's publicProfile to exist), so the composer
+          // is replaced rather than left inviting a doomed send attempt.
+          <View style={styles.blockedBar}>
+            <Text style={styles.blockedBarText}>This person&apos;s account has been deleted. You can&apos;t send new messages here.</Text>
           </View>
         ) : (
           <View style={styles.composerRow}>

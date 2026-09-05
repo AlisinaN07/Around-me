@@ -16,7 +16,11 @@ type ConversationRowProps = {
 /** A single Messages row — avatar, name, last-message preview, time, unread badge. */
 export function ConversationRow({ conversation, otherProfile, unreadCount, onPress }: ConversationRowProps) {
   const isUnread = unreadCount > 0;
-  const displayName = otherProfile?.displayName ?? 'Unknown user';
+  // A missing publicProfile now overwhelmingly means the account was
+  // deleted (see README "Account deletion — DM retention") — conversations
+  // and messages are retained by locked policy, so this row must render
+  // safely rather than crash or show a blank name.
+  const displayName = otherProfile?.displayName ?? 'Deleted user';
 
   return (
     <Pressable

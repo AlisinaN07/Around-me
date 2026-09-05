@@ -3,7 +3,7 @@ import { ActivityIndicator, Pressable, StyleSheet, Text } from 'react-native';
 
 import { Colors, ControlHeight, Gradients, Radius, Spacing, Typography } from '@/constants/theme';
 
-type ButtonVariant = 'primary' | 'secondary';
+type ButtonVariant = 'primary' | 'secondary' | 'destructive';
 
 type ButtonProps = {
   label: string;
@@ -22,9 +22,9 @@ export function Button({ label, onPress, variant = 'primary', loading = false, d
   const isDisabled = disabled || loading;
 
   const content = loading ? (
-    <ActivityIndicator color={variant === 'primary' ? Colors.text : Colors.text} />
+    <ActivityIndicator color={Colors.text} />
   ) : (
-    <Text style={variant === 'primary' ? styles.primaryLabel : styles.secondaryLabel}>{label}</Text>
+    <Text style={variant === 'secondary' ? styles.secondaryLabel : styles.primaryLabel}>{label}</Text>
   );
 
   if (variant === 'secondary') {
@@ -35,6 +35,20 @@ export function Button({ label, onPress, variant = 'primary', loading = false, d
         accessibilityRole="button"
         accessibilityState={{ disabled: isDisabled, busy: loading }}
         style={({ pressed }) => [styles.base, styles.secondary, pressed && !isDisabled && styles.pressed, isDisabled && styles.disabled]}
+      >
+        {content}
+      </Pressable>
+    );
+  }
+
+  if (variant === 'destructive') {
+    return (
+      <Pressable
+        onPress={onPress}
+        disabled={isDisabled}
+        accessibilityRole="button"
+        accessibilityState={{ disabled: isDisabled, busy: loading }}
+        style={({ pressed }) => [styles.base, styles.destructive, pressed && !isDisabled && styles.pressed, isDisabled && styles.disabled]}
       >
         {content}
       </Pressable>
@@ -74,6 +88,9 @@ const styles = StyleSheet.create({
     backgroundColor: 'transparent',
     borderWidth: 1,
     borderColor: Colors.border,
+  },
+  destructive: {
+    backgroundColor: Colors.error,
   },
   pressed: {
     opacity: 0.85,

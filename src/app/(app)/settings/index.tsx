@@ -69,6 +69,12 @@ export default function SettingsScreen() {
         <View style={styles.container}>
           <SettingsSection title="Account">
             <SettingsRow icon="person-outline" label="Edit profile" onPress={() => router.push('/profile/edit')} />
+            <SettingsRow
+              icon="trash-outline"
+              label="Delete account"
+              onPress={() => router.push('/settings/delete-account')}
+              destructive
+            />
           </SettingsSection>
 
           <SettingsSection title="Privacy">

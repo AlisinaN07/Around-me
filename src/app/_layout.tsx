@@ -13,6 +13,7 @@ import { useProfile } from '@/hooks/useProfile';
 import { AuthProvider } from '@/providers/AuthProvider';
 import { CityProvider } from '@/providers/CityProvider';
 import { ProfileProvider } from '@/providers/ProfileProvider';
+import { isDeletionPending } from '@/utils/deletionPending';
 
 SystemUI.setBackgroundColorAsync(Colors.background);
 SplashScreen.preventAutoHideAsync();
@@ -31,10 +32,35 @@ export default function RootLayout() {
 }
 
 function RootNavigator() {
-  const { isLoading: isAuthLoading, isAuthenticated } = useAuth();
+  const { isLoading: isAuthLoading, isAuthenticated, user } = useAuth();
   const { isProfileLoading, hasCompletedOnboarding, profileError, refreshProfile } = useProfile();
 
-  const isWaitingOnSession = isAuthLoading || (isAuthenticated && isProfileLoading);
+  // Local-only (see src/utils/deletionPending.ts) — checked before the
+  // onboarding guard below so a mid-account-deletion state (Auth still
+  // signed in, users/{uid} already removed) can never be misread as "needs
+  // onboarding" and routed there. Not a security boundary: the deletion
+  // backend itself only ever trusts request.auth.uid.
+  const [deletionPendingStatus, setDeletionPendingStatus] = useState<'checking' | 'pending' | 'clear'>('checking');
+
+  useEffect(() => {
+    if (!isAuthenticated || !user) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setDeletionPendingStatus('clear');
+      return;
+    }
+    let cancelled = false;
+    setDeletionPendingStatus('checking');
+    isDeletionPending(user.uid).then((pending) => {
+      if (!cancelled) setDeletionPendingStatus(pending ? 'pending' : 'clear');
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [isAuthenticated, user]);
+
+  const isDeletionPendingForCurrentUser = deletionPendingStatus === 'pending';
+  const isWaitingOnSession =
+    isAuthLoading || (isAuthenticated && (isProfileLoading || deletionPendingStatus === 'checking'));
 
   useEffect(() => {
     if (!isWaitingOnSession) {
@@ -48,7 +74,7 @@ function RootNavigator() {
     return null;
   }
 
-  if (isAuthenticated && profileError) {
+  if (isAuthenticated && !isDeletionPendingForCurrentUser && profileError) {
     return <ProfileErrorScreen message={profileError} onRetry={refreshProfile} />;
   }
 
@@ -62,10 +88,13 @@ function RootNavigator() {
       <Stack.Protected guard={!isAuthenticated}>
         <Stack.Screen name="(auth)" />
       </Stack.Protected>
-      <Stack.Protected guard={isAuthenticated && hasCompletedOnboarding}>
+      <Stack.Protected guard={isAuthenticated && isDeletionPendingForCurrentUser}>
+        <Stack.Screen name="deletion-recovery" />
+      </Stack.Protected>
+      <Stack.Protected guard={isAuthenticated && !isDeletionPendingForCurrentUser && hasCompletedOnboarding}>
         <Stack.Screen name="(app)" />
       </Stack.Protected>
-      <Stack.Protected guard={isAuthenticated && !hasCompletedOnboarding}>
+      <Stack.Protected guard={isAuthenticated && !isDeletionPendingForCurrentUser && !hasCompletedOnboarding}>
         <Stack.Screen name="(onboarding)" />
       </Stack.Protected>
     </Stack>
