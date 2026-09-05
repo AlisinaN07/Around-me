@@ -9,10 +9,9 @@ import { OnboardingProgress } from '@/components/OnboardingProgress';
 import { Colors, Spacing } from '@/constants/theme';
 import { useOnboardingDraft } from '@/providers/OnboardingDraftProvider';
 import { checkUsernameAvailability } from '@/services/userProfile';
+import { DISPLAY_NAME_MAX_LENGTH as MAX_NAME_LENGTH, DISPLAY_NAME_MIN_LENGTH as MIN_NAME_LENGTH } from '@/types/user';
 import { normalizeUsername } from '@/utils/username';
 
-const MIN_NAME_LENGTH = 2;
-const MAX_NAME_LENGTH = 50;
 const AVAILABILITY_DEBOUNCE_MS = 600;
 
 type CheckResult = { username: string; status: 'available' | 'taken'; reason?: string };

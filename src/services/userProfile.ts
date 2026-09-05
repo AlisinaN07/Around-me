@@ -6,7 +6,15 @@
 import { doc, getDoc, runTransaction, serverTimestamp, type WithFieldValue } from 'firebase/firestore';
 
 import type { PublicProfile } from '@/types/social';
-import type { AccountType, UserProfile, UsernameReservation } from '@/types/user';
+import {
+  BIO_MAX_LENGTH,
+  DISPLAY_NAME_MAX_LENGTH,
+  DISPLAY_NAME_MIN_LENGTH,
+  type AccountType,
+  type UserProfile,
+  type UsernameReservation,
+} from '@/types/user';
+import { MAX_INTERESTS, MIN_INTERESTS } from '@/constants/interests';
 import { buildCityKey } from '@/utils/cityKey';
 import { normalizeUsername } from '@/utils/username';
 
@@ -50,13 +58,19 @@ class ProfileTransactionError extends Error {
   }
 }
 
-/** Reads the caller's own profile. Returns null if it doesn't exist yet. */
+/**
+ * Reads the caller's own profile. Returns null if it doesn't exist yet.
+ * Normalizes a missing `bio` (accounts created before Step 33) to '' —
+ * every call site can treat profile.bio as always a real string.
+ */
 export async function fetchUserProfile(uid: string): Promise<UserProfile | null> {
   if (!firestore) {
     return null;
   }
   const snapshot = await getDoc(doc(firestore, USERS_COLLECTION, uid));
-  return snapshot.exists() ? (snapshot.data() as UserProfile) : null;
+  if (!snapshot.exists()) return null;
+  const data = snapshot.data() as UserProfile;
+  return { ...data, bio: data.bio ?? '' };
 }
 
 /** Lightweight existence check — does not reserve the username. */
@@ -136,6 +150,10 @@ export async function createInitialUserProfile(
         countryCode,
         cityKey,
         interests: input.interests,
+        // Step 33 — canonical empty-string representation, never omitted
+        // and never null. Onboarding itself doesn't collect a bio yet
+        // (Edit Profile is the only place that sets a real one).
+        bio: '',
         accountType: input.accountType,
         onboardingCompleted: true,
         createdAt: serverTimestamp(),
@@ -155,6 +173,7 @@ export async function createInitialUserProfile(
         countryCode,
         cityKey,
         interests: input.interests,
+        bio: '',
         accountType: input.accountType,
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
@@ -172,6 +191,143 @@ export async function createInitialUserProfile(
   const profile = await fetchUserProfile(input.uid);
   if (!profile) {
     return { ok: false, error: 'unknown', message: 'Profile was created but could not be read back.' };
+  }
+  return { ok: true, profile };
+}
+
+export type UpdateProfileInput = {
+  uid: string;
+  displayName: string;
+  username: string;
+  bio: string;
+  interests: string[];
+};
+
+export type UpdateProfileError =
+  | 'not-configured'
+  | 'no-profile'
+  | 'invalid-display-name'
+  | 'invalid-username'
+  | 'username-taken'
+  | 'invalid-bio'
+  | 'invalid-interests'
+  | 'unknown';
+
+export type UpdateProfileResult =
+  | { ok: true; profile: UserProfile }
+  | { ok: false; error: UpdateProfileError; message: string };
+
+class UpdateProfileTransactionError extends Error {
+  constructor(public code: 'no-profile' | 'username-taken') {
+    super(code);
+  }
+}
+
+/**
+ * Step 33 — Edit Profile. Atomically updates displayName/username/bio/
+ * interests on both users/{uid} and publicProfiles/{uid}, and — only when
+ * the normalized username actually changes — reserves the new
+ * usernames/{newUsernameLower} doc and releases the old one, all in the
+ * same transaction. Never touches email/cityName/countryCode/cityKey/
+ * accountType/onboardingCompleted/createdAt (firestore.rules independently
+ * enforces the same immutability — this is defense in depth, not the only
+ * guarantee).
+ */
+export async function updateMyProfile(input: UpdateProfileInput): Promise<UpdateProfileResult> {
+  if (!firestore) {
+    return { ok: false, error: 'not-configured', message: 'Firestore is not available.' };
+  }
+  // Narrowed local binding — TypeScript's null-check on the module-level
+  // `firestore` doesn't carry into the transaction callback closure below.
+  const db = firestore;
+
+  const trimmedDisplayName = input.displayName.trim();
+  if (trimmedDisplayName.length < DISPLAY_NAME_MIN_LENGTH || trimmedDisplayName.length > DISPLAY_NAME_MAX_LENGTH) {
+    return {
+      ok: false,
+      error: 'invalid-display-name',
+      message: `Enter a name between ${DISPLAY_NAME_MIN_LENGTH} and ${DISPLAY_NAME_MAX_LENGTH} characters.`,
+    };
+  }
+
+  const normalizedUsername = normalizeUsername(input.username);
+  if (!normalizedUsername.valid) {
+    return { ok: false, error: 'invalid-username', message: normalizedUsername.reason };
+  }
+
+  // Trimmed, not otherwise sanitized — plain text only, no HTML/link/
+  // hashtag parsing exists or is planned for bio (Step 33 Section 12).
+  const trimmedBio = input.bio.trim();
+  if (trimmedBio.length > BIO_MAX_LENGTH) {
+    return { ok: false, error: 'invalid-bio', message: `Bio must be ${BIO_MAX_LENGTH} characters or fewer.` };
+  }
+
+  if (input.interests.length < MIN_INTERESTS || input.interests.length > MAX_INTERESTS) {
+    return {
+      ok: false,
+      error: 'invalid-interests',
+      message: `Choose between ${MIN_INTERESTS} and ${MAX_INTERESTS} interests.`,
+    };
+  }
+
+  const userRef = doc(db, USERS_COLLECTION, input.uid);
+  const publicProfileRef = doc(db, PUBLIC_PROFILES_COLLECTION, input.uid);
+
+  try {
+    await runTransaction(db, async (transaction) => {
+      // All reads before any write, per Firestore transaction rules.
+      const userSnapshot = await transaction.get(userRef);
+      if (!userSnapshot.exists()) {
+        throw new UpdateProfileTransactionError('no-profile');
+      }
+      const current = userSnapshot.data() as UserProfile;
+
+      const usernameChanged = normalizedUsername.usernameLower !== current.usernameLower;
+      const newUsernameRef = usernameChanged
+        ? doc(db, USERNAMES_COLLECTION, normalizedUsername.usernameLower)
+        : null;
+
+      if (newUsernameRef) {
+        const newUsernameSnapshot = await transaction.get(newUsernameRef);
+        if (newUsernameSnapshot.exists()) {
+          throw new UpdateProfileTransactionError('username-taken');
+        }
+      }
+
+      const sharedUpdate = {
+        displayName: trimmedDisplayName,
+        username: normalizedUsername.username,
+        usernameLower: normalizedUsername.usernameLower,
+        bio: trimmedBio,
+        interests: input.interests,
+        updatedAt: serverTimestamp(),
+      };
+
+      transaction.update(userRef, sharedUpdate);
+      transaction.update(publicProfileRef, sharedUpdate);
+
+      // Reserve the new username and release the old one only when it's
+      // actually changing (Section 11) — keeping the same username never
+      // touches the usernames/{...} collection at all.
+      if (newUsernameRef) {
+        transaction.set(newUsernameRef, {
+          uid: input.uid,
+          createdAt: serverTimestamp(),
+        } satisfies WithFieldValue<UsernameReservation>);
+        transaction.delete(doc(db, USERNAMES_COLLECTION, current.usernameLower));
+      }
+    });
+  } catch (error) {
+    if (error instanceof UpdateProfileTransactionError) {
+      const message = error.code === 'no-profile' ? 'Profile not found.' : 'That username is already taken.';
+      return { ok: false, error: error.code, message };
+    }
+    return { ok: false, error: 'unknown', message: "Couldn't save your profile." };
+  }
+
+  const profile = await fetchUserProfile(input.uid);
+  if (!profile) {
+    return { ok: false, error: 'unknown', message: 'Profile was updated but could not be read back.' };
   }
   return { ok: true, profile };
 }

@@ -10,6 +10,8 @@ type ProfileHeaderProps = {
   displayName: string;
   username: string;
   cityLabel: string;
+  /** Real, optional free-text bio (Step 33) — rendered only when non-empty, never a placeholder like "Add a bio". */
+  bio?: string;
   /** Real, bounded profile content count — see the caller for its exact source/limit. */
   postsCount: number;
   followersCount: number;
@@ -21,17 +23,17 @@ type ProfileHeaderProps = {
 };
 
 /**
- * Shared identity block — avatar, name, username, city, Posts/Following/
- * Followers stats (Step 27). Used by both the own Profile tab and the
- * public profile route so they read as one visual system rather than two
- * (Step 27 Section 19). Deliberately carries no bio/likes-total/
- * verification-badge slot — none of that exists in the real schema yet
- * (see README "Profile v1" section).
+ * Shared identity block — avatar, name, username, city, bio, Posts/
+ * Following/Followers stats (Step 27, bio added Step 33). Used by both the
+ * own Profile tab and the public profile route so they read as one visual
+ * system rather than two (Step 27 Section 19). Deliberately carries no
+ * likes-total/verification-badge slot — neither exists in the real schema.
  */
 export function ProfileHeader({
   displayName,
   username,
   cityLabel,
+  bio,
   postsCount,
   followersCount,
   followingCount,
@@ -56,6 +58,11 @@ export function ProfileHeader({
             {cityLabel}
           </Text>
         </View>
+      ) : null}
+      {bio ? (
+        <Text style={styles.bio} numberOfLines={3}>
+          {bio}
+        </Text>
       ) : null}
 
       <View style={styles.statsRow}>
@@ -98,6 +105,14 @@ const styles = StyleSheet.create({
   locationText: {
     color: Colors.textSecondary,
     fontSize: 13,
+  },
+  bio: {
+    color: Colors.text,
+    fontSize: 13,
+    lineHeight: 18,
+    textAlign: 'center',
+    marginTop: Spacing.sm,
+    paddingHorizontal: Spacing.lg,
   },
   statsRow: {
     flexDirection: 'row',

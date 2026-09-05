@@ -16,13 +16,13 @@ import { NEW_MESSAGES_FROM_OPTIONS } from '@/types/privacy';
 type LoadStatus = 'loading' | 'loaded' | 'error';
 
 /**
- * Settings home (Step 27) — real rows only. There is deliberately no
- * Account section: the only candidate row (Edit profile) has no real
- * route/backend yet, and a dead row is worse than an absent one (see
- * README "Settings — real rows only"). No Notifications section (no
- * preference backend or push system exists) and no Content & Reels
- * section (no real per-account content preferences exist) — both
- * intentionally omitted rather than rendered as inert toggles.
+ * Settings home (Step 27; Account section added Step 33) — real rows only.
+ * Edit profile now has a real route/backend (src/app/(app)/profile/edit.tsx),
+ * so it's a real row, not a dead one (see README "Settings — real rows
+ * only"). No Notifications section (no preference backend or push system
+ * exists) and no Content & Reels section (no real per-account content
+ * preferences exist) — both intentionally omitted rather than rendered as
+ * inert toggles.
  */
 export default function SettingsScreen() {
   const { user, signOut } = useAuth();
@@ -67,6 +67,10 @@ export default function SettingsScreen() {
         <LoadingState size="large" />
       ) : (
         <View style={styles.container}>
+          <SettingsSection title="Account">
+            <SettingsRow icon="person-outline" label="Edit profile" onPress={() => router.push('/profile/edit')} />
+          </SettingsSection>
+
           <SettingsSection title="Privacy">
             <SettingsRow
               icon="chatbubble-outline"

@@ -19,6 +19,8 @@ export type PublicProfile = {
   countryCode: string;
   cityKey: string;
   interests: string[];
+  /** Mirrors users/{uid}.bio exactly — see types/user.ts. Always a string, never missing. */
+  bio: string;
   accountType: AccountType;
   createdAt: Timestamp;
   updatedAt: Timestamp;

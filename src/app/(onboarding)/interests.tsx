@@ -1,12 +1,13 @@
 import { router } from 'expo-router';
 import { useState } from 'react';
-import { Pressable, StyleSheet, Text, View } from 'react-native';
+import { StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { Button } from '@/components/Button';
+import { InterestSelector } from '@/components/InterestSelector';
 import { OnboardingProgress } from '@/components/OnboardingProgress';
-import { INTERESTS, MAX_INTERESTS, MIN_INTERESTS } from '@/constants/interests';
-import { Colors, Radius, Spacing } from '@/constants/theme';
+import { MIN_INTERESTS } from '@/constants/interests';
+import { Colors, Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
 import { useProfile } from '@/hooks/useProfile';
 import { useOnboardingDraft } from '@/providers/OnboardingDraftProvider';
@@ -19,18 +20,6 @@ export default function InterestsScreen() {
   const [selected, setSelected] = useState<string[]>(draft.interests);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-
-  const toggle = (id: string) => {
-    setSelected((prev) => {
-      if (prev.includes(id)) {
-        return prev.filter((item) => item !== id);
-      }
-      if (prev.length >= MAX_INTERESTS) {
-        return prev;
-      }
-      return [...prev, id];
-    });
-  };
 
   const canContinue = selected.length >= MIN_INTERESTS && !isSubmitting;
 
@@ -95,23 +84,7 @@ export default function InterestsScreen() {
           </Text>
         </View>
 
-        <View style={styles.grid}>
-          {INTERESTS.map((interest) => {
-            const isSelected = selected.includes(interest.id);
-            return (
-              <Pressable
-                key={interest.id}
-                onPress={() => toggle(interest.id)}
-                style={[styles.chip, isSelected && styles.chipSelected]}
-                accessibilityRole="button"
-                accessibilityState={{ selected: isSelected }}
-              >
-                <Text style={styles.chipEmoji}>{interest.emoji}</Text>
-                <Text style={[styles.chipLabel, isSelected && styles.chipLabelSelected]}>{interest.label}</Text>
-              </Pressable>
-            );
-          })}
-        </View>
+        <InterestSelector value={selected} onChange={setSelected} />
 
         {error ? <Text style={styles.error}>{error}</Text> : null}
 
@@ -145,37 +118,6 @@ const styles = StyleSheet.create({
     color: Colors.textSecondary,
     fontSize: 15,
     lineHeight: 21,
-  },
-  grid: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: Spacing.sm,
-  },
-  chip: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: Spacing.xs,
-    borderWidth: 1,
-    borderColor: Colors.border,
-    borderRadius: Radius.full,
-    backgroundColor: Colors.surface,
-    paddingHorizontal: Spacing.md,
-    paddingVertical: Spacing.sm,
-  },
-  chipSelected: {
-    borderColor: Colors.accent,
-    backgroundColor: Colors.accent,
-  },
-  chipEmoji: {
-    fontSize: 16,
-  },
-  chipLabel: {
-    color: Colors.text,
-    fontSize: 14,
-    fontWeight: '600',
-  },
-  chipLabelSelected: {
-    color: Colors.background,
   },
   error: {
     color: Colors.error,

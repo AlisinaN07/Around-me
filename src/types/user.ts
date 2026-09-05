@@ -9,6 +9,18 @@ import type { Timestamp } from 'firebase/firestore';
  */
 export type AccountType = 'personal' | 'business';
 
+/** Same bounds used at onboarding (src/app/(onboarding)/name.tsx) and Edit Profile (Step 33) — one shared rule, not two. */
+export const DISPLAY_NAME_MIN_LENGTH = 2;
+export const DISPLAY_NAME_MAX_LENGTH = 50;
+
+/**
+ * Step 33 — optional free-text bio. Always stored as a string, never null/
+ * undefined: existing accounts created before this field existed simply
+ * have it read back as '' (see fetchUserProfile/fetchPublicProfile), never
+ * a missing key that call sites have to special-case.
+ */
+export const BIO_MAX_LENGTH = 160;
+
 /** users/{uid} — private to its owner. */
 export type UserProfile = {
   uid: string;
@@ -23,6 +35,8 @@ export type UserProfile = {
   /** Normalized "{countryCode}:{cityName}" key used for city-based filtering. */
   cityKey: string;
   interests: string[];
+  /** Optional, plain text only — no links/hashtags system. See BIO_MAX_LENGTH. */
+  bio: string;
   accountType: AccountType;
   onboardingCompleted: boolean;
   createdAt: Timestamp;

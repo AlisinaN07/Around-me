@@ -1,6 +1,7 @@
 import {
   createUserWithEmailAndPassword,
   onAuthStateChanged,
+  sendPasswordResetEmail,
   signInWithEmailAndPassword,
   signOut as firebaseSignOut,
   type User,
@@ -17,6 +18,13 @@ type AuthContextValue = {
   signUp: (email: string, password: string) => Promise<void>;
   signIn: (email: string, password: string) => Promise<void>;
   signOut: () => Promise<void>;
+  /**
+   * Step 33 — deliberately throws the raw Firebase error (not wrapped into
+   * a friendly message here) so the Forgot Password screen can special-
+   * case `auth/user-not-found` for enumeration safety (Section 29) — every
+   * other caller keeps using getAuthErrorMessage() the normal way.
+   */
+  resetPassword: (email: string) => Promise<void>;
 };
 
 const AuthContext = createContext<AuthContextValue | undefined>(undefined);
@@ -69,6 +77,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           return;
         }
         await firebaseSignOut(auth);
+      },
+      resetPassword: async (email) => {
+        if (!auth) {
+          throw new Error('Firebase Auth is not available.');
+        }
+        await sendPasswordResetEmail(auth, email);
       },
     }),
     [user, isLoading]

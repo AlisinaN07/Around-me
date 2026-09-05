@@ -54,6 +54,7 @@ function validUserProfile(uid, usernameLower) {
     countryCode: 'SE',
     cityKey: 'se:karlstad',
     interests: ['music'],
+    bio: '',
     accountType: 'personal',
     onboardingCompleted: true,
     createdAt: serverTimestamp(),
@@ -167,6 +168,7 @@ function validPublicProfile(uid, displayName, username, overrides = {}) {
     countryCode: 'SE',
     cityKey: 'se:karlstad',
     interests: ['music'],
+    bio: '',
     accountType: 'personal',
     createdAt: serverTimestamp(),
     updatedAt: serverTimestamp(),
@@ -1237,7 +1239,12 @@ async function main() {
     });
 
     await check('DENY: public profile includes an arbitrary extra field', async () => {
-      await assertFails(setDoc(doc(bob, 'publicProfiles', 'bob'), { ...validPublicProfile('bob', 'Bob Bobsson', 'bob_handle'), bio: 'hello' }));
+      // 'bio' itself is a real schema field as of Step 33 — use a name that
+      // is still genuinely not part of the schema to keep testing what
+      // this check is actually for (rejecting unexpected keys).
+      await assertFails(
+        setDoc(doc(bob, 'publicProfiles', 'bob'), { ...validPublicProfile('bob', 'Bob Bobsson', 'bob_handle'), verified: true })
+      );
     });
 
     await check('ALLOW: second user creates own matching public profile (setup for follows)', async () => {
@@ -1254,6 +1261,162 @@ async function main() {
 
     await check('DENY: delete a public profile', async () => {
       await assertFails(deleteDoc(doc(alice, 'publicProfiles', 'alice')));
+    });
+
+    // =========================================================================
+    // Edit Profile (Step 33) — users/{uid} + publicProfiles/{uid} updates,
+    // and the paired usernames/{...} reservation swap on a real rename.
+    // Alice is Business, Bob is Personal (both already exist from the
+    // content/publicProfiles sections above); Carol's existing
+    // 'carol_handle' is the target for the username-theft test below.
+    // =========================================================================
+    await check('ALLOW: owner changes displayName, bio, and interests together', async () => {
+      const sharedUpdate = {
+        displayName: 'Alice Updated',
+        username: 'alice_handle',
+        usernameLower: 'alice_handle',
+        bio: 'Hello, this is my bio.',
+        interests: ['music', 'sports', 'food'],
+        updatedAt: serverTimestamp(),
+      };
+      await assertSucceeds(
+        runTransaction(alice, async (tx) => {
+          tx.update(doc(alice, 'users', 'alice'), sharedUpdate);
+          tx.update(doc(alice, 'publicProfiles', 'alice'), sharedUpdate);
+        })
+      );
+      const savedUser = await getDoc(doc(alice, 'users', 'alice'));
+      const savedPublic = await getDoc(doc(alice, 'publicProfiles', 'alice'));
+      assert.equal(savedUser.data().displayName, 'Alice Updated');
+      assert.equal(savedUser.data().bio, 'Hello, this is my bio.');
+      assert.deepEqual(savedUser.data().interests, ['music', 'sports', 'food']);
+      assert.equal(savedPublic.data().displayName, 'Alice Updated');
+      assert.equal(savedPublic.data().bio, 'Hello, this is my bio.');
+    });
+
+    await check('ALLOW: valid username-change transaction (reserve new, release old, update both docs)', async () => {
+      const sharedUpdate = {
+        displayName: 'Alice Updated',
+        username: 'alice_new_handle',
+        usernameLower: 'alice_new_handle',
+        bio: 'Hello, this is my bio.',
+        interests: ['music', 'sports', 'food'],
+        updatedAt: serverTimestamp(),
+      };
+      await assertSucceeds(
+        runTransaction(alice, async (tx) => {
+          await Promise.all([tx.get(doc(alice, 'usernames', 'alice_new_handle'))]);
+          tx.update(doc(alice, 'users', 'alice'), sharedUpdate);
+          tx.update(doc(alice, 'publicProfiles', 'alice'), sharedUpdate);
+          tx.set(doc(alice, 'usernames', 'alice_new_handle'), usernameReservation('alice'));
+          tx.delete(doc(alice, 'usernames', 'alice_handle'));
+        })
+      );
+      const oldReservation = await getDoc(doc(bob, 'usernames', 'alice_handle'));
+      const newReservation = await getDoc(doc(bob, 'usernames', 'alice_new_handle'));
+      assert.equal(oldReservation.exists(), false);
+      assert.equal(newReservation.exists(), true);
+      assert.equal(newReservation.data().uid, 'alice');
+      const savedUser = await getDoc(doc(alice, 'users', 'alice'));
+      assert.equal(savedUser.data().usernameLower, 'alice_new_handle');
+    });
+
+    await check('ALLOW: keeping the same username leaves the reservation untouched', async () => {
+      await assertSucceeds(
+        runTransaction(bob, async (tx) => {
+          tx.update(doc(bob, 'users', 'bob'), { bio: 'Unchanged username.', updatedAt: serverTimestamp() });
+          tx.update(doc(bob, 'publicProfiles', 'bob'), { bio: 'Unchanged username.', updatedAt: serverTimestamp() });
+        })
+      );
+      const reservation = await getDoc(doc(bob, 'usernames', 'bob_handle'));
+      assert.equal(reservation.exists(), true);
+      assert.equal(reservation.data().uid, 'bob');
+    });
+
+    await check('DENY: user A updates user B\'s profile', async () => {
+      await assertFails(updateDoc(doc(bob, 'users', 'alice'), { displayName: 'Hijacked' }));
+    });
+
+    await check('DENY: owner changes accountType via update', async () => {
+      await assertFails(updateDoc(doc(bob, 'users', 'bob'), { accountType: 'business', updatedAt: serverTimestamp() }));
+    });
+
+    await check('DENY: owner changes cityName/cityKey via update', async () => {
+      await assertFails(
+        updateDoc(doc(bob, 'users', 'bob'), { cityName: 'Stockholm', cityKey: 'se:stockholm', updatedAt: serverTimestamp() })
+      );
+    });
+
+    await check('DENY: owner changes email via update', async () => {
+      await assertFails(updateDoc(doc(bob, 'users', 'bob'), { email: 'new@example.com', updatedAt: serverTimestamp() }));
+    });
+
+    await check('DENY: owner changes uid via update', async () => {
+      await assertFails(updateDoc(doc(bob, 'users', 'bob'), { uid: 'someone-else', updatedAt: serverTimestamp() }));
+    });
+
+    await check('DENY: owner changes onboardingCompleted via update', async () => {
+      await assertFails(updateDoc(doc(bob, 'users', 'bob'), { onboardingCompleted: false, updatedAt: serverTimestamp() }));
+    });
+
+    await check('DENY: owner changes createdAt via update', async () => {
+      await assertFails(updateDoc(doc(bob, 'users', 'bob'), { createdAt: Timestamp.now(), updatedAt: serverTimestamp() }));
+    });
+
+    await check('DENY: bio exceeds 160 characters', async () => {
+      await assertFails(updateDoc(doc(bob, 'users', 'bob'), { bio: 'x'.repeat(161), updatedAt: serverTimestamp() }));
+    });
+
+    await check('DENY: interests below the 3-minimum on update', async () => {
+      await assertFails(updateDoc(doc(bob, 'users', 'bob'), { interests: ['music'], updatedAt: serverTimestamp() }));
+    });
+
+    await check('DENY: interests above the 8-maximum on update', async () => {
+      await assertFails(
+        updateDoc(doc(bob, 'users', 'bob'), {
+          interests: ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i'],
+          updatedAt: serverTimestamp(),
+        })
+      );
+    });
+
+    await check('DENY: invalid username format on update', async () => {
+      await assertFails(
+        updateDoc(doc(bob, 'users', 'bob'), { username: 'a', usernameLower: 'a', updatedAt: serverTimestamp() })
+      );
+    });
+
+    await check('DENY: username theft — change to an already-taken username', async () => {
+      await assertFails(
+        runTransaction(bob, async (tx) => {
+          await tx.get(doc(bob, 'usernames', 'carol_handle'));
+          tx.update(doc(bob, 'users', 'bob'), { username: 'carol_handle', usernameLower: 'carol_handle', updatedAt: serverTimestamp() });
+          tx.set(doc(bob, 'usernames', 'carol_handle'), usernameReservation('bob'));
+        })
+      );
+      // Carol's reservation must be completely unaffected by the failed attempt.
+      const carolReservation = await getDoc(doc(bob, 'usernames', 'carol_handle'));
+      assert.equal(carolReservation.data().uid, 'carol');
+    });
+
+    await check('DENY: delete another user\'s username reservation directly', async () => {
+      await assertFails(deleteDoc(doc(bob, 'usernames', 'carol_handle')));
+    });
+
+    await check('DENY: delete your own CURRENT username reservation without renaming', async () => {
+      await assertFails(deleteDoc(doc(bob, 'usernames', 'bob_handle')));
+    });
+
+    await check('DENY: publicProfiles update drifts from users/{uid} (not a paired write)', async () => {
+      await assertFails(updateDoc(doc(bob, 'publicProfiles', 'bob'), { displayName: 'Drifted', updatedAt: serverTimestamp() }));
+    });
+
+    await check('DENY: arbitrary extra field on users update', async () => {
+      await assertFails(updateDoc(doc(bob, 'users', 'bob'), { verified: true, updatedAt: serverTimestamp() }));
+    });
+
+    await check('DENY: fabricated (non-server) updatedAt on update', async () => {
+      await assertFails(updateDoc(doc(bob, 'users', 'bob'), { bio: 'trying to fake a timestamp', updatedAt: Timestamp.now() }));
     });
 
     // =========================================================================

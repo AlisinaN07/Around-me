@@ -518,17 +518,17 @@ Own Profile (`src/app/(app)/(tabs)/profile.tsx`) and public profile (`src/app/(a
 
 **No Likes total** — this app has no efficient authoritative aggregated like count across a profile's content, and computing one would mean an N+1 aggregation per profile visit. Not shown, not faked.
 
-### No bio
+### Bio
 
-`UserProfile`/`PublicProfile` have no bio field. No placeholder biography text is rendered — `ProfileHeader` simply has no bio slot to leave a gap in. Adding a real bio field is future work, not a Step 27 schema change.
+As of Step 33, `UserProfile`/`PublicProfile` have a real optional `bio` field — see "Profile editing and account recovery (Step 33)" below. `ProfileHeader`'s bio slot renders only when non-empty, same rule as before.
 
 ### Content tabs
 
 **Reels, Posts, Events, Activities** — in that order on both own and public profile, all four real and data-backed (the previous own-Profile screen's "Posts"/"Activities" tabs were static placeholders regardless of real data, and a "Saved" tab existed with no Saved backend at all — both fixed/removed this step). Reels render via `ReelPreviewCard` (now using `MediaCard`'s Step 26 gradient+glow fallback for a more premium grid look — no thumbnail generation, still no fake media). Posts/Events/Activities render via the existing `ContentCard`, tapping through to `/content/{contentId}` exactly as before.
 
-### Edit profile — omitted, not disabled
+### Edit profile
 
-No edit-profile route or profile-update service function exists anywhere in the codebase. The previous own-Profile screen showed a permanently `disabled` "Edit profile" button; Step 27 removes it entirely rather than keep a dead control — the Settings screen's Account section is likewise entirely omitted for the same reason (see below).
+As of Step 33, Edit Profile is real — see "Profile editing and account recovery (Step 33)" below. (Step 27 itself removed the old permanently-`disabled` "Edit profile" button rather than keep a dead control, since no backend existed yet at that point.)
 
 ### Settings — real rows only
 
@@ -538,7 +538,7 @@ Sections shown, and only these:
 - **Privacy** — "Message privacy" (shows the real current setting as its value) and "Blocked accounts" (shows the real blocked count), both routing to the existing `/settings/privacy` screen, which still handles both and is otherwise unchanged (message-privacy `everyone`/`people_i_follow`/`nobody` semantics and blocked-list unblock behavior are untouched).
 - **Session** — Log out (moved from Profile; no longer duplicated in two places).
 
-Sections deliberately **not shown**: **Account** (its only candidate row, Edit profile, isn't real), **Notifications** (no notification-preference backend or push system exists — no toggles that do nothing), **Content & Reels** (no real per-account content preferences exist). **Private Account** is not shown anywhere — this app has no private-account/follow-request architecture. **Delete account** is not shown — account deletion doesn't exist yet; that's explicit future work, not this step.
+As of Step 33 an **Account** section is also shown, with a real "Edit profile" row (see below). Still deliberately **not shown**: **Notifications** (no notification-preference backend or push system exists — no toggles that do nothing), **Content & Reels** (no real per-account content preferences exist). **Private Account** is not shown anywhere — this app has no private-account/follow-request architecture. **Delete account** is not shown — account deletion doesn't exist yet; that's explicit future work (Step 34), not this step.
 
 ### Activity discovery-card state (Step 26.1 follow-up)
 
@@ -547,6 +547,70 @@ Reviewed per this step's instructions: the Step 26 discovery Activity cards alre
 ### Firebase/security
 
 No changes. No new Firestore rules, indexes, or schema fields — every stat/tab above is computed from data already fetched by existing, unchanged services.
+
+## Profile editing and account recovery (Step 33)
+
+The first functional-completion step after the Steps 24–31 visual reconstruction. Adds the two account fundamentals every real user needs: editing your own profile, and recovering access if you forget your password. Account **deletion** is deliberately not part of this step — its cleanup/security model needs its own isolated review (Step 34).
+
+### Editable fields
+
+`/profile/edit` (`src/app/(app)/profile/edit.tsx`, reached from Own Profile's new "Edit profile" button and from Settings → Account → Edit profile) lets a signed-in user change:
+
+- **Display name** — same 2–50 character rule as onboarding (`DISPLAY_NAME_MIN_LENGTH`/`DISPLAY_NAME_MAX_LENGTH` in `src/types/user.ts`, now shared by both `name.tsx` and this screen instead of duplicated).
+- **Username** — same normalization/format rules as onboarding (`normalizeUsername`), same live-availability check (`checkUsernameAvailability`) — with one addition: keeping your *current* username is recognized and short-circuits the availability check instead of reporting it "taken" against yourself.
+- **Bio** — new, optional, plain text, capped at 160 characters (`BIO_MAX_LENGTH`). No HTML parsing, no links, no hashtags.
+- **Interests** — same shared `InterestSelector` component (extracted from the onboarding screen, which now uses it too instead of its own inline copy) and the same 3–8 count rule.
+
+**Home City** and **Account Type** are shown read-only in a small info panel at the bottom of the form and are never included in the update payload at all — not merely hidden by the UI, but structurally absent from what the client ever sends.
+
+### Bio
+
+Stored as a real, always-present string — never `null`, never a missing key. New accounts get `bio: ''` at onboarding (`createInitialUserProfile`). **Existing-user compatibility**: accounts created before this step have no `bio` field in Firestore at all; `fetchUserProfile`/`fetchPublicProfile` normalize a missing `bio` to `''` at the read boundary, so every other call site can treat `profile.bio` as always a real string. No production migration was run and no existing document was touched — the normalization happens purely at read time, and a legacy account gets a real `bio` field the first time it's ever edited.
+
+Displayed on `ProfileHeader` (own and public profile) only when non-empty — no "Add a bio" placeholder is ever shown on someone else's profile.
+
+### Username transaction
+
+Changing your username is one atomic Firestore transaction (`updateMyProfile` in `src/services/userProfile.ts`), mirroring the exact sequence `createInitialUserProfile` already used at onboarding:
+
+1. Read the caller's current `users/{uid}` document (all reads happen before any write, per Firestore transaction rules).
+2. If the normalized new username differs from the current one: read `usernames/{newUsernameLower}` — if it already exists, abort with `username-taken`.
+3. Update `users/{uid}` and `publicProfiles/{uid}` together with the same field values (`displayName`, `username`, `usernameLower`, `bio`, `interests`, `updatedAt: serverTimestamp()`).
+4. Only if the username actually changed: reserve `usernames/{newUsernameLower}` and delete `usernames/{oldUsernameLower}` — in the same commit as step 3.
+
+If the username is unchanged, steps 2 and 4 never touch the `usernames` collection at all — no unnecessary delete/recreate of your own reservation.
+
+### Firestore profile security
+
+`users/{uid}` gained a narrow owner-only `allow update` (previously there was none at all — profile editing didn't exist). It permits changing only `displayName`, `username`/`usernameLower`, `bio`, and `interests`; every other field (`uid`, `email`, `cityName`, `countryCode`, `cityKey`, `accountType`, `onboardingCompleted`, `createdAt`) must be byte-identical to its prior value, enforced field-by-field, plus a fresh `isServerTimestamp(updatedAt)` on every update and the same `keys().hasOnly([...])` allowlist as create.
+
+`publicProfiles/{uid}` gained a matching owner-only `allow update` (previously `if false`) that requires the editable fields to exactly equal the **post-commit** `users/{uid}` document via `getAfter()` — the same technique `isValidPublicProfileCreate` already used for the onboarding transaction — so the public mirror can never drift from the private profile, and immutable fields must match what `publicProfiles/{uid}` already had.
+
+`usernames/{usernameLower}` gained a narrow `allow delete`: a user may delete a reservation only if it names them as owner (`resource.data.uid == request.auth.uid`) **and** their own `users/{uid}` document, read via `getAfter()` in the same commit, now has a *different* `usernameLower` than the document being deleted. This is only ever true during a real rename happening in the same atomic write — it can't be used to delete another user's reservation, and can't be used to delete your own *current* reservation while leaving `users/{uid}` still pointing at it.
+
+Full ALLOW/DENY matrix (owner edits, cross-user denial, accountType/cityName/email/uid/onboardingCompleted/createdAt immutability, bio length, interests count, username format, username theft, reservation-deletion misuse, publicProfiles drift, extra fields) is in `tests/firestore.rules.test.mjs` and was verified against the real deployed rules in production with disposable accounts (the local emulator has the same sandbox networking limitation documented in Step 30/31).
+
+### AccountType immutability
+
+Unchanged from Step 30, and now doubly guaranteed: the create rule's allowlist check still exists, and the new update rule independently asserts `accountType` is unchanged on every edit. Edit Profile's form never includes `accountType` in its payload at all — there is no code path, malicious or otherwise, by which this screen could send it.
+
+### Home City immutability
+
+Home City is not editable in this step — shown read-only on `/profile/edit`. Active City (browsing another city) remains completely separate and unaffected. Home City editing is intentionally deferred as its own, more deliberate future step.
+
+### Historical snapshots
+
+Editing your profile changes your `users`/`publicProfiles` documents and therefore every *future* profile view and *future* content you create. It does **not** rewrite `authorDisplayName`/`authorUsername` already stored on existing Post/Activity/Event/Reel/comment/message documents — those are point-in-time snapshots taken at creation, by design (see the Firestore section above). This is intentional MVP behavior, not a bug: an old Post keeps showing the display name you had when you posted it.
+
+### Settings
+
+Settings gained a real **Account** section with one row, "Edit profile" — Settings' existing "real rows only" rule (Step 27) is preserved; this row is included specifically because it now has a real route and a real backend, not despite that rule.
+
+### Password reset
+
+`AuthProvider.resetPassword(email)` (`src/providers/AuthProvider.tsx`) wraps Firebase Auth's `sendPasswordResetEmail` directly — no custom reset-token screen exists or is needed, since Firebase's own emailed link handles the actual password change outside the app. Login gained a "Forgot password?" link to the new `/(auth)/forgot-password` screen, which asks only for an email and shows a clear "Check your email" confirmation with a "Back to login" action — it never auto-logs the user in.
+
+**Account enumeration safety**: whether or not the entered email actually belongs to an account, the user sees the identical neutral confirmation ("If an account exists for this email, we've sent password reset instructions."). Only genuine service failures (network problems, rate limiting) surface as a real, retryable error — `auth/user-not-found` specifically is treated the same as success.
 
 ## Reels (Cloud Storage — Step 18)
 

@@ -18,8 +18,8 @@ service cloud.firestore {
     }
 
     // users/{uid} — private profile, readable and creatable only by its
-    // own owner. No update/delete yet: profile editing is a future step
-    // with its own explicit rules.
+    // own owner. Step 33 adds a narrow owner-only update for Edit Profile
+    // (see below) — every other field stays immutable after create.
     match /users/{uid} {
       allow read: if isOwner(uid);
 
@@ -34,19 +34,53 @@ service cloud.firestore {
         && request.resource.data.countryCode is string
         && request.resource.data.cityKey is string
         && request.resource.data.interests is list
+        && request.resource.data.bio is string
+        && request.resource.data.bio.size() <= 160
         // Step 30: Around Me supports exactly two account types, chosen
         // once during onboarding — no arbitrary string (e.g. 'admin',
-        // 'organizer', 'verified_business') is ever accepted. This match
-        // block has no `allow update` at all, so accountType is already
-        // immutable after create — a client can never later rewrite
-        // personal -> business or back through a profile edit.
+        // 'organizer', 'verified_business') is ever accepted. accountType
+        // is also asserted unchanged in `allow update` below, so it is
+        // immutable after create either way — a client can never later
+        // rewrite personal -> business or back through a profile edit.
         && (request.resource.data.accountType == 'personal' || request.resource.data.accountType == 'business')
         && request.resource.data.onboardingCompleted is bool
         && isServerTimestamp(request.resource.data.createdAt)
         && isServerTimestamp(request.resource.data.updatedAt)
         && request.resource.data.keys().hasOnly([
           'uid', 'email', 'displayName', 'username', 'usernameLower',
-          'cityName', 'countryCode', 'cityKey', 'interests',
+          'cityName', 'countryCode', 'cityKey', 'interests', 'bio',
+          'accountType', 'onboardingCompleted', 'createdAt', 'updatedAt'
+        ]);
+
+      // Step 33 — Edit Profile. Only displayName, username/usernameLower
+      // (always updated as a matched pair — see updateMyProfile), bio, and
+      // interests may change. Every other field must be byte-identical to
+      // its prior value: uid/email/cityName/countryCode/cityKey (Home City
+      // is not editable in this step — Section 15), accountType (still
+      // immutable — Section 14), onboardingCompleted, and createdAt.
+      allow update: if isOwner(uid)
+        && request.resource.data.uid == resource.data.uid
+        && request.resource.data.email == resource.data.email
+        && request.resource.data.cityName == resource.data.cityName
+        && request.resource.data.countryCode == resource.data.countryCode
+        && request.resource.data.cityKey == resource.data.cityKey
+        && request.resource.data.accountType == resource.data.accountType
+        && request.resource.data.onboardingCompleted == resource.data.onboardingCompleted
+        && request.resource.data.createdAt == resource.data.createdAt
+        && request.resource.data.displayName is string
+        && request.resource.data.displayName.size() > 0
+        && request.resource.data.username is string
+        && request.resource.data.usernameLower is string
+        && request.resource.data.usernameLower.matches('^[a-z0-9_]{3,24}$')
+        && request.resource.data.interests is list
+        && request.resource.data.interests.size() >= 3
+        && request.resource.data.interests.size() <= 8
+        && request.resource.data.bio is string
+        && request.resource.data.bio.size() <= 160
+        && isServerTimestamp(request.resource.data.updatedAt)
+        && request.resource.data.keys().hasOnly([
+          'uid', 'email', 'displayName', 'username', 'usernameLower',
+          'cityName', 'countryCode', 'cityKey', 'interests', 'bio',
           'accountType', 'onboardingCompleted', 'createdAt', 'updatedAt'
         ]);
     }
@@ -54,7 +88,15 @@ service cloud.firestore {
     // usernames/{usernameLower} — a uniqueness index. Any signed-in user
     // may check whether a single username is taken (get, not list); only
     // the reserving user may create their own reservation, and it can
-    // never be updated or deleted once created.
+    // never be updated once created. Step 33 adds a narrow delete: a user
+    // may remove ONLY a reservation that says it's theirs, and ONLY as
+    // part of the same atomic write that changes their users/{uid}
+    // usernameLower to something else (getAfter() sees the post-commit
+    // value from the paired users/{uid} update in the same transaction —
+    // same technique isValidPublicProfileCreate already uses below). This
+    // means: no stealing another user's reservation, no deleting your own
+    // CURRENT reservation while leaving users/{uid} pointed at it, and no
+    // deletion at all outside a real rename.
     match /usernames/{usernameLower} {
       allow get: if isSignedIn();
 
@@ -63,6 +105,11 @@ service cloud.firestore {
         && usernameLower.matches('^[a-z0-9_]{3,24}$')
         && isServerTimestamp(request.resource.data.createdAt)
         && request.resource.data.keys().hasOnly(['uid', 'createdAt']);
+
+      allow delete: if isSignedIn()
+        && resource.data.uid == request.auth.uid
+        && existsAfter(/databases/$(database)/documents/users/$(request.auth.uid))
+        && getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.usernameLower != usernameLower;
     }
 
     // publicProfiles/{uid} — the social-facing counterpart to the private
@@ -80,8 +127,11 @@ service cloud.firestore {
         && request.auth.uid == uid
         && isValidPublicProfileCreate(uid, request.resource.data);
 
-      // Profile editing is a later step — nothing to validate yet.
-      allow update: if false;
+      // Step 33 — Edit Profile mirror. The same atomic write that updates
+      // users/{uid} also updates publicProfiles/{uid} (see updateMyProfile)
+      // — getAfter() reads that post-commit users/{uid} document, so this
+      // rule can require the two stay in lockstep without a separate get().
+      allow update: if isOwner(uid) && isValidPublicProfileUpdate(uid, request.resource.data, resource.data);
 
       // Social identity documents aren't independently erasable from
       // account lifecycle yet.
@@ -106,12 +156,40 @@ service cloud.firestore {
         && data.countryCode == profile.countryCode
         && data.cityKey == profile.cityKey
         && data.interests == profile.interests
+        && data.bio == profile.bio
         && data.accountType == profile.accountType
         && isServerTimestamp(data.createdAt)
         && isServerTimestamp(data.updatedAt)
         && data.keys().hasOnly([
           'uid', 'displayName', 'username', 'usernameLower', 'cityName',
-          'countryCode', 'cityKey', 'interests', 'accountType', 'createdAt', 'updatedAt'
+          'countryCode', 'cityKey', 'interests', 'bio', 'accountType', 'createdAt', 'updatedAt'
+        ]);
+    }
+
+    // Step 33 — mirrors isValidPublicProfileCreate's shape/consistency
+    // checks for the update path: the editable fields must match the
+    // post-commit users/{uid} document exactly, and every immutable field
+    // (cityName/countryCode/cityKey/accountType/createdAt) must be
+    // unchanged from what publicProfiles/{uid} already had — a client can
+    // never use this update to drift the public mirror away from the
+    // private profile, or to change something Edit Profile doesn't cover.
+    function isValidPublicProfileUpdate(uid, data, oldData) {
+      let profile = getAfter(/databases/$(database)/documents/users/$(uid)).data;
+      return data.uid == oldData.uid
+        && data.cityName == oldData.cityName
+        && data.countryCode == oldData.countryCode
+        && data.cityKey == oldData.cityKey
+        && data.accountType == oldData.accountType
+        && data.createdAt == oldData.createdAt
+        && data.displayName == profile.displayName
+        && data.username == profile.username
+        && data.usernameLower == profile.usernameLower
+        && data.interests == profile.interests
+        && data.bio == profile.bio
+        && isServerTimestamp(data.updatedAt)
+        && data.keys().hasOnly([
+          'uid', 'displayName', 'username', 'usernameLower', 'cityName',
+          'countryCode', 'cityKey', 'interests', 'bio', 'accountType', 'createdAt', 'updatedAt'
         ]);
     }
 

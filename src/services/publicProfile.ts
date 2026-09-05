@@ -17,10 +17,13 @@ import { fetchUserProfile } from './userProfile';
 const PUBLIC_PROFILES_COLLECTION = 'publicProfiles';
 const USERNAMES_COLLECTION = 'usernames';
 
+/** Normalizes a missing `bio` (public profiles created before Step 33) to '' — see fetchUserProfile's identical rule. */
 export async function fetchPublicProfile(uid: string): Promise<PublicProfile | null> {
   if (!firestore) return null;
   const snapshot = await getDoc(doc(firestore, PUBLIC_PROFILES_COLLECTION, uid));
-  return snapshot.exists() ? (snapshot.data() as PublicProfile) : null;
+  if (!snapshot.exists()) return null;
+  const data = snapshot.data() as PublicProfile;
+  return { ...data, bio: data.bio ?? '' };
 }
 
 /** Resolves a username to a uid via the existing usernames/{usernameLower} reservation, then reads the public profile — never scans publicProfiles itself. */
@@ -70,6 +73,9 @@ export async function ensureMyPublicProfile(uid: string): Promise<EnsurePublicPr
     countryCode: privateProfile.countryCode,
     cityKey: privateProfile.cityKey,
     interests: privateProfile.interests,
+    // privateProfile.bio is already normalized to '' by fetchUserProfile
+    // above when missing (pre-Step-33 accounts) — never omitted here.
+    bio: privateProfile.bio,
     accountType: privateProfile.accountType,
     createdAt: serverTimestamp(),
     updatedAt: serverTimestamp(),

@@ -7,8 +7,8 @@ import { Button } from '@/components/Button';
 import { FormField } from '@/components/FormField';
 import { Colors, Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
+import { isValidEmail } from '@/utils/email';
 
-const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const MIN_PASSWORD_LENGTH = 6;
 
 export default function SignUpScreen() {
@@ -26,7 +26,7 @@ export default function SignUpScreen() {
 
     const trimmedEmail = email.trim();
 
-    if (!trimmedEmail || !EMAIL_REGEX.test(trimmedEmail)) {
+    if (!trimmedEmail || !isValidEmail(trimmedEmail)) {
       setError('Enter a valid email address.');
       return;
     }

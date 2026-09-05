@@ -213,6 +213,7 @@ export default function PublicProfileScreen() {
             displayName={profile.displayName}
             username={profile.username}
             cityLabel={cityLabel}
+            bio={profile.bio}
             postsCount={postsCount}
             followersCount={followerCount}
             followingCount={followingCount}

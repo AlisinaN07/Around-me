@@ -115,6 +115,7 @@ export default function ProfileScreen() {
                 displayName={profile?.displayName ?? ''}
                 username={profile?.username ?? ''}
                 cityLabel={cityLabel}
+                bio={profile?.bio}
                 postsCount={postsCount}
                 followersCount={followerCount}
                 followingCount={followingCount}
@@ -132,6 +133,10 @@ export default function ProfileScreen() {
                   </Pressable>
                 }
               />
+
+              <View style={styles.editProfileButton}>
+                <Button label="Edit profile" variant="secondary" onPress={() => router.push('/profile/edit')} />
+              </View>
 
               {cityLabel ? (
                 <Pressable
@@ -207,6 +212,10 @@ const styles = StyleSheet.create({
     height: 36,
     alignItems: 'center',
     justifyContent: 'center',
+  },
+  editProfileButton: {
+    alignSelf: 'center',
+    width: '100%',
   },
   exploreCityLink: {
     alignSelf: 'center',
