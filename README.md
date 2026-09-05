@@ -784,6 +784,40 @@ A `search-outline` icon was added to Home's existing top-right icon group, next 
 
 Using three disposable accounts (Personal, Business, Personal), verified: a shared prefix returns both the Personal and Business account identically; an exact full username returns only that account; a leading `@` normalizes to the same result as without it; a nonexistent prefix returns zero, not an error. Renaming a disposable account's username through the real Step 33 `updateMyProfile` transaction confirmed the old prefix stops matching and the new one starts matching immediately — there's no separate search index to go stale, since search reads `publicProfiles` directly. Calling the real deployed `deleteMyAccountData` trusted-backend callable (Step 34.2) against a disposable account confirmed it disappears from search the moment its `publicProfiles/{uid}` document is gone.
 
+## Event / Activity engagement notifications (Step 38)
+
+Completes the in-app notification set alongside like/comment/follow/reel_like/reel_comment (Step 15/19): responding to someone's Event, and joining someone's Activity, now notify that Event/Activity's author. In-app Inbox only — no push infrastructure of any kind was added.
+
+### Event response — one logical notification per (event, actor)
+
+A response notification is keyed deterministically as `event_response_{eventId}_{actorUid}` — there is never a separate "Interested" and "Going" notification for the same person's response to the same Event. Switching Interested ↔ Going updates this same document: `responseStatus` changes to the new value, `read` is forced back to `false`, and `createdAt` is deliberately bumped to a fresh server timestamp (not preserved) so the notification re-sorts to the top of the recipient's Inbox — the product intent is that a changed response reads as a new Activity update, not a stale entry. Only `notificationId`/`recipientUid`/`actorUid`/`actorDisplayName`/`actorUsername`/`type`/`contentId` are immutable identity fields; nothing about the underlying Like/Follow-style "everything except read is frozen" pattern applies to this one field. Tapping the same response again is a client-side no-op (`setEventResponse` only touches the notification when the status actually changes) and is additionally backstopped at the rules layer (a same-value "update" is rejected). Removing a response deletes the paired notification in the same transaction.
+
+### Activity join — one notification per (activity, actor), while joined
+
+Keyed as `activity_join_{activityId}_{actorUid}`. Created only on a genuinely first-time join (the existing "already joined" early-return means this is always a create, never an update) and deleted the moment the actor leaves. A join rejected for being full or ended never reaches the notification write at all — the participant document's existence is what the notification-create rule checks, so "notification exists" already implies "a real join succeeded."
+
+### Self-notifications: never
+
+Both flows compare the actor's uid against the content's `authorUid` before touching the notification — an author responding to or joining their own content (where the product doesn't already block that) writes the response/participation but never a notification, both client-side and as a Firestore Rules backstop.
+
+### Atomicity
+
+`setEventResponse`/`removeEventResponse` were converted from plain reads/writes into `runTransaction` calls (previously not transactional) so the response and its notification always land — or fail — together. `joinActivity`/`leaveActivity` already used a transaction for the participant + `stats/activity` counter pairing (Step 9); the notification create/delete was added into that same transaction rather than a separate write, so a join can never produce a notification without the participant doc, or vice versa.
+
+### Firestore Rules
+
+Two new narrow create-validators (`isValidEventResponseNotification`, `isValidActivityJoinNotification`) follow the exact same "the underlying doc must existAfter() in the same write, and its content must match the notification's claim" pattern as every prior notification type. A new `isValidEventResponseStateUpdate` function is the only rule in this collection that ever allows a non-`read` field to change — gated to the notification's own actor (not the recipient), requiring the new `responseStatus` to actually differ from the old one, and requiring `getAfter()` on the response doc to match. `isValidNotificationDelete` gained two more type-specific `existsAfter()` branches (response absent / participant absent).
+
+One necessary, narrowly-scoped rule correction was required and confirmed empirically against production before it shipped: notifications were previously readable only by their `recipientUid`, but `setEventResponse`/`removeEventResponse`/`leaveActivity` all need the **actor** to read their own already-existing notification inside a transaction (to decide create-vs-update, or whether a delete is needed at all) — an unconditional delete/update of a notification the actor can't even read would either be denied outright or risk the documented "null `resource`" failure mode this codebase has hit before. The read rule now also allows `actorUid == request.auth.uid`, but **only** for `event_response`/`activity_join` — every other notification type's read permission is completely unchanged.
+
+### No new fields beyond what's needed
+
+`Notification` gained exactly one new field, `responseStatus: EventResponseStatus | null` — null for every pre-existing type (mirroring how `reelId` was introduced in Step 19), set only for `event_response`. No Event/Activity title snapshot was added to the notification — copy reads "is interested in **your** event" / "joined **your** activity," which needs no target-content text, keeping the schema minimal.
+
+### Reused, not duplicated
+
+Recipient is always `content.authorUid` — never participants, followers, or anyone else. Navigation reuses the Inbox's existing generic `contentId` → `/content/{id}` branch unchanged (no new routing code). Actor snapshot fields come from the same `resolveTrustedFields`/profile read the response/join write already needed — no extra profile read added for notification purposes. The unread count is the existing real `!notification.read` filter — no second counter, no new listener. `deleteMyAccountData` required zero Functions changes: it already deletes every `notifications` doc where `recipientUid == uid` or `actorUid == uid`, regardless of type — verified against production that an Activity-join notification an account generated is correctly removed when that account is deleted through the existing trusted backend.
+
 ## Reels (Cloud Storage — Step 18)
 
 Reels are short (≤60s), video-only posts with vertical, city-scoped playback — the first feature in this app to use Cloud Storage rather than Firestore alone. They live in their own root collection, `reels/{reelId}`, separate from `content/{contentId}` (posts/activities/events): a Reel has a media-upload lifecycle and Storage metadata that the other content types never had, and folding it into `content` would have meant giving every Post/Activity/Event query an upload-status field it never needs.

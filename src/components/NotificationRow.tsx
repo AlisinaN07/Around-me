@@ -6,13 +6,22 @@ import { Colors, Spacing } from '@/constants/theme';
 import type { Notification } from '@/types/notification';
 import { formatTimeAgo } from '@/utils/timeFormat';
 
-const TYPE_ICON: Record<Notification['type'], keyof typeof Ionicons.glyphMap> = {
+/** Icon depends on responseStatus for event_response, not just type — see getNotificationIcon below. */
+const TYPE_ICON: Record<Exclude<Notification['type'], 'event_response'>, keyof typeof Ionicons.glyphMap> = {
   like: 'heart',
   comment: 'chatbubble',
   follow: 'person-add',
   reel_like: 'heart',
   reel_comment: 'chatbubble',
+  activity_join: 'people',
 };
+
+function getNotificationIcon(notification: Notification): keyof typeof Ionicons.glyphMap {
+  if (notification.type === 'event_response') {
+    return notification.responseStatus === 'going' ? 'checkmark-circle' : 'star';
+  }
+  return TYPE_ICON[notification.type];
+}
 
 function describeNotification(notification: Notification): string {
   switch (notification.type) {
@@ -30,6 +39,12 @@ function describeNotification(notification: Notification): string {
       return notification.previewText
         ? `${notification.actorDisplayName} commented on your Reel: "${notification.previewText}"`
         : `${notification.actorDisplayName} commented on your Reel`;
+    case 'event_response':
+      return notification.responseStatus === 'going'
+        ? `${notification.actorDisplayName} is going to your event`
+        : `${notification.actorDisplayName} is interested in your event`;
+    case 'activity_join':
+      return `${notification.actorDisplayName} joined your activity`;
   }
 }
 
@@ -52,7 +67,7 @@ export function NotificationRow({ notification, onPress }: NotificationRowProps)
       <View style={styles.avatarWrap}>
         <Avatar name={notification.actorDisplayName} size={52} />
         <View style={styles.badge}>
-          <Ionicons name={TYPE_ICON[notification.type]} size={11} color={Colors.background} />
+          <Ionicons name={getNotificationIcon(notification)} size={11} color={Colors.background} />
         </View>
       </View>
       <View style={styles.body}>

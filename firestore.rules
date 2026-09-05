@@ -821,7 +821,25 @@ service cloud.firestore {
       // for follow edges that may predate this notifications feature
       // (created before Step 15) and therefore have no paired notification
       // — without this, that existence check would itself be denied.
-      allow read: if isSignedIn() && (resource == null || resource.data.recipientUid == request.auth.uid);
+      //
+      // Step 38 — event_response/activity_join notifications additionally
+      // let their own ACTOR read them (not just the recipient). This is a
+      // narrow widening scoped to only these two types: setEventResponse
+      // needs to read its own prior notification to decide create vs.
+      // update when Interested/Going changes, and removeEventResponse/
+      // leaveActivity need to check "does my generated notification still
+      // exist" before conditionally deleting it — an unconditional delete
+      // of a possibly-nonexistent doc would otherwise risk exactly the
+      // null-`resource` failure documented above. The actor already knows
+      // everything in their own generated notification (they supplied
+      // actorUid/actorDisplayName/actorUsername/contentId/type themselves)
+      // except its `read` state — a minor, narrowly-scoped exposure,
+      // unchanged for every other notification type.
+      allow read: if isSignedIn() && (
+        resource == null
+        || resource.data.recipientUid == request.auth.uid
+        || (resource.data.actorUid == request.auth.uid && (resource.data.type == 'event_response' || resource.data.type == 'activity_join'))
+      );
 
       allow create: if isSignedIn()
         && isValidNotificationActor(request.resource.data)
@@ -832,9 +850,20 @@ service cloud.firestore {
           || isValidFollowNotification(notificationId, request.resource.data)
           || isValidReelLikeNotification(notificationId, request.resource.data)
           || isValidReelCommentNotification(notificationId, request.resource.data)
+          || isValidEventResponseNotification(notificationId, request.resource.data)
+          || isValidActivityJoinNotification(notificationId, request.resource.data)
         );
 
-      allow update: if isSignedIn() && isValidNotificationUpdate(request.resource.data, resource.data);
+      // Two structurally different callers can update a notification: the
+      // RECIPIENT toggling read state (every type), or the ACTOR of an
+      // event_response notification switching Interested <-> Going (Step
+      // 38) — the only notification type whose non-read state is ever
+      // mutable. These are deliberately separate functions rather than one
+      // combined one, since they're authorized by different people.
+      allow update: if isSignedIn() && (
+        isValidNotificationReadUpdate(request.resource.data, resource.data)
+        || isValidEventResponseStateUpdate(request.resource.data, resource.data)
+      );
 
       allow delete: if isSignedIn() && isValidNotificationDelete(resource.data);
     }
@@ -860,7 +889,7 @@ service cloud.firestore {
         && isServerTimestamp(data.updatedAt)
         && data.keys().hasOnly([
           'notificationId', 'recipientUid', 'actorUid', 'actorDisplayName', 'actorUsername',
-          'type', 'contentId', 'reelId', 'commentId', 'previewText', 'read', 'createdAt', 'updatedAt'
+          'type', 'contentId', 'reelId', 'commentId', 'previewText', 'responseStatus', 'read', 'createdAt', 'updatedAt'
         ]);
     }
 
@@ -876,6 +905,7 @@ service cloud.firestore {
         && data.reelId == null
         && data.commentId == null
         && data.previewText == null
+        && data.responseStatus == null
         && notificationId == 'like_' + data.contentId + '_' + data.actorUid
         && exists(contentPath)
         && get(contentPath).data.status == 'published'
@@ -893,6 +923,7 @@ service cloud.firestore {
         && data.contentId is string
         && data.reelId == null
         && data.commentId is string
+        && data.responseStatus == null
         && notificationId == 'comment_' + data.commentId
         && (data.previewText == null || (data.previewText is string && data.previewText.size() <= 500))
         && exists(contentPath)
@@ -912,6 +943,7 @@ service cloud.firestore {
         && data.reelId == null
         && data.commentId == null
         && data.previewText == null
+        && data.responseStatus == null
         && notificationId == 'follow_' + data.actorUid + '_' + data.recipientUid
         && exists(/databases/$(database)/documents/publicProfiles/$(data.recipientUid))
         && existsAfter(followPath)
@@ -932,6 +964,7 @@ service cloud.firestore {
         && data.contentId == null
         && data.commentId == null
         && data.previewText == null
+        && data.responseStatus == null
         && notificationId == 'reel_like_' + data.reelId + '_' + data.actorUid
         && exists(reelPath)
         && get(reelPath).data.status == 'published'
@@ -946,6 +979,7 @@ service cloud.firestore {
         && data.reelId is string
         && data.contentId == null
         && data.commentId is string
+        && data.responseStatus == null
         && notificationId == 'reel_comment_' + data.commentId
         && (data.previewText == null || (data.previewText is string && data.previewText.size() <= 500))
         && exists(reelPath)
@@ -955,18 +989,68 @@ service cloud.firestore {
         && getAfter(commentPath).data.authorUid == data.actorUid;
     }
 
+    // Step 38 — Event responses (Interested/Going). ONE logical
+    // notification per (event, actor): the deterministic ID has no
+    // Interested/Going distinction, so switching between them is always an
+    // update to this same document (see isValidEventResponseStateUpdate
+    // below), never a second create. existsAfter() on the response doc,
+    // AND that its status matches responseStatus, proves a real Interested
+    // or Going response landed in the same transaction as this
+    // notification create — not just a claim.
+    function isValidEventResponseNotification(notificationId, data) {
+      let eventPath = /databases/$(database)/documents/content/$(data.contentId);
+      let responsePath = /databases/$(database)/documents/content/$(data.contentId)/responses/$(data.actorUid);
+      return data.type == 'event_response'
+        && data.contentId is string
+        && data.reelId == null
+        && data.commentId == null
+        && data.previewText == null
+        && (data.responseStatus == 'interested' || data.responseStatus == 'going')
+        && notificationId == 'event_response_' + data.contentId + '_' + data.actorUid
+        && exists(eventPath)
+        && get(eventPath).data.type == 'event'
+        && get(eventPath).data.status == 'published'
+        && get(eventPath).data.authorUid == data.recipientUid
+        && existsAfter(responsePath)
+        && getAfter(responsePath).data.uid == data.actorUid
+        && getAfter(responsePath).data.status == data.responseStatus;
+    }
+
+    // Step 38 — Activity joins. One notification per (activity, actor)
+    // that exists only while the actor is joined (see
+    // isValidNotificationDelete below for the paired leave-time delete
+    // rule). existsAfter() on the participant doc proves a real join
+    // landed in the same transaction — never a bare claim.
+    function isValidActivityJoinNotification(notificationId, data) {
+      let activityPath = /databases/$(database)/documents/content/$(data.contentId);
+      let participantPath = /databases/$(database)/documents/content/$(data.contentId)/participants/$(data.actorUid);
+      return data.type == 'activity_join'
+        && data.contentId is string
+        && data.reelId == null
+        && data.commentId == null
+        && data.previewText == null
+        && data.responseStatus == null
+        && notificationId == 'activity_join_' + data.contentId + '_' + data.actorUid
+        && exists(activityPath)
+        && get(activityPath).data.type == 'activity'
+        && get(activityPath).data.status == 'published'
+        && get(activityPath).data.authorUid == data.recipientUid
+        && existsAfter(participantPath);
+    }
+
     // Only the recipient, and only to toggle read state — every other
     // field, including actorUid/recipientUid/type, must stay byte-identical
     // to what create validated. Nobody can "retarget" or "relabel" an
-    // existing notification via update. reelId is read via .get() with a
-    // null default (not plain dot access) because notifications created
-    // before Step 19 predate that field entirely and genuinely lack the
-    // key — plain dot access on a missing map key errors out the whole
+    // existing notification via update. reelId/responseStatus are read via
+    // .get() with a null default (not plain dot access) because
+    // notifications created before Step 19 (reelId) / Step 38
+    // (responseStatus) predate those fields entirely and genuinely lack
+    // the key — plain dot access on a missing map key errors out the whole
     // rule evaluation, which would have broken mark-as-read for every
-    // pre-Step-19 notification. New writes always set reelId explicitly
-    // (null for non-Reel types — see src/types/notification.ts), so this
-    // only ever matters for reading OLD stored documents.
-    function isValidNotificationUpdate(newData, oldData) {
+    // pre-existing notification. New writes always set both explicitly
+    // (null for types that don't use them — see src/types/notification.ts),
+    // so this only ever matters for reading OLD stored documents.
+    function isValidNotificationReadUpdate(newData, oldData) {
       return oldData.recipientUid == request.auth.uid
         && newData.notificationId == oldData.notificationId
         && newData.recipientUid == oldData.recipientUid
@@ -978,21 +1062,67 @@ service cloud.firestore {
         && newData.get('reelId', null) == oldData.get('reelId', null)
         && newData.commentId == oldData.commentId
         && newData.previewText == oldData.previewText
+        && newData.get('responseStatus', null) == oldData.get('responseStatus', null)
         && newData.createdAt == oldData.createdAt
         && newData.read is bool
         && isServerTimestamp(newData.updatedAt)
         && newData.keys().hasOnly([
           'notificationId', 'recipientUid', 'actorUid', 'actorDisplayName', 'actorUsername',
-          'type', 'contentId', 'reelId', 'commentId', 'previewText', 'read', 'createdAt', 'updatedAt'
+          'type', 'contentId', 'reelId', 'commentId', 'previewText', 'responseStatus', 'read', 'createdAt', 'updatedAt'
+        ]);
+    }
+
+    // Step 38 — the ONLY notification field (besides read/timestamps) that
+    // is ever mutable, and only for event_response, and only by the ACTOR
+    // (not the recipient — see isValidNotificationReadUpdate above for
+    // that side). Interested <-> Going updates this SAME document rather
+    // than creating a second one. Identity fields (actorUid/recipientUid/
+    // contentId/type) stay immutable; responseStatus must actually change
+    // (Step 38 Section 13 — tapping the same state again is a no-op the
+    // client never even calls this for, but the rule enforces it as a
+    // backstop too) and must match the real underlying response
+    // (getAfter) — a client can never claim "Going" while the response
+    // doc still says "interested". createdAt is deliberately bumped to a
+    // fresh server timestamp here (not preserved) and read forced back to
+    // false: the Event creator should see this as a NEW Activity update,
+    // sorted to the top of their Inbox by createdAt — not a stale entry
+    // wherever the original response first landed (Step 38 Section 23).
+    function isValidEventResponseStateUpdate(newData, oldData) {
+      let responsePath = /databases/$(database)/documents/content/$(oldData.contentId)/responses/$(oldData.actorUid);
+      return oldData.type == 'event_response'
+        && oldData.actorUid == request.auth.uid
+        && newData.notificationId == oldData.notificationId
+        && newData.recipientUid == oldData.recipientUid
+        && newData.actorUid == oldData.actorUid
+        && newData.actorDisplayName == oldData.actorDisplayName
+        && newData.actorUsername == oldData.actorUsername
+        && newData.type == oldData.type
+        && newData.contentId == oldData.contentId
+        && newData.reelId == oldData.reelId
+        && newData.commentId == oldData.commentId
+        && newData.previewText == oldData.previewText
+        && (newData.responseStatus == 'interested' || newData.responseStatus == 'going')
+        && newData.responseStatus != oldData.get('responseStatus', null)
+        && newData.read == false
+        && isServerTimestamp(newData.createdAt)
+        && isServerTimestamp(newData.updatedAt)
+        && existsAfter(responsePath)
+        && getAfter(responsePath).data.uid == oldData.actorUid
+        && getAfter(responsePath).data.status == newData.responseStatus
+        && newData.keys().hasOnly([
+          'notificationId', 'recipientUid', 'actorUid', 'actorDisplayName', 'actorUsername',
+          'type', 'contentId', 'reelId', 'commentId', 'previewText', 'responseStatus', 'read', 'createdAt', 'updatedAt'
         ]);
     }
 
     // Recipients can always clear their own inbox. Actors may only delete a
     // notification they generated as part of genuinely undoing the same
-    // action (unlike/delete-comment/unfollow) in the same batch — this
-    // keeps "notification exists iff the action exists" true from the
-    // actor's side too, instead of letting an actor delete a notification
-    // while leaving the Like/Comment/Follow it came from intact.
+    // action (unlike/delete-comment/unfollow/removing an Event response/
+    // leaving an Activity) in the same batch/transaction — this keeps
+    // "notification exists iff the action exists" true from the actor's
+    // side too, instead of letting an actor delete a notification while
+    // leaving the Like/Comment/Follow/response/participation it came from
+    // intact.
     function isValidNotificationDelete(data) {
       return data.recipientUid == request.auth.uid
         || (
@@ -1003,6 +1133,8 @@ service cloud.firestore {
             || (data.type == 'follow' && !existsAfter(/databases/$(database)/documents/follows/$(data.actorUid + '_' + data.recipientUid)))
             || (data.type == 'reel_like' && !existsAfter(/databases/$(database)/documents/reels/$(data.reelId)/likes/$(data.actorUid)))
             || (data.type == 'reel_comment' && !existsAfter(/databases/$(database)/documents/reels/$(data.reelId)/comments/$(data.commentId)))
+            || (data.type == 'event_response' && !existsAfter(/databases/$(database)/documents/content/$(data.contentId)/responses/$(data.actorUid)))
+            || (data.type == 'activity_join' && !existsAfter(/databases/$(database)/documents/content/$(data.contentId)/participants/$(data.actorUid)))
           )
         );
     }

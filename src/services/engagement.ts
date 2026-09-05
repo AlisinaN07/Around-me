@@ -6,7 +6,6 @@
 
 import {
   collection,
-  deleteDoc,
   doc,
   getCountFromServer,
   getDoc,
@@ -16,15 +15,15 @@ import {
   query,
   runTransaction,
   serverTimestamp,
-  setDoc,
-  updateDoc,
   where,
   type WithFieldValue,
 } from 'firebase/firestore';
 
 import type { ActivityContent, ActivityParticipant, ActivityStats, EventContent, EventResponse, EventResponseStatus } from '@/types/content';
+import type { Notification } from '@/types/notification';
 
 import { firestore } from './firestore';
+import { buildNotificationId, notificationRef } from './notifications';
 import { fetchUserProfile } from './userProfile';
 
 const CONTENT_COLLECTION = 'content';
@@ -131,6 +130,35 @@ export async function joinActivity(activityId: string, uid: string): Promise<Joi
         updatedAt: serverTimestamp(),
       } satisfies WithFieldValue<ActivityStats>);
 
+      // Notification lands in the same transaction as the participant +
+      // counter writes — Firestore rules require the participant doc to
+      // existAfter() for this create to validate (see firestore.rules), so
+      // "notification exists" can never be true without a real join having
+      // landed. Never notify yourself for your own Activity. This branch
+      // only ever runs on a genuinely first-time join (the alreadyJoined
+      // early-return above already handled re-joins), so the notification
+      // is guaranteed not to already exist — a plain create, never an
+      // update.
+      if (uid !== activity.authorUid) {
+        const notificationId = buildNotificationId('activity_join', { contentId: activityId, actorUid: uid });
+        tx.set(notificationRef(notificationId), {
+          notificationId,
+          recipientUid: activity.authorUid,
+          actorUid: uid,
+          actorDisplayName: trusted.fields.displayName,
+          actorUsername: trusted.fields.username,
+          type: 'activity_join',
+          contentId: activityId,
+          reelId: null,
+          commentId: null,
+          previewText: null,
+          responseStatus: null,
+          read: false,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        } satisfies WithFieldValue<Notification>);
+      }
+
       return { alreadyJoined: false, participantCount: nextCount };
     });
 
@@ -150,7 +178,11 @@ export async function leaveActivity(activityId: string, uid: string): Promise<Le
 
   try {
     const outcome = await runTransaction(firestore, async (tx) => {
-      const [participantSnap, statsSnap] = await Promise.all([tx.get(participantRef(activityId, uid)), tx.get(statsRef(activityId))]);
+      const [activitySnap, participantSnap, statsSnap] = await Promise.all([
+        tx.get(contentDocRef(activityId)),
+        tx.get(participantRef(activityId, uid)),
+        tx.get(statsRef(activityId)),
+      ]);
 
       const currentCount = statsSnap.exists() ? (statsSnap.data() as ActivityStats).participantCount : 0;
 
@@ -158,12 +190,31 @@ export async function leaveActivity(activityId: string, uid: string): Promise<Le
         return { wasJoined: false, participantCount: currentCount };
       }
 
+      // All reads (including the notification pre-check below) must happen
+      // before any writes in a Firestore transaction — this is why the
+      // notification lookup is resolved here, ahead of the participant/
+      // stats deletes further down, rather than interleaved with them.
+      // Never look up (or delete) a notification for your own Activity —
+      // joining your own Activity never created one. A plain, unconditional
+      // delete would risk Firestore Rules evaluating a null `resource` for
+      // a genuinely nonexistent notification (the exact class of bug this
+      // app hit once before with block-related deletes — see
+      // src/services/blocks.ts) — so existence is checked first.
+      const activity = activitySnap.exists() ? (activitySnap.data() as ActivityContent) : null;
+      const notificationId =
+        activity && uid !== activity.authorUid ? buildNotificationId('activity_join', { contentId: activityId, actorUid: uid }) : null;
+      const notificationSnap = notificationId ? await tx.get(notificationRef(notificationId)) : null;
+
       const nextCount = Math.max(0, currentCount - 1);
       tx.delete(participantRef(activityId, uid));
       tx.set(statsRef(activityId), {
         participantCount: nextCount,
         updatedAt: serverTimestamp(),
       } satisfies WithFieldValue<ActivityStats>);
+
+      if (notificationId && notificationSnap?.exists()) {
+        tx.delete(notificationRef(notificationId));
+      }
 
       return { wasJoined: true, participantCount: nextCount };
     });
@@ -213,34 +264,88 @@ export type SetEventResponseResult = EngagementResult<{ status: EventResponseSta
 
 export async function setEventResponse(eventId: string, uid: string, status: EventResponseStatus): Promise<SetEventResponseResult> {
   if (!firestore) return { ok: false, error: 'not-configured', message: 'Firestore is not available.' };
+  const db = firestore;
 
   const trusted = await resolveTrustedFields(uid);
   if (!trusted.ok) return trusted;
 
-  const eventSnap = await getDoc(contentDocRef(eventId));
-  if (!eventSnap.exists() || eventSnap.data().type !== 'event' || eventSnap.data().status !== 'published') {
-    return { ok: false, error: 'not-found', message: "Couldn't update your response." };
-  }
-  const event = eventSnap.data() as EventContent;
-  if (event.endsAt.toMillis() <= Date.now()) {
-    return { ok: false, error: 'ended', message: 'Event has ended.' };
-  }
-
   try {
-    const existingSnap = await getDoc(responseRef(eventId, uid));
-    if (existingSnap.exists()) {
-      await updateDoc(responseRef(eventId, uid), { status, updatedAt: serverTimestamp() });
-    } else {
-      await setDoc(responseRef(eventId, uid), {
-        uid,
-        displayName: trusted.fields.displayName,
-        username: trusted.fields.username,
-        status,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      } satisfies WithFieldValue<EventResponse>);
+    await runTransaction(db, async (tx) => {
+      const eventSnap = await tx.get(contentDocRef(eventId));
+      if (!eventSnap.exists() || eventSnap.data().type !== 'event' || eventSnap.data().status !== 'published') {
+        throw new TransactionAbort('not-found', "Couldn't update your response.");
+      }
+      const event = eventSnap.data() as EventContent;
+      if (event.endsAt.toMillis() <= Date.now()) {
+        throw new TransactionAbort('ended', 'Event has ended.');
+      }
+
+      const existingSnap = await tx.get(responseRef(eventId, uid));
+      const currentStatus = existingSnap.exists() ? (existingSnap.data() as EventResponse).status : null;
+
+      // ONE logical notification per (actor, event) representing the
+      // actor's CURRENT response (see src/types/notification.ts) — never
+      // notify yourself. Reading it here, before any writes below, keeps
+      // every tx.get() ahead of every tx.set()/tx.delete(), which Firestore
+      // transactions require.
+      const isSelf = uid === event.authorUid;
+      const notificationId = isSelf ? null : buildNotificationId('event_response', { contentId: eventId, actorUid: uid });
+      const notificationSnap = notificationId ? await tx.get(notificationRef(notificationId)) : null;
+
+      // Response write — create or update, exactly as before Step 38.
+      if (existingSnap.exists()) {
+        tx.update(responseRef(eventId, uid), { status, updatedAt: serverTimestamp() });
+      } else {
+        tx.set(responseRef(eventId, uid), {
+          uid,
+          displayName: trusted.fields.displayName,
+          username: trusted.fields.username,
+          status,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        } satisfies WithFieldValue<EventResponse>);
+      }
+
+      // Only touch the notification when the response is actually new or
+      // its status is actually changing — tapping/selecting the same
+      // status again must stay a true no-op (Step 38 Section 13), and must
+      // never spuriously reset an already-read notification back to
+      // unread. Interested <-> Going updates the SAME document (never a
+      // second one) and deliberately bumps createdAt to a fresh
+      // serverTimestamp alongside read:false — the Event creator should
+      // see this as a new Activity update, sorted to the top of their
+      // Inbox, not a stale entry sitting wherever the original Interested
+      // notification first landed (see firestore.rules' narrow update
+      // rule for this exact transition).
+      if (notificationId && currentStatus !== status) {
+        const notificationData = {
+          notificationId,
+          recipientUid: event.authorUid,
+          actorUid: uid,
+          actorDisplayName: trusted.fields.displayName,
+          actorUsername: trusted.fields.username,
+          type: 'event_response' as const,
+          contentId: eventId,
+          reelId: null,
+          commentId: null,
+          previewText: null,
+          responseStatus: status,
+          read: false,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        } satisfies WithFieldValue<Notification>;
+
+        if (notificationSnap?.exists()) {
+          tx.update(notificationRef(notificationId), notificationData);
+        } else {
+          tx.set(notificationRef(notificationId), notificationData);
+        }
+      }
+    });
+  } catch (error) {
+    if (error instanceof TransactionAbort) {
+      return { ok: false, error: error.code, message: error.message };
     }
-  } catch {
     return { ok: false, error: 'unknown', message: "Couldn't update your response." };
   }
 
@@ -252,8 +357,23 @@ export async function removeEventResponse(
   uid: string
 ): Promise<{ ok: true } | { ok: false; error: EngagementError; message: string }> {
   if (!firestore) return { ok: false, error: 'not-configured', message: 'Firestore is not available.' };
+  const db = firestore;
+
+  // The notification ID is deterministic from (eventId, uid) alone — no
+  // need to read the Event doc to find its author here. Existence is
+  // checked before deleting (same reasoning as leaveActivity/blocks.ts):
+  // an unconditional delete of a genuinely nonexistent notification risks
+  // Firestore Rules evaluating a null `resource`. A self-response never
+  // has a paired notification, so this is naturally a no-op for that case.
+  const notificationId = buildNotificationId('event_response', { contentId: eventId, actorUid: uid });
   try {
-    await deleteDoc(responseRef(eventId, uid));
+    await runTransaction(db, async (tx) => {
+      const notificationSnap = await tx.get(notificationRef(notificationId));
+      tx.delete(responseRef(eventId, uid));
+      if (notificationSnap.exists()) {
+        tx.delete(notificationRef(notificationId));
+      }
+    });
   } catch {
     return { ok: false, error: 'unknown', message: "Couldn't update your response." };
   }

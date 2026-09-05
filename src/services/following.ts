@@ -81,6 +81,7 @@ export async function followUser(followerUid: string, targetUid: string): Promis
       reelId: null,
       commentId: null,
       previewText: null,
+      responseStatus: null,
       read: false,
       createdAt: serverTimestamp(),
       updatedAt: serverTimestamp(),

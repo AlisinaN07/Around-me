@@ -222,11 +222,24 @@ function validNotification(notificationId, recipientUid, actorUid, actorDisplayN
     reelId: null,
     commentId: null,
     previewText: null,
+    // responseStatus: null by default — matches every real notification
+    // write (see src/types/notification.ts). Only event_response tests
+    // override it to 'interested'/'going'.
+    responseStatus: null,
     read: false,
     createdAt: serverTimestamp(),
     updatedAt: serverTimestamp(),
     ...overrides,
   };
+}
+
+// Same deterministic ID scheme as buildNotificationId in
+// src/services/notifications.ts for event_response/activity_join.
+function eventResponseNotificationId(contentId, actorUid) {
+  return `event_response_${contentId}_${actorUid}`;
+}
+function activityJoinNotificationId(contentId, actorUid) {
+  return `activity_join_${contentId}_${actorUid}`;
 }
 
 // Same deterministic ID scheme as buildNotificationId in
@@ -2058,6 +2071,311 @@ async function main() {
       const batch = writeBatch(notifB);
       batch.update(doc(notifB, 'notifications', likeNotificationId('post-notif-1', 'notifb')), { read: true, updatedAt: serverTimestamp() });
       await assertFails(batch.commit());
+    });
+
+    // --- EVENT RESPONSE notifications (Step 38) ---
+    await check('setup: notifa creates an Event for notification testing', async () => {
+      await assertSucceeds(
+        setDoc(doc(notifA, 'content', 'event-notif-1'), validEvent('notifa', 'Notif Alpha', 'notifa_handle', 'event-notif-1'))
+      );
+    });
+
+    await check('ALLOW: B responds Interested to A\'s Event + notification created atomically', async () => {
+      const notificationId = eventResponseNotificationId('event-notif-1', 'notifb');
+      const batch = writeBatch(notifB);
+      batch.set(doc(notifB, 'content', 'event-notif-1', 'responses', 'notifb'), validResponse('notifb', 'Notif Bravo', 'notifb_handle', 'interested'));
+      batch.set(
+        doc(notifB, 'notifications', notificationId),
+        validNotification(notificationId, 'notifa', 'notifb', 'Notif Bravo', 'notifb_handle', 'event_response', {
+          contentId: 'event-notif-1',
+          responseStatus: 'interested',
+        })
+      );
+      await assertSucceeds(batch.commit());
+
+      const snapshot = await getDoc(doc(notifA, 'notifications', notificationId));
+      assert.equal(snapshot.data().responseStatus, 'interested');
+      assert.equal(snapshot.data().read, false);
+    });
+
+    await check('DENY: self notification (A responds to own Event)', async () => {
+      const notificationId = eventResponseNotificationId('event-notif-1', 'notifa');
+      const batch = writeBatch(notifA);
+      batch.set(doc(notifA, 'content', 'event-notif-1', 'responses', 'notifa'), validResponse('notifa', 'Notif Alpha', 'notifa_handle', 'going'));
+      batch.set(
+        doc(notifA, 'notifications', notificationId),
+        validNotification(notificationId, 'notifa', 'notifa', 'Notif Alpha', 'notifa_handle', 'event_response', {
+          contentId: 'event-notif-1',
+          responseStatus: 'going',
+        })
+      );
+      await assertFails(batch.commit());
+    });
+
+    await check('DENY: notification recipient is not the Event\'s real author', async () => {
+      const notificationId = eventResponseNotificationId('event-notif-1', 'notifc');
+      const batch = writeBatch(notifC);
+      batch.set(doc(notifC, 'content', 'event-notif-1', 'responses', 'notifc'), validResponse('notifc', 'Notif Charlie', 'notifc_handle', 'going'));
+      batch.set(
+        doc(notifC, 'notifications', notificationId),
+        // Real author is notifa, not notifb — recipientUid is spoofed.
+        validNotification(notificationId, 'notifb', 'notifc', 'Notif Charlie', 'notifc_handle', 'event_response', {
+          contentId: 'event-notif-1',
+          responseStatus: 'going',
+        })
+      );
+      await assertFails(batch.commit());
+    });
+
+    await check('DENY: Event response notification with no matching response document', async () => {
+      const notificationId = eventResponseNotificationId('event-notif-1', 'notifc');
+      await assertFails(
+        setDoc(
+          doc(notifC, 'notifications', notificationId),
+          validNotification(notificationId, 'notifa', 'notifc', 'Notif Charlie', 'notifc_handle', 'event_response', {
+            contentId: 'event-notif-1',
+            responseStatus: 'going',
+          })
+        )
+      );
+    });
+
+    await check('DENY: notification claims Interested while the real response is Going', async () => {
+      const notificationId = eventResponseNotificationId('event-notif-1', 'notifc');
+      const batch = writeBatch(notifC);
+      batch.set(doc(notifC, 'content', 'event-notif-1', 'responses', 'notifc'), validResponse('notifc', 'Notif Charlie', 'notifc_handle', 'going'));
+      batch.set(
+        doc(notifC, 'notifications', notificationId),
+        validNotification(notificationId, 'notifa', 'notifc', 'Notif Charlie', 'notifc_handle', 'event_response', {
+          contentId: 'event-notif-1',
+          responseStatus: 'interested', // mismatched — the response doc above says 'going'
+        })
+      );
+      await assertFails(batch.commit());
+    });
+
+    await check('ALLOW: B switches Interested -> Going — same logical notification, unread again', async () => {
+      const notificationId = eventResponseNotificationId('event-notif-1', 'notifb');
+      const before = await getDoc(doc(notifA, 'notifications', notificationId));
+      const beforeCreatedAt = before.data().createdAt;
+
+      const batch = writeBatch(notifB);
+      batch.update(doc(notifB, 'content', 'event-notif-1', 'responses', 'notifb'), { status: 'going', updatedAt: serverTimestamp() });
+      batch.update(doc(notifB, 'notifications', notificationId), {
+        responseStatus: 'going',
+        read: false,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+      await assertSucceeds(batch.commit());
+
+      const after = await getDoc(doc(notifA, 'notifications', notificationId));
+      assert.equal(after.data().responseStatus, 'going');
+      assert.equal(after.data().read, false);
+      assert.ok(after.data().createdAt.toMillis() > beforeCreatedAt.toMillis(), 'createdAt should bump so this resurfaces at the top of the Inbox');
+
+      // Exactly one notification for this (event, actor) pair — never a
+      // stale second "Interested" alongside the new "Going".
+      const notifQuery = query(
+        collection(notifA, 'notifications'),
+        where('recipientUid', '==', 'notifa'),
+        where('contentId', '==', 'event-notif-1'),
+        where('actorUid', '==', 'notifb')
+      );
+      const notifSnapshot = await getDocs(notifQuery);
+      assert.equal(notifSnapshot.size, 1);
+    });
+
+    await check('DENY: updating an event_response notification without a real response change', async () => {
+      // The notification is already 'going' (from the test above) — trying
+      // to "update" it to 'going' again (no actual state change) must fail,
+      // even though the response doc itself is untouched in this batch.
+      const notificationId = eventResponseNotificationId('event-notif-1', 'notifb');
+      await assertFails(
+        updateDoc(doc(notifB, 'notifications', notificationId), {
+          responseStatus: 'going',
+          read: false,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        })
+      );
+    });
+
+    await check('DENY: changing an immutable field (actorUid) on an event_response notification update', async () => {
+      const notificationId = eventResponseNotificationId('event-notif-1', 'notifb');
+      const batch = writeBatch(notifB);
+      batch.update(doc(notifB, 'content', 'event-notif-1', 'responses', 'notifb'), { status: 'interested', updatedAt: serverTimestamp() });
+      batch.update(doc(notifB, 'notifications', notificationId), {
+        actorUid: 'notifc',
+        responseStatus: 'interested',
+        read: false,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+      await assertFails(batch.commit());
+    });
+
+    await check('ALLOW: B removes their Event response + notification deleted atomically', async () => {
+      const notificationId = eventResponseNotificationId('event-notif-1', 'notifb');
+      const batch = writeBatch(notifB);
+      batch.delete(doc(notifB, 'content', 'event-notif-1', 'responses', 'notifb'));
+      batch.delete(doc(notifB, 'notifications', notificationId));
+      await assertSucceeds(batch.commit());
+
+      await testEnv.withSecurityRulesDisabled(async (adminContext) => {
+        const snapshot = await getDoc(doc(adminContext.firestore(), 'notifications', notificationId));
+        assert.equal(snapshot.exists(), false);
+      });
+    });
+
+    await check('DENY: deleting an event_response notification while the response still exists', async () => {
+      const notificationId = eventResponseNotificationId('event-notif-1', 'notifc');
+      // notifc's response + notification from the mismatch test above were
+      // never committed (that batch failed), so seed a real one first.
+      await testEnv.withSecurityRulesDisabled(async (adminContext) => {
+        const db = adminContext.firestore();
+        await setDoc(doc(db, 'content', 'event-notif-1', 'responses', 'notifc'), validResponse('notifc', 'Notif Charlie', 'notifc_handle', 'going'));
+        await setDoc(
+          doc(db, 'notifications', notificationId),
+          validNotification(notificationId, 'notifa', 'notifc', 'Notif Charlie', 'notifc_handle', 'event_response', {
+            contentId: 'event-notif-1',
+            responseStatus: 'going',
+          })
+        );
+      });
+      await assertFails(deleteDoc(doc(notifC, 'notifications', notificationId)));
+    });
+
+    await check('DENY: arbitrary/unknown notification type', async () => {
+      await assertFails(
+        setDoc(doc(notifB, 'notifications', 'made-up-id'), {
+          notificationId: 'made-up-id',
+          recipientUid: 'notifa',
+          actorUid: 'notifb',
+          actorDisplayName: 'Notif Bravo',
+          actorUsername: 'notifb_handle',
+          type: 'made_up_type',
+          contentId: null,
+          reelId: null,
+          commentId: null,
+          previewText: null,
+          responseStatus: null,
+          read: false,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        })
+      );
+    });
+
+    // --- ACTIVITY JOIN notifications (Step 38) ---
+    await check('setup: notifa creates an Activity for notification testing', async () => {
+      await assertSucceeds(
+        setDoc(doc(notifA, 'content', 'activity-notif-1'), validActivity('notifa', 'Notif Alpha', 'notifa_handle', 'activity-notif-1'))
+      );
+    });
+
+    await check('ALLOW: B joins A\'s Activity + notification + counter, all atomic', async () => {
+      const notificationId = activityJoinNotificationId('activity-notif-1', 'notifb');
+      const batch = writeBatch(notifB);
+      batch.set(doc(notifB, 'content', 'activity-notif-1', 'participants', 'notifb'), validParticipant('notifb', 'Notif Bravo', 'notifb_handle'));
+      batch.set(doc(notifB, 'content', 'activity-notif-1', 'stats', 'activity'), statsDoc(1));
+      batch.set(
+        doc(notifB, 'notifications', notificationId),
+        validNotification(notificationId, 'notifa', 'notifb', 'Notif Bravo', 'notifb_handle', 'activity_join', { contentId: 'activity-notif-1' })
+      );
+      await assertSucceeds(batch.commit());
+
+      const snapshot = await getDoc(doc(notifA, 'notifications', notificationId));
+      assert.equal(snapshot.data().type, 'activity_join');
+      assert.equal(snapshot.data().read, false);
+    });
+
+    await check('DENY: self notification (A joins own Activity)', async () => {
+      // A isn't actually joining (that would be a legitimate no-notification
+      // case) — this asserts that even an attempted self-targeted
+      // notification is rejected outright.
+      const notificationId = activityJoinNotificationId('activity-notif-1', 'notifa');
+      await assertFails(
+        setDoc(
+          doc(notifA, 'notifications', notificationId),
+          validNotification(notificationId, 'notifa', 'notifa', 'Notif Alpha', 'notifa_handle', 'activity_join', { contentId: 'activity-notif-1' })
+        )
+      );
+    });
+
+    await check('DENY: Activity join notification with no matching participant document', async () => {
+      const notificationId = activityJoinNotificationId('activity-notif-1', 'notifc');
+      await assertFails(
+        setDoc(
+          doc(notifC, 'notifications', notificationId),
+          validNotification(notificationId, 'notifa', 'notifc', 'Notif Charlie', 'notifc_handle', 'activity_join', { contentId: 'activity-notif-1' })
+        )
+      );
+    });
+
+    await check('DENY: Activity join notification after a full Activity rejects the join', async () => {
+      await assertSucceeds(
+        setDoc(
+          doc(notifA, 'content', 'activity-notif-full'),
+          validActivity('notifa', 'Notif Alpha', 'notifa_handle', 'activity-notif-full', { maxParticipants: 1 })
+        )
+      );
+      await testEnv.withSecurityRulesDisabled(async (adminContext) => {
+        const db = adminContext.firestore();
+        await setDoc(doc(db, 'content', 'activity-notif-full', 'participants', 'notifa'), validParticipant('notifa', 'Notif Alpha', 'notifa_handle'));
+        await setDoc(doc(db, 'content', 'activity-notif-full', 'stats', 'activity'), statsDoc(1));
+      });
+
+      const notificationId = activityJoinNotificationId('activity-notif-full', 'notifc');
+      const batch = writeBatch(notifC);
+      // The participant create itself must fail (Activity already full at
+      // maxParticipants) — since it's in the same batch as the
+      // notification, the notification's existsAfter(participant) check
+      // also fails, and the notification create is denied — proving
+      // "notification exists" can never happen without a real successful
+      // join, even inside one combined batch.
+      batch.set(doc(notifC, 'content', 'activity-notif-full', 'participants', 'notifc'), validParticipant('notifc', 'Notif Charlie', 'notifc_handle'));
+      batch.set(doc(notifC, 'content', 'activity-notif-full', 'stats', 'activity'), statsDoc(2));
+      batch.set(
+        doc(notifC, 'notifications', notificationId),
+        validNotification(notificationId, 'notifa', 'notifc', 'Notif Charlie', 'notifc_handle', 'activity_join', { contentId: 'activity-notif-full' })
+      );
+      await assertFails(batch.commit());
+    });
+
+    await check('ALLOW: B leaves the Activity + notification deleted atomically', async () => {
+      const notificationId = activityJoinNotificationId('activity-notif-1', 'notifb');
+      const batch = writeBatch(notifB);
+      batch.delete(doc(notifB, 'content', 'activity-notif-1', 'participants', 'notifb'));
+      batch.set(doc(notifB, 'content', 'activity-notif-1', 'stats', 'activity'), statsDoc(0));
+      batch.delete(doc(notifB, 'notifications', notificationId));
+      await assertSucceeds(batch.commit());
+
+      await testEnv.withSecurityRulesDisabled(async (adminContext) => {
+        const snapshot = await getDoc(doc(adminContext.firestore(), 'notifications', notificationId));
+        assert.equal(snapshot.exists(), false);
+      });
+    });
+
+    await check('DENY: deleting an activity_join notification while the participant still exists', async () => {
+      const notificationId = activityJoinNotificationId('activity-notif-1', 'notifc');
+      await testEnv.withSecurityRulesDisabled(async (adminContext) => {
+        const db = adminContext.firestore();
+        await setDoc(doc(db, 'content', 'activity-notif-1', 'participants', 'notifc'), validParticipant('notifc', 'Notif Charlie', 'notifc_handle'));
+        await setDoc(doc(db, 'content', 'activity-notif-1', 'stats', 'activity'), statsDoc(1));
+        await setDoc(
+          doc(db, 'notifications', notificationId),
+          validNotification(notificationId, 'notifa', 'notifc', 'Notif Charlie', 'notifc_handle', 'activity_join', { contentId: 'activity-notif-1' })
+        );
+      });
+      // notifc still has a real participant doc — deleting only the
+      // notification (without leaving) must be denied.
+      await assertFails(deleteDoc(doc(notifC, 'notifications', notificationId)));
+    });
+
+    await check('ALLOW: recipient marks an activity_join notification read', async () => {
+      const notificationId = activityJoinNotificationId('activity-notif-1', 'notifc');
+      await assertSucceeds(updateDoc(doc(notifA, 'notifications', notificationId), { read: true, updatedAt: serverTimestamp() }));
     });
 
     // =========================================================================

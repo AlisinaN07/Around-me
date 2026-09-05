@@ -36,6 +36,10 @@ export function buildNotificationId(
       return `reel_like_${params.reelId}_${params.actorUid}`;
     case 'reel_comment':
       return `reel_comment_${params.commentId}`;
+    case 'event_response':
+      return `event_response_${params.contentId}_${params.actorUid}`;
+    case 'activity_join':
+      return `activity_join_${params.contentId}_${params.actorUid}`;
   }
 }
 
