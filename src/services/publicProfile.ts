@@ -5,7 +5,19 @@
  * document (that stays owner-only — see firestore.rules).
  */
 
-import { doc, getDoc, serverTimestamp, setDoc, type WithFieldValue } from 'firebase/firestore';
+import {
+  collection,
+  doc,
+  getDoc,
+  getDocs,
+  limit,
+  orderBy,
+  query,
+  serverTimestamp,
+  setDoc,
+  where,
+  type WithFieldValue,
+} from 'firebase/firestore';
 
 import type { PublicProfile } from '@/types/social';
 import type { UsernameReservation } from '@/types/user';
@@ -16,6 +28,7 @@ import { fetchUserProfile } from './userProfile';
 
 const PUBLIC_PROFILES_COLLECTION = 'publicProfiles';
 const USERNAMES_COLLECTION = 'usernames';
+const SEARCH_RESULT_LIMIT = 20;
 
 /** Normalizes a missing `bio` (public profiles created before Step 33) to '' — see fetchUserProfile's identical rule. */
 export async function fetchPublicProfile(uid: string): Promise<PublicProfile | null> {
@@ -97,4 +110,36 @@ export async function ensureMyPublicProfile(uid: string): Promise<EnsurePublicPr
     return { ok: false, error: 'unknown', message: 'Public profile was created but could not be read back.' };
   }
   return { ok: true, profile: created };
+}
+
+/**
+ * Global people search (Step 37) — a `usernameLower` prefix range query
+ * directly against `publicProfiles`, the same collection every other
+ * profile lookup here already reads from. There is no separate search
+ * index: a deleted account's `publicProfiles/{uid}` is gone (see the
+ * account-deletion backend), so it naturally stops appearing here with no
+ * stale-index cleanup ever required; a changed username is read from this
+ * same live document, so the old prefix stops matching and the new one
+ * starts matching immediately, atomically with the rename itself.
+ *
+ * `normalizedQuery` must already be lower-cased (see
+ * `normalizeUsernameSearchQuery`) — this function does not re-normalize,
+ * so callers control exactly what's queried. Deliberately does not filter
+ * by `accountType`: Personal and Business accounts are equally
+ * discoverable by username (Step 37 locked scope).
+ */
+export async function searchPublicProfilesByUsername(normalizedQuery: string): Promise<PublicProfile[]> {
+  if (!firestore) return [];
+  if (!normalizedQuery) return [];
+
+  const snapshot = await getDocs(
+    query(
+      collection(firestore, PUBLIC_PROFILES_COLLECTION),
+      orderBy('usernameLower'),
+      where('usernameLower', '>=', normalizedQuery),
+      where('usernameLower', '<=', `${normalizedQuery}`),
+      limit(SEARCH_RESULT_LIMIT)
+    )
+  );
+  return snapshot.docs.map((docSnapshot) => docSnapshot.data() as PublicProfile);
 }

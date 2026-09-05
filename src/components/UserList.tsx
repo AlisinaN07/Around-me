@@ -51,28 +51,42 @@ export function UserList({ title, emptyText, fetcher }: UserListProps) {
       ) : profiles.length === 0 ? (
         <EmptyState icon="people-outline" title={emptyText} />
       ) : (
-        <View style={styles.list}>
-          {profiles.map((profile, index) => (
-            <AuthorLink
-              key={profile.uid}
-              uid={profile.uid}
-              style={[styles.row, index === profiles.length - 1 && styles.rowLast]}
-            >
-              <Avatar name={profile.displayName} size={52} />
-              <View style={styles.rowText}>
-                <Text style={styles.displayName} numberOfLines={1}>
-                  {profile.displayName}
-                </Text>
-                <Text style={styles.username} numberOfLines={1}>
-                  @{profile.username}
-                  {profile.cityName ? ` · ${formatCityDisplayName(profile.cityName)}` : ''}
-                </Text>
-              </View>
-            </AuthorLink>
-          ))}
-        </View>
+        <ProfileList profiles={profiles} />
       )}
     </HeaderScreenLayout>
+  );
+}
+
+/**
+ * Shared profile-row list — the same Avatar/name/@username/city row used
+ * by Followers/Following, reused as-is by global People Search (Step 37)
+ * so both surfaces render identically rather than maintaining two visual
+ * copies of the same row.
+ */
+export function ProfileList({ profiles }: { profiles: PublicProfile[] }) {
+  return (
+    <View style={styles.list}>
+      {profiles.map((profile, index) => (
+        <ProfileRow key={profile.uid} profile={profile} isLast={index === profiles.length - 1} />
+      ))}
+    </View>
+  );
+}
+
+export function ProfileRow({ profile, isLast }: { profile: PublicProfile; isLast?: boolean }) {
+  return (
+    <AuthorLink uid={profile.uid} style={[styles.row, isLast && styles.rowLast]}>
+      <Avatar name={profile.displayName} size={52} />
+      <View style={styles.rowText}>
+        <Text style={styles.displayName} numberOfLines={1}>
+          {profile.displayName}
+        </Text>
+        <Text style={styles.username} numberOfLines={1}>
+          @{profile.username}
+          {profile.cityName ? ` · ${formatCityDisplayName(profile.cityName)}` : ''}
+        </Text>
+      </View>
+    </AuthorLink>
   );
 }
 

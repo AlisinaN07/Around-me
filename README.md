@@ -752,6 +752,38 @@ Per the step's scope, these were deliberately not added anywhere in Auth/onboard
 
 No Firestore Rules, Storage Rules, Functions, or index changes — this step touched only two client-side view files (`UserList.tsx`, `interests.tsx`).
 
+## Global people search (Step 37)
+
+Closes the basic social-discovery loop: Home → Search → type a username → tap a result → real Public Profile → Follow/Message from there.
+
+### Scope: username only, no external search service
+
+Search is a `usernameLower` prefix range query directly against `publicProfiles` — the same collection every other profile lookup here already reads from. There is no display-name search, no `displayNameLower`/`searchTokens` schema, no Algolia/Typesense/Elasticsearch, and no recommendations — this is intentionally the smallest possible discovery primitive. Personal and Business accounts are equally searchable and rendered identically in results: no verified/official/business badge exists anywhere in this app, and this step didn't add one.
+
+### Query and normalization
+
+`searchPublicProfilesByUsername(normalizedQuery)` in `src/services/publicProfile.ts` runs `where('usernameLower', '>=', q)` / `where('usernameLower', '<=', q + '')`, `orderBy('usernameLower')`, `limit(20)` — the standard Firestore prefix-range pattern, capped at 20 reads per completed query, no pagination. `normalizeUsernameSearchQuery` in `src/utils/username.ts` strips one leading `@`, trims, and lowercases — deliberately more permissive than `normalizeUsername` (no length/character-set validation), since a partial prefix like `"a"` is never itself expected to be a valid username. A plain-string range query can't be broken by unexpected input, so there's nothing else to guard against.
+
+Empirically verified against production (not assumed): the query succeeded immediately with no missing-index error and no Firestore Rules change — `publicProfiles` already allows `read` (covering `list`) to any signed-in user (Step 11), and Firestore's automatic single-field index on `usernameLower` is sufficient for a pure range query with no additional filters. `firestore.rules` and `firestore.indexes.json` are both untouched by this step.
+
+### Search screen (`src/app/(app)/search.tsx`)
+
+A 300ms debounce and a 2-character minimum keep this from querying on every keystroke or on an empty/near-empty string. A monotonic generation counter discards any in-flight response that a newer keystroke has already superseded (typing `al` → `ali` → `alix` quickly can never let `al`'s slower response overwrite `alix`'s). Five distinct states are rendered explicitly and never conflated: idle (before 2 normalized characters — "Find people on Around Me / Search by username."), loading (a small inline spinner, not a full-screen takeover), loaded-with-results, loaded-with-zero-results ("No people found" — only ever shown after a query actually completes), and error (a real retryable state, never silently downgraded to "no results"). The current user's own uid is filtered out of results client-side. My own outgoing blocks are fetched once per screen visit via the existing bounded `fetchMyBlockedUserIds` (the same mechanism Home already uses for its own client-side content filtering) and filtered out client-side too — this is one-directional by design: there's no efficient way to check whether someone has blocked *me* without an extra read per result, so that direction is left entirely to Public Profile's own pre-existing, unmodified block guard.
+
+Search results intentionally carry no inline Follow/Message action — tapping a row always goes to the real Public Profile first, which is the sole owner of Follow/Message/Block/Report. This keeps each result to exactly one document read (its own `publicProfiles` doc, nothing more).
+
+### Global, not Active-City scoped
+
+People Search deliberately ignores Active City — a Karlstad user can search and find a Stockholm user directly by username. Each result still shows its home city for context (reusing the same `formatCityDisplayName` + row layout as Followers/Following, via a shared `ProfileList`/`ProfileRow` extracted from `src/components/UserList.tsx`).
+
+### Entry point
+
+A `search-outline` icon was added to Home's existing top-right icon group, next to the pre-existing category-filter icon — Active City, Following/For You, and the filter button are all unchanged. `/search` is a plain authenticated route (`src/app/(app)/search.tsx`), not a tab — the bottom navigation stays Home/Events/Create/Inbox/Profile.
+
+### Regression-tested against real production fixtures
+
+Using three disposable accounts (Personal, Business, Personal), verified: a shared prefix returns both the Personal and Business account identically; an exact full username returns only that account; a leading `@` normalizes to the same result as without it; a nonexistent prefix returns zero, not an error. Renaming a disposable account's username through the real Step 33 `updateMyProfile` transaction confirmed the old prefix stops matching and the new one starts matching immediately — there's no separate search index to go stale, since search reads `publicProfiles` directly. Calling the real deployed `deleteMyAccountData` trusted-backend callable (Step 34.2) against a disposable account confirmed it disappears from search the moment its `publicProfiles/{uid}` document is gone.
+
 ## Reels (Cloud Storage — Step 18)
 
 Reels are short (≤60s), video-only posts with vertical, city-scoped playback — the first feature in this app to use Cloud Storage rather than Firestore alone. They live in their own root collection, `reels/{reelId}`, separate from `content/{contentId}` (posts/activities/events): a Reel has a media-upload lifecycle and Storage metadata that the other content types never had, and folding it into `content` would have meant giving every Post/Activity/Event query an upload-status field it never needs.

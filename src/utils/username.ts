@@ -25,3 +25,19 @@ export function normalizeUsername(rawUsername: string): UsernameValidationResult
 
   return { valid: true, username, usernameLower };
 }
+
+/**
+ * Normalizes free-typed search input into the lower-case form
+ * `usernameLower` is queried against — deliberately more permissive than
+ * `normalizeUsername` (no length/character-set validation, since a partial
+ * prefix like "a" or a still-being-typed string is never itself a valid
+ * username). Only three transforms, each safe for any input: trim, strip
+ * one leading "@", lowercase. Never throws, never rejects a string — a
+ * plain-string Firestore range query can't be broken by unexpected
+ * characters, so there's nothing else to guard against here.
+ */
+export function normalizeUsernameSearchQuery(rawQuery: string): string {
+  const trimmed = rawQuery.trim();
+  const withoutAt = trimmed.startsWith('@') ? trimmed.slice(1) : trimmed;
+  return withoutAt.toLowerCase();
+}

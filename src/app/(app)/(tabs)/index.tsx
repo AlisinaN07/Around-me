@@ -125,9 +125,14 @@ export default function HomeScreen() {
         <ModeTab label="For You" active={mode === 'forYou'} onPress={() => setMode('forYou')} />
       </View>
 
-      <Pressable onPress={() => setIsFilterOpen(true)} style={styles.filterButton} accessibilityRole="button" accessibilityLabel="Filter by category">
-        <Ionicons name="options-outline" size={20} color={Colors.text} />
-      </Pressable>
+      <View style={styles.rightIcons}>
+        <Pressable onPress={() => router.push('/search')} style={styles.iconButton} accessibilityRole="button" accessibilityLabel="Search people">
+          <Ionicons name="search-outline" size={20} color={Colors.text} />
+        </Pressable>
+        <Pressable onPress={() => setIsFilterOpen(true)} style={styles.iconButton} accessibilityRole="button" accessibilityLabel="Filter by category">
+          <Ionicons name="options-outline" size={20} color={Colors.text} />
+        </Pressable>
+      </View>
     </View>
   );
 
@@ -246,9 +251,14 @@ const styles = StyleSheet.create({
     borderRadius: 1,
     backgroundColor: Colors.text,
   },
-  filterButton: {
-    width: 32,
-    alignItems: 'flex-end',
+  rightIcons: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+  },
+  iconButton: {
+    width: 24,
+    alignItems: 'center',
   },
   exploringHint: {
     color: Colors.textSecondary,
