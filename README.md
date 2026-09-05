@@ -612,6 +612,51 @@ Settings gained a real **Account** section with one row, "Edit profile" — Sett
 
 **Account enumeration safety**: whether or not the entered email actually belongs to an account, the user sees the identical neutral confirmation ("If an account exists for this email, we've sent password reset instructions."). Only genuine service failures (network problems, rate limiting) surface as a real, retryable error — `auth/user-not-found` specifically is treated the same as success.
 
+## Trusted account-deletion backend (Step 34.2)
+
+Steps 34 (read-only design audit) and 34.1 (read-only feasibility proof) established that account deletion cannot be done from the client: `content/{contentId}` and published `reels/{reelId}` have no client-side delete rule under any circumstance, `conversations`/`messages`/`reports` are `allow delete: if false` unconditionally, and there is no way for a client to discover every cross-user artifact (likes/comments/responses/participation left on *other* users' content) without either a reverse-index registry or a trusted backend. Step 34.1 proved, against production, that the Admin SDK's `collectionGroup()` queries succeed once the right Firestore indexes exist — they hit `FAILED_PRECONDITION` (missing index), never `permission-denied` — so **no reverse-index/denormalized-ownership registry is required**. This step builds the real backend on that finding.
+
+### What this step does NOT do
+
+No Delete Account UI exists yet (no Settings row, no confirmation screen, no reauthentication prompt) — that is Step 34.3. This callable also never calls any Firebase Auth deletion API; the Auth account itself is untouched and remains signed-in-capable after this callable runs. Both are deliberate, locked decisions from the Step 34 audit: Auth deletion must happen last, once, only after every other cleanup step has already succeeded, and only behind a real reauthentication UX.
+
+### Cloud Functions foundation
+
+`functions/` is a minimal Firebase Cloud Functions 2nd-gen (`firebase-functions/v2/https`) TypeScript workspace, requiring Node 22 (`firebase-admin@14.3.0`'s own `engines` constraint) — separate from the mobile app's Node 20. Deployed to **`europe-north1`** (Finland): Firestore lives in `europe-north2` (Stockholm), which is not itself a supported 2nd-gen Functions region, so this is the closest region that actually is, chosen by genuine geographic proximity after confirming (via Firebase's own docs) there's no direct mapping for Stockholm.
+
+### The callable: `deleteMyAccountData`
+
+A single `onCall` callable. **Security boundary**: the target uid comes exclusively from `request.auth.uid` — there is no `uid`/`targetUid`/`userId` parameter of any kind, and `request.data` is never read for identity. An unauthenticated call is denied (`unauthenticated`); a call that deliberately sends `{ uid: someoneElse }` has that payload silently ignored, verified in production. Runs at `timeoutSeconds: 300`, `memory: '256MiB'` — sized for pagination-based cleanup of up to roughly 100 Reels and 1,000 follows per user, not for holding everything in memory at once.
+
+**Deletion policy** (owner-locked in Step 34):
+
+| Data | Policy |
+| --- | --- |
+| Posts/Activities/Events the caller authored | DELETE (subcollections first, then the parent) |
+| Reels the caller authored | DELETE Firestore doc + Storage object + subcollections |
+| Caller's own likes/comments/responses/participation on *other* users' content/Reels | DELETE |
+| Follow graph, block graph (both directions) | DELETE |
+| Notifications (as recipient and as actor) | DELETE |
+| Conversations/messages | **RETAIN** — never mutated, deleted, or read for content; a future "Deleted user" chat-display fallback is a later concern |
+| Reports (in every direction) | **RETAIN** — never mutated or deleted; reason/details text never appears in this callable's response |
+| Profile documents | DELETE last, in dependency order (see below) |
+
+**Idempotency**: every phase treats a missing document/object as "already cleaned," never an error. Verified in production by invoking the callable twice in a row for the same account — the second call returns all-zero counts with no errors.
+
+**Pagination**: every query that could return many documents uses "query a bounded page (≤400 docs), delete it, repeat until empty," never an unbounded `get()` or a cursor (a cursor is unsafe here since deleting shifts the result set out from under it).
+
+**Activity participation — counter integrity**: `content/{activityId}/stats/activity.participantCount` is an invariant-protected counter. When the caller is a participant on *someone else's* still-existing Activity, their participant doc is removed and the counter decremented by exactly 1 inside one Admin Firestore transaction — verified by production test to decrement exactly once on the first call and not again on a retry. When the caller is deleting their *own* Activity, other participants' docs are not individually counter-corrected — the whole `stats/activity` doc is removed with the parent, so a per-doc decrement would be wasted work. If a cross-user Activity's stats document is missing or its `participantCount` looks corrupt, that one item is left untouched and recorded as an error rather than risking corruption of another user's data.
+
+**Reels**: Storage objects are deleted only at their exact, schema-derived path (`reels/{authorUid}/{reelId}/source`) — never a prefix, never a recursive folder delete — using `ignoreNotFound: true` so an already-missing object counts as success. Both still-`uploading` drafts and `published` Reels go through this same authoritative path, unlike the client-only `discardReelDraft()`.
+
+**Profile documents**, deleted last and in this order: `privacySettings/{uid}` → `publicProfiles/{uid}` → `usernames/{usernameLower}` (read from the still-present `users/{uid}` document, and only deleted if that reservation's own `uid` field actually still matches the caller — a mismatch is left untouched and recorded, never force-deleted) → `users/{uid}` **last of all**, since `usernameLower` must still be readable from it right up until that point.
+
+**No reverse-index architecture**: confirmed unnecessary. The only Firestore change this step needed was four collection-group indexes (`likes.uid`, `comments.authorUid`, `responses.uid`, `participants.uid`, all `COLLECTION_GROUP` scope, configured via `firestore.indexes.json`'s `fieldOverrides` rather than its composite `indexes` array, since these are single-field indexes) — no Firestore Rules change and no Storage Rules change were needed or made; the Admin SDK bypasses both via IAM, not by loosening either.
+
+### Production verification
+
+Verified against real disposable accounts (no emulator — this sandbox's Firestore emulator networking is broken, the established fallback throughout this project): a Personal account (own Post/Activity/Reel-with-real-Storage-object, plus every cross-user interaction type on a second account's content) and a Business account (own Event + Reel). Confirmed independently via direct Firestore reads (not just trusting the callable's own response): full cross-user cleanup, the Activity counter decrementing exactly once and not on retry, both accounts' own content/Reels/Storage/profile fully gone, the DM conversation and report documents fully intact and unaltered on both sides, and — for the Business account — the Firebase Auth account still able to sign in after its data was deleted. All fixture data (including both disposable Auth accounts) was removed afterward via `scripts/delete-test-documents.cjs`'s exact-ID deletion; the real owner account was never touched.
+
 ## Reels (Cloud Storage — Step 18)
 
 Reels are short (≤60s), video-only posts with vertical, city-scoped playback — the first feature in this app to use Cloud Storage rather than Firestore alone. They live in their own root collection, `reels/{reelId}`, separate from `content/{contentId}` (posts/activities/events): a Reel has a media-upload lifecycle and Storage metadata that the other content types never had, and folding it into `content` would have meant giving every Post/Activity/Event query an upload-status field it never needs.

@@ -1,222 +1,356 @@
 /**
- * Step 34.1 — trusted-backend feasibility PROOF ONLY. This file does not
- * delete any user account or authored data. Its one export,
- * diagnoseAccountDeletionFeasibility, exists purely to answer, with real
- * evidence against the real production project, the open questions from
- * Step 34's read-only design audit:
+ * Step 34.2 — trusted, idempotent account-DATA deletion backend.
  *
- *  - Can a trusted backend authenticate the caller safely, with the target
- *    uid coming ONLY from the callable's own auth context?
- *  - Can the Admin SDK do what Step 26.1 found the client SDK categorically
- *    could not (collectionGroup queries across content/{*}/likes,
- *    content/{*}/comments, content/{*}/responses, content/{*}/participants,
- *    reels/{*}/likes, reels/{*}/comments)?
- *  - Can the Admin SDK access/delete a published Reel's Storage object at
- *    its real deterministic path, which storage.rules blocks for every
- *    client (see storage.rules's own "no trusted media + Firestore
- *    cascade-deletion workflow yet" comment)?
+ * This does NOT delete the Firebase Auth account — that is a deliberately
+ * later step (34.3/34.4), once a reauthentication UX exists. This callable
+ * cleans every piece of Around Me application data owned by, or authored
+ * by, the caller, per the owner's locked Step 34 policy:
  *
- * SECURITY: the target account is derived exclusively from
- * `request.auth.uid` (2nd-gen callable auth context, provided by Firebase
- * and unforgeable by the caller). `request.data` is never read for
- * identity purposes anywhere in this file — there is no `uid`/`targetUid`/
- * `userId` parameter of any kind. A caller can only ever see counts and
- * document paths for their OWN uid.
+ *   - Posts/Activities/Events the caller authored: DELETE (subcollections
+ *     first, then the parent).
+ *   - Reels the caller authored: DELETE Firestore doc + Storage object +
+ *     subcollections.
+ *   - The caller's own likes/comments/responses/participation left on
+ *     OTHER users' content/Reels: DELETE (participation on someone else's
+ *     still-existing Activity decrements that Activity's stats counter in
+ *     the same transaction as the participant doc's removal — see
+ *     cleanupCrossUserParticipants).
+ *   - Follow graph, block graph, notifications (both directions): DELETE.
+ *   - Conversations/messages, Reports: RETAIN — never mutated, never
+ *     deleted, never leaked into this callable's response.
+ *   - Profile documents are removed last, in dependency order:
+ *     privacySettings -> publicProfiles -> usernames (only if the
+ *     reservation still actually points at this uid) -> users/{uid} LAST,
+ *     since usernameLower is read from users/{uid} right up until then.
  *
- * This function only READS Firestore. Its only WRITE of any kind is one
- * tiny synthetic Storage object it creates and immediately deletes itself,
- * scoped under the caller's own uid, to prove Admin Storage access — see
- * runStorageAdminSelfTest below.
+ * SECURITY: the target uid comes exclusively from `request.auth.uid`.
+ * `request.data` is never read for identity — there is no uid/targetUid/
+ * userId parameter of any kind, so a caller can only ever delete their own
+ * data no matter what they send.
+ *
+ * IDEMPOTENCY: every phase treats a missing document/object as "already
+ * cleaned," never an error, so this callable is safe to invoke again after
+ * a partial failure (network drop, timeout, retry) without double-counting
+ * or corrupting another user's data.
+ *
+ * PAGINATION: every query that could return many documents uses "query a
+ * bounded page, delete it, repeat until empty" rather than an unbounded
+ * get() or a cursor (a cursor is unsafe here since deleting shifts the
+ * result set out from under it).
  */
+import {
+  FieldValue,
+  getFirestore,
+  type Firestore,
+  type Query,
+} from 'firebase-admin/firestore';
 import { initializeApp } from 'firebase-admin/app';
-import { getFirestore, type Firestore } from 'firebase-admin/firestore';
 import { getStorage } from 'firebase-admin/storage';
 import { HttpsError, onCall } from 'firebase-functions/v2/https';
 
 initializeApp();
 
-// europe-north1 (Finland) — the closest Cloud Functions 2nd-gen-supported
-// region to this project's Firestore location, europe-north2 (Stockholm).
-// Firebase's own "selecting regions based on Cloud Firestore location"
-// guidance has no direct europe-north2 entry (confirmed by inspection of
-// https://firebase.google.com/docs/functions/locations at design time —
-// its one Nordic/Northern-Europe mapping example is eur3 -> europe-west1),
-// so this falls back to genuine geographic proximity rather than that
-// table's more distant example, since europe-north1 is an explicitly
-// supported 2nd-gen region and sits far closer to Stockholm than any
-// europe-west option.
+// europe-north1 (Finland) — see Step 34.1: the closest Cloud Functions
+// 2nd-gen-supported region to this project's Firestore location,
+// europe-north2 (Stockholm).
 const REGION = 'europe-north1';
 
-type CollectionGroupCheck = {
-  pass: boolean;
-  count: number;
-  paths: string[];
-  error?: string;
+// Firestore's hard cap is 500 ops/batch — stay comfortably under it.
+const BATCH_DELETE_SIZE = 400;
+// Own content/Reels pages are processed one doc at a time (several nested
+// operations each), so a smaller page keeps any single iteration bounded.
+const OWNED_DOC_PAGE_SIZE = 50;
+// Participant transactions run one at a time — keep pages modest.
+const PARTICIPANT_PAGE_SIZE = 100;
+
+type DrainResult = { total: number; roots: Record<string, number> };
+
+/** Deletes every document in a query, paginating until it's empty. */
+async function drainQuery(db: Firestore, makeQuery: () => Query): Promise<DrainResult> {
+  let total = 0;
+  const roots: Record<string, number> = {};
+  for (;;) {
+    const snap = await makeQuery().limit(BATCH_DELETE_SIZE).get();
+    if (snap.empty) break;
+    const batch = db.batch();
+    for (const docSnap of snap.docs) {
+      const root = docSnap.ref.path.split('/')[0];
+      roots[root] = (roots[root] ?? 0) + 1;
+      batch.delete(docSnap.ref);
+    }
+    await batch.commit();
+    total += snap.size;
+  }
+  return { total, roots };
+}
+
+/** Deletes every document directly under one collection path (no filter needed — the whole subcollection is going away). */
+async function drainCollection(db: Firestore, collectionPath: string): Promise<number> {
+  const { total } = await drainQuery(db, () => db.collection(collectionPath));
+  return total;
+}
+
+// ---------------------------------------------------------------------------
+// Cross-user Activity participation — the one cross-user artifact with a
+// paired invariant (content/{contentId}/stats/activity.participantCount)
+// that must move atomically with the participant doc's removal.
+// ---------------------------------------------------------------------------
+
+type ParticipantCleanupResult = {
+  /** The caller's own participation record on an Activity they themselves authored — removed directly; its stats doc is going away with the whole Activity in the own-content phase, so no decrement is needed or performed here. */
+  ownActivitySkipped: number;
+  /** Cross-user: participant doc removed and the sibling stats counter decremented by exactly 1, atomically. */
+  crossUserDecremented: number;
+  /** Already gone on a retry, or the parent content no longer exists at all. */
+  alreadyGone: number;
+  /** Stats doc missing/corrupt for a still-existing, someone-else-authored Activity — left untouched rather than risk corrupting that user's counter. */
+  errors: string[];
 };
 
-async function checkCollectionGroupSplitByRoot(
-  db: Firestore,
-  groupName: string,
-  field: 'uid' | 'authorUid',
-  uid: string
-): Promise<{ content: CollectionGroupCheck; reels: CollectionGroupCheck }> {
-  const empty = (): CollectionGroupCheck => ({ pass: false, count: 0, paths: [] });
-  const content = empty();
-  const reels = empty();
-  try {
-    const snap = await db.collectionGroup(groupName).where(field, '==', uid).get();
-    content.pass = true;
-    reels.pass = true;
-    for (const doc of snap.docs) {
-      const root = doc.ref.path.split('/')[0];
-      if (root === 'content') {
-        content.count += 1;
-        content.paths.push(doc.ref.path);
-      } else if (root === 'reels') {
-        reels.count += 1;
-        reels.paths.push(doc.ref.path);
-      }
-    }
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    content.error = message;
-    reels.error = message;
-  }
-  return { content, reels };
-}
-
-async function checkCollectionGroupSingleRoot(
-  db: Firestore,
-  groupName: string,
-  field: 'uid' | 'authorUid',
-  uid: string
-): Promise<CollectionGroupCheck> {
-  try {
-    const snap = await db.collectionGroup(groupName).where(field, '==', uid).get();
-    return { pass: true, count: snap.size, paths: snap.docs.map((d) => d.ref.path) };
-  } catch (error) {
-    return { pass: false, count: 0, paths: [], error: error instanceof Error ? error.message : String(error) };
-  }
-}
-
-/**
- * Storage self-test — writes ONE tiny synthetic object at the exact
- * deterministic path scheme a real published Reel uses
- * (reels/{authorUid}/{reelId}/source, see src/services/reels.ts and
- * storage.rules), scoped under the caller's own uid with a
- * function-generated reelId (never client-supplied), then deletes it.
- * Proves Admin/IAM access to a path storage.rules explicitly denies every
- * client from deleting once status is 'published'. No real Reel or real
- * user's object is ever touched.
- */
-async function runStorageAdminSelfTest(uid: string) {
-  const diagnosticReelId = `diagnostic-${Date.now()}`;
-  const path = `reels/${uid}/${diagnosticReelId}/source`;
-  const bytes = Buffer.from('around-me step 34.1 storage admin feasibility proof', 'utf8');
-
-  const result = {
-    path,
-    bytesWritten: bytes.byteLength,
-    writeOk: false,
-    existsAfterWrite: false,
-    deleteOk: false,
-    existsAfterDelete: true,
-    error: undefined as string | undefined,
+async function cleanupCrossUserParticipants(db: Firestore, uid: string): Promise<ParticipantCleanupResult> {
+  const result: ParticipantCleanupResult = {
+    ownActivitySkipped: 0,
+    crossUserDecremented: 0,
+    alreadyGone: 0,
+    errors: [],
   };
 
-  try {
-    const bucket = getStorage().bucket();
-    const file = bucket.file(path);
-    await file.save(bytes, { contentType: 'text/plain', resumable: false });
-    result.writeOk = true;
+  for (;;) {
+    const snap = await db.collectionGroup('participants').where('uid', '==', uid).limit(PARTICIPANT_PAGE_SIZE).get();
+    if (snap.empty) break;
 
-    const [existsAfterWrite] = await file.exists();
-    result.existsAfterWrite = existsAfterWrite;
+    let progressed = false;
 
-    await file.delete();
-    result.deleteOk = true;
+    for (const participantSnap of snap.docs) {
+      // participants live at content/{contentId}/participants/{uid}.
+      const contentId = participantSnap.ref.path.split('/')[1];
+      const contentRef = db.doc(`content/${contentId}`);
+      const contentSnap = await contentRef.get();
 
-    const [existsAfterDelete] = await file.exists();
-    result.existsAfterDelete = existsAfterDelete;
-  } catch (error) {
-    result.error = error instanceof Error ? error.message : String(error);
+      if (!contentSnap.exists) {
+        await participantSnap.ref.delete();
+        result.alreadyGone += 1;
+        progressed = true;
+        continue;
+      }
+
+      if (contentSnap.data()?.authorUid === uid) {
+        // Own Activity — the whole document (and its stats doc) is removed
+        // together in the own-content phase, so no counter correction is
+        // needed here; just remove this one participant doc now.
+        await participantSnap.ref.delete();
+        result.ownActivitySkipped += 1;
+        progressed = true;
+        continue;
+      }
+
+      const statsRef = db.doc(`content/${contentId}/stats/activity`);
+      try {
+        const outcome = await db.runTransaction(async (tx) => {
+          const [pSnap, statsSnap] = await Promise.all([tx.get(participantSnap.ref), tx.get(statsRef)]);
+          if (!pSnap.exists) return 'already-gone' as const;
+          if (!statsSnap.exists) return 'stats-missing' as const;
+          const count = statsSnap.data()?.participantCount;
+          if (typeof count !== 'number' || count <= 0) return 'stats-invalid' as const;
+          tx.delete(participantSnap.ref);
+          tx.update(statsRef, { participantCount: count - 1, updatedAt: FieldValue.serverTimestamp() });
+          return 'decremented' as const;
+        });
+
+        if (outcome === 'decremented') {
+          result.crossUserDecremented += 1;
+          progressed = true;
+        } else if (outcome === 'already-gone') {
+          result.alreadyGone += 1;
+          progressed = true;
+        } else {
+          result.errors.push(`content/${contentId}/participants/${uid}: ${outcome}, left untouched`);
+        }
+      } catch (error) {
+        result.errors.push(`content/${contentId}/participants/${uid}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+
+    if (!progressed) {
+      result.errors.push('Activity participation cleanup stalled on remaining items — stopped rather than loop or corrupt another user\'s counter.');
+      break;
+    }
   }
 
   return result;
 }
 
-export const diagnoseAccountDeletionFeasibility = onCall({ region: REGION }, async (request) => {
+// ---------------------------------------------------------------------------
+// Own authored content (Posts/Activities/Events) — subcollections first
+// (every possible one; a Post simply has none of participants/responses,
+// which just costs one empty read), then the parent document.
+// ---------------------------------------------------------------------------
+
+async function deleteOwnContent(db: Firestore, uid: string): Promise<{ deleted: number }> {
+  let deleted = 0;
+  for (;;) {
+    const snap = await db.collection('content').where('authorUid', '==', uid).limit(OWNED_DOC_PAGE_SIZE).get();
+    if (snap.empty) break;
+    for (const docSnap of snap.docs) {
+      const contentId = docSnap.id;
+      await drainCollection(db, `content/${contentId}/likes`);
+      await drainCollection(db, `content/${contentId}/comments`);
+      await drainCollection(db, `content/${contentId}/participants`);
+      await drainCollection(db, `content/${contentId}/responses`);
+      await db.doc(`content/${contentId}/stats/activity`).delete().catch(() => undefined);
+      await docSnap.ref.delete();
+      deleted += 1;
+    }
+  }
+  return { deleted };
+}
+
+// ---------------------------------------------------------------------------
+// Own Reels — subcollections, then the exact-path Storage object (never a
+// prefix/recursive delete), then the Firestore doc. Covers both
+// still-"uploading" drafts and "published" Reels through the same
+// authoritative path, unlike the client-only discardReelDraft().
+// ---------------------------------------------------------------------------
+
+async function deleteOwnReels(
+  db: Firestore,
+  uid: string
+): Promise<{ deleted: number; storageDeleted: number; storageAlreadyMissing: number }> {
+  const bucket = getStorage().bucket();
+  let deleted = 0;
+  let storageDeleted = 0;
+  let storageAlreadyMissing = 0;
+
+  for (;;) {
+    const snap = await db.collection('reels').where('authorUid', '==', uid).limit(OWNED_DOC_PAGE_SIZE).get();
+    if (snap.empty) break;
+    for (const docSnap of snap.docs) {
+      const reelId = docSnap.id;
+      const storagePath = docSnap.data()?.storagePath as string | undefined;
+
+      await drainCollection(db, `reels/${reelId}/likes`);
+      await drainCollection(db, `reels/${reelId}/comments`);
+
+      if (storagePath) {
+        const file = bucket.file(storagePath);
+        const [existedBefore] = await file.exists();
+        await file.delete({ ignoreNotFound: true });
+        if (existedBefore) storageDeleted += 1;
+        else storageAlreadyMissing += 1;
+      }
+
+      await docSnap.ref.delete();
+      deleted += 1;
+    }
+  }
+
+  return { deleted, storageDeleted, storageAlreadyMissing };
+}
+
+// ---------------------------------------------------------------------------
+// Profile documents — dependency order matters: users/{uid} is read for
+// usernameLower right up until it is the LAST document removed of any kind.
+// ---------------------------------------------------------------------------
+
+async function deleteProfileDocuments(db: Firestore, uid: string) {
+  const result = {
+    privacySettingsDeleted: false,
+    publicProfileDeleted: false,
+    usernameReservationDeleted: false,
+    usernameReservationMismatch: false,
+    userDocDeleted: false,
+  };
+
+  await db.doc(`privacySettings/${uid}`).delete().catch(() => undefined);
+  result.privacySettingsDeleted = true;
+
+  await db.doc(`publicProfiles/${uid}`).delete().catch(() => undefined);
+  result.publicProfileDeleted = true;
+
+  const userRef = db.doc(`users/${uid}`);
+  const userSnap = await userRef.get();
+  if (userSnap.exists) {
+    const usernameLower = userSnap.data()?.usernameLower as string | undefined;
+    if (typeof usernameLower === 'string') {
+      const reservationRef = db.doc(`usernames/${usernameLower}`);
+      const reservationSnap = await reservationRef.get();
+      if (reservationSnap.exists) {
+        if (reservationSnap.data()?.uid === uid) {
+          await reservationRef.delete();
+          result.usernameReservationDeleted = true;
+        } else {
+          // Data corruption, not a normal case: the reservation this
+          // profile claims as its own actually points at someone else.
+          // Leave it untouched rather than delete another uid's reservation.
+          result.usernameReservationMismatch = true;
+        }
+      }
+    }
+    await userRef.delete();
+    result.userDocDeleted = true;
+  }
+
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// The callable itself.
+// ---------------------------------------------------------------------------
+
+export const deleteMyAccountData = onCall({ region: REGION, timeoutSeconds: 300, memory: '256MiB' }, async (request) => {
   if (!request.auth) {
     throw new HttpsError('unauthenticated', 'Sign in required.');
   }
-  // The ONLY source of truth for "whose data" this function ever looks
-  // at. request.data is never consulted for identity — see file header.
+  // The ONLY source of truth for whose data this deletes. request.data is
+  // never consulted for identity — see file header.
   const uid = request.auth.uid;
-
   const db = getFirestore();
 
-  const [likes, comments, responses, participants] = await Promise.all([
-    checkCollectionGroupSplitByRoot(db, 'likes', 'uid', uid),
-    checkCollectionGroupSplitByRoot(db, 'comments', 'authorUid', uid),
-    checkCollectionGroupSingleRoot(db, 'responses', 'uid', uid),
-    checkCollectionGroupSingleRoot(db, 'participants', 'uid', uid),
-  ]);
+  const followerOf = await drainQuery(db, () => db.collection('follows').where('followerUid', '==', uid));
+  const followingOf = await drainQuery(db, () => db.collection('follows').where('followingUid', '==', uid));
+  const blockerOf = await drainQuery(db, () => db.collection('blocks').where('blockerUid', '==', uid));
+  const blockedOf = await drainQuery(db, () => db.collection('blocks').where('blockedUid', '==', uid));
 
-  // Section 11 — for every Activity participation found, confirm the
-  // sibling stats/activity counter document is actually reachable from
-  // the same parent, and report its current value. Read-only.
-  const participantContentPairings = await Promise.all(
-    participants.paths.map(async (participantPath) => {
-      const contentId = participantPath.split('/')[1];
-      const statsSnap = await db.doc(`content/${contentId}/stats/activity`).get();
-      return {
-        contentId,
-        statsExists: statsSnap.exists,
-        participantCount: statsSnap.exists ? (statsSnap.data()?.participantCount ?? null) : null,
-      };
-    })
-  );
+  // No counter is paired with likes/comments/responses (see firestore.rules
+  // — like/comment counts are aggregation queries, and Event responses have
+  // no stored count at all), so these are plain deletes across both content
+  // and reels roots at once — see Step 34.1's proven collectionGroup finding.
+  const crossUserLikes = await drainQuery(db, () => db.collectionGroup('likes').where('uid', '==', uid));
+  const crossUserComments = await drainQuery(db, () => db.collectionGroup('comments').where('authorUid', '==', uid));
+  const crossUserResponses = await drainQuery(db, () => db.collectionGroup('responses').where('uid', '==', uid));
+  const crossUserParticipants = await cleanupCrossUserParticipants(db, uid);
 
-  const [ownContent, ownReels] = await Promise.all([
-    db.collection('content').where('authorUid', '==', uid).get(),
-    db.collection('reels').where('authorUid', '==', uid).get(),
-  ]);
+  const ownContent = await deleteOwnContent(db, uid);
+  const ownReels = await deleteOwnReels(db, uid);
 
-  const [followerOf, followingOf, blockerOf, blockedOf, notifRecipient, notifActor, conversations, reports] =
-    await Promise.all([
-      db.collection('follows').where('followerUid', '==', uid).get(),
-      db.collection('follows').where('followingUid', '==', uid).get(),
-      db.collection('blocks').where('blockerUid', '==', uid).get(),
-      db.collection('blocks').where('blockedUid', '==', uid).get(),
-      db.collection('notifications').where('recipientUid', '==', uid).get(),
-      db.collection('notifications').where('actorUid', '==', uid).get(),
-      db.collection('conversations').where('participantUids', 'array-contains', uid).get(),
-      // Count only — never returns reason/details text (Section 19's own
-      // "do not return sensitive report text" instruction).
-      db.collection('reports').where('reporterUid', '==', uid).get(),
-    ]);
+  // The backend also cleans the underlying actions itself (above), so it
+  // doesn't need the client-rules "paired action" pairing constraint —
+  // both directions are simply removed directly.
+  const notifRecipient = await drainQuery(db, () => db.collection('notifications').where('recipientUid', '==', uid));
+  const notifActor = await drainQuery(db, () => db.collection('notifications').where('actorUid', '==', uid));
 
-  const storageAdminTest = await runStorageAdminSelfTest(uid);
+  const profile = await deleteProfileDocuments(db, uid);
 
   return {
-    authenticatedUid: uid,
+    uid,
+    follows: { asFollowerRemoved: followerOf.total, asFollowingRemoved: followingOf.total },
+    blocks: { asBlockerRemoved: blockerOf.total, asBlockedRemoved: blockedOf.total },
     crossUser: {
-      contentLikes: likes.content,
-      contentComments: comments.content,
-      eventResponses: responses,
-      activityParticipants: { ...participants, pairings: participantContentPairings },
-      reelLikes: likes.reels,
-      reelComments: comments.reels,
+      likesRemoved: crossUserLikes.total,
+      likesRemovedByRoot: crossUserLikes.roots,
+      commentsRemoved: crossUserComments.total,
+      commentsRemovedByRoot: crossUserComments.roots,
+      eventResponsesRemoved: crossUserResponses.total,
+      activityParticipation: crossUserParticipants,
     },
-    own: {
-      content: { count: ownContent.size, ids: ownContent.docs.map((d) => d.id) },
-      reels: { count: ownReels.size, ids: ownReels.docs.map((d) => d.id) },
-    },
-    follows: { asFollower: followerOf.size, asFollowing: followingOf.size },
-    blocks: { asBlocker: blockerOf.size, asBlocked: blockedOf.size },
-    notifications: { asRecipient: notifRecipient.size, asActor: notifActor.size },
-    conversations: { count: conversations.size },
-    reports: { asReporter: reports.size },
-    storageAdminTest,
+    ownContentDeleted: ownContent.deleted,
+    ownReels,
+    notifications: { asRecipientRemoved: notifRecipient.total, asActorRemoved: notifActor.total },
+    // Locked policy: never deleted, never mutated, never inspected beyond
+    // this fixed literal — no counts, no bodies, no reasons ever leave here.
+    conversations: 'retained',
+    reports: 'retained',
+    profile,
+    authAccountDeleted: false,
   };
 });
