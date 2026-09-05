@@ -470,7 +470,9 @@ Interested/Going (a lightweight RSVP) and Join/Leave (real membership, with a pa
 
 ### "Tagged at {Place}" — future architecture, not built
 
-The reference screenshot's "Tagged at Nöjesfabriken" Reel rail is a real, locked-in **future** product concept, not a Step 29 deliverable: the Reels shown there would be **ordinary user-generated Reels from the normal Home feed** that happen to be tagged to the same Place/venue as the Event — never a special "Event Reel" content type, and Events/Reels remain two separate data models. `Reel` has no `placeId`/`eventId`/`businessId` field today, and Step 29 does not add one (no schema change, per the explicit constraint). A new `TaggedReelsSection` component exists (`src/components/TaggedReelsSection.tsx`) — it accepts a real `Reel[]` and a Place name, renders `Tagged at {name}`, and returns `null` for an empty array — but it is **not mounted anywhere in production**, since no real caller can ever produce a non-empty array yet. The intended future insertion point (right after the creator row in `EventDetail`) is marked with a comment.
+The reference screenshot's "Tagged at Nöjesfabriken" Reel rail is a real, locked-in **future** product concept, not a Step 29 deliverable: the Reels shown there would be **ordinary user-generated Reels from the normal Home feed** that happen to be tagged to the same Place/venue as the Event — never a special "Event Reel" content type, and Events/Reels remain two separate data models. `Reel` has no `placeId`/`eventId`/`businessId` field today, and no step adds one yet (no schema change).
+
+Step 29 added a `TaggedReelsSection` component as speculative future-ready scaffolding, wired nowhere. Step 32's product audit and a fresh re-check at Step 35 both confirmed it was never mounted by any live screen and had no real caller that could ever produce a non-empty array — dead code, not a dormant feature — so Step 35 deleted `src/components/TaggedReelsSection.tsx` and the commented-out `<TaggedReelsSection ... />` JSX/doc-comment that referenced it in `EventDetail.tsx`. **This did not touch the product decision above** — "Tagged at {Place}" remains approved future work; building it for real means adding a `placeId` (or `eventId`) to `Reel`, a real tagging UI, a real "Tagged at {Place}" query, and only then a real rendering component — none of which existed here, so there was nothing worth preserving in code, only in this document.
 
 ### Loading/error
 
@@ -514,7 +516,7 @@ Own Profile (`src/app/(app)/(tabs)/profile.tsx`) and public profile (`src/app/(a
 
 ### Stats — real only
 
-**Posts / Following / Followers**, in that order, on both screens. Follower/Following counts are real `getCountFromServer` aggregations (unchanged, cheap). Posts is `content.filter(item => item.type === 'post').length` over the same bounded `fetchPublicUserContent` result (`DEFAULT_FEED_LIMIT` = 20, mixed post/activity/event) already fetched for the content tabs — **not** a second query. This means an account with more than 20 total posts/activities/events combined can show an undercounted Posts number (only whichever posts fall within the newest 20 mixed items) — an explicit, documented MVP limitation, not a bug, matching the same "bounded and honest, not exact" tradeoff used elsewhere in this app (e.g. Following's 30-uid cap).
+**Posts / Following / Followers**, in that order, on both screens. All three are now real, exact `getCountFromServer` aggregations — see "Profile Posts stat accuracy (Step 35)" below for why Posts changed from an in-memory derivation to its own count query.
 
 **No Likes total** — this app has no efficient authoritative aggregated like count across a profile's content, and computing one would mean an N+1 aggregation per profile visit. Not shown, not faked.
 
@@ -701,6 +703,30 @@ Conversations and messages are retained forever (locked policy) — meaning a su
 ### Testing
 
 Verified against three disposable production accounts (no emulator) through the real browser UI, not just the backend directly: a Personal account (wrong password rejected with nothing changed, then a correct full deletion — backend cleanup, Auth deletion, session cleared, old credentials confirmed to fail login afterward) and a Business account (same flow, with the Business-only "published Events" line visible on the warning screen; its authored Event and Reel confirmed gone via direct navigation as a third account, Storage cleanup already proven by Step 34.2). The retained conversation between the two accounts was confirmed fully intact and readable by the survivor, showing the "Deleted user" fallback correctly. Both reports (one per direction) were confirmed retained with their reason/details unaltered, read via the trusted CLI session since both reporters' Auth accounts were by then gone. Notably, **all three accounts' Auth entries were already gone by the time cleanup ran** — the feature's own Auth-deletion step had already done that job; only the locked-RETAIN conversation/messages/reports needed explicit exact-ID cleanup afterward. The deletion-pending recovery marker's persistence was independently confirmed via the one-shot post-deletion notice (identical AsyncStorage read/write path) correctly surviving a full page reload and displaying after a real deletion; a live reproduction of the exact mid-flight-interruption scenario itself could not be forced in this browser-automation environment, since the full reauth→backend→Auth-delete sequence for a small fixture account completes faster than the tooling's round-trip latency — the routing guard in `src/app/_layout.tsx` was instead verified by direct code review.
+
+## Profile Posts stat accuracy + dead-code cleanup (Step 35)
+
+A small, scoped cleanup step — no visual redesign, no new features. Around Me's account lifecycle (password reset, Edit Profile, account deletion, Personal/Business handling, deletion recovery) was left untouched.
+
+### Profile Posts stat accuracy
+
+Both profile screens (own `src/app/(app)/(tabs)/profile.tsx` and public `src/app/(app)/user/[uid]/index.tsx`) previously derived the "Posts" stat as `content.filter(item => item.type === 'post').length` over `fetchPublicUserContent`'s bounded, mixed (Post/Activity/Event) result — capped at `DEFAULT_FEED_LIMIT` (20). An account with more than 20 total pieces of content could have older Posts silently excluded from that array, undercounting a number the UI presents as authoritative.
+
+Fixed with a new `fetchProfilePostCount(uid)` in `src/services/content.ts`, using Firestore's server-side `getCountFromServer` aggregation — one count read, zero documents transferred, no client-side scan, and no `limit()` clause of any kind, so it's exact regardless of how much content a user has authored. Its filter (`authorUid == uid`, `type == 'post'`, `status == 'published'`) matches `fetchPublicUserContent`'s own published/visibility semantics exactly, so a user's Posts stat can never disagree with what a profile would otherwise consider "their published content." Both profile screens now fetch this in the same `Promise.all` as their other stats/content — a failure surfaces through the screen's existing error state (`ErrorState`/retry), exactly like a Follower-count failure already did, rather than ever rendering a confidently wrong "0". The Reels/Posts/Events/Activities content **tabs** are deliberately unchanged — they still use the same bounded `fetchPublicUserContent`/`fetchProfileReels` queries as before; only the Posts **stat number** became exact.
+
+No Firestore Rules change: `getCountFromServer` is subject to the same `content` read rule as every other query here (`status == 'published'`, readable by any signed-in user). No new Firestore index was needed — verified empirically against production (not assumed): the three-equality-filter count query (`authorUid`/`type`/`status`, no `orderBy`) succeeded immediately, and a small real fixture (3 Posts + 2 Activities for one disposable account) confirmed the count returns exactly 3, distinct from the 5-item mixed total — proving the `type` filter, not just the query's absence of a `limit()`, is doing real work. Cost: one additional aggregation read per profile visit, no listeners.
+
+### Legacy Map route removed
+
+`src/app/(app)/map.tsx` — orphaned since the Map tab was removed from the tab bar and replaced by Inbox (Step 15) — was re-verified unreachable at this step's HEAD (no `/map` string, `router.push`, `href`, or import referencing it anywhere in `src/`) and deleted. This is a **route** removal only: `MapPlaceExplorer`, `NativeMapScreen`, `NativeCityMap.*`, `useCityPlaces`, `PlaceFilters`, `PlaceList`, the `expo-maps` package, and every other piece of real Place architecture are untouched — Places, place detail, `PlaceSelector`, `placeId`/`placeName` on content, and the future geographic-discovery direction they represent are not what was dead here; only the one abandoned tab screen was.
+
+### TaggedReelsSection removed — concept preserved
+
+See "'Tagged at {Place}' — future architecture, not built" above: the unused `TaggedReelsSection` component and its commented-out JSX/doc-comment reference in `EventDetail.tsx` were deleted as dead code. The underlying "Tagged at {Place}" product concept remains fully documented and approved for future work — nothing about that decision changed, only the premature, never-mounted scaffolding for it.
+
+### Dead-code search (this step's scope)
+
+Beyond the two removals above, this step's repo-wide search for `/map` references and `TaggedReelsSection` references found no other orphaned routes or dead component references in scope. A broader dead-code sweep (e.g. auditing every component for live importers) was not performed — out of scope for this step's three named goals.
 
 ## Reels (Cloud Storage — Step 18)
 

@@ -19,7 +19,7 @@ import { ReportModal } from '@/components/ReportModal';
 import { Colors, Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
 import { blockUser, isUserBlocked, unblockUser } from '@/services/blocks';
-import { fetchPublicUserContent } from '@/services/content';
+import { fetchProfilePostCount, fetchPublicUserContent } from '@/services/content';
 import { fetchFollowerCount, fetchFollowingCount, followUser, isFollowing, unfollowUser } from '@/services/following';
 import { fetchConversation, getConversationId } from '@/services/messages';
 import { fetchMyNewMessagesFrom } from '@/services/privacySettings';
@@ -64,6 +64,7 @@ export default function PublicProfileScreen() {
   const [profile, setProfile] = useState<PublicProfile | null>(null);
   const [followerCount, setFollowerCount] = useState(0);
   const [followingCount, setFollowingCount] = useState(0);
+  const [postsCount, setPostsCount] = useState(0);
   const [amFollowing, setAmFollowing] = useState(false);
   const [isFollowSubmitting, setIsFollowSubmitting] = useState(false);
   const [followError, setFollowError] = useState<string | null>(null);
@@ -86,15 +87,21 @@ export default function PublicProfileScreen() {
   // synchronously during the effect body below.
   const load = useCallback(async () => {
     try {
-      const [publicProfile, followers, following, followingState, userContent, userReels, blockedByMe] = await Promise.all([
+      const [publicProfile, followers, following, posts, followingState, userContent, userReels, blockedByMe] = await Promise.all([
         fetchPublicProfile(uid),
         fetchFollowerCount(uid),
         fetchFollowingCount(uid),
+        // Exact server-side aggregation — see fetchProfilePostCount's own
+        // doc comment. A failure here falls into the same catch as every
+        // other profile fetch below, so a failed count is never shown as
+        // a confident (wrong) 0 — the whole screen shows its error state
+        // instead, same as an own-profile load failure.
+        fetchProfilePostCount(uid),
         !isOwnProfile && user ? isFollowing(user.uid, uid) : Promise.resolve(false),
         // One mixed, limited query — then split into Posts/Activities/Events
-        // tabs in-memory below, rather than running three separate queries
-        // for a single profile page. Its own bounded limit is also the
-        // source of the real (but capped) Posts stat in ProfileHeader.
+        // TABS in-memory below, rather than running three separate queries
+        // for a single profile page. This stays bounded on purpose; only
+        // the Posts STAT above is now exact (see fetchProfilePostCount).
         fetchPublicUserContent(uid),
         // Reels are a separate root collection from content/{contentId}
         // (see src/types/reel.ts), so this is its own capped query, not
@@ -109,6 +116,7 @@ export default function PublicProfileScreen() {
       setProfile(publicProfile);
       setFollowerCount(followers);
       setFollowingCount(following);
+      setPostsCount(posts);
       setAmFollowing(followingState);
       setContent(userContent);
       setReels(userReels);
@@ -185,7 +193,6 @@ export default function PublicProfileScreen() {
 
   const cityLabel = profile?.cityName ? formatCityDisplayName(profile.cityName) : '';
 
-  const postsCount = useMemo(() => content.filter((item) => item.type === 'post').length, [content]);
   const visibleContent = useMemo(
     () => (contentTab === 'reel' ? [] : content.filter((item) => item.type === contentTab)),
     [content, contentTab]

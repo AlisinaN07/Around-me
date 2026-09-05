@@ -19,7 +19,7 @@ import { useProfile } from '@/hooks/useProfile';
 import type { Content, ContentType } from '@/types/content';
 import type { Reel } from '@/types/reel';
 import { fetchFollowerCount, fetchFollowingCount } from '@/services/following';
-import { fetchPublicUserContent } from '@/services/content';
+import { fetchProfilePostCount, fetchPublicUserContent } from '@/services/content';
 import { fetchProfileReels } from '@/services/reels';
 import { formatCityDisplayName } from '@/utils/cityDisplay';
 
@@ -58,6 +58,7 @@ export default function ProfileScreen() {
   const [status, setStatus] = useState<LoadStatus>('loading');
   const [followerCount, setFollowerCount] = useState(0);
   const [followingCount, setFollowingCount] = useState(0);
+  const [postsCount, setPostsCount] = useState(0);
   const [content, setContent] = useState<Content[]>([]);
   const [reels, setReels] = useState<Reel[]>([]);
   const [activeTab, setActiveTab] = useState<ProfileTab>('reel');
@@ -66,17 +67,27 @@ export default function ProfileScreen() {
     if (!user) return;
     setStatus('loading');
     try {
-      const [followers, following, userContent, userReels] = await Promise.all([
+      const [followers, following, posts, userContent, userReels] = await Promise.all([
         fetchFollowerCount(user.uid),
         fetchFollowingCount(user.uid),
+        // Exact server-side aggregation — see fetchProfilePostCount's own
+        // doc comment for why this is never derived from the bounded
+        // mixed query below. A failure here falls into the same catch as
+        // every other profile fetch, so a failed count is never shown as
+        // a confident (wrong) 0 — the whole screen shows its error state
+        // instead.
+        fetchProfilePostCount(user.uid),
         // One bounded, mixed query — see fetchPublicUserContent's own
         // DEFAULT_FEED_LIMIT (20) — split into Posts/Events/Activities tabs
-        // in-memory below rather than three separate queries.
+        // in-memory below rather than three separate queries. The Posts
+        // TAB below intentionally stays bounded by this same query; only
+        // the Posts STAT above is now exact.
         fetchPublicUserContent(user.uid),
         fetchProfileReels(user.uid),
       ]);
       setFollowerCount(followers);
       setFollowingCount(following);
+      setPostsCount(posts);
       setContent(userContent);
       setReels(userReels);
       setStatus('loaded');
@@ -93,7 +104,6 @@ export default function ProfileScreen() {
   );
 
   const cityLabel = profile?.cityName ? formatCityDisplayName(profile.cityName) : '';
-  const postsCount = useMemo(() => content.filter((item) => item.type === 'post').length, [content]);
   const visibleContent = useMemo(
     () => (activeTab === 'reel' ? [] : content.filter((item) => item.type === activeTab)),
     [content, activeTab]

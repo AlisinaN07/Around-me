@@ -8,6 +8,7 @@ import {
   Timestamp,
   collection,
   doc,
+  getCountFromServer,
   getDoc,
   getDocs,
   limit,
@@ -413,6 +414,32 @@ export async function fetchPublicUserContent(uid: string, limitCount = DEFAULT_F
   );
   const snapshot = await getDocs(contentQuery);
   return snapshot.docs.map((docSnapshot) => docSnapshot.data() as Content);
+}
+
+/**
+ * The exact number of a user's own published Posts — the Profile "Posts"
+ * stat (src/components/ProfileHeader.tsx). Deliberately NOT derived from
+ * fetchPublicUserContent's mixed, DEFAULT_FEED_LIMIT-bounded result: a
+ * user with more than that many total Posts/Activities/Events would have
+ * older Posts silently excluded from that array, undercounting a visible
+ * statistic. This runs a server-side aggregation instead (Firestore
+ * getCountFromServer) — one count read, no documents transferred, no
+ * client-side scan — using the same authorUid + status('published') filter
+ * as fetchPublicUserContent, plus type=='post', so this never counts a
+ * draft/unpublished document a profile wouldn't otherwise show.
+ */
+export async function fetchProfilePostCount(uid: string): Promise<number> {
+  if (!firestore) {
+    return 0;
+  }
+  const countQuery = query(
+    collection(firestore, CONTENT_COLLECTION),
+    where('authorUid', '==', uid),
+    where('type', '==', 'post'),
+    where('status', '==', 'published')
+  );
+  const snapshot = await getCountFromServer(countQuery);
+  return snapshot.data().count;
 }
 
 /**

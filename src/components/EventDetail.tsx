@@ -31,9 +31,10 @@ type LoadStatus = 'loading' | 'loaded' | 'error';
  * fetch, and mounting it twice to split those items apart would mean a
  * duplicate read of the same data, which Step 29 explicitly forbids.
  *
- * A future `TaggedReelsSection` (real Reels tagged at this Event's Place)
- * belongs after the creator row — see the comment near the bottom of this
- * file and README "Tagged at {Place}" for why it isn't wired in yet.
+ * A future "Tagged Reels" section (real Reels tagged at this Event's
+ * Place) is an approved but unbuilt product concept — see README
+ * "Tagged at {Place}" for the full rationale. No code for it exists here;
+ * that's intentional until a Reel can actually carry a placeId.
  */
 export function EventDetail({ content }: { content: EventContent }) {
   const { user } = useAuth();
@@ -149,11 +150,6 @@ export function EventDetail({ content }: { content: EventContent }) {
         <Text style={styles.authorName}>{content.authorDisplayName}</Text>
         <Text style={styles.username}>@{content.authorUsername}</Text>
       </AuthorLink>
-
-      {/* Future: <TaggedReelsSection placeName={content.placeName} reels={...} />
-          once a Reel can carry a real placeId — see README "Tagged at {Place}"
-          and src/components/TaggedReelsSection.tsx. Not wired in today: there
-          is no real tagged-Reel data source, and this step doesn't add one. */}
 
       <EngagementSection contentId={content.contentId} />
     </View>
