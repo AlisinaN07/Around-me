@@ -6,7 +6,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { Button } from '@/components/Button';
 import { InterestSelector } from '@/components/InterestSelector';
 import { OnboardingProgress } from '@/components/OnboardingProgress';
-import { MIN_INTERESTS } from '@/constants/interests';
+import { MAX_INTERESTS, MIN_INTERESTS } from '@/constants/interests';
 import { Colors, Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
 import { useProfile } from '@/hooks/useProfile';
@@ -86,6 +86,10 @@ export default function InterestsScreen() {
 
         <InterestSelector value={selected} onChange={setSelected} />
 
+        <Text style={styles.selectedCount}>
+          {selected.length} of {MAX_INTERESTS} selected
+        </Text>
+
         {error ? <Text style={styles.error}>{error}</Text> : null}
 
         <View style={styles.actions}>
@@ -118,6 +122,11 @@ const styles = StyleSheet.create({
     color: Colors.textSecondary,
     fontSize: 15,
     lineHeight: 21,
+  },
+  selectedCount: {
+    color: Colors.textSecondary,
+    fontSize: 13,
+    fontWeight: '600',
   },
   error: {
     color: Colors.error,

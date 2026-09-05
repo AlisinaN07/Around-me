@@ -728,6 +728,30 @@ See "'Tagged at {Place}' — future architecture, not built" above: the unused `
 
 Beyond the two removals above, this step's repo-wide search for `/map` references and `TaggedReelsSection` references found no other orphaned routes or dead component references in scope. A broader dead-code sweep (e.g. auditing every component for live importers) was not performed — out of scope for this step's three named goals.
 
+## Auth/onboarding/secondary-screen visual polish (Step 36)
+
+A visual-consistency step only — no new product features, no Firebase/Rules/Storage/Functions changes. The goal: a new user should never feel a jump from "old prototype UI" to "polished app" while moving through Auth, onboarding, or the social-list/city screens.
+
+### What was actually legacy
+
+A source-level audit found that Auth (Welcome, Login, Signup, Forgot Password), all four onboarding screens (Account Type, Name/Username, City, Interests), and the Cities screen already used the Step 24+ design system (`FormField`/`Button`/`FormScreenLayout`/`HeaderScreenLayout`/`OnboardingProgress`/`InterestSelector`, `Colors`/`Spacing`/`Radius` tokens) from earlier steps — they needed no changes. The one genuinely legacy surface was `src/components/UserList.tsx`, the shared list behind Followers/Following, which still used ad-hoc `Pressable`/`Text` styling instead of the shared components.
+
+### UserList rebuilt
+
+`UserList` was rewritten to compose existing shared components rather than introduce new ones: `HeaderScreenLayout` for the screen chrome, `LoadingState`/`ErrorState`/`EmptyState` for its three non-happy-path states, and `AuthorLink` (unchanged, already handled `router.push` + `stopPropagation`) for each row's tap-through, wrapping an `Avatar` + display name + `@username` + city. The external prop API (`title`/`emptyText`/`fetcher`) was kept identical, so the calling routes (`src/app/(app)/user/[uid]/followers.tsx` and `following.tsx`) needed no changes.
+
+### Interests screen: selected-count indicator
+
+`src/app/(onboarding)/interests.tsx` gained a small `"{n} of {MAX_INTERESTS} selected"` text between the `InterestSelector` and the error text, using the already-exported `MAX_INTERESTS` constant. `InterestSelector` itself already enforced the cap internally; this only makes the cap visible.
+
+### Features intentionally omitted
+
+Per the step's scope, these were deliberately not added anywhere in Auth/onboarding, since none of them exist elsewhere in the app: social login, GPS beyond the already-existing `detectCurrentCity` on the City screen, friend requests, online-presence indicators, fake/algorithmic recommendations, and verification badges.
+
+### No Firebase/security changes
+
+No Firestore Rules, Storage Rules, Functions, or index changes — this step touched only two client-side view files (`UserList.tsx`, `interests.tsx`).
+
 ## Reels (Cloud Storage — Step 18)
 
 Reels are short (≤60s), video-only posts with vertical, city-scoped playback — the first feature in this app to use Cloud Storage rather than Firestore alone. They live in their own root collection, `reels/{reelId}`, separate from `content/{contentId}` (posts/activities/events): a Reel has a media-upload lifecycle and Storage metadata that the other content types never had, and folding it into `content` would have meant giving every Post/Activity/Event query an upload-status field it never needs.

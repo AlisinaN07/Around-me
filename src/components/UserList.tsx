@@ -3,8 +3,10 @@ import { StyleSheet, Text, View } from 'react-native';
 
 import { Avatar } from '@/components/Avatar';
 import { AuthorLink } from '@/components/AuthorLink';
-import { Button } from '@/components/Button';
+import { EmptyState } from '@/components/EmptyState';
+import { ErrorState } from '@/components/ErrorState';
 import { HeaderScreenLayout } from '@/components/HeaderScreenLayout';
+import { LoadingState } from '@/components/LoadingState';
 import { Colors, Spacing } from '@/constants/theme';
 import type { PublicProfile } from '@/types/social';
 import { formatCityDisplayName } from '@/utils/cityDisplay';
@@ -25,6 +27,7 @@ export function UserList({ title, emptyText, fetcher }: UserListProps) {
   // load() never calls setState before its first await, so nothing runs
   // synchronously during the effect body below.
   const load = useCallback(async () => {
+    setStatus('loading');
     try {
       const list = await fetcher();
       setProfiles(list);
@@ -42,19 +45,20 @@ export function UserList({ title, emptyText, fetcher }: UserListProps) {
   return (
     <HeaderScreenLayout title={title}>
       {status === 'loading' ? (
-        <Text style={styles.mutedText}>Loading…</Text>
+        <LoadingState size="large" />
       ) : status === 'error' ? (
-        <View style={styles.centered}>
-          <Text style={styles.errorText}>Couldn&apos;t load this list.</Text>
-          <Button label="Try again" onPress={load} />
-        </View>
+        <ErrorState title="Couldn't load this list" onRetry={load} />
       ) : profiles.length === 0 ? (
-        <Text style={styles.mutedText}>{emptyText}</Text>
+        <EmptyState icon="people-outline" title={emptyText} />
       ) : (
         <View style={styles.list}>
-          {profiles.map((profile) => (
-            <AuthorLink key={profile.uid} uid={profile.uid} style={styles.row}>
-              <Avatar name={profile.displayName} size={40} />
+          {profiles.map((profile, index) => (
+            <AuthorLink
+              key={profile.uid}
+              uid={profile.uid}
+              style={[styles.row, index === profiles.length - 1 && styles.rowLast]}
+            >
+              <Avatar name={profile.displayName} size={52} />
               <View style={styles.rowText}>
                 <Text style={styles.displayName} numberOfLines={1}>
                   {profile.displayName}
@@ -73,26 +77,20 @@ export function UserList({ title, emptyText, fetcher }: UserListProps) {
 }
 
 const styles = StyleSheet.create({
-  mutedText: {
-    color: Colors.textSecondary,
-    fontSize: 14,
-  },
-  centered: {
-    alignItems: 'center',
-    gap: Spacing.sm,
-  },
-  errorText: {
-    color: Colors.error,
-    fontSize: 13,
-    textAlign: 'center',
-  },
   list: {
-    gap: Spacing.md,
+    marginHorizontal: -Spacing.xl,
   },
   row: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: Spacing.sm,
+    gap: Spacing.md,
+    paddingHorizontal: Spacing.xl,
+    paddingVertical: Spacing.md,
+    borderBottomWidth: 1,
+    borderBottomColor: Colors.border,
+  },
+  rowLast: {
+    borderBottomWidth: 0,
   },
   rowText: {
     flex: 1,
