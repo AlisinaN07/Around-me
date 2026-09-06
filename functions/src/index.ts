@@ -46,7 +46,7 @@ import {
 } from 'firebase-admin/firestore';
 import { initializeApp } from 'firebase-admin/app';
 import { getStorage } from 'firebase-admin/storage';
-import { HttpsError, onCall } from 'firebase-functions/v2/https';
+import { HttpsError, onCall, type CallableRequest } from 'firebase-functions/v2/https';
 
 initializeApp();
 
@@ -352,5 +352,87 @@ export const deleteMyAccountData = onCall({ region: REGION, timeoutSeconds: 300,
     reports: 'retained',
     profile,
     authAccountDeleted: false,
+  };
+});
+
+// ---------------------------------------------------------------------------
+// Step 39.1 — moderation authorization foundation.
+//
+// Admin identity is a Firebase Auth custom claim (admin: true), set only by
+// a trusted operator via the Admin SDK — never by any client write, never
+// derived from accountType (Personal/Business is unrelated and stays
+// locked), and never a hardcoded uid. requireAdmin is the single choke
+// point every moderation callable must call first; it trusts nothing from
+// request.data for authorization, only the verified ID token's own claim.
+//
+// reports/{reportId}'s Firestore Rules keep "allow update: if false" for
+// every client, including an admin-claimed one (see firestore.rules) — a
+// claim only authorizes trusted Functions in v1, never a direct client
+// write, so every moderation action lives here, reading/writing via the
+// Admin SDK, which bypasses Rules through IAM rather than through them.
+// ---------------------------------------------------------------------------
+
+function requireAdmin(request: CallableRequest): void {
+  if (!request.auth) {
+    throw new HttpsError('unauthenticated', 'Sign in required.');
+  }
+  if (request.auth.token.admin !== true) {
+    throw new HttpsError('permission-denied', 'Admin privileges required.');
+  }
+}
+
+const MAX_REPORT_ID_LENGTH = 300;
+
+/**
+ * Marks one report dismissed — the only moderation action this step ships.
+ * Removal/ban/suspend callables are explicitly out of scope (Step 39.2+).
+ *
+ * Input is exactly { reportId }: no report object, no reporterUid/targetUid,
+ * no moderatedByUid, no isAdmin — every one of those is derived server-side
+ * (moderatedByUid from request.auth.uid) or read from the existing document,
+ * never accepted from the caller.
+ *
+ * Reports created before this step have no status/moderatedAt/
+ * moderatedByUid fields at all; a missing status is treated as 'open' here
+ * without ever writing that default back onto the document except as part
+ * of a genuine dismiss.
+ */
+export const dismissReport = onCall({ region: REGION }, async (request) => {
+  requireAdmin(request);
+
+  const reportId = request.data?.reportId;
+  if (typeof reportId !== 'string' || reportId.length === 0 || reportId.length > MAX_REPORT_ID_LENGTH) {
+    throw new HttpsError('invalid-argument', 'reportId must be a non-empty string.');
+  }
+
+  const db = getFirestore();
+  const reportRef = db.doc(`reports/${reportId}`);
+  const adminUid = request.auth!.uid;
+
+  const outcome = await db.runTransaction(async (tx) => {
+    const snap = await tx.get(reportRef);
+    if (!snap.exists) return 'not-found' as const;
+    const status = (snap.data()?.status as string | undefined) ?? 'open';
+    if (status === 'resolved') return 'already-resolved' as const;
+    if (status === 'dismissed') return 'already-dismissed' as const;
+    tx.update(reportRef, {
+      status: 'dismissed',
+      moderatedAt: FieldValue.serverTimestamp(),
+      moderatedByUid: adminUid,
+    });
+    return 'dismissed' as const;
+  });
+
+  if (outcome === 'not-found') {
+    throw new HttpsError('not-found', 'No report with that ID exists.');
+  }
+  if (outcome === 'already-resolved') {
+    throw new HttpsError('failed-precondition', 'This report was already resolved and cannot be dismissed.');
+  }
+
+  return {
+    status: 'dismissed' as const,
+    reportId,
+    alreadyDismissed: outcome === 'already-dismissed',
   };
 });

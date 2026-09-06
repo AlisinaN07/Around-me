@@ -818,6 +818,48 @@ One necessary, narrowly-scoped rule correction was required and confirmed empiri
 
 Recipient is always `content.authorUid` — never participants, followers, or anyone else. Navigation reuses the Inbox's existing generic `contentId` → `/content/{id}` branch unchanged (no new routing code). Actor snapshot fields come from the same `resolveTrustedFields`/profile read the response/join write already needed — no extra profile read added for notification purposes. The unread count is the existing real `!notification.read` filter — no second counter, no new listener. `deleteMyAccountData` required zero Functions changes: it already deletes every `notifications` doc where `recipientUid == uid` or `actorUid == uid`, regardless of type — verified against production that an Activity-join notification an account generated is correctly removed when that account is deleted through the existing trusted backend.
 
+## Moderation authorization foundation (Step 39.1)
+
+Step 39 (read-only architecture audit) found reports (Step 17) had no reviewer, no status, and one rule inconsistency. Step 39.1 builds the smallest secure moderation foundation on top of that finding — admin identity, a report lifecycle, and exactly one moderation action (dismiss) — without building any admin UI, report queue, content-removal action, or account suspension/ban. Those are explicitly later phases.
+
+### Admin identity is a Firebase Auth custom claim, never `accountType`
+
+Moderator authorization is the standard `admin: true` Firebase Auth custom claim, set only via the Admin SDK from a trusted operator context — never via any client write, never derived from `users/{uid}.accountType`, and never a hardcoded uid in shipped code. `AccountType` stays exactly `'personal' | 'business'`; admin is a completely orthogonal token claim that either account type can independently carry. The real owner account has **not** been granted this claim — moderation was proven end-to-end using disposable synthetic Firebase Auth accounts only, created, tested, and fully deleted within this step. Granting the owner's own account the claim is a deliberate later decision, not something this step does automatically.
+
+### Report lifecycle: `open` → `dismissed` / `resolved`
+
+`Report` (`src/types/report.ts`) gained three fields: `status: 'open' | 'dismissed' | 'resolved'`, `moderatedAt: Timestamp | null`, `moderatedByUid: string | null`. Every new report is created `status: 'open'` with both moderation fields `null` — `src/services/reports.ts`'s four report-creation functions all spread the same `INITIAL_MODERATION_FIELDS` constant, and `firestore.rules`' `isValidReportBase` independently enforces the exact same three values on create, so a client can never submit a report that's pre-seeded as `dismissed`/`resolved` or carries a fabricated `moderatedAt`/`moderatedByUid`. `resolved` is reserved for a future moderation-removal callable (Step 39.2+) — nothing in this step ever sets it.
+
+Reports created before this step have none of these three fields. They are never migrated — trusted backend code (the `dismissReport` callable) simply treats a missing `status` as `'open'` when read, and writes the canonical fields only as part of a genuine dismiss.
+
+### Content self-report fix
+
+Step 39's audit found `reportUser`, `reportReel`, and `reportMessage` all blocked self-reporting (client service **and** Rules), but `reportContent` — the shared path for Post/Activity/Event, since all three are `content/{contentId}` documents — did not. `reportContent` now rejects `content.authorUid === reporterUid` before submitting, and `firestore.rules`' `isValidContentReport` independently requires `data.targetUid != request.auth.uid`, matching `isValidUserReport`/`isValidReelReport` exactly. Since Activity/Event share this same `content` report path, the fix applies identically to all three content types with no type-specific branching.
+
+### Firestore report security is otherwise unchanged — no admin exception
+
+Read remains reporter-only (`resource.data.reporterUid == request.auth.uid`, plus the pre-existing `resource == null` allowance for the duplicate-check). `allow update: if false` and `allow delete: if false` remain unconditional for **every** client, including one carrying the `admin` custom claim — Firestore Rules never reference `request.auth.token.admin` anywhere in this collection, by design. A custom claim only ever authorizes a trusted Cloud Function in this app; it grants no direct Firestore privilege. This was verified in production: a client signed in with the admin claim still gets `permission-denied` reading another reporter's report, updating one, or deleting one — the claim only works through `dismissReport`.
+
+### `dismissReport` — the one moderation action this step ships
+
+A `europe-north1`, Node 22, Cloud Functions v2 `onCall`, in the same `functions/src/index.ts` codebase as `deleteMyAccountData` (no second Functions stack). A shared `requireAdmin(request)` helper is the single choke point: throws `unauthenticated` if `request.auth` is missing, `permission-denied` if `request.auth.token.admin !== true` — checked before anything else, so a spoofed payload (`{ reportId, isAdmin: true, moderatedByUid: adminUid }`) is denied identically to a bare `{ reportId }`, since authorization never looks at `request.data` at all.
+
+Input is exactly `{ reportId }`. The callable loads `reports/{reportId}` via the Admin SDK inside a transaction, normalizes a missing `status` to `'open'`, and:
+- `open` (or status-less) → `dismissed`, `moderatedAt: serverTimestamp()`, `moderatedByUid: request.auth.uid` — no other field touched.
+- already `dismissed` → returns `{ status: 'dismissed', reportId, alreadyDismissed: true }` without a second write — `moderatedAt`/`moderatedByUid` never change on a repeat call.
+- `resolved` → throws `failed-precondition`; the report is left completely unchanged. `dismissReport` can never regress a `resolved` report back to `dismissed` — only a future removal callable owns that transition.
+- nonexistent `reportId` → `not-found`.
+
+The response is action metadata only (`status`, `reportId`, `alreadyDismissed`) — never `reason`/`details`/`reporterUid`/`targetUid` or any message content. This is an action endpoint, not a report-reading endpoint; there is still no `listReports`/`getReport` callable of any kind.
+
+### Production verification
+
+Verified against real disposable Firebase Auth accounts and a live-deployed `dismissReport` (no emulator — this sandbox's Firestore emulator networking remains broken, the established fallback throughout this project): a disposable admin-claimed account correctly dismissed an open report (fields set exactly as designed), repeated the call idempotently (no field changes on the second call), normalized a synthetic status-less "legacy" report to `dismissed`, and was correctly refused by the resolved-report guard (report left untouched). A disposable non-admin account and an unauthenticated caller were both denied, including with a spoofed `isAdmin`/`moderatedByUid` payload. The same admin-claimed account was denied reading, updating, and deleting reports directly via the client Firestore SDK. The reported user was confirmed unable to read the report about them at any point. A cross-user content report (`A reports B's post`) was confirmed to `ALLOW` and land with the correct `open`/`null`/`null` defaults, while `A reports own post` was confirmed `DENY`. All disposable Auth accounts, Firestore documents (`users`, `publicProfiles`, `usernames`, `content`, `reports`), and the admin-claimed test identity itself were deleted afterward by exact ID — no privileged synthetic account, temporary claim-grant script, or fixture data was left behind.
+
+### What this step deliberately does not build
+
+No admin route, admin settings row, or report-queue UI anywhere in the consumer Expo app — normal users have no way to discover that moderation exists. The Firebase Console (backed by IAM/Admin SDK, which bypasses Rules the same way `deleteMyAccountData` already does) remains the v1 report-review surface; there is still no `listReports` callable. No content/Reel/Activity/Event removal, no message removal, no account suspension or ban — all deferred to later, narrower phases once this authorization foundation is in place. `deleteMyAccountData` is unchanged: reports remain retained (never read, mutated, or deleted by that callable) regardless of who authored or was named in them.
+
 ## Reels (Cloud Storage — Step 18)
 
 Reels are short (≤60s), video-only posts with vertical, city-scoped playback — the first feature in this app to use Cloud Storage rather than Firestore alone. They live in their own root collection, `reels/{reelId}`, separate from `content/{contentId}` (posts/activities/events): a Reel has a media-upload lifecycle and Storage metadata that the other content types never had, and folding it into `content` would have meant giving every Post/Activity/Event query an upload-status field it never needs.

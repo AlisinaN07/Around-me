@@ -39,6 +39,9 @@ function normalizeDetails(details: string | undefined): string | null {
   return trimmed.length > REPORT_DETAILS_MAX_LENGTH ? trimmed.slice(0, REPORT_DETAILS_MAX_LENGTH) : trimmed;
 }
 
+/** Every newly-created report starts in this moderation state — see firestore.rules' isValidReportBase, which requires exactly this on create. */
+const INITIAL_MODERATION_FIELDS = { status: 'open', moderatedAt: null, moderatedByUid: null } as const;
+
 export type ReportError = 'not-configured' | 'invalid-input' | 'not-found' | 'unknown';
 export type ReportResult = { ok: true; alreadyReported: boolean } | { ok: false; error: ReportError; message: string };
 
@@ -77,6 +80,7 @@ export async function reportUser(reporterUid: string, targetUid: string, reason:
     reason,
     details: normalizeDetails(details),
     createdAt: serverTimestamp(),
+    ...INITIAL_MODERATION_FIELDS,
   });
 }
 
@@ -84,6 +88,9 @@ export async function reportContent(reporterUid: string, contentId: string, reas
   const content = await fetchContentById(contentId);
   if (!content || content.status !== 'published') {
     return { ok: false, error: 'not-found', message: "Couldn't find that." };
+  }
+  if (content.authorUid === reporterUid) {
+    return { ok: false, error: 'invalid-input', message: "You can't report your own post." };
   }
   const reportId = contentReportId(reporterUid, contentId);
   return submitReport(reportId, {
@@ -98,6 +105,7 @@ export async function reportContent(reporterUid: string, contentId: string, reas
     reason,
     details: normalizeDetails(details),
     createdAt: serverTimestamp(),
+    ...INITIAL_MODERATION_FIELDS,
   });
 }
 
@@ -122,6 +130,7 @@ export async function reportReel(reporterUid: string, reelId: string, reason: Re
     reason,
     details: normalizeDetails(details),
     createdAt: serverTimestamp(),
+    ...INITIAL_MODERATION_FIELDS,
   });
 }
 
@@ -154,5 +163,6 @@ export async function reportMessage(
     reason,
     details: normalizeDetails(details),
     createdAt: serverTimestamp(),
+    ...INITIAL_MODERATION_FIELDS,
   });
 }

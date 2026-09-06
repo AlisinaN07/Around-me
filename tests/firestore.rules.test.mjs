@@ -322,6 +322,11 @@ function validReport(reportId, reporterUid, targetType, overrides = {}) {
     reason: 'spam',
     details: null,
     createdAt: serverTimestamp(),
+    // Step 39.1 moderation lifecycle — every report is created 'open';
+    // status only ever changes via the trusted dismissReport callable.
+    status: 'open',
+    moderatedAt: null,
+    moderatedByUid: null,
     ...overrides,
   };
 }
@@ -3217,6 +3222,17 @@ async function main() {
       );
     });
 
+    // Step 39.1: isValidContentReport now independently enforces
+    // targetUid != request.auth.uid, matching isValidUserReport and
+    // isValidReelReport — this was the one report type that previously let
+    // an author report their own published Post/Activity/Event.
+    await check('DENY: self content report', async () => {
+      const reportId = contentReportId('s17b', 'post-s17b-1');
+      await assertFails(
+        setDoc(doc(s17b, 'reports', reportId), validReport(reportId, 's17b', 'content', { contentId: 'post-s17b-1', targetUid: 's17b' }))
+      );
+    });
+
     await check('DENY: third user reports a private message they cannot access', async () => {
       const convId = conversationId('s17a', 's17d');
       const reportId = messageReportId('s17c', 'msg-ad-1');
@@ -3254,6 +3270,30 @@ async function main() {
     await check('DENY: arbitrary extra field on report', async () => {
       const reportId = userReportId('s17b', 's17a');
       await assertFails(setDoc(doc(s17b, 'reports', reportId), { ...validReport(reportId, 's17b', 'user', { targetUid: 's17a' }), extra: 'nope' }));
+    });
+
+    // Step 39.1: a client may only ever create a report in the canonical
+    // initial moderation state — it can never pre-seed dismissed/resolved,
+    // a moderatedAt, or a moderatedByUid to fake a prior review.
+    await check('DENY: report create with non-open status', async () => {
+      const reportId = userReportId('s17b', 's17a');
+      await assertFails(
+        setDoc(doc(s17b, 'reports', reportId), validReport(reportId, 's17b', 'user', { targetUid: 's17a', status: 'dismissed' }))
+      );
+    });
+
+    await check('DENY: report create with non-null moderatedAt', async () => {
+      const reportId = userReportId('s17b', 's17a');
+      await assertFails(
+        setDoc(doc(s17b, 'reports', reportId), validReport(reportId, 's17b', 'user', { targetUid: 's17a', moderatedAt: serverTimestamp() }))
+      );
+    });
+
+    await check('DENY: report create with non-null moderatedByUid', async () => {
+      const reportId = userReportId('s17b', 's17a');
+      await assertFails(
+        setDoc(doc(s17b, 'reports', reportId), validReport(reportId, 's17b', 'user', { targetUid: 's17a', moderatedByUid: 's17b' }))
+      );
     });
 
     await check('DENY: update a report', async () => {

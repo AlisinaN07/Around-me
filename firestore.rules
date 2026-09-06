@@ -1441,14 +1441,23 @@ service cloud.firestore {
     }
 
     function reportBaseKeys() {
-      return ['reportId', 'reporterUid', 'targetType', 'targetUid', 'contentId', 'conversationId', 'messageId', 'reelId', 'reason', 'details', 'createdAt'];
+      return ['reportId', 'reporterUid', 'targetType', 'targetUid', 'contentId', 'conversationId', 'messageId', 'reelId', 'reason', 'details', 'createdAt', 'status', 'moderatedAt', 'moderatedByUid'];
     }
 
+    // Step 39.1: a report is captured by its reporter but moderated by a
+    // trusted admin-claim-gated Cloud Function (see functions/src/index.ts's
+    // dismissReport), never by a client write — so report creation must
+    // pin the moderation fields to their exact initial state. There is no
+    // client-side path that ever changes them afterward (allow update: if
+    // false, below, for everyone including the reporter).
     function isValidReportBase(data) {
       return data.reporterUid == request.auth.uid
         && isValidReportReasonEnum(data.reason)
         && (data.details == null || (data.details is string && data.details.size() <= 1000))
         && isServerTimestamp(data.createdAt)
+        && data.status == 'open'
+        && data.moderatedAt == null
+        && data.moderatedByUid == null
         && data.keys().hasOnly(reportBaseKeys());
     }
 
@@ -1474,7 +1483,8 @@ service cloud.firestore {
         && reportId == 'content_' + request.auth.uid + '_' + data.contentId
         && exists(contentPath)
         && get(contentPath).data.status == 'published'
-        && data.targetUid == get(contentPath).data.authorUid;
+        && data.targetUid == get(contentPath).data.authorUid
+        && data.targetUid != request.auth.uid;
     }
 
     function isValidMessageReport(reportId, data) {
