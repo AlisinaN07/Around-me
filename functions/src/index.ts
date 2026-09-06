@@ -184,7 +184,24 @@ async function cleanupCrossUserParticipants(db: Firestore, uid: string): Promise
 // Own authored content (Posts/Activities/Events) — subcollections first
 // (every possible one; a Post simply has none of participants/responses,
 // which just costs one empty read), then the parent document.
+//
+// deleteContentDocumentAndSubcollections is the shared per-document
+// primitive: deleteMyAccountData calls it once per document an author owns
+// (below), and Step 39.1's removeReportedContent calls it exactly once for
+// a single moderator-named contentId. Sharing this primitive is safe
+// because it never queries "everything this author owns" itself — the
+// caller always supplies one exact contentId — so reusing it cannot widen
+// moderation's scope beyond the one target a report actually named.
 // ---------------------------------------------------------------------------
+
+async function deleteContentDocumentAndSubcollections(db: Firestore, contentId: string): Promise<void> {
+  await drainCollection(db, `content/${contentId}/likes`);
+  await drainCollection(db, `content/${contentId}/comments`);
+  await drainCollection(db, `content/${contentId}/participants`);
+  await drainCollection(db, `content/${contentId}/responses`);
+  await db.doc(`content/${contentId}/stats/activity`).delete().catch(() => undefined);
+  await db.doc(`content/${contentId}`).delete();
+}
 
 async function deleteOwnContent(db: Firestore, uid: string): Promise<{ deleted: number }> {
   let deleted = 0;
@@ -192,13 +209,7 @@ async function deleteOwnContent(db: Firestore, uid: string): Promise<{ deleted: 
     const snap = await db.collection('content').where('authorUid', '==', uid).limit(OWNED_DOC_PAGE_SIZE).get();
     if (snap.empty) break;
     for (const docSnap of snap.docs) {
-      const contentId = docSnap.id;
-      await drainCollection(db, `content/${contentId}/likes`);
-      await drainCollection(db, `content/${contentId}/comments`);
-      await drainCollection(db, `content/${contentId}/participants`);
-      await drainCollection(db, `content/${contentId}/responses`);
-      await db.doc(`content/${contentId}/stats/activity`).delete().catch(() => undefined);
-      await docSnap.ref.delete();
+      await deleteContentDocumentAndSubcollections(db, docSnap.id);
       deleted += 1;
     }
   }
@@ -210,7 +221,35 @@ async function deleteOwnContent(db: Firestore, uid: string): Promise<{ deleted: 
 // prefix/recursive delete), then the Firestore doc. Covers both
 // still-"uploading" drafts and "published" Reels through the same
 // authoritative path, unlike the client-only discardReelDraft().
+//
+// deleteReelDocumentAndSubcollections is the shared per-document primitive
+// — same sharing rationale as deleteContentDocumentAndSubcollections above.
+// storagePath is always the caller's choice, never re-derived here, so a
+// caller that only has a reelId/authorUid pair (no Firestore doc left to
+// read a stored path from) must build the canonical path itself; see
+// removeReportedReel's storage-retry branch.
 // ---------------------------------------------------------------------------
+
+async function deleteReelDocumentAndSubcollections(
+  db: Firestore,
+  bucket: ReturnType<ReturnType<typeof getStorage>['bucket']>,
+  reelId: string,
+  storagePath: string | undefined
+): Promise<{ storageDeleted: boolean }> {
+  await drainCollection(db, `reels/${reelId}/likes`);
+  await drainCollection(db, `reels/${reelId}/comments`);
+
+  let storageDeleted = false;
+  if (storagePath) {
+    const file = bucket.file(storagePath);
+    const [existedBefore] = await file.exists();
+    await file.delete({ ignoreNotFound: true });
+    storageDeleted = existedBefore;
+  }
+
+  await db.doc(`reels/${reelId}`).delete();
+  return { storageDeleted };
+}
 
 async function deleteOwnReels(
   db: Firestore,
@@ -225,21 +264,12 @@ async function deleteOwnReels(
     const snap = await db.collection('reels').where('authorUid', '==', uid).limit(OWNED_DOC_PAGE_SIZE).get();
     if (snap.empty) break;
     for (const docSnap of snap.docs) {
-      const reelId = docSnap.id;
       const storagePath = docSnap.data()?.storagePath as string | undefined;
-
-      await drainCollection(db, `reels/${reelId}/likes`);
-      await drainCollection(db, `reels/${reelId}/comments`);
-
+      const result = await deleteReelDocumentAndSubcollections(db, bucket, docSnap.id, storagePath);
       if (storagePath) {
-        const file = bucket.file(storagePath);
-        const [existedBefore] = await file.exists();
-        await file.delete({ ignoreNotFound: true });
-        if (existedBefore) storageDeleted += 1;
+        if (result.storageDeleted) storageDeleted += 1;
         else storageAlreadyMissing += 1;
       }
-
-      await docSnap.ref.delete();
       deleted += 1;
     }
   }
@@ -383,6 +413,15 @@ function requireAdmin(request: CallableRequest): void {
 
 const MAX_REPORT_ID_LENGTH = 300;
 
+/** Shared by every moderation callable — input is always exactly `{ reportId }`. */
+function parseReportId(request: CallableRequest): string {
+  const reportId = request.data?.reportId;
+  if (typeof reportId !== 'string' || reportId.length === 0 || reportId.length > MAX_REPORT_ID_LENGTH) {
+    throw new HttpsError('invalid-argument', 'reportId must be a non-empty string.');
+  }
+  return reportId;
+}
+
 /**
  * Marks one report dismissed — the only moderation action this step ships.
  * Removal/ban/suspend callables are explicitly out of scope (Step 39.2+).
@@ -399,11 +438,7 @@ const MAX_REPORT_ID_LENGTH = 300;
  */
 export const dismissReport = onCall({ region: REGION }, async (request) => {
   requireAdmin(request);
-
-  const reportId = request.data?.reportId;
-  if (typeof reportId !== 'string' || reportId.length === 0 || reportId.length > MAX_REPORT_ID_LENGTH) {
-    throw new HttpsError('invalid-argument', 'reportId must be a non-empty string.');
-  }
+  const reportId = parseReportId(request);
 
   const db = getFirestore();
   const reportRef = db.doc(`reports/${reportId}`);
@@ -434,5 +469,187 @@ export const dismissReport = onCall({ region: REGION }, async (request) => {
     status: 'dismissed' as const,
     reportId,
     alreadyDismissed: outcome === 'already-dismissed',
+  };
+});
+
+// ---------------------------------------------------------------------------
+// Step 39.2 — trusted removal of reported public content (Post/Activity/
+// Event/Reel). Report CAPTURE, moderation STATUS (39.1), and moderation
+// ACTION (this) stay three separate concerns: these two callables are the
+// only code in this app that can delete someone else's published content,
+// and they may only ever act on the exact single target a report already
+// named — never an author's other content, never a client-supplied id.
+//
+// Both callables:
+//   1. requireAdmin(request) first — same choke point as dismissReport.
+//   2. Accept ONLY { reportId }. The target id is read from the TRUSTED
+//      reports/{reportId} document via the Admin SDK, never from
+//      request.data — so a client can never redirect a report about one
+//      target into deleting a different one by adding an extra field.
+//   3. Validate report.targetType matches the callable, and normalize a
+//      missing status to 'open' (same as dismissReport, for reports
+//      created before Step 39.1).
+//   4. dismissed -> failed-precondition, target untouched. resolved ->
+//      idempotent short-circuit (no re-check, no re-delete, no new
+//      moderatedAt) — a resolved content/reel report can only have
+//      reached that state via this exact code path already having
+//      finished once.
+//   5. Only after the target (and its subcollections/Storage) are
+//      confirmed gone does the report become resolved. If any step
+//      throws, the report is left 'open' — every deletion primitive
+//      here (drainCollection, delete-if-exists, Storage
+//      ignoreNotFound) is already idempotent, so a retry safely resumes
+//      wherever the previous attempt stopped.
+// ---------------------------------------------------------------------------
+
+function reportStatusOf(data: FirebaseFirestore.DocumentData): string {
+  return (data.status as string | undefined) ?? 'open';
+}
+
+async function resolveReport(db: Firestore, reportId: string, adminUid: string): Promise<void> {
+  await db.doc(`reports/${reportId}`).update({
+    status: 'resolved',
+    moderatedAt: FieldValue.serverTimestamp(),
+    moderatedByUid: adminUid,
+  });
+}
+
+/** contentId/reelId are plain equality filters — Firestore auto-indexes single-field equality, so this needs no composite index. */
+async function drainNotificationsByField(db: Firestore, field: 'contentId' | 'reelId', value: string): Promise<number> {
+  const { total } = await drainQuery(db, () => db.collection('notifications').where(field, '==', value));
+  return total;
+}
+
+/**
+ * Removes a reported Post/Activity/Event and its subcollections
+ * (likes/comments/participants/responses/stats — all four are drained
+ * unconditionally regardless of which of the three content types this
+ * actually is, exactly like deleteContentDocumentAndSubcollections already
+ * does for account deletion; an absent subcollection just costs one empty
+ * read) plus every notification referencing it. Never touches any other
+ * content the same author owns.
+ */
+export const removeReportedContent = onCall({ region: REGION, timeoutSeconds: 300, memory: '256MiB' }, async (request) => {
+  requireAdmin(request);
+  const reportId = parseReportId(request);
+  const adminUid = request.auth!.uid;
+
+  const db = getFirestore();
+  const reportSnap = await db.doc(`reports/${reportId}`).get();
+  if (!reportSnap.exists) {
+    throw new HttpsError('not-found', 'No report with that ID exists.');
+  }
+  const report = reportSnap.data()!;
+  if (report.targetType !== 'content') {
+    throw new HttpsError('failed-precondition', 'This report is not a content report.');
+  }
+  const contentId = report.contentId as string | undefined;
+  if (typeof contentId !== 'string' || contentId.length === 0) {
+    throw new HttpsError('failed-precondition', 'This report has no valid content target.');
+  }
+
+  const status = reportStatusOf(report);
+  if (status === 'dismissed') {
+    throw new HttpsError('failed-precondition', 'This report has been dismissed and cannot be used for removal.');
+  }
+  if (status === 'resolved') {
+    return {
+      reportId,
+      status: 'resolved' as const,
+      targetType: 'content' as const,
+      removed: true,
+      targetAlreadyMissing: false,
+      alreadyResolved: true,
+    };
+  }
+
+  const contentSnap = await db.doc(`content/${contentId}`).get();
+  const targetAlreadyMissing = !contentSnap.exists;
+  if (contentSnap.exists) {
+    await deleteContentDocumentAndSubcollections(db, contentId);
+  }
+  await drainNotificationsByField(db, 'contentId', contentId);
+  await resolveReport(db, reportId, adminUid);
+
+  return {
+    reportId,
+    status: 'resolved' as const,
+    targetType: 'content' as const,
+    removed: true,
+    targetAlreadyMissing,
+  };
+});
+
+/**
+ * Removes a reported Reel: its subcollections, its exact Storage source
+ * object, the Firestore document, and every notification referencing it.
+ *
+ * If the Firestore doc is already gone (e.g. a prior attempt deleted it
+ * but failed before Storage cleanup), the canonical Storage path is
+ * re-derived from the REPORT's own targetUid + reelId rather than given up
+ * on — isValidReelReport (firestore.rules) pins targetUid to the Reel's
+ * real authorUid at report-creation time, and authorUid is never mutated
+ * afterward, so `reels/{targetUid}/{reelId}/source` is exactly the same
+ * canonical path reelStoragePath() derives client-side
+ * (src/services/reels.ts). This is what makes a Storage-only retry safe
+ * without trusting anything from the request itself.
+ */
+export const removeReportedReel = onCall({ region: REGION, timeoutSeconds: 300, memory: '256MiB' }, async (request) => {
+  requireAdmin(request);
+  const reportId = parseReportId(request);
+  const adminUid = request.auth!.uid;
+
+  const db = getFirestore();
+  const reportSnap = await db.doc(`reports/${reportId}`).get();
+  if (!reportSnap.exists) {
+    throw new HttpsError('not-found', 'No report with that ID exists.');
+  }
+  const report = reportSnap.data()!;
+  if (report.targetType !== 'reel') {
+    throw new HttpsError('failed-precondition', 'This report is not a Reel report.');
+  }
+  const reelId = report.reelId as string | undefined;
+  const reportedAuthorUid = report.targetUid as string | undefined;
+  if (typeof reelId !== 'string' || reelId.length === 0 || typeof reportedAuthorUid !== 'string' || reportedAuthorUid.length === 0) {
+    throw new HttpsError('failed-precondition', 'This report has no valid Reel target.');
+  }
+
+  const status = reportStatusOf(report);
+  if (status === 'dismissed') {
+    throw new HttpsError('failed-precondition', 'This report has been dismissed and cannot be used for removal.');
+  }
+  if (status === 'resolved') {
+    return {
+      reportId,
+      status: 'resolved' as const,
+      targetType: 'reel' as const,
+      removed: true,
+      targetAlreadyMissing: false,
+      alreadyResolved: true,
+    };
+  }
+
+  const bucket = getStorage().bucket();
+  const reelDocRef = db.doc(`reels/${reelId}`);
+  const reelSnap = await reelDocRef.get();
+  const targetAlreadyMissing = !reelSnap.exists;
+
+  if (reelSnap.exists) {
+    const storagePath = reelSnap.data()?.storagePath as string | undefined;
+    await deleteReelDocumentAndSubcollections(db, bucket, reelId, storagePath);
+  } else {
+    const inferredStoragePath = `reels/${reportedAuthorUid}/${reelId}/source`;
+    await bucket.file(inferredStoragePath).delete({ ignoreNotFound: true });
+  }
+
+  await drainNotificationsByField(db, 'reelId', reelId);
+  await resolveReport(db, reportId, adminUid);
+
+  return {
+    reportId,
+    status: 'resolved' as const,
+    targetType: 'reel' as const,
+    removed: true,
+    targetAlreadyMissing,
   };
 });

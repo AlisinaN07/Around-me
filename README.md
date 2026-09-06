@@ -860,6 +860,50 @@ Verified against real disposable Firebase Auth accounts and a live-deployed `dis
 
 No admin route, admin settings row, or report-queue UI anywhere in the consumer Expo app — normal users have no way to discover that moderation exists. The Firebase Console (backed by IAM/Admin SDK, which bypasses Rules the same way `deleteMyAccountData` already does) remains the v1 report-review surface; there is still no `listReports` callable. No content/Reel/Activity/Event removal, no message removal, no account suspension or ban — all deferred to later, narrower phases once this authorization foundation is in place. `deleteMyAccountData` is unchanged: reports remain retained (never read, mutated, or deleted by that callable) regardless of who authored or was named in them.
 
+## Trusted removal of reported public content (Step 39.2)
+
+Step 39.1 built admin identity and a report lifecycle but no way to actually act on a report beyond dismissing it. Step 39.2 adds real enforcement for public content — Post, Activity, Event, and Reel — while deliberately leaving messages, bans, and suspension for later, narrower steps.
+
+### reportId-only targeting — never an arbitrary delete API
+
+`removeReportedContent` and `removeReportedReel` (`functions/src/index.ts`, same `europe-north1`/Node 22/Cloud Functions v2 codebase as `deleteMyAccountData`/`dismissReport`) both accept exactly `{ reportId }`. The target id is read from the trusted `reports/{reportId}` document via the Admin SDK — never from `request.data`. A payload like `{ reportId, contentId: 'someone-elses-post', isAdmin: true }` has its extra fields silently ignored: only the contentId the report itself named is ever touched. This was verified in production — a call naming Post A's report but smuggling Post B's id in `contentId` removed exactly Post A; Post B was confirmed untouched afterward. Without this design, a moderation callable would effectively be a general-purpose "delete anything by id" endpoint gated only by the admin claim — a far larger blast radius than "resolve the one thing a report named."
+
+### Status behavior: open → resolved, dismissed is a hard stop, resolved is idempotent
+
+Both callables normalize a missing `status` to `'open'` (same as `dismissReport`, for reports predating Step 39.1). A `dismissed` report cannot be used for removal — `failed-precondition`, target left completely untouched, verified against a report dismissed via the existing `dismissReport` callable immediately beforehand. A `resolved` report short-circuits to a safe idempotent response (`alreadyResolved: true`) without re-reading or re-deleting anything and without bumping `moderatedAt` — verified by calling the same callable twice on the same report and confirming byte-identical `moderatedAt`. The report only becomes `resolved` **after** its target cleanup finishes; if any step throws, the report is left `open` so a retry can resume safely.
+
+### Post / Activity / Event removal — one shared primitive, reused from account deletion
+
+`content/{contentId}` and its subcollections (`likes`, `comments`, `participants`, `responses`, `stats/activity`) are deleted by `deleteContentDocumentAndSubcollections` — a new function extracted from the account-deletion backend's existing `deleteOwnContent` loop, which now calls the same primitive per document it owns. This is a pure extraction (identical operations, same order, same idempotent guarantees) — `deleteMyAccountData`'s own behavior is unchanged, confirmed by code-level diff review and a clean Functions typecheck. The same four subcollections are drained unconditionally regardless of whether the target is actually a Post/Activity/Event (an absent subcollection just costs one empty paginated read) — the same approach `deleteOwnContent` already used, so Activity's `participants`/`stats` and Event's `responses` are covered without any type-specific branching. Since the whole Activity is being removed, `participantCount` is never decremented — the `stats/activity` document itself is deleted, not adjusted. Verified in production for all three types: Post (root + likes + comments gone), Activity (root + participants + stats + likes + comments gone), Event (root + responses + likes + comments gone) — in every case the corresponding report ended up `resolved` with the correct `moderatedByUid`.
+
+### Reel + Storage removal
+
+`removeReportedReel` mirrors the same shape via a new `deleteReelDocumentAndSubcollections` primitive (also extracted from the account-deletion backend's `deleteOwnReels`, same no-behavior-change guarantee): drains `likes`/`comments`, deletes the exact Storage object at the Reel's own `storagePath` (never a prefix or folder delete), then deletes the Firestore document. Verified in production: Reel doc, likes, comments, and the real uploaded Storage object were all confirmed gone, with the report resolved.
+
+### Storage-retry safety for a partially-failed prior attempt
+
+If the Firestore `reels/{reelId}` document is already gone (e.g. an earlier attempt deleted it but failed before Storage cleanup) but the report is still `open`, the callable can't read a `storagePath` off a document that no longer exists. Instead it re-derives the canonical path as `reels/{report.targetUid}/{reelId}/source` — safe specifically because `isValidReelReport` (`firestore.rules`) already pinned `targetUid` to the Reel's real `authorUid` at report-creation time, and `authorUid` is never mutated afterward, so this is exactly the same path `reelStoragePath()` would derive client-side. This was verified against a real production scenario: a Reel's Firestore document was deleted directly (simulating a partial prior failure) while its real Storage object and open report were left in place; invoking `removeReportedReel` again correctly derived the path, deleted the orphaned Storage object, and resolved the report (`targetAlreadyMissing: true`). Had the report schema not guaranteed that author/reel pairing, this retry path would have been unsafe to build — it would have meant guessing an author uid, which this callable never does.
+
+### Missing-target handling
+
+If a report's target was already independently removed by the time removal runs (verified in production by directly deleting a Post's Firestore document while its report stayed `open`), the callable does not error — it treats the target as already cleaned, still drains any notifications referencing it, and resolves the report with `targetAlreadyMissing: true`.
+
+### Notification cleanup
+
+Every notification carrying the removed content's `contentId` (covering `like`, `comment`, `event_response`, and `activity_join` — all four share that one field) or a removed Reel's `reelId` (covering `reel_like`/`reel_comment`) is deleted via the existing `drainQuery` pagination helper. `contentId`/`reelId` are plain equality filters, which Firestore auto-indexes — no new composite index was needed or added. Verified in production: an `event_response` notification and a `reel_like` notification were both confirmed gone after their respective target's removal, so a user's Inbox never keeps an actionable row pointing at content that no longer exists.
+
+### Client Firestore security is completely unchanged
+
+No Firestore Rules were touched in this step. Report read stays reporter-only; `allow update: if false` / `allow delete: if false` remain unconditional for every client. Verified again in production with the admin-claimed disposable account itself: direct client attempts to delete content, update a report, or delete a report were all denied identically to Step 39.1 — the admin claim still authorizes these two trusted Functions only, never a Firestore Rules exception.
+
+### Production verification summary
+
+Using disposable Firebase Auth accounts and real production data (no emulator, same established fallback as every prior step): the invalid-report-type guard (Reel report rejected by `removeReportedContent`, content report rejected by `removeReportedReel`), the spoofed-target-override test, Post/Activity/Event removal, Post idempotency, Reel removal with a real Storage object, the Storage-retry scenario, the missing-target scenario, the dismissed-report guard, non-admin and unauthenticated denial (including a spoofed `isAdmin` payload) for both callables, and the direct-client-Firestore security checks were all confirmed — every check passed. All synthetic Firestore documents, the real Storage objects, every synthetic report, and all five disposable Auth accounts (including the admin-claimed one) were deleted afterward by exact ID; the disposable admin uid was independently re-confirmed gone via a follow-up `getUser` call.
+
+### What this step still deliberately does not build
+
+No message review or removal (Step 39.3, if pursued, is the narrow scoped follow-up). No account suspension or ban. No admin UI of any kind — the Firebase Console remains the v1 review surface. No `listReports`/`getReport` callable. The real owner account still does not carry the `admin` claim.
+
 ## Reels (Cloud Storage — Step 18)
 
 Reels are short (≤60s), video-only posts with vertical, city-scoped playback — the first feature in this app to use Cloud Storage rather than Firestore alone. They live in their own root collection, `reels/{reelId}`, separate from `content/{contentId}` (posts/activities/events): a Reel has a media-upload lifecycle and Storage metadata that the other content types never had, and folding it into `content` would have meant giving every Post/Activity/Event query an upload-status field it never needs.
