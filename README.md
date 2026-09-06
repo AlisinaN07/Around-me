@@ -904,6 +904,73 @@ Using disposable Firebase Auth accounts and real production data (no emulator, s
 
 No message review or removal (Step 39.3, if pursued, is the narrow scoped follow-up). No account suspension or ban. No admin UI of any kind — the Firebase Console remains the v1 review surface. No `listReports`/`getReport` callable. The real owner account still does not carry the `admin` claim.
 
+## Narrow reported-message review and removal (Step 39.3)
+
+Around Me already lets users report a DM message (Step 17), but that report path terminated in an inert record — nobody could see what was reported or act on it, which isn't an acceptable gap for an owner-approved v1 given DM harassment is a real report category. Step 39.3 closes it with the narrowest possible privileged DM access: **one reportId names exactly one message**, and that message is the only thing either new callable can ever read or delete. There is no conversation browsing, no surrounding-message access, and no generic "read/delete any message" endpoint of any kind.
+
+### getReportedMessageForReview — exact response payload
+
+`europe-north1`, Node 22, Cloud Functions v2, same codebase as every other moderation callable. `requireAdmin(request)` first, then `{ reportId }` only. `conversationId`/`messageId` are read from the trusted `reports/{reportId}` document — never from the request — so a payload smuggling a different `conversationId`/`messageId`/`targetUid` alongside the real `reportId` is verified to have zero effect: the response is always for the report's real target. No status gate: review is a pure read with no side effects, so it's allowed for `open`, `dismissed`, or `resolved` reports alike (gating a harmless read by status would add complexity without adding real protection).
+
+Verified exact response shape in production:
+```json
+{
+  "reportId": "...",
+  "status": "open",
+  "report": { "reason": "harassment", "details": "..." },
+  "message": { "messageId": "...", "senderUid": "...", "body": "...", "createdAt": "..." }
+}
+```
+`reporterUid` is never present — confirmed directly against the live response. Neither neighboring message's id nor text ever appeared in the response in a three-message-conversation test (message 1 and message 3 surrounding the reported message 2) — the callable does exactly one `doc().get()` against the one named message path, never a query. If the message no longer exists, the response is `{ reportId, status, messageMissing: true }` with no substitute content fetched.
+
+### removeReportedMessage — why reportId-only
+
+Same shape as `removeReportedContent`/`removeReportedReel`: `requireAdmin` first, `{ reportId }` only, target derived from the trusted report. Verified live with the same spoofed-payload test used in Step 39.2 — a call naming Report A while smuggling a different conversation/message/targetUid in the payload still only affected Report A's real message; the "other" message named in the spoofed fields was independently confirmed untouched afterward.
+
+### Report status behavior
+
+Identical policy to every other removal callable: missing status normalizes to `open`. `dismissed` → `failed-precondition`, message untouched — verified by dismissing a report via the existing `dismissReport` callable first, then confirming removal was refused and the message still existed. `resolved` → idempotent short-circuit, `alreadyResolved: true`, `moderatedAt` provably unchanged — verified with a genuine repeat call after a real removal.
+
+### Exact message deletion
+
+Deletes exactly `conversations/{conversationId}/messages/{messageId}` — nothing else. Verified: the reported message was gone afterward while the conversation root, the other two messages in that same conversation, and an entirely separate synthetic conversation between different users were all confirmed untouched.
+
+### Conversation metadata repair
+
+`conversations/{conversationId}` (`src/types/message.ts`) denormalizes `lastMessageId`/`lastMessageText`/`lastMessageSenderUid`/`lastMessageAt` so the Inbox never has to query every conversation's messages just to render a preview row. If the removed message is **not** the conversation's current `lastMessageId`, nothing about the conversation document is touched — verified by comparing the full conversation document before and after removal and confirming byte-identical `lastMessage*` fields and `updatedAt` (no unnecessary write). If the removed message **is** the current latest, the preview is repaired from a single bounded query — `messages.orderBy('createdAt', 'desc').limit(1)`, never a history scan — verified live: reporting and removing a conversation's genuinely-latest message correctly repaired `lastMessageId`/`lastMessageText`/`lastMessageSenderUid` to point at the next-newest surviving message. If no messages remain in the conversation at all, the preview fields are deliberately left pointing at the now-deleted message — the `Conversation` type has no "empty" representation for these fields (they're required strings, not nullable), and the client was never built to render one; inventing a synthetic empty state now would mean guessing UI behavior that doesn't exist. This is a known, narrow, explicitly-accepted gap: it can only occur when the *only* message in a conversation is the one being moderated away, and it self-resolves the next time either participant sends a new message.
+
+### Unread behavior
+
+`unreadCounts` (`Record<uid, number>`) is a per-recipient **sent-message counter** incremented by `sendMessage` on every send — not a live count of existing message documents (confirmed by reading `sendMessage`'s transaction directly). There is no way to "correctly" decrement it for one deleted message without knowing whether the recipient had already read it, so `removeReportedMessage` deliberately leaves it untouched — inventing a decrement here would be exactly the kind of unproven counter repair this step was told not to do. The impact is bounded: `markConversationRead` already resets a participant's own count to `0` unconditionally the next time they open that conversation, so any one-off overcount from a moderated message self-corrects on the recipient's next visit regardless.
+
+### Message-report body privacy
+
+Reconfirmed unchanged: `reports/{reportId}` for `targetType: 'message'` still stores only `conversationId`/`messageId`/`targetUid` — never a copy of the message body (`src/types/report.ts`, `src/services/reports.ts`). The only place a message's body is ever readable by an admin is a live `getReportedMessageForReview` call while the message still exists; after removal, the report stays retained as a permanent record that a report existed and was actioned, but the message text itself is genuinely gone — the report never becomes a second archive of DM content.
+
+### Missing-message handling
+
+Verified live: a message was deleted directly (via Admin SDK, simulating a scenario with no client-reachable equivalent) while its report stayed `open`. `removeReportedMessage` treated the target as already clean and resolved the report with `targetAlreadyMissing: true` — no error, no substitute content touched. A subsequent review of that same report correctly returned `messageMissing: true` rather than fetching anything else.
+
+### Direct client Firestore security — unchanged
+
+No Firestore Rules changes in this step (confirmed via `git diff`). Verified again with the admin-claimed disposable account itself, via the plain client SDK: reading a message in a conversation it isn't a participant of — denied; deleting a message directly — denied (`allow delete: if false` already covered every client, admin claim included); reading another user's report — denied; updating a report directly — denied. The claim authorizes these two trusted Functions only, exactly like every other moderation callable in this app.
+
+### Account deletion policy — unchanged, code-level regression only
+
+`deleteMyAccountData` was not modified in this step (confirmed via `git diff` — the only file touched besides README is the addition of these two new callables). DMs/messages remain retained on self-deletion; this step's message removal is a narrow, separate, report-triggered safety action against exactly one message, never a change to that policy. This was a code-level review, not a fresh production account-deletion run — no shared helper was touched by this step, so there was nothing new to regression-test.
+
+### No generic DM access anywhere
+
+Confirmed by reviewing every Functions export: there is no `getConversation`, `getMessages`, `searchMessages`, `adminMessages`, `deleteMessage`, or `deleteConversation` — only `getReportedMessageForReview` and `removeReportedMessage`, both permanently reportId-scoped.
+
+### Production verification summary
+
+Disposable Firebase Auth accounts and real production data (no emulator, same established fallback throughout this project): the exact review payload shape, the neighbor-message privacy guarantee (a 3-message conversation with the middle one reported), an entirely separate conversation's total isolation, exact single-message removal, the dismissed-report guard, resolved idempotency (verified with a genuine repeat call), the missing-message scenario, the invalid-report-type guard (a content report rejected by both message callables), the preview-repair path (removing a conversation's actual latest message), the spoofed-target-override test for both callables, non-admin and unauthenticated denial (including spoofed `isAdmin` payloads), the direct-client-Firestore checks, and reporter-identity privacy were all confirmed. All synthetic conversations/messages/reports/content, and all disposable Auth accounts (including the admin-claimed one), were deleted afterward by exact ID; the disposable admin uid was independently re-confirmed gone via a follow-up `getUser` call.
+
+### What this step still deliberately does not build
+
+No account suspension or ban. No admin UI of any kind. No message-status field, no "reviewed" state beyond the existing open/dismissed/resolved lifecycle. The real owner account still does not carry the `admin` claim.
+
 ## Reels (Cloud Storage — Step 18)
 
 Reels are short (≤60s), video-only posts with vertical, city-scoped playback — the first feature in this app to use Cloud Storage rather than Firestore alone. They live in their own root collection, `reels/{reelId}`, separate from `content/{contentId}` (posts/activities/events): a Reel has a media-upload lifecycle and Storage metadata that the other content types never had, and folding it into `content` would have meant giving every Post/Activity/Event query an upload-status field it never needs.

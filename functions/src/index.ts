@@ -506,6 +506,14 @@ function reportStatusOf(data: FirebaseFirestore.DocumentData): string {
   return (data.status as string | undefined) ?? 'open';
 }
 
+async function loadReportOrThrow(db: Firestore, reportId: string): Promise<FirebaseFirestore.DocumentData> {
+  const snap = await db.doc(`reports/${reportId}`).get();
+  if (!snap.exists) {
+    throw new HttpsError('not-found', 'No report with that ID exists.');
+  }
+  return snap.data()!;
+}
+
 async function resolveReport(db: Firestore, reportId: string, adminUid: string): Promise<void> {
   await db.doc(`reports/${reportId}`).update({
     status: 'resolved',
@@ -535,11 +543,7 @@ export const removeReportedContent = onCall({ region: REGION, timeoutSeconds: 30
   const adminUid = request.auth!.uid;
 
   const db = getFirestore();
-  const reportSnap = await db.doc(`reports/${reportId}`).get();
-  if (!reportSnap.exists) {
-    throw new HttpsError('not-found', 'No report with that ID exists.');
-  }
-  const report = reportSnap.data()!;
+  const report = await loadReportOrThrow(db, reportId);
   if (report.targetType !== 'content') {
     throw new HttpsError('failed-precondition', 'This report is not a content report.');
   }
@@ -600,11 +604,7 @@ export const removeReportedReel = onCall({ region: REGION, timeoutSeconds: 300, 
   const adminUid = request.auth!.uid;
 
   const db = getFirestore();
-  const reportSnap = await db.doc(`reports/${reportId}`).get();
-  if (!reportSnap.exists) {
-    throw new HttpsError('not-found', 'No report with that ID exists.');
-  }
-  const report = reportSnap.data()!;
+  const report = await loadReportOrThrow(db, reportId);
   if (report.targetType !== 'reel') {
     throw new HttpsError('failed-precondition', 'This report is not a Reel report.');
   }
@@ -649,6 +649,170 @@ export const removeReportedReel = onCall({ region: REGION, timeoutSeconds: 300, 
     reportId,
     status: 'resolved' as const,
     targetType: 'reel' as const,
+    removed: true,
+    targetAlreadyMissing,
+  };
+});
+
+// ---------------------------------------------------------------------------
+// Step 39.3 — narrow reported-message review and removal.
+//
+// This is deliberately the narrowest possible privileged DM access: ONE
+// reportId names ONE message, and that is the only message either callable
+// can ever read or delete. There is no conversation browsing, no
+// surrounding-message access, no generic "read any message" or "delete any
+// message" endpoint — conversationId/messageId always come from the
+// trusted reports/{reportId} document (validated at report-creation time
+// by isValidMessageReport in firestore.rules: reporter was a participant,
+// the message existed, and targetUid was pinned to the real sender —
+// see src/services/reports.ts's reportMessage), never from request.data.
+//
+// Reports still store zero message content (see src/types/report.ts) — the
+// review callable fetches the LIVE message only at the moment an
+// authorized admin explicitly asks to review that one report, and nothing
+// is ever copied back into the report document.
+// ---------------------------------------------------------------------------
+
+async function requireValidMessageReport(
+  db: Firestore,
+  reportId: string
+): Promise<{ report: FirebaseFirestore.DocumentData; conversationId: string; messageId: string }> {
+  const report = await loadReportOrThrow(db, reportId);
+  if (report.targetType !== 'message') {
+    throw new HttpsError('failed-precondition', 'This report is not a message report.');
+  }
+  const conversationId = report.conversationId as string | undefined;
+  const messageId = report.messageId as string | undefined;
+  if (typeof conversationId !== 'string' || conversationId.length === 0 || typeof messageId !== 'string' || messageId.length === 0) {
+    throw new HttpsError('failed-precondition', 'This report has no valid message target.');
+  }
+  return { report, conversationId, messageId };
+}
+
+/**
+ * Lets an admin see exactly the one message a report named, plus why it
+ * was reported — nothing else. No status gate: this is a read with no
+ * side effects, so it's allowed regardless of open/dismissed/resolved
+ * (an admin reviewing moderation history is a legitimate, safe use of a
+ * read-only action; gating it on status would only complicate this
+ * without adding any real protection).
+ *
+ * Never returns reporterUid — the admin can see what was reported and why
+ * without learning who reported it, matching the same reporter-privacy
+ * guarantee normal report reads already have.
+ */
+export const getReportedMessageForReview = onCall({ region: REGION }, async (request) => {
+  requireAdmin(request);
+  const reportId = parseReportId(request);
+
+  const db = getFirestore();
+  const { report, conversationId, messageId } = await requireValidMessageReport(db, reportId);
+  const status = reportStatusOf(report);
+
+  const messageSnap = await db.doc(`conversations/${conversationId}/messages/${messageId}`).get();
+  if (!messageSnap.exists) {
+    return { reportId, status, messageMissing: true as const };
+  }
+  const message = messageSnap.data()!;
+
+  return {
+    reportId,
+    status,
+    report: {
+      reason: report.reason as string,
+      details: (report.details as string | null) ?? null,
+    },
+    message: {
+      messageId,
+      senderUid: message.senderUid as string,
+      body: message.body as string,
+      createdAt: message.createdAt as FirebaseFirestore.Timestamp,
+    },
+  };
+});
+
+/**
+ * Deletes exactly the one message a report named. Never touches the
+ * conversation itself, any other message, or any other conversation.
+ *
+ * Conversation preview repair: conversations/{conversationId} denormalizes
+ * lastMessageId/lastMessageText/lastMessageSenderUid/lastMessageAt (see
+ * src/types/message.ts) so the Inbox never has to query every
+ * conversation's messages just to render a preview. If the removed
+ * message was the CURRENT lastMessageId, that preview is repaired from
+ * the single newest surviving message (one bounded orderBy(createdAt,
+ * desc).limit(1) query — never the full history). If no messages remain
+ * at all, the preview fields are deliberately left as-is: the Conversation
+ * type has no "empty" representation for lastMessageText/lastMessageId
+ * (they're required strings, not nullable), and inventing one now would
+ * mean guessing a schema the client was never built to render — see the
+ * README for this documented edge case.
+ *
+ * unreadCounts is a per-recipient SENT-message counter, not a count of
+ * existing message documents (see sendMessage) — there is no way to
+ * "correctly" decrement it for one deleted message without knowing
+ * whether the recipient had already read it, so it is deliberately left
+ * untouched. The user's next visit to this conversation already resets
+ * their own count to 0 via markConversationRead regardless, so any
+ * one-off overcount here is bounded and self-correcting.
+ */
+export const removeReportedMessage = onCall({ region: REGION, timeoutSeconds: 300, memory: '256MiB' }, async (request) => {
+  requireAdmin(request);
+  const reportId = parseReportId(request);
+  const adminUid = request.auth!.uid;
+
+  const db = getFirestore();
+  const { report, conversationId, messageId } = await requireValidMessageReport(db, reportId);
+  const status = reportStatusOf(report);
+
+  if (status === 'dismissed') {
+    throw new HttpsError('failed-precondition', 'This report has been dismissed and cannot be used for removal.');
+  }
+  if (status === 'resolved') {
+    return {
+      reportId,
+      status: 'resolved' as const,
+      removed: true,
+      targetAlreadyMissing: false,
+      alreadyResolved: true,
+    };
+  }
+
+  const messageRef = db.doc(`conversations/${conversationId}/messages/${messageId}`);
+  const messageSnap = await messageRef.get();
+  const targetAlreadyMissing = !messageSnap.exists;
+
+  if (messageSnap.exists) {
+    await messageRef.delete();
+
+    const convRef = db.doc(`conversations/${conversationId}`);
+    const convSnap = await convRef.get();
+    if (convSnap.exists && convSnap.data()?.lastMessageId === messageId) {
+      const newestSnap = await db
+        .collection(`conversations/${conversationId}/messages`)
+        .orderBy('createdAt', 'desc')
+        .limit(1)
+        .get();
+      if (!newestSnap.empty) {
+        const newest = newestSnap.docs[0].data();
+        await convRef.update({
+          lastMessageId: newest.messageId,
+          lastMessageText: newest.body,
+          lastMessageSenderUid: newest.senderUid,
+          lastMessageAt: newest.createdAt,
+          updatedAt: FieldValue.serverTimestamp(),
+        });
+      }
+      // No messages remain at all — preview fields intentionally left
+      // untouched; see this function's doc comment above.
+    }
+  }
+
+  await resolveReport(db, reportId, adminUid);
+
+  return {
+    reportId,
+    status: 'resolved' as const,
     removed: true,
     targetAlreadyMissing,
   };
