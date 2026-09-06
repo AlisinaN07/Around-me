@@ -1116,6 +1116,24 @@ All synthetic accounts/documents were deleted immediately after and independentl
 
 **Deployment:** Firestore Rules only (`firebase deploy --only firestore:rules`), deployed successfully with exactly two expected "unused function" warnings (`isValidPostShape`, `isValidActivityShape`). Functions, Storage Rules, and indexes were not touched or redeployed.
 
+## Simplify account-aware Create flow (Step 41.2D)
+
+There are now exactly two user-facing creatable concepts — **Post** and **Event** — and the Create entry point is fully account-aware instead of showing every account type the same chooser.
+
+**Personal:** tapping the bottom tab bar's center **+** goes straight to Post creation (`/create/reel`) — no intermediate chooser. **Business:** tapping **+** opens a clean two-option chooser — **Post** (`/create/reel`) and **Event** (`/create/event`).
+
+**Implementation architecture — two layers, not one:** (1) `(tabs)/_layout.tsx` reads `accountType` from the already-mounted `ProfileProvider` context (a single one-shot fetch, not a new realtime listener) and, only when accountType is confidently known and Personal, intercepts the tab's `tabPress` event (`preventDefault()` + `router.push('/create/reel')`) so a Personal account never even visits `/create`. (2) `(tabs)/create.tsx` itself is the canonical, deterministic fallback: it independently re-derives `isBusinessAccount(profile)` and, once `isProfileLoading` resolves, either `router.replace('/create/reel')`s (Personal) or renders the two-option chooser (Business). Layer (2) exists because layer (1) only fires on an actual tab press with an already-resolved profile — a cold-start tab press before the profile loads, a direct link to `/create`, or the `/create/activity` redirect stub all still land on `/create` and must resolve correctly there too. Both layers reuse the exact same `isBusinessAccount()` helper and the exact same `ProfileProvider` context — no redundant Firestore subscription was added.
+
+**Loading safety:** while `isProfileLoading` is true, `/create` renders the shared `LoadingState` spinner and nothing else — it never guesses account type, never briefly shows the Business chooser to a Personal account (or vice versa), and the redirect-effect only fires once profile resolution is confirmed, so there's no redirect loop.
+
+**Business Create chooser design:** two equally-weighted cards (not a "hero + secondary row" hierarchy) using the same accent-gradient treatment the old Reel hero card used — `videocam` icon for Post ("Share a video with your city."), `calendar` icon for Event ("Create an event for people to discover."). No new visual language, dependency, spacing, or icon set was introduced.
+
+**Legacy routes, unchanged behavior, new effective result:** `/create/post` still redirects to `/create/reel` (Step 41.2C) and `/create/activity` still redirects to `/create` (Step 41.2B) — neither route itself changed in this step, but since `/create` is now account-aware, a Personal account following the old `/create/activity` link now lands on the real Post creator instead of a chooser, exactly as intended.
+
+**Event protection, layered and unchanged:** Personal never sees the Event option in the UI (this step); `/create/event`'s own `canCreateEvent(profile)` guard still independently blocks direct navigation (Step 30); `firestore.rules`' Event-create check still requires `accountType == 'business'` (Step 30, unaffected by Step 41.2C.1). None of these three layers were weakened or replaced by this step — this step only adds the first one's better UX (no option shown), it never removes the other two.
+
+**Explicitly unchanged:** `/create/reel`'s camera/upload/publish flow, `/create/event`'s form and publish flow, Home (still video-Posts-only), Events (still Business-Event-discovery-only), and Profile's unified Posts tab (Step 41.2C) — this step changes only how a user *enters* Create, not anything downstream of it.
+
 ## Reels (Cloud Storage — Step 18)
 
 Reels are short (≤60s), video-only posts with vertical, city-scoped playback — the first feature in this app to use Cloud Storage rather than Firestore alone. They live in their own root collection, `reels/{reelId}`, separate from `content/{contentId}` (posts/activities/events): a Reel has a media-upload lifecycle and Storage metadata that the other content types never had, and folding it into `content` would have meant giving every Post/Activity/Event query an upload-status field it never needs.

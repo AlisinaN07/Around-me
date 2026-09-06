@@ -1,9 +1,11 @@
 import { Ionicons } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
-import { Tabs } from 'expo-router';
+import { router, Tabs } from 'expo-router';
 import { Platform, StyleSheet, View } from 'react-native';
 
 import { Colors, Gradients, IconSize } from '@/constants/theme';
+import { useProfile } from '@/hooks/useProfile';
+import { isBusinessAccount } from '@/utils/accountCapabilities';
 
 /**
  * Bottom tab bar (Step 24 visual foundation). Reels intentionally does NOT
@@ -14,6 +16,19 @@ import { Colors, Gradients, IconSize } from '@/constants/theme';
  * (src/app/(app)/reels.tsx) — only its place in the tab bar moved.
  */
 export default function TabsLayout() {
+  // Step 41.2D — reuses the already-mounted ProfileProvider context (a
+  // single one-shot profile fetch, not a realtime listener); this layout
+  // never subscribes to anything new just to read accountType. Only used
+  // to let a Personal account's + tap skip the /create hop entirely when
+  // accountType is already confidently known. When it ISN'T yet known
+  // (isProfileLoading), the tab press is left alone — the canonical
+  // account-aware /create screen (create.tsx) is the deterministic
+  // fallback for that case and for every other way of reaching /create,
+  // so Personal never gets stuck looking at a chooser with only one real
+  // option.
+  const { profile, isProfileLoading } = useProfile();
+  const isConfidentlyPersonal = !isProfileLoading && !isBusinessAccount(profile);
+
   return (
     <Tabs
       screenOptions={{
@@ -53,6 +68,21 @@ export default function TabsLayout() {
               <Ionicons name="add" size={IconSize.xl} color={Colors.text} />
             </LinearGradient>
           ),
+        }}
+        listeners={{
+          tabPress: (event) => {
+            // Personal has exactly one creatable concept (Post) — skip the
+            // /create hop and go straight to its canonical route. Business
+            // (or accountType not yet confidently known) falls through to
+            // the default tab-press behavior, landing on /create, which
+            // renders the Post/Event chooser for Business and independently
+            // redirects Personal itself if this listener ever runs before
+            // the profile has loaded.
+            if (isConfidentlyPersonal) {
+              event.preventDefault();
+              router.push('/create/reel');
+            }
+          },
         }}
       />
       <Tabs.Screen

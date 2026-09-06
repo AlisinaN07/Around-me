@@ -1,49 +1,56 @@
 import { Ionicons } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
-import { router, type Href } from 'expo-router';
+import { router } from 'expo-router';
+import { useEffect } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
+import { LoadingState } from '@/components/LoadingState';
 import { Colors, Gradients, Layout, Radius, Spacing, Typography } from '@/constants/theme';
 import { useProfile } from '@/hooks/useProfile';
 import { useCity } from '@/providers/CityProvider';
-import { canCreateEvent } from '@/utils/accountCapabilities';
-
-type CreateOption = {
-  id: string;
-  icon: keyof typeof Ionicons.glyphMap;
-  label: string;
-  description: string;
-  href: Href;
-};
-
-// Home is a Reel-first social feed (Step 25), so the video Post is the
-// visually strongest option here too — a large hero card above the
-// secondary list. Step 41.2C retired the legacy text-only Post creation
-// option entirely (see /create/post's redirect stub), so the hero card
-// below is now simply labeled "Post" with no secondary duplicate.
-const SECONDARY_OPTIONS: CreateOption[] = [];
+import { isBusinessAccount } from '@/utils/accountCapabilities';
 
 /**
- * Event creation is Business-only (Step 30 core rule: Business = Personal
- * + the ability to create Events). Personal accounts simply never see
- * this option — no disabled "Coming soon" card, no badge on the account
- * that does see it. The real guarantee is firestore.rules' Event-create
- * check, not this filter — see /create/event's own capability guard for
- * what happens if a Personal account navigates there directly.
+ * Create hub — Step 41.2D. There are now exactly two user-facing creatable
+ * concepts: Post (video, technically a Reel — see /create/reel) and Event
+ * (Business-only). Personal has only one, so this screen is not a chooser
+ * for Personal at all: once the already-loaded profile confirms
+ * accountType, it immediately `router.replace`s to /create/reel rather than
+ * showing a "chooser" with a single real option. Business sees a two-option
+ * Post/Event chooser below.
+ *
+ * The tab bar's + button (see (tabs)/_layout.tsx) skips this screen
+ * entirely for Personal when accountType is already confidently known —
+ * but this screen is still the canonical, deterministic entry point for
+ * every other way of reaching /create (a cold-start tab press before the
+ * profile has resolved, a direct link, or the /create/activity redirect
+ * stub from Step 41.2B), so the account-aware behavior has to be enforced
+ * here too, not only at the tab-press layer.
  */
-const EVENT_OPTION: CreateOption = {
-  id: 'event',
-  icon: 'calendar-outline',
-  label: 'Event',
-  description: 'Publish an event.',
-  href: '/create/event',
-};
-
 export default function CreateScreen() {
   const { homeCity, activeCity, isExploringAnotherCity } = useCity();
-  const { profile } = useProfile();
-  const showEvent = canCreateEvent(profile);
+  const { profile, isProfileLoading } = useProfile();
+  const isBusiness = isBusinessAccount(profile);
+
+  useEffect(() => {
+    if (!isProfileLoading && !isBusiness) {
+      router.replace('/create/reel');
+    }
+  }, [isProfileLoading, isBusiness]);
+
+  // Covers two cases with the same loading treatment: accountType isn't
+  // known yet, or it is known and it's Personal — the effect above is
+  // already replacing the route in the latter case, so this is just the
+  // one frame before that takes effect. Never render the Business chooser
+  // here on the strength of a guess.
+  if (isProfileLoading || !isBusiness) {
+    return (
+      <SafeAreaView style={styles.safeArea}>
+        <LoadingState size="large" />
+      </SafeAreaView>
+    );
+  }
 
   return (
     <SafeAreaView style={styles.safeArea}>
@@ -59,55 +66,56 @@ export default function CreateScreen() {
           </View>
         ) : null}
 
-        <Pressable
-          style={({ pressed }) => [styles.reelHero, pressed && styles.pressed]}
-          onPress={() => router.push('/create/reel')}
-          accessibilityRole="button"
-          accessibilityLabel="Post"
-        >
-          <LinearGradient
-            colors={Gradients.accent}
-            start={{ x: 0, y: 0 }}
-            end={{ x: 1, y: 1 }}
-            style={StyleSheet.absoluteFill}
+        <View style={styles.chooser}>
+          <CreateOptionCard
+            icon="videocam"
+            title="Post"
+            description="Share a video with your city."
+            accessibilityLabel="Post"
+            onPress={() => router.push('/create/reel')}
           />
-          <View style={styles.reelIconWrap}>
-            <Ionicons name="videocam" size={26} color={Colors.text} />
-          </View>
-          <View style={styles.reelHeroText}>
-            <Text style={styles.reelHeroTitle}>Post</Text>
-            <Text style={styles.reelHeroDescription}>Share what&apos;s happening around you.</Text>
-          </View>
-          <Ionicons name="chevron-forward" size={20} color={Colors.text} />
-        </Pressable>
-
-        <View style={styles.list}>
-          {SECONDARY_OPTIONS.map((option) => (
-            <OptionRow key={option.id} option={option} />
-          ))}
-          {showEvent ? <OptionRow option={EVENT_OPTION} /> : null}
+          <CreateOptionCard
+            icon="calendar"
+            title="Event"
+            description="Create an event for people to discover."
+            accessibilityLabel="Event"
+            onPress={() => router.push('/create/event')}
+          />
         </View>
       </View>
     </SafeAreaView>
   );
 }
 
-function OptionRow({ option }: { option: CreateOption }) {
+function CreateOptionCard({
+  icon,
+  title,
+  description,
+  accessibilityLabel,
+  onPress,
+}: {
+  icon: keyof typeof Ionicons.glyphMap;
+  title: string;
+  description: string;
+  accessibilityLabel: string;
+  onPress: () => void;
+}) {
   return (
     <Pressable
-      style={({ pressed }) => [styles.option, pressed && styles.optionPressed]}
-      onPress={() => router.push(option.href)}
+      style={({ pressed }) => [styles.optionCard, pressed && styles.pressed]}
+      onPress={onPress}
       accessibilityRole="button"
-      accessibilityLabel={option.label}
+      accessibilityLabel={accessibilityLabel}
     >
-      <View style={styles.iconWrap}>
-        <Ionicons name={option.icon} size={22} color={Colors.accent} />
+      <LinearGradient colors={Gradients.accent} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={StyleSheet.absoluteFill} />
+      <View style={styles.optionIconWrap}>
+        <Ionicons name={icon} size={26} color={Colors.text} />
       </View>
-      <View style={styles.optionText}>
-        <Text style={styles.optionLabel}>{option.label}</Text>
-        <Text style={styles.optionDescription}>{option.description}</Text>
+      <View style={styles.optionCardText}>
+        <Text style={styles.optionCardTitle}>{title}</Text>
+        <Text style={styles.optionCardDescription}>{description}</Text>
       </View>
-      <Ionicons name="chevron-forward" size={18} color={Colors.textSecondary} />
+      <Ionicons name="chevron-forward" size={20} color={Colors.text} />
     </Pressable>
   );
 }
@@ -148,13 +156,15 @@ const styles = StyleSheet.create({
     fontSize: 13,
     lineHeight: 18,
   },
-  reelHero: {
+  chooser: {
+    gap: Spacing.md,
+  },
+  optionCard: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: Spacing.md,
     borderRadius: Radius.lg,
     padding: Spacing.lg,
-    marginBottom: Spacing.md,
     overflow: 'hidden',
     shadowColor: Colors.accent,
     shadowOpacity: 0.35,
@@ -164,7 +174,7 @@ const styles = StyleSheet.create({
   pressed: {
     opacity: 0.9,
   },
-  reelIconWrap: {
+  optionIconWrap: {
     width: 52,
     height: 52,
     borderRadius: Radius.md,
@@ -172,54 +182,18 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     backgroundColor: 'rgba(255, 255, 255, 0.2)',
   },
-  reelHeroText: {
+  optionCardText: {
     flex: 1,
     gap: 2,
   },
-  reelHeroTitle: {
+  optionCardTitle: {
     color: Colors.text,
     fontSize: 19,
     fontWeight: '800',
   },
-  reelHeroDescription: {
+  optionCardDescription: {
     color: 'rgba(255, 255, 255, 0.85)',
     fontSize: 13,
     lineHeight: 18,
-  },
-  list: {
-    gap: Spacing.md,
-  },
-  option: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: Spacing.md,
-    borderRadius: Radius.lg,
-    backgroundColor: Colors.surface,
-    borderWidth: 1,
-    borderColor: Colors.border,
-    padding: Spacing.md,
-  },
-  optionPressed: {
-    opacity: 0.85,
-  },
-  iconWrap: {
-    width: 44,
-    height: 44,
-    borderRadius: Radius.md,
-    alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: Colors.background,
-  },
-  optionText: {
-    flex: 1,
-    gap: 2,
-  },
-  optionLabel: {
-    color: Colors.text,
-    ...Typography.cardTitle,
-  },
-  optionDescription: {
-    color: Colors.textSecondary,
-    ...Typography.bodySecondary,
   },
 });
