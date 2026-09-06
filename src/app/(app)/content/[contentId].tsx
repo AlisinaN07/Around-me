@@ -1,10 +1,11 @@
 import { Ionicons } from '@expo/vector-icons';
-import { useLocalSearchParams } from 'expo-router';
+import { router, useLocalSearchParams } from 'expo-router';
 import { useCallback, useEffect, useState } from 'react';
 import { Pressable, ScrollView, StyleSheet, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { ActivityDetail } from '@/components/ActivityDetail';
+import { ConfirmDialog } from '@/components/ConfirmDialog';
 import { DetailHero } from '@/components/DetailHero';
 import { ErrorState } from '@/components/ErrorState';
 import { EventDetail } from '@/components/EventDetail';
@@ -15,10 +16,16 @@ import { PostDetail } from '@/components/PostDetail';
 import { ReportModal } from '@/components/ReportModal';
 import { Colors, Layout, Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
-import { fetchContentById } from '@/services/content';
+import { deleteMyContent, fetchContentById } from '@/services/content';
 import type { ActivityContent, Content, EventContent } from '@/types/content';
 
 type LoadStatus = 'loading' | 'loaded' | 'error';
+
+const DELETE_LABEL: Record<Content['type'], string> = {
+  post: 'Delete post?',
+  activity: 'Delete activity?',
+  event: 'Delete event?',
+};
 
 export default function ContentDetailScreen() {
   const { contentId } = useLocalSearchParams<{ contentId: string }>();
@@ -27,6 +34,9 @@ export default function ContentDetailScreen() {
   const [content, setContent] = useState<Content | null>(null);
   const [isOptionsMenuOpen, setIsOptionsMenuOpen] = useState(false);
   const [isReportOpen, setIsReportOpen] = useState(false);
+  const [isDeleteConfirmOpen, setIsDeleteConfirmOpen] = useState(false);
+  const [isDeleting, setIsDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
 
   // load() never calls setState before its first await, so nothing runs
   // synchronously during the effect body below.
@@ -51,6 +61,38 @@ export default function ContentDetailScreen() {
 
   const isOwnContent = !!user && !!content && content.authorUid === user.uid;
 
+  const optionsMenuOptions = isOwnContent
+    ? [{ label: 'Delete', destructive: true, onPress: () => setIsDeleteConfirmOpen(true) }]
+    : [{ label: 'Report', onPress: () => setIsReportOpen(true) }];
+
+  // Permanent — no recycle bin, no restore (locked Step 40.1 policy). The
+  // backend independently re-verifies content.authorUid == request.auth.uid
+  // server-side, so this is never trusted client-side beyond gating which
+  // menu option even appears.
+  const handleConfirmDelete = async () => {
+    if (!content || isDeleting) return;
+    setIsDeleting(true);
+    setDeleteError(null);
+    const result = await deleteMyContent(content.contentId);
+    setIsDeleting(false);
+    if (!result.ok) {
+      setDeleteError(result.message);
+      return;
+    }
+    setIsDeleteConfirmOpen(false);
+    // Prefer returning to wherever the user actually came from (their own
+    // Profile, a Place page, Events discovery); a fresh deep link has no
+    // back stack, so fall back to a surface that still makes sense for
+    // content they authored — Events discovery for a deleted Event,
+    // Profile (where their own content always lives) otherwise. Never
+    // Home — Posts/Activities/Events never appear there (see Step 25/40).
+    if (router.canGoBack()) {
+      router.back();
+    } else {
+      router.replace(content.type === 'event' ? '/events' : '/profile');
+    }
+  };
+
   // Event/Activity get the Step 29 media-first hero chrome — Back/More
   // are overlaid directly on the hero, not shown in a separate header bar
   // above it, so this branch owns its own SafeAreaView/ScrollView instead
@@ -61,16 +103,8 @@ export default function ContentDetailScreen() {
   if (status === 'loaded' && content && content.type !== 'post') {
     return (
       <>
-        <MediaDetailScreen
-          content={content}
-          isOwnContent={isOwnContent}
-          onOptionsPress={() => setIsOptionsMenuOpen(true)}
-        />
-        <OptionsMenu
-          visible={isOptionsMenuOpen}
-          onClose={() => setIsOptionsMenuOpen(false)}
-          options={[{ label: 'Report', onPress: () => setIsReportOpen(true) }]}
-        />
+        <MediaDetailScreen content={content} onOptionsPress={() => setIsOptionsMenuOpen(true)} />
+        <OptionsMenu visible={isOptionsMenuOpen} onClose={() => setIsOptionsMenuOpen(false)} options={optionsMenuOptions} />
         {user ? (
           <ReportModal
             visible={isReportOpen}
@@ -79,6 +113,18 @@ export default function ContentDetailScreen() {
             target={{ type: 'content', contentId: content.contentId }}
           />
         ) : null}
+        <ConfirmDialog
+          visible={isDeleteConfirmOpen}
+          title={DELETE_LABEL[content.type]}
+          message={deleteError ?? "This can't be undone."}
+          confirmLabel="Delete"
+          isSubmitting={isDeleting}
+          onConfirm={handleConfirmDelete}
+          onCancel={() => {
+            setIsDeleteConfirmOpen(false);
+            setDeleteError(null);
+          }}
+        />
       </>
     );
   }
@@ -89,7 +135,7 @@ export default function ContentDetailScreen() {
     <HeaderScreenLayout
       title={title}
       headerRight={
-        status === 'loaded' && content && !isOwnContent ? (
+        status === 'loaded' && content ? (
           <Pressable
             onPress={() => setIsOptionsMenuOpen(true)}
             hitSlop={8}
@@ -120,11 +166,7 @@ export default function ContentDetailScreen() {
         <PostDetail content={content} />
       ) : null}
 
-      <OptionsMenu
-        visible={isOptionsMenuOpen}
-        onClose={() => setIsOptionsMenuOpen(false)}
-        options={[{ label: 'Report', onPress: () => setIsReportOpen(true) }]}
-      />
+      <OptionsMenu visible={isOptionsMenuOpen} onClose={() => setIsOptionsMenuOpen(false)} options={optionsMenuOptions} />
 
       {user && content ? (
         <ReportModal
@@ -134,18 +176,32 @@ export default function ContentDetailScreen() {
           target={{ type: 'content', contentId: content.contentId }}
         />
       ) : null}
+
+      {content ? (
+        <ConfirmDialog
+          visible={isDeleteConfirmOpen}
+          title={DELETE_LABEL[content.type]}
+          message={deleteError ?? "This can't be undone."}
+          confirmLabel="Delete"
+          isSubmitting={isDeleting}
+          onConfirm={handleConfirmDelete}
+          onCancel={() => {
+            setIsDeleteConfirmOpen(false);
+            setDeleteError(null);
+          }}
+        />
+      ) : null}
     </HeaderScreenLayout>
   );
 }
 
 type MediaDetailScreenProps = {
   content: EventContent | ActivityContent;
-  isOwnContent: boolean;
   onOptionsPress: () => void;
 };
 
 /** Full-bleed hero + body for Event/Activity detail (Step 29) — see the branch above for why this bypasses HeaderScreenLayout. */
-function MediaDetailScreen({ content, isOwnContent, onOptionsPress }: MediaDetailScreenProps) {
+function MediaDetailScreen({ content, onOptionsPress }: MediaDetailScreenProps) {
   return (
     <SafeAreaView style={styles.mediaSafeArea} edges={['top']}>
       <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.mediaScrollContent}>
@@ -155,7 +211,7 @@ function MediaDetailScreen({ content, isOwnContent, onOptionsPress }: MediaDetai
             categoryId={content.categoryId}
             startsAt={content.startsAt}
             endsAt={content.endsAt}
-            onOptionsPress={isOwnContent ? undefined : onOptionsPress}
+            onOptionsPress={onOptionsPress}
           />
           <View style={styles.mediaBody}>
             {content.type === 'activity' ? <ActivityDetail content={content} /> : <EventDetail content={content} />}

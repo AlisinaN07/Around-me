@@ -973,6 +973,43 @@ Disposable Firebase Auth accounts and real production data (no emulator, same es
 
 No account suspension or ban. No admin UI of any kind. No message-status field, no "reviewed" state beyond the existing open/dismissed/resolved lifecycle. The real owner account still does not carry the `admin` claim.
 
+## Posts product role + author content self-delete (Step 40 / Step 40.1)
+
+### Locked Post role (Step 40, read-only audit — no code changed)
+
+Around Me Posts are **persistent local text notes** that live on a user's Profile and, when connected to a Place, also on that Place's page. Posts remain **completely absent from Home** — Home renders exactly one thing (Reels; see Step 25 above), and that stays true after this step. Posts are text-only (no media), have no edit capability, and Place stays optional. This was a locked product decision among four options (remove, profile-only, profile+place, separate discovery surface); profile+place was chosen and approved before any Step 40.1 code was written.
+
+### Author self-delete (Step 40.1)
+
+Personal authors can permanently delete their own Post, Activity, or Reel; Business authors can additionally delete their own Event. This is deliberately **not** an edit feature (none exists) and **not** a recycle bin — deletion is immediate and permanent, matching the locked policy: *you may delete public content you authored, never content authored by anyone else.*
+
+Two new trusted callables, `europe-north1`, Node 22, Cloud Functions v2, same codebase as every moderation callable:
+
+- **`deleteMyContent({ contentId })`** — loads `content/{contentId}` via the Admin SDK, checks `content.authorUid === request.auth.uid`, rejects any type other than `post`/`activity`/`event`, then reuses the exact same `deleteContentDocumentAndSubcollections` primitive Step 39.2's moderation and Step 34.2's account deletion already share (likes/comments/participants/responses/stats drained first, root deleted last) plus `drainNotificationsByField`.
+- **`deleteMyReel({ reelId })`** — same shape for `reels/{reelId}`, reusing `deleteReelDocumentAndSubcollections` (likes/comments drained, exact Storage source object deleted by its literal path, then the Firestore doc deleted last).
+
+**This is not moderation** — `requireAdmin` is never called here. Authorization is exclusively `request.auth.uid === <trusted document's own authorUid>`, loaded server-side via the Admin SDK; nothing from `request.data` (`authorUid`, `ownerUid`, `accountType`, `isOwner`, `isAdmin`) can influence the result — confirmed with a spoofed-payload production test (a non-owner sending the real owner's `authorUid` alongside the real `contentId` was still denied).
+
+**Root-last retry design:** every dependent cleanup step (subcollections, notifications, the Reel's Storage object) completes before the root document is deleted, because the root is the only proof of ownership a retry can re-check. A call that fails partway can simply be retried — every step is already idempotent. A **second** call after a genuinely successful deletion returns a controlled `not-found`, not a fake idempotent success: once the root is gone there is nothing left to re-authorize ownership against, unlike moderation callables, which can stay idempotent because the *report* document survives as an anchor.
+
+**Reports are never touched.** Neither callable references the `reports` collection — verified in production: a report filed against a Post survived that Post's own self-deletion with `status: 'open'` and its `reportId` unchanged.
+
+### UI
+
+Content detail (`src/app/(app)/content/[contentId].tsx`) and Reel detail (`src/app/(app)/reel/[reelId].tsx`) show a **Delete** option in the overflow menu only to the author (never Report, which is what a non-author sees instead); `ReelFeed.tsx` (shared by Home and `/reels`) adds the same **Delete Reel** option to its own-Reel menu. All four confirmations use the shared `ConfirmDialog` with exact copy ("Delete post?"/"Delete activity?"/"Delete event?"/"Delete reel?" + "This can't be undone."), disable both buttons while the call is in flight, and show the real error message in place of the dialog body on failure. On success: `router.canGoBack() ? router.back() : router.replace(...)`, falling back to `/events` for a deleted Event or `/profile` otherwise — **never Home**, since Posts/Activities/Events never render there. `ReelFeed` reuses its existing `onReload()` refresh (the same one already used after a successful Block) rather than any new local-removal logic.
+
+### Firestore/Storage Rules — unchanged
+
+Zero diff to either `firestore.rules` or `storage.rules` this step. `allow delete: if false` remains in force for `content/{contentId}` and `reels/{reelId}` — both callables delete exclusively via the Admin SDK, bypassing Rules through IAM, never through a client-facing exception.
+
+### Production verification
+
+Ran across two script executions (30 effective checks total — see the commit history for the exact breakdown): non-owner denial for all four content types plus a spoofed-`authorUid` payload (all denied); real author deletion of a Post, an Activity, a Business-owned Event, and a published Reel, each independently verified via subsequent reads that the root, likes, comments, participants/stats/responses (as applicable), and target notifications were gone; a second `deleteMyContent` call on the already-deleted Post returned `functions/not-found`; the report on that Post survived with `status: 'open'` untouched; and the Reel's exact Cloud Storage source object (`reels/{authorUid}/{reelId}/source`) was independently confirmed absent via an Admin SDK check run separately from this app's own client — a Storage read from the client is gated on the Firestore Reel doc existing, so a client-only check could never have told deleted-doc-therefore-permission-denied apart from object-still-there-therefore-permission-denied. All synthetic fixtures (3 disposable Auth accounts, their `users`/`publicProfiles`/`usernames` docs, and the retained report) were deleted by exact ID afterward and independently re-verified absent.
+
+### What this step does not build
+
+No content editing of any kind (Post, Activity, Event, or Reel). No recycle bin, no grace period, no "restore" affordance. No new Rules exception. No `accountType`-based authorization at deletion time (a Business author deletes their own Event purely because `authorUid` matches, the same as every other type).
+
 ## Reels (Cloud Storage — Step 18)
 
 Reels are short (≤60s), video-only posts with vertical, city-scoped playback — the first feature in this app to use Cloud Storage rather than Firestore alone. They live in their own root collection, `reels/{reelId}`, separate from `content/{contentId}` (posts/activities/events): a Reel has a media-upload lifecycle and Storage metadata that the other content types never had, and folding it into `content` would have meant giving every Post/Activity/Event query an upload-status field it never needs.

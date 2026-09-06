@@ -74,11 +74,11 @@ export default function CreatePostScreen() {
   };
 
   return (
-    <HeaderScreenLayout title="Create post" subtitle="Share something with people in your city.">
+    <HeaderScreenLayout title="Share a local note" subtitle="A thought, recommendation, or update from your city. Add a Place when it's about somewhere specific.">
       <View>
         <FormField
           label="What's happening?"
-          placeholder="Share what's going on around you..."
+          placeholder="Share a thought, recommendation, or update..."
           value={body}
           onChangeText={(text) => {
             setBody(text);

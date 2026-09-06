@@ -19,6 +19,7 @@ import {
   where,
   type WithFieldValue,
 } from 'firebase/firestore';
+import { httpsCallable } from 'firebase/functions';
 
 import { INTERESTS } from '@/constants/interests';
 import type { ActivityContent, Content, EventContent, PostContent } from '@/types/content';
@@ -33,6 +34,7 @@ import { getTodayOrTonightWindow, getUpcomingWindow } from '@/utils/dateWindows'
 
 import { fetchFollowingUids } from './following';
 import { firestore } from './firestore';
+import { functions } from './functions';
 import { fetchUserProfile } from './userProfile';
 
 const CONTENT_COLLECTION = 'content';
@@ -714,4 +716,25 @@ export async function fetchFollowingFeed({
 
   merged.sort((a, b) => b.createdAt.toMillis() - a.createdAt.toMillis());
   return merged.slice(0, limitCount);
+}
+
+export type DeleteMyContentResult = { ok: true } | { ok: false; message: string };
+
+/**
+ * Client wrapper around the deleteMyContent trusted backend (Step 40.1 —
+ * functions/src/index.ts). Deletes exactly the one Post/Activity/Event the
+ * caller authored — the backend independently re-verifies authorUid
+ * server-side, so this never needs (and never sends) anything beyond the
+ * contentId. Permanent: no recycle bin, no restore.
+ */
+export async function deleteMyContent(contentId: string): Promise<DeleteMyContentResult> {
+  if (!functions) {
+    return { ok: false, message: 'This feature is not available right now.' };
+  }
+  try {
+    await httpsCallable(functions, 'deleteMyContent')({ contentId });
+  } catch {
+    return { ok: false, message: "Couldn't delete this." };
+  }
+  return { ok: true };
 }

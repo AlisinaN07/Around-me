@@ -839,3 +839,110 @@ export const removeReportedMessage = onCall({ region: REGION, timeoutSeconds: 30
     targetAlreadyMissing,
   };
 });
+
+// ---------------------------------------------------------------------------
+// Step 40.1 — author self-delete for Post/Activity/Event/Reel.
+//
+// This is NOT moderation. requireAdmin is never called here — authorization
+// is exclusively "does request.auth.uid match the trusted target document's
+// own authorUid," checked server-side against the Admin-SDK-loaded document,
+// never against anything the client claims. A payload smuggling a
+// different authorUid/contentId alongside the real target has zero effect,
+// same reportId-only/contentId-only discipline as every other trusted
+// callable in this file.
+//
+// Both callables reuse the exact same per-document cleanup primitives as
+// moderation (deleteContentDocumentAndSubcollections /
+// deleteReelDocumentAndSubcollections) and the same root-last ordering:
+// the root document is what proves ownership, so it is only ever deleted
+// once every subcollection/notification has been drained. If a call fails
+// partway, the root still exists, so a retry re-proves ownership and
+// safely resumes — every cleanup step is already idempotent. A second call
+// after a genuinely successful deletion sees no root at all and gets
+// 'not-found', which is the correct, honest outcome — there is nothing to
+// re-authorize ownership against once the document is gone, so this
+// deliberately does not fake idempotent success the way the moderation
+// callables can (they still have the report document to key off of).
+// ---------------------------------------------------------------------------
+
+function parseContentIdParam(request: CallableRequest): string {
+  const contentId = request.data?.contentId;
+  if (typeof contentId !== 'string' || contentId.length === 0 || contentId.length > MAX_REPORT_ID_LENGTH) {
+    throw new HttpsError('invalid-argument', 'contentId must be a non-empty string.');
+  }
+  return contentId;
+}
+
+function parseReelIdParam(request: CallableRequest): string {
+  const reelId = request.data?.reelId;
+  if (typeof reelId !== 'string' || reelId.length === 0 || reelId.length > MAX_REPORT_ID_LENGTH) {
+    throw new HttpsError('invalid-argument', 'reelId must be a non-empty string.');
+  }
+  return reelId;
+}
+
+/**
+ * Deletes exactly one Post/Activity/Event the caller authored. Never
+ * touches any other document the same author owns — the target is the
+ * one exact contentId given, nothing derived from an authorUid query.
+ */
+export const deleteMyContent = onCall({ region: REGION, timeoutSeconds: 300, memory: '256MiB' }, async (request) => {
+  if (!request.auth) {
+    throw new HttpsError('unauthenticated', 'Sign in required.');
+  }
+  const contentId = parseContentIdParam(request);
+  const uid = request.auth.uid;
+
+  const db = getFirestore();
+  const contentSnap = await db.doc(`content/${contentId}`).get();
+  if (!contentSnap.exists) {
+    throw new HttpsError('not-found', 'No content with that ID exists.');
+  }
+  const content = contentSnap.data()!;
+  if (content.authorUid !== uid) {
+    throw new HttpsError('permission-denied', 'You can only delete your own content.');
+  }
+  const type = content.type as string | undefined;
+  if (type !== 'post' && type !== 'activity' && type !== 'event') {
+    throw new HttpsError('failed-precondition', 'Unsupported content type.');
+  }
+
+  await drainNotificationsByField(db, 'contentId', contentId);
+  await deleteContentDocumentAndSubcollections(db, contentId);
+
+  return { contentId, type, deleted: true as const };
+});
+
+/**
+ * Deletes exactly one Reel the caller authored — any status, published or
+ * still "uploading" (this doesn't replace or narrow the existing
+ * client-side discardReelDraft path for a still-uploading draft; it's just
+ * an equally-valid, trusted way to remove a Reel the author owns
+ * regardless of status, reusing the same per-document primitive
+ * moderation already relies on).
+ */
+export const deleteMyReel = onCall({ region: REGION, timeoutSeconds: 300, memory: '256MiB' }, async (request) => {
+  if (!request.auth) {
+    throw new HttpsError('unauthenticated', 'Sign in required.');
+  }
+  const reelId = parseReelIdParam(request);
+  const uid = request.auth.uid;
+
+  const db = getFirestore();
+  const reelSnap = await db.doc(`reels/${reelId}`).get();
+  if (!reelSnap.exists) {
+    throw new HttpsError('not-found', 'No Reel with that ID exists.');
+  }
+  const reel = reelSnap.data()!;
+  if (reel.authorUid !== uid) {
+    throw new HttpsError('permission-denied', 'You can only delete your own Reel.');
+  }
+
+  const bucket = getStorage().bucket();
+  const storagePath = reel.storagePath as string | undefined;
+
+  await drainNotificationsByField(db, 'reelId', reelId);
+  await deleteReelDocumentAndSubcollections(db, bucket, reelId, storagePath);
+
+  return { reelId, deleted: true as const };
+});

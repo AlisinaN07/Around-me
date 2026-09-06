@@ -1,6 +1,6 @@
 import { Ionicons } from '@expo/vector-icons';
 import * as Clipboard from 'expo-clipboard';
-import { useLocalSearchParams } from 'expo-router';
+import { router, useLocalSearchParams } from 'expo-router';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Pressable, StyleSheet, Text, View } from 'react-native';
 import { VideoView, useVideoPlayer } from 'expo-video';
@@ -17,7 +17,7 @@ import { INTERESTS } from '@/constants/interests';
 import { Colors, Radius, Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
 import { blockUser, isUserBlocked, unblockUser } from '@/services/blocks';
-import { fetchReel, resolveReelPlaybackUrl } from '@/services/reels';
+import { deleteMyReel, fetchReel, resolveReelPlaybackUrl } from '@/services/reels';
 import type { Reel } from '@/types/reel';
 import { buildReelShareUrl, shareReel } from '@/utils/reelShare';
 import { formatTimeAgo } from '@/utils/timeFormat';
@@ -43,6 +43,9 @@ export default function ReelDetailScreen() {
   const [isOptionsMenuOpen, setIsOptionsMenuOpen] = useState(false);
   const [isBlockConfirmOpen, setIsBlockConfirmOpen] = useState(false);
   const [isReportOpen, setIsReportOpen] = useState(false);
+  const [isDeleteConfirmOpen, setIsDeleteConfirmOpen] = useState(false);
+  const [isDeleting, setIsDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -176,10 +179,33 @@ export default function ReelDetailScreen() {
     showToast('Link copied');
   };
 
+  // Permanent — no recycle bin, no restore (locked Step 40.1 policy). The
+  // backend independently re-verifies reel.authorUid == request.auth.uid
+  // server-side, so this is never trusted client-side beyond gating which
+  // menu option even appears.
+  const handleConfirmDelete = async () => {
+    if (!reel || isDeleting) return;
+    setIsDeleting(true);
+    setDeleteError(null);
+    const result = await deleteMyReel(reel.reelId);
+    setIsDeleting(false);
+    if (!result.ok) {
+      setDeleteError(result.message);
+      return;
+    }
+    setIsDeleteConfirmOpen(false);
+    if (router.canGoBack()) {
+      router.back();
+    } else {
+      router.replace('/profile');
+    }
+  };
+
   const optionsMenuOptions: OptionsMenuOption[] = isOwnReel
     ? [
         { label: 'Share Reel', onPress: handleShare },
         { label: 'Copy link', onPress: handleCopyLink },
+        { label: 'Delete Reel', onPress: () => setIsDeleteConfirmOpen(true), destructive: true },
       ]
     : amIBlockingThem
       ? [
@@ -285,6 +311,19 @@ export default function ReelDetailScreen() {
         isSubmitting={isBlockSubmitting}
         onConfirm={handleConfirmBlock}
         onCancel={() => setIsBlockConfirmOpen(false)}
+      />
+
+      <ConfirmDialog
+        visible={isDeleteConfirmOpen}
+        title="Delete reel?"
+        message={deleteError ?? "This can't be undone."}
+        confirmLabel="Delete"
+        isSubmitting={isDeleting}
+        onConfirm={handleConfirmDelete}
+        onCancel={() => {
+          setIsDeleteConfirmOpen(false);
+          setDeleteError(null);
+        }}
       />
 
       {user && reel ? (

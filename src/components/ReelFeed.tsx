@@ -12,6 +12,7 @@ import { ReportModal } from '@/components/ReportModal';
 import { Colors, Radius, Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
 import { blockUser } from '@/services/blocks';
+import { deleteMyReel } from '@/services/reels';
 import { buildReelShareUrl, shareReel } from '@/utils/reelShare';
 import type { Reel } from '@/types/reel';
 
@@ -47,6 +48,9 @@ export function ReelFeed({ reels, status, errorTitle, emptyState, onReload, topO
   const [reportReel, setReportReel] = useState<Reel | null>(null);
   const [blockTarget, setBlockTarget] = useState<Reel | null>(null);
   const [isBlockSubmitting, setIsBlockSubmitting] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState<Reel | null>(null);
+  const [isDeleteSubmitting, setIsDeleteSubmitting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -101,6 +105,7 @@ export function ReelFeed({ reels, status, errorTitle, emptyState, onReload, topO
       ? [
           { label: 'Share Reel', onPress: () => handleShare(optionsReel) },
           { label: 'Copy link', onPress: () => handleCopyLink(optionsReel) },
+          { label: 'Delete Reel', onPress: () => setDeleteTarget(optionsReel), destructive: true },
         ]
       : [
           { label: 'Share Reel', onPress: () => handleShare(optionsReel) },
@@ -119,6 +124,24 @@ export function ReelFeed({ reels, status, errorTitle, emptyState, onReload, topO
     if (result.ok) {
       onReload();
     }
+  };
+
+  // Permanent — no recycle bin, no restore (locked Step 40.1 policy).
+  // Reusing the same onReload() the feed already calls after a successful
+  // block is the smallest way to make a deleted Reel disappear from this
+  // list — no separate local-state removal path needed.
+  const handleConfirmDelete = async () => {
+    if (!deleteTarget || isDeleteSubmitting) return;
+    setIsDeleteSubmitting(true);
+    setDeleteError(null);
+    const result = await deleteMyReel(deleteTarget.reelId);
+    setIsDeleteSubmitting(false);
+    if (!result.ok) {
+      setDeleteError(result.message);
+      return;
+    }
+    setDeleteTarget(null);
+    onReload();
   };
 
   return (
@@ -211,6 +234,19 @@ export function ReelFeed({ reels, status, errorTitle, emptyState, onReload, topO
         isSubmitting={isBlockSubmitting}
         onConfirm={handleConfirmBlock}
         onCancel={() => setBlockTarget(null)}
+      />
+
+      <ConfirmDialog
+        visible={!!deleteTarget}
+        title="Delete reel?"
+        message={deleteError ?? "This can't be undone."}
+        confirmLabel="Delete"
+        isSubmitting={isDeleteSubmitting}
+        onConfirm={handleConfirmDelete}
+        onCancel={() => {
+          setDeleteTarget(null);
+          setDeleteError(null);
+        }}
       />
     </SafeAreaView>
   );

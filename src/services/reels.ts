@@ -31,6 +31,7 @@ import {
   type WithFieldValue,
 } from 'firebase/firestore';
 import { deleteObject, getDownloadURL, ref, uploadBytesResumable, type UploadTask } from 'firebase/storage';
+import { httpsCallable } from 'firebase/functions';
 
 import { INTERESTS } from '@/constants/interests';
 import {
@@ -42,6 +43,7 @@ import {
 
 import { fetchFollowingUids } from './following';
 import { firestore } from './firestore';
+import { functions } from './functions';
 import { storage } from './storage';
 import { fetchUserProfile } from './userProfile';
 
@@ -449,4 +451,28 @@ export async function resolveReelPlaybackUrl(storagePath: string): Promise<strin
   } catch {
     return null;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Author self-delete (Step 40.1) — a trusted backend callable, not a client
+// Storage/Firestore delete: deleting a published Reel needs the exact
+// Storage object removed too, which a client has no permission to do
+// directly (see storage.rules — only a still-"uploading" draft is
+// client-deletable, via discardReelDraft above, an entirely separate path
+// this doesn't touch).
+// ---------------------------------------------------------------------------
+
+export type DeleteMyReelResult = { ok: true } | { ok: false; message: string };
+
+/** Deletes exactly the one Reel the caller authored — root, likes, comments, target notifications, and the exact Storage source object. Permanent. */
+export async function deleteMyReel(reelId: string): Promise<DeleteMyReelResult> {
+  if (!functions) {
+    return { ok: false, message: 'This feature is not available right now.' };
+  }
+  try {
+    await httpsCallable(functions, 'deleteMyReel')({ reelId });
+  } catch {
+    return { ok: false, message: "Couldn't delete this Reel." };
+  }
+  return { ok: true };
 }
