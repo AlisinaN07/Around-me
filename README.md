@@ -1028,7 +1028,7 @@ The old user-created, joinable **Activity** content type (`content/{contentId}` 
 
 **Active product now:** Post and Event only. Events discovery (`/events`) is Business-Event-only.
 
-**What changed (UI/query-layer only — no data migration, no Rules change, no Function change):**
+**What changed in Step 41.2B (UI/query-layer only — no data migration, no Function change; the one remaining Rules gap this left open was closed separately in Step 41.2B.1, below):**
 - Create hub no longer offers an Activity option (Personal/Business alike).
 - `/create/activity` no longer renders a creation form — it immediately `router.replace('/create')`s. Kept only so an existing bookmark doesn't dead-end.
 - `fetchDiscoverySections` (`src/services/content.ts`) filters `type !== 'activity'` out of its `happeningNow`/`today`/`upcoming` results before returning them — the single function every Events-tab fetch already goes through. The underlying per-type fetchers (`fetchHappeningNow`, `fetchByStartsAtWindow`, `fetchUpcomingActivities`, etc.) are untouched.
@@ -1039,7 +1039,28 @@ The old user-created, joinable **Activity** content type (`content/{contentId}` 
 
 **What was deliberately left alone (legacy compatibility, by design):** `content/{contentId}` documents with `type == 'activity'` remain fully intact — readable via a direct `/content/{contentId}` link, reportable, moderatable (`removeReportedContent`), author-self-deletable (`deleteMyContent`), and cleaned up by `deleteMyAccountData` exactly as before. The Activity detail UI (`ActivityDetail.tsx`, Join/Leave via `joinActivity`/`leaveActivity`, `EventActionButtons`) is untouched. The `activity_join` notification type, its icon, and its copy are untouched — an existing one still navigates correctly to a still-live legacy Activity. No Cloud Function changed. `createActivity` (`content.ts`) is left in place, unused by any current UI, rather than deleted — the safest option when nothing depends on removing it.
 
-**Firestore Rules — deliberately NOT changed, flagged instead of silently patched:** `isValidContentCreate`'s existing `isValidActivityShape(data)` branch (`firestore.rules`) has no `accountType` gate — unlike Event, any signed-in user with a completed profile could still successfully write a `type: 'activity'` document directly (bypassing the app's UI entirely, e.g. via a modified client or the Firestore console with valid credentials). Removing the UI creation path does **not** close this. A real fix would be a narrow, additive Rules change — but per explicit instruction for this step, that decision is left to the owner rather than made silently here. See "Problems/warnings" in the Step 41.2B report.
+**Firestore Rules as of Step 41.2B — flagged, not yet closed:** `isValidContentCreate`'s `isValidActivityShape(data)` branch had no `accountType` gate — unlike Event, any signed-in user with a completed profile could still successfully write a `type: 'activity'` document directly (bypassing the app's UI entirely, e.g. via a modified client or the Firestore console with valid credentials). Removing the UI creation path alone didn't close this. Per explicit instruction for that step, the decision was surfaced to the owner rather than made silently — see Step 41.2B.1 immediately below for the resolution.
+
+### Blocking legacy Activity creation in Firestore Rules (Step 41.2B.1)
+
+The gap above is now closed. `isValidContentCreate`'s final create-policy expression (`firestore.rules`) dropped the `isValidActivityShape(data)` branch entirely:
+
+```
+&& (
+  isValidPostShape(data)
+  || (isValidEventShape(data) && profile.accountType == 'business')
+);
+```
+
+**Final client create policy:** `type == 'post'` — allowed under the existing Post shape rules, any account type. `type == 'event'` — allowed only for `accountType == 'business'`, unchanged. `type == 'activity'` — **denied for everyone**, client-side, no exceptions. Any other/malformed `type` was already denied and still is.
+
+`isValidActivityShape` itself is **left defined and unreferenced** in the rules file — not deleted — since it documents the shape of documents that may still exist; the deploy emits a harmless "unused function" compiler warning as a result, expected and accepted rather than deleting a helper purely for lint cleanliness.
+
+This only gates **new document creation**. Every legacy-compatibility guarantee from Step 41.2B is unaffected: existing `type == 'activity'` documents remain readable, directly deep-linkable, joinable/leavable, reportable, moderatable, author-self-deletable, and account-deletion-compatible — none of `deleteMyContent`, `removeReportedContent`, `deleteMyAccountData`, `joinActivity`/`leaveActivity`, or any index changed.
+
+**Production-verified** with two disposable accounts (Personal + Business) against the deployed rule: a Personal user's direct `type:'activity'` write was denied (`permission-denied`); the same user's `type:'post'` write succeeded; a Personal user's `type:'event'` write was denied (regression check, unchanged behavior); a Business user's `type:'event'` write succeeded (regression check, unchanged behavior). All four outcomes were independently re-confirmed by reading the documents back. All synthetic accounts/documents were deleted immediately after and independently re-verified absent.
+
+**Known, pre-existing, out-of-scope-for-this-step consequence:** the local Firestore emulator rules test suite (`tests/firestore.rules.test.mjs`) seeds several of its own Activity-participation tests by calling `assertSucceeds(setDoc(...))` to create a real Activity document as a fixture before testing Join/Leave against it. That specific `assertSucceeds` call will now correctly fail, since the product no longer allows creating one — this is a test-fixture consequence of the intentional policy change, not a product regression, and updating that test file was out of scope for this step.
 
 ## Reels (Cloud Storage — Step 18)
 

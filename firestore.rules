@@ -353,16 +353,25 @@ service cloud.firestore {
           && isServerTimestamp(data.createdAt)
           && isServerTimestamp(data.updatedAt)
           // Step 30 core rule: Business = Personal + the ability to create
-          // Events. Post and Activity stay open to both account types —
-          // only the Event branch adds the accountType check, using the
-          // exact same cached `profile` this function already read once
-          // above (no extra get()). Personal accounts creating an Event
-          // fail this whole `&&` chain and are denied; every other
-          // Event validation (author/city snapshot, place link, shape)
-          // still applies in full — this is additive, not a bypass.
+          // Events. Post stays open to both account types — only the Event
+          // branch adds the accountType check, using the exact same cached
+          // `profile` this function already read once above (no extra
+          // get()). Personal accounts creating an Event fail this whole
+          // `&&` chain and are denied; every other Event validation
+          // (author/city snapshot, place link, shape) still applies in
+          // full — this is additive, not a bypass.
+          //
+          // Step 41.2B.1: isValidActivityShape is deliberately no longer
+          // referenced here — the legacy Activity content type is retired
+          // from creation everywhere, client and server alike. The
+          // function itself is left defined and untouched (not deleted)
+          // since it documents the shape of documents that may still
+          // exist; only the create policy changed. Existing
+          // type == 'activity' documents are entirely unaffected — this
+          // rule only gates NEW document creation, never reads, updates,
+          // or the trusted Admin-SDK deletion paths.
           && (
             isValidPostShape(data)
-            || isValidActivityShape(data)
             || (isValidEventShape(data) && profile.accountType == 'business')
           );
       }
