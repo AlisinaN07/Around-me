@@ -396,6 +396,22 @@ async function seedReel(testEnv, authorUid, displayName, username, reelId, overr
   });
 }
 
+/**
+ * Seeds a legacy content/{contentId} Activity directly, bypassing rules
+ * (Step 41.2B.1 — client creation of a NEW Activity is now denied for
+ * everyone, proven separately below; this helper exists purely so the
+ * still-supported legacy-compatibility behaviors — read, join, leave,
+ * participants, stats, likes, notifications — have a real pre-existing
+ * Activity document to run their normal, non-bypassed Rules checks
+ * against, exactly mirroring how a real already-existing production
+ * Activity document behaves today).
+ */
+async function seedActivity(testEnv, authorUid, displayName, username, contentId, overrides = {}) {
+  await testEnv.withSecurityRulesDisabled(async (adminContext) => {
+    await setDoc(doc(adminContext.firestore(), 'content', contentId), validActivity(authorUid, displayName, username, contentId, overrides));
+  });
+}
+
 async function main() {
   const testEnv = await initializeTestEnvironment({
     projectId: 'around-me-rules-test',
@@ -525,20 +541,33 @@ async function main() {
       );
     });
 
-    await check('ALLOW: completed user creates a valid Activity', async () => {
-      await assertSucceeds(
+    // Step 41.2B.1 — legacy Activity is retired from creation entirely,
+    // for every account type. This is now a genuine security-policy
+    // assertion (assertFails), not a fixture-creation step — the real
+    // 'activity-alice-1' fixture that every join/leave/participant/stats
+    // test below still needs is seeded separately via seedActivity(),
+    // which bypasses Rules on purpose (see that helper's own doc comment)
+    // rather than pretending a real user could still create one.
+    await check('DENY: Business account creates an Activity (retired product policy)', async () => {
+      await assertFails(
         setDoc(
-          doc(alice, 'content', 'activity-alice-1'),
-          validActivity('alice', 'Test User', 'alice_handle', 'activity-alice-1')
+          doc(alice, 'content', 'activity-alice-denied-1'),
+          validActivity('alice', 'Test User', 'alice_handle', 'activity-alice-denied-1')
         )
       );
     });
 
-    await check('ALLOW: Personal account creates a valid Activity', async () => {
-      await assertSucceeds(
-        setDoc(doc(bob, 'content', 'activity-bob-1'), validActivity('bob', 'Bob Bobsson', 'bob_handle', 'activity-bob-1'))
+    await check('DENY: Personal account creates an Activity (retired product policy)', async () => {
+      await assertFails(
+        setDoc(doc(bob, 'content', 'activity-bob-denied-1'), validActivity('bob', 'Bob Bobsson', 'bob_handle', 'activity-bob-denied-1'))
       );
     });
+
+    // Privileged fixture seed, not a Rules assertion — see seedActivity's
+    // doc comment. Everything below that reuses 'activity-alice-1' (join,
+    // leave, participants, stats, likes, notifications) still runs its own
+    // real interaction through normal, non-bypassed Rules.
+    await seedActivity(testEnv, 'alice', 'Test User', 'alice_handle', 'activity-alice-1');
 
     // --- DENY: Personal account creates an Event (Step 30 core rule —
     // Business = Personal + the ability to create Events). Bob is Personal
@@ -748,16 +777,13 @@ async function main() {
       );
     });
 
-    await check('setup: create an already-ended Activity', async () => {
-      await assertSucceeds(
-        setDoc(
-          doc(alice, 'content', 'activity-ended-1'),
-          validActivity('alice', 'Test User', 'alice_handle', 'activity-ended-1', {
-            startsAt: Timestamp.fromMillis(Date.now() - 2 * 60 * 60 * 1000),
-            endsAt: Timestamp.fromMillis(Date.now() - 60 * 60 * 1000),
-          })
-        )
-      );
+    // Privileged fixture seed (see seedActivity's doc comment) — a real
+    // user can no longer create this, but an already-ended legacy Activity
+    // is exactly the kind of pre-existing document join-rules must still
+    // handle correctly.
+    await seedActivity(testEnv, 'alice', 'Test User', 'alice_handle', 'activity-ended-1', {
+      startsAt: Timestamp.fromMillis(Date.now() - 2 * 60 * 60 * 1000),
+      endsAt: Timestamp.fromMillis(Date.now() - 60 * 60 * 1000),
     });
 
     await check('DENY: join an ended Activity', async () => {
@@ -791,14 +817,8 @@ async function main() {
       await assertFails(updateDoc(doc(alice, 'content', 'activity-alice-1', 'participants', 'alice'), { displayName: 'Changed' }));
     });
 
-    await check('setup: activity with maxParticipants = 1', async () => {
-      await assertSucceeds(
-        setDoc(
-          doc(alice, 'content', 'activity-full-1'),
-          validActivity('alice', 'Test User', 'alice_handle', 'activity-full-1', { maxParticipants: 1 })
-        )
-      );
-    });
+    // Privileged fixture seed (see seedActivity's doc comment).
+    await seedActivity(testEnv, 'alice', 'Test User', 'alice_handle', 'activity-full-1', { maxParticipants: 1 });
 
     await check('ALLOW: first user joins a maxParticipants=1 Activity', async () => {
       await assertSucceeds(joinTransaction(bob, 'activity-full-1', 'bob', 'Bob Bobsson', 'bob_handle', 1));
@@ -2273,11 +2293,11 @@ async function main() {
     });
 
     // --- ACTIVITY JOIN notifications (Step 38) ---
-    await check('setup: notifa creates an Activity for notification testing', async () => {
-      await assertSucceeds(
-        setDoc(doc(notifA, 'content', 'activity-notif-1'), validActivity('notifa', 'Notif Alpha', 'notifa_handle', 'activity-notif-1'))
-      );
-    });
+    // Privileged fixture seed (see seedActivity's doc comment) — the
+    // notification behaviors below are exactly the legacy-compatibility
+    // engagement this suite still needs to prove works on a pre-existing
+    // Activity.
+    await seedActivity(testEnv, 'notifa', 'Notif Alpha', 'notifa_handle', 'activity-notif-1');
 
     await check('ALLOW: B joins A\'s Activity + notification + counter, all atomic', async () => {
       const notificationId = activityJoinNotificationId('activity-notif-1', 'notifb');
@@ -2318,13 +2338,11 @@ async function main() {
       );
     });
 
+    // Privileged fixture seed (see seedActivity's doc comment) — moved out
+    // of the check() below since it's setup, not the behavior under test.
+    await seedActivity(testEnv, 'notifa', 'Notif Alpha', 'notifa_handle', 'activity-notif-full', { maxParticipants: 1 });
+
     await check('DENY: Activity join notification after a full Activity rejects the join', async () => {
-      await assertSucceeds(
-        setDoc(
-          doc(notifA, 'content', 'activity-notif-full'),
-          validActivity('notifa', 'Notif Alpha', 'notifa_handle', 'activity-notif-full', { maxParticipants: 1 })
-        )
-      );
       await testEnv.withSecurityRulesDisabled(async (adminContext) => {
         const db = adminContext.firestore();
         await setDoc(doc(db, 'content', 'activity-notif-full', 'participants', 'notifa'), validParticipant('notifa', 'Notif Alpha', 'notifa_handle'));
