@@ -1080,9 +1080,41 @@ Profile now shows **one** "Posts" tab instead of a separate "Reels" tab and lega
 
 **What was deliberately left alone:** Home remains video-Post-only — this step does not touch Home; "unified Profile Posts" never meant a mixed Home feed. Legacy text Posts continue appearing on Place pages exactly as before (`fetchPlaceContent` untouched); new video Posts still have no Place linkage. `/content/[contentId]` (legacy text Post detail — like, comment, report, self-delete, Place linkage) is fully unchanged. Notifications are unchanged: video-Post notifications remain technically `reel_like`/`reel_comment`; legacy-text-Post notifications remain `like`/`comment`/`contentId`. Self-delete/moderation Functions are unchanged and not unified — video Posts still use `deleteMyReel`/`removeReportedReel`; legacy text Posts still use `deleteMyContent`/`removeReportedContent`. `createPost` (`src/services/content.ts`) is left in place, unused by any current UI, rather than deleted — same reasoning as `createActivity` in Step 41.2B.
 
-**Firestore Rules — flagged, not fixed:** `isValidContentCreate` still unconditionally allows `isValidPostShape(data)` for any signed-in user with a completed profile — a modified client (or the Firestore console) can still create a new legacy `type == 'post'` document even though no UI path reaches it anymore. This is the exact same category of gap that Activity had after Step 41.2B, closed separately in Step 41.2B.1 — the analogous follow-up for Posts is **Step 41.2C.1 — Block legacy text Post creation in Firestore Rules**, not yet started.
+**Firestore Rules — flagged as of this step, closed in Step 41.2C.1 below:** at the time this step shipped, `isValidContentCreate` still unconditionally allowed `isValidPostShape(data)` for any signed-in user with a completed profile — a modified client (or the Firestore console) could still create a new legacy `type == 'post'` document even though no UI path reached it anymore. This was the exact same category of gap that Activity had after Step 41.2B, closed separately in Step 41.2B.1. The analogous follow-up for Posts is documented immediately below.
 
 **Outstanding from Step 41.2B.2:** the Firestore emulator rules test suite still has not been run in a working environment (the sandbox's emulator networking is broken — see that step's own notes); this remains an outstanding verification gap independent of this step's changes.
+
+### Blocking legacy text Post creation in Firestore Rules (Step 41.2C.1)
+
+The gap above is now closed, mirroring Step 41.2B.1's Activity closure exactly. `isValidContentCreate`'s final create-policy expression (`firestore.rules`) dropped the `isValidPostShape(data)` branch entirely:
+
+```
+&& isValidEventShape(data) && profile.accountType == 'business';
+```
+
+**Final client create policy for `content/{contentId}`:** `type == 'post'` — **denied for everyone**, client-side, no exceptions. `type == 'activity'` — denied for everyone (unchanged from Step 41.2B.1). `type == 'event'` — allowed only for `accountType == 'business'`, unchanged. Any other/malformed `type` was already denied and still is. New user-facing Post creation lives entirely under `reels/{reelId}` (Step 18's Reel Rules), which this step does not touch at all.
+
+`isValidPostShape` itself is **left defined and unreferenced** in the rules file — not deleted — since it documents the shape of documents that may still exist (mirroring `isValidActivityShape`'s precedent); the deploy emits a second harmless "unused function" compiler warning as a result, expected and accepted.
+
+This only gates **new document creation**. Every legacy-compatibility guarantee from Step 41.2C is unaffected: existing `type == 'post'` documents remain readable, directly deep-linkable via `/content/[contentId]`, likeable, commentable, reportable, moderatable (`removeReportedContent`), author-self-deletable (`deleteMyContent`), account-deletion-compatible, and (where linked) still appear on Place pages — none of those Functions, the read policy, or any index changed.
+
+**Production-verified** with two disposable accounts (Personal + Business) against the deployed rule, plus one more disposable account used only to independently re-verify cleanup:
+- A: Personal creates `type:'post'` → denied (`permission-denied`).
+- B: Business creates `type:'post'` → denied (`permission-denied`).
+- C: Personal creates `type:'activity'` → denied (regression check, unchanged since Step 41.2B.1).
+- D: Business creates `type:'activity'` → denied (regression check, unchanged since Step 41.2B.1).
+- E: Personal creates `type:'event'` → denied (regression check, unchanged since Step 30).
+- F: Business creates `type:'event'` → succeeds (regression check, unchanged since Step 30).
+- G: Personal creates a Reel draft (`reels/{reelId}`, `status:'uploading'`) → succeeds (regression check — new video Post creation is untouched by this Rules change).
+- Read compatibility: a real, pre-existing published `type == 'post'` document (not a synthetic fixture — creating one via client would itself now be denied) was successfully queried and read by a signed-in test account, confirming the read policy (`allow read: if isSignedIn() && resource.data.status == 'published';`) was not touched.
+
+All synthetic accounts/documents were deleted immediately after and independently re-verified: `usernames` and `publicProfiles` fixture docs confirmed absent via a direct read from a separate account; the `users/{uid}`, `content/{contentId}`, and `reels/{reelId}` fixture paths returned `permission-denied` on that same read-back, which — per the same "null resource" Rules-evaluation behavior documented in Step 41.2B.1's troubleshooting notes — is the expected signal for "document does not exist" on rules that reference `resource.data`, not an inconclusive result.
+
+**Rules test suite:** `tests/firestore.rules.test.mjs` updated to match the new policy — added a `seedPost()` helper (mirroring `seedActivity`'s bypass-Rules pattern) for legacy text Post fixtures; converted the two genuine "can a user create a Post" assertions into `DENY: Business account creates a legacy text Post` / `DENY: Personal account creates a legacy text Post`; converted every remaining `assertSucceeds(setDoc(...))` Post-fixture-creation call (Like/Comment aggregation setup, notification setup, Step 17 block/report setup) into a privileged `seedPost()` seed instead, since a real user can no longer create one. Pre-existing spoof/malformed/wrong-city Post DENY tests were left untouched — they still correctly `assertFails`, now for the additional (blanket) reason that all Post creation is denied, not only for their original spoof-specific reason; this is noted here for transparency rather than silently reworking their intent. No compatibility tests were removed.
+
+**Emulator verification: OUTSTANDING ENVIRONMENT LIMITATION**, not green. Running `npm run test:rules` reproduced the exact same sandbox-level failure documented in Step 41.2B.2 (`TypeError: fetch failed` / `ECONNRESET` inside `@firebase/rules-unit-testing`'s `loadFirestoreRules`, on Node 22) — the emulator started and was shut down cleanly, no process was left running. Per that step's own precedent, this was not retried in a loop and production was not used as a substitute for this suite beyond the explicit security matrix above. Verified instead via `node --check tests/firestore.rules.test.mjs` (valid syntax) and a full manual trace-through of the diff. The real automated green run remains outstanding in a normal environment.
+
+**Deployment:** Firestore Rules only (`firebase deploy --only firestore:rules`), deployed successfully with exactly two expected "unused function" warnings (`isValidPostShape`, `isValidActivityShape`). Functions, Storage Rules, and indexes were not touched or redeployed.
 
 ## Reels (Cloud Storage — Step 18)
 

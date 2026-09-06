@@ -353,13 +353,11 @@ service cloud.firestore {
           && isServerTimestamp(data.createdAt)
           && isServerTimestamp(data.updatedAt)
           // Step 30 core rule: Business = Personal + the ability to create
-          // Events. Post stays open to both account types — only the Event
-          // branch adds the accountType check, using the exact same cached
+          // Events. The accountType check below uses the exact same cached
           // `profile` this function already read once above (no extra
-          // get()). Personal accounts creating an Event fail this whole
-          // `&&` chain and are denied; every other Event validation
-          // (author/city snapshot, place link, shape) still applies in
-          // full — this is additive, not a bypass.
+          // get()) — a Personal account fails this whole `&&` chain and is
+          // denied; every other Event validation (author/city snapshot,
+          // place link, shape) still applies in full.
           //
           // Step 41.2B.1: isValidActivityShape is deliberately no longer
           // referenced here — the legacy Activity content type is retired
@@ -370,10 +368,19 @@ service cloud.firestore {
           // type == 'activity' documents are entirely unaffected — this
           // rule only gates NEW document creation, never reads, updates,
           // or the trusted Admin-SDK deletion paths.
-          && (
-            isValidPostShape(data)
-            || (isValidEventShape(data) && profile.accountType == 'business')
-          );
+          //
+          // Step 41.2C.1: isValidPostShape is, by the identical reasoning,
+          // now also no longer referenced here — the legacy text-only Post
+          // content type is retired from creation everywhere now that the
+          // user-facing Post product is video-first (reels/{reelId}, see
+          // Step 41.2C). The function itself is left defined and untouched
+          // (not deleted) since it documents the shape of documents that
+          // may still exist; only the create policy changed. Existing
+          // type == 'post' documents are entirely unaffected — this rule
+          // only gates NEW document creation, never reads, updates, or the
+          // trusted Admin-SDK deletion paths. content/{contentId} client
+          // creation is now Event-only.
+          && isValidEventShape(data) && profile.accountType == 'business';
       }
 
       // Published content is readable by any signed-in user (this also

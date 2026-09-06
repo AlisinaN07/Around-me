@@ -412,6 +412,22 @@ async function seedActivity(testEnv, authorUid, displayName, username, contentId
   });
 }
 
+/**
+ * Seeds a legacy content/{contentId} text Post directly, bypassing rules
+ * (Step 41.2C.1 — client creation of a NEW legacy text Post is now denied
+ * for everyone, proven separately below; this helper exists purely so the
+ * still-supported legacy-compatibility behaviors — read, like, comment,
+ * notifications, block/report interactions — have a real pre-existing
+ * text Post document to run their normal, non-bypassed Rules checks
+ * against, exactly mirroring how a real already-existing production text
+ * Post document behaves today).
+ */
+async function seedPost(testEnv, authorUid, displayName, username, contentId, overrides = {}) {
+  await testEnv.withSecurityRulesDisabled(async (adminContext) => {
+    await setDoc(doc(adminContext.firestore(), 'content', contentId), validPost(authorUid, displayName, username, contentId, overrides));
+  });
+}
+
 async function main() {
   const testEnv = await initializeTestEnvironment({
     projectId: 'around-me-rules-test',
@@ -535,11 +551,35 @@ async function main() {
     const bob = testEnv.authenticatedContext('bob').firestore();
     const anon = testEnv.unauthenticatedContext().firestore();
 
-    await check('ALLOW: completed user creates a valid Post', async () => {
-      await assertSucceeds(
-        setDoc(doc(alice, 'content', 'post-alice-1'), validPost('alice', 'Test User', 'alice_handle', 'post-alice-1'))
+    // Step 41.2C.1 — legacy text Post is retired from creation entirely,
+    // for every account type, exactly mirroring how Activity was retired
+    // in Step 41.2B.1. This is now a genuine security-policy assertion
+    // (assertFails), not a fixture-creation step — the real 'post-alice-1'
+    // fixture that many later tests still need is seeded separately via
+    // seedPost(), which bypasses Rules on purpose (see that helper's own
+    // doc comment) rather than pretending a real user could still create
+    // one.
+    await check('DENY: Business account creates a legacy text Post (retired product policy)', async () => {
+      await assertFails(
+        setDoc(
+          doc(alice, 'content', 'post-alice-denied-1'),
+          validPost('alice', 'Test User', 'alice_handle', 'post-alice-denied-1')
+        )
       );
     });
+
+    await check('DENY: Personal account creates a legacy text Post (retired product policy)', async () => {
+      await assertFails(
+        setDoc(doc(bob, 'content', 'post-bob-denied-1'), validPost('bob', 'Bob Bobsson', 'bob_handle', 'post-bob-denied-1'))
+      );
+    });
+
+    // Privileged fixture seeds, not Rules assertions — see seedPost's doc
+    // comment. Everything below that reuses 'post-alice-1'/'post-bob-1'
+    // (reads, likes, comments, self-delete) still runs its own real
+    // interaction through normal, non-bypassed Rules.
+    await seedPost(testEnv, 'alice', 'Test User', 'alice_handle', 'post-alice-1');
+    await seedPost(testEnv, 'bob', 'Bob Bobsson', 'bob_handle', 'post-bob-1');
 
     // Step 41.2B.1 — legacy Activity is retired from creation entirely,
     // for every account type. This is now a genuine security-policy
@@ -687,14 +727,11 @@ async function main() {
       await assertFails(setDoc(doc(alice, 'content', 'activity-bad-times'), malformed));
     });
 
-    // Bob is Personal throughout this file, so this also doubles as the
-    // Step 30 matrix's "Personal account creates a Post -> ALLOW" case.
-    await check('ALLOW: second author creates their own valid Post (setup for delete tests)', async () => {
-      await assertSucceeds(
-        setDoc(doc(bob, 'content', 'post-bob-1'), validPost('bob', 'Bob Bobsson', 'bob_handle', 'post-bob-1'))
-      );
-    });
-
+    // 'post-bob-1' (needed below for the delete-safety tests) was already
+    // seeded via seedPost() above, alongside 'post-alice-1' — Step 30's old
+    // "Personal account creates a Post -> ALLOW" case no longer exists as
+    // policy (see the DENY tests above), so there is nothing to re-assert
+    // here.
     await check('DENY: user deletes another user\'s content', async () => {
       await assertFails(deleteDoc(doc(alice, 'content', 'post-bob-1')));
     });
@@ -1086,9 +1123,10 @@ async function main() {
       return snapshot.data().count;
     }
 
-    await check('setup: fresh Post for Like aggregation testing', async () => {
-      await assertSucceeds(setDoc(doc(alice, 'content', 'post-agg-1'), validPost('alice', 'Test User', 'alice_handle', 'post-agg-1')));
-    });
+    // Privileged fixture seed (see seedPost's doc comment) — a real user
+    // can no longer create this, but Like-aggregation tests just need a
+    // real, pre-existing published Post to hang Likes off of.
+    await seedPost(testEnv, 'alice', 'Test User', 'alice_handle', 'post-agg-1');
 
     await check('AGGREGATION: Like count 0 -> 1 -> 2 -> 1', async () => {
       assert.equal(await likeCount(bob, 'post-agg-1'), 0);
@@ -1221,9 +1259,9 @@ async function main() {
       return snapshot.data().count;
     }
 
-    await check('setup: fresh Post for Comment aggregation testing', async () => {
-      await assertSucceeds(setDoc(doc(alice, 'content', 'post-agg-2'), validPost('alice', 'Test User', 'alice_handle', 'post-agg-2')));
-    });
+    // Privileged fixture seed (see seedPost's doc comment) — Comment-
+    // aggregation tests just need a real, pre-existing published Post.
+    await seedPost(testEnv, 'alice', 'Test User', 'alice_handle', 'post-agg-2');
 
     await check('AGGREGATION: Comment count 0 -> 1 -> 2 -> 1', async () => {
       assert.equal(await commentCount(bob, 'post-agg-2'), 0);
@@ -1804,11 +1842,11 @@ async function main() {
       await assertSucceeds(setDoc(doc(notifC, 'publicProfiles', 'notifc'), validPublicProfile('notifc', 'Notif Charlie', 'notifc_handle')));
     });
 
-    await check('setup: notifa creates a Post for notification testing', async () => {
-      await assertSucceeds(
-        setDoc(doc(notifA, 'content', 'post-notif-1'), validPost('notifa', 'Notif Alpha', 'notifa_handle', 'post-notif-1'))
-      );
-    });
+    // Privileged fixture seed (see seedPost's doc comment) — notification
+    // tests just need a real, pre-existing published Post to like/comment
+    // on; the notification writes themselves still go through normal,
+    // non-bypassed Rules below.
+    await seedPost(testEnv, 'notifa', 'Notif Alpha', 'notifa_handle', 'post-notif-1');
 
     // --- LIKE notifications ---
     await check('ALLOW: B likes A\'s post + notification created atomically', async () => {
@@ -2804,10 +2842,12 @@ async function main() {
       await assertSucceeds(setDoc(doc(s17d, 'publicProfiles', 's17d'), validPublicProfile('s17d', 'Step17 Delta', 's17d_handle')));
     });
 
-    await check('setup: Step17 Alpha and Bravo each create a Post', async () => {
-      await assertSucceeds(setDoc(doc(s17a, 'content', 'post-s17a-1'), validPost('s17a', 'Step17 Alpha', 's17a_handle', 'post-s17a-1')));
-      await assertSucceeds(setDoc(doc(s17b, 'content', 'post-s17b-1'), validPost('s17b', 'Step17 Bravo', 's17b_handle', 'post-s17b-1')));
-    });
+    // Privileged fixture seeds (see seedPost's doc comment) — the Step 17
+    // block/report attack tests below just need real, pre-existing
+    // published Posts to like/comment/report; those interactions still go
+    // through normal, non-bypassed Rules.
+    await seedPost(testEnv, 's17a', 'Step17 Alpha', 's17a_handle', 'post-s17a-1');
+    await seedPost(testEnv, 's17b', 'Step17 Bravo', 's17b_handle', 'post-s17b-1');
 
     // --- blocks/{blockerUid}_{blockedUid} — attack tests ---
     await check('DENY: unauthenticated block create', async () => {
