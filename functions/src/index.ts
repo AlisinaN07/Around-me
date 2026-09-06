@@ -733,7 +733,8 @@ export const getReportedMessageForReview = onCall({ region: REGION }, async (req
 
 /**
  * Deletes exactly the one message a report named. Never touches the
- * conversation itself, any other message, or any other conversation.
+ * conversation itself beyond the exact preview repair below, any other
+ * message, or any other conversation.
  *
  * Conversation preview repair: conversations/{conversationId} denormalizes
  * lastMessageId/lastMessageText/lastMessageSenderUid/lastMessageAt (see
@@ -742,19 +743,27 @@ export const getReportedMessageForReview = onCall({ region: REGION }, async (req
  * message was the CURRENT lastMessageId, that preview is repaired from
  * the single newest surviving message (one bounded orderBy(createdAt,
  * desc).limit(1) query — never the full history). If no messages remain
- * at all, the preview fields are deliberately left as-is: the Conversation
- * type has no "empty" representation for lastMessageText/lastMessageId
- * (they're required strings, not nullable), and inventing one now would
- * mean guessing a schema the client was never built to render — see the
- * README for this documented edge case.
+ * at all, the Conversation document itself is deleted rather than left
+ * with a stale preview: the type has no "empty" representation for
+ * lastMessageText/lastMessageId (required strings, not nullable), so
+ * there is no safe value to write that both satisfies the schema and
+ * doesn't leave the moderated-away body sitting in the Inbox. Deleting
+ * the document is safe specifically because sendMessage's own transaction
+ * already creates a Conversation from scratch on a pair's very first
+ * message — a future message between the same two users simply takes
+ * that exact path again, and until then fetchConversations' query just
+ * won't return a document that doesn't exist, identical to the "never
+ * messaged" state the Inbox already renders correctly today.
  *
  * unreadCounts is a per-recipient SENT-message counter, not a count of
  * existing message documents (see sendMessage) — there is no way to
  * "correctly" decrement it for one deleted message without knowing
  * whether the recipient had already read it, so it is deliberately left
- * untouched. The user's next visit to this conversation already resets
- * their own count to 0 via markConversationRead regardless, so any
- * one-off overcount here is bounded and self-correcting.
+ * untouched when the conversation survives. The user's next visit to a
+ * surviving conversation already resets their own count to 0 via
+ * markConversationRead regardless, so any one-off overcount is bounded
+ * and self-correcting; when the conversation is deleted outright (the
+ * zero-survivor case above), unreadCounts is deleted along with it.
  */
 export const removeReportedMessage = onCall({ region: REGION, timeoutSeconds: 300, memory: '256MiB' }, async (request) => {
   requireAdmin(request);
@@ -802,9 +811,22 @@ export const removeReportedMessage = onCall({ region: REGION, timeoutSeconds: 30
           lastMessageAt: newest.createdAt,
           updatedAt: FieldValue.serverTimestamp(),
         });
+      } else {
+        // No messages remain at all — the Conversation type has no
+        // nullable/"empty" representation for lastMessageId/lastMessageText
+        // (required strings), so there is no safe value to write that
+        // doesn't either invent unsupported schema or leave the moderated
+        // body sitting in the preview. Deleting the root instead is safe
+        // and idiomatic: sendMessage's own transaction already creates a
+        // Conversation from scratch on a pair's very first message (see
+        // src/services/messages.ts) — a future message between these same
+        // two users takes that exact path again, recreating the document
+        // correctly. Until then, fetchConversations' participantUids query
+        // simply won't return a document that doesn't exist, matching the
+        // same "never messaged" state the Inbox already renders correctly
+        // for any two users who haven't spoken yet.
+        await convRef.delete();
       }
-      // No messages remain at all — preview fields intentionally left
-      // untouched; see this function's doc comment above.
     }
   }
 
