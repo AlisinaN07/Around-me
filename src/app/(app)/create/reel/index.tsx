@@ -249,13 +249,13 @@ export default function CreateReelScreen() {
       (percent) => setProgress(percent),
       async (uploadResult) => {
         if (!uploadResult.ok) {
-          await resetAfterFailure("Couldn't upload Reel.", { keepFailureBanner: true });
+          await resetAfterFailure("Couldn't upload post.", { keepFailureBanner: true });
           return;
         }
         setStage('publishing');
         const publishResult = await publishReel(draftResult.reel.reelId);
         if (!publishResult.ok) {
-          await resetAfterFailure("Couldn't upload Reel.", { keepFailureBanner: true });
+          await resetAfterFailure("Couldn't upload post.", { keepFailureBanner: true });
           return;
         }
         draftRef.current = null;
@@ -277,7 +277,7 @@ export default function CreateReelScreen() {
   const canPublish = !!video && !isBusy;
 
   return (
-    <HeaderScreenLayout title="Create reel" subtitle="Share what's happening around you.">
+    <HeaderScreenLayout title="Create post" subtitle="Share what's happening around you.">
       {isResolvingCameraVideo ? (
         <View style={styles.picker}>
           <ActivityIndicator color={Colors.textSecondary} />
@@ -375,7 +375,7 @@ export default function CreateReelScreen() {
           <View style={styles.progressRow}>
             <Text style={styles.progressText}>
               {stage === 'creating'
-                ? 'Creating Reel…'
+                ? 'Creating post…'
                 : stage === 'publishing'
                   ? 'Publishing…'
                   : `Uploading ${progress}%`}
@@ -398,12 +398,12 @@ export default function CreateReelScreen() {
         <Button
           label={
             stage === 'creating'
-              ? 'Creating Reel…'
+              ? 'Creating post…'
               : stage === 'publishing'
                 ? 'Publishing…'
                 : stage === 'uploading'
                   ? `Uploading ${progress}%`
-                  : 'Publish Reel'
+                  : 'Publish post'
           }
           onPress={handlePublish}
           disabled={!canPublish}

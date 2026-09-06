@@ -103,14 +103,14 @@ export function ReelFeed({ reels, status, errorTitle, emptyState, onReload, topO
   const optionsMenuOptions: OptionsMenuOption[] = optionsReel
     ? optionsReel.authorUid === user?.uid
       ? [
-          { label: 'Share Reel', onPress: () => handleShare(optionsReel) },
+          { label: 'Share post', onPress: () => handleShare(optionsReel) },
           { label: 'Copy link', onPress: () => handleCopyLink(optionsReel) },
-          { label: 'Delete Reel', onPress: () => setDeleteTarget(optionsReel), destructive: true },
+          { label: 'Delete post', onPress: () => setDeleteTarget(optionsReel), destructive: true },
         ]
       : [
-          { label: 'Share Reel', onPress: () => handleShare(optionsReel) },
+          { label: 'Share post', onPress: () => handleShare(optionsReel) },
           { label: 'Copy link', onPress: () => handleCopyLink(optionsReel) },
-          { label: 'Report reel', onPress: () => setReportReel(optionsReel) },
+          { label: 'Report post', onPress: () => setReportReel(optionsReel) },
           { label: `Block ${optionsReel.authorDisplayName}`, onPress: () => setBlockTarget(optionsReel), destructive: true },
         ]
     : [];
@@ -238,7 +238,7 @@ export function ReelFeed({ reels, status, errorTitle, emptyState, onReload, topO
 
       <ConfirmDialog
         visible={!!deleteTarget}
-        title="Delete reel?"
+        title="Delete post?"
         message={deleteError ?? "This can't be undone."}
         confirmLabel="Delete"
         isSubmitting={isDeleteSubmitting}

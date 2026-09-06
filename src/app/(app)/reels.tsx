@@ -55,7 +55,7 @@ export default function ReelsScreen() {
     <ReelFeed
       reels={reels}
       status={status}
-      errorTitle={`Couldn't load Reels in ${cityLabel}`}
+      errorTitle={`Couldn't load posts in ${cityLabel}`}
       onReload={load}
       topOverlay={
         <View style={styles.backRow}>
@@ -72,13 +72,13 @@ export default function ReelsScreen() {
         <EmptyState
           bare
           icon="videocam-outline"
-          title="No Reels yet"
+          title="No posts yet"
           body={`Be the first to show what's happening in ${cityLabel}.`}
           action={
             <>
-              <Button label="Create Reel" onPress={() => router.push('/create/reel')} />
+              <Button label="Create post" onPress={() => router.push('/create/reel')} />
               {isExploringAnotherCity && homeCity ? (
-                <Text style={styles.exploringHint}>Reels you create publish to your home city, {homeCity.cityName}.</Text>
+                <Text style={styles.exploringHint}>Posts you create publish to your home city, {homeCity.cityName}.</Text>
               ) : null}
             </>
           }

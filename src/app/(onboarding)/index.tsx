@@ -26,7 +26,7 @@ const OPTIONS: OptionConfig[] = [
     id: 'personal',
     icon: 'person-outline',
     title: 'Personal',
-    description: 'For people who want to discover their city, share Reels and connect locally.',
+    description: 'For people who want to discover their city, share posts and connect locally.',
   },
   {
     id: 'business',

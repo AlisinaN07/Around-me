@@ -45,12 +45,12 @@ export async function shareReel(reelId: string): Promise<ShareReelResult> {
   const url = buildReelShareUrl(reelId);
   try {
     await Share.share({
-      title: 'Around Me Reel',
-      message: `Check out this Reel on Around Me: ${url}`,
+      title: 'Around Me Post',
+      message: `Check out this post on Around Me: ${url}`,
       url,
     });
     return { ok: true };
   } catch (error) {
-    return { ok: false, message: error instanceof Error ? error.message : "Couldn't share this Reel." };
+    return { ok: false, message: error instanceof Error ? error.message : "Couldn't share this post." };
   }
 }

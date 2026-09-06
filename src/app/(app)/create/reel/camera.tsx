@@ -108,7 +108,7 @@ export default function CreateReelCameraScreen() {
       <SafeAreaView style={styles.safeArea}>
         <View style={styles.centered}>
           <Ionicons name="videocam-off-outline" size={40} color={Colors.textSecondary} />
-          <Text style={styles.deniedTitle}>Camera access is needed to record a Reel.</Text>
+          <Text style={styles.deniedTitle}>Camera access is needed to record a post.</Text>
           <View style={styles.deniedActions}>
             <Button
               label="Try again"

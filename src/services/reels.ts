@@ -109,7 +109,7 @@ export async function createReelDraft(input: CreateReelDraftInput): Promise<Crea
 
   const profile = await fetchUserProfile(input.uid);
   if (!profile || !profile.onboardingCompleted) {
-    return { ok: false, error: 'no-profile', message: 'Complete your profile before creating a Reel.' };
+    return { ok: false, error: 'no-profile', message: 'Complete your profile before creating a post.' };
   }
 
   const caption = input.caption.trim();
@@ -120,7 +120,7 @@ export async function createReelDraft(input: CreateReelDraftInput): Promise<Crea
     return { ok: false, error: 'invalid-input', message: 'Choose a valid category.' };
   }
   if (!input.storageContentType.startsWith('video/')) {
-    return { ok: false, error: 'invalid-input', message: 'Only video files can be shared as a Reel.' };
+    return { ok: false, error: 'invalid-input', message: 'Only video files can be shared as a post.' };
   }
   if (!Number.isFinite(input.fileSizeBytes) || input.fileSizeBytes <= 0 || input.fileSizeBytes > REEL_MAX_FILE_SIZE_BYTES) {
     return { ok: false, error: 'invalid-input', message: 'Video must be under 50 MB.' };
@@ -159,12 +159,12 @@ export async function createReelDraft(input: CreateReelDraftInput): Promise<Crea
   try {
     await setDoc(draftRef, data);
   } catch {
-    return { ok: false, error: 'unknown', message: "Couldn't start this Reel upload." };
+    return { ok: false, error: 'unknown', message: "Couldn't start this post upload." };
   }
 
   const created = await fetchReel(draftRef.id);
   if (!created) {
-    return { ok: false, error: 'unknown', message: 'Reel draft was created but could not be read back.' };
+    return { ok: false, error: 'unknown', message: 'Post draft was created but could not be read back.' };
   }
   return { ok: true, reel: created };
 }
@@ -263,11 +263,11 @@ export async function publishReel(reelId: string): Promise<PublishReelResult> {
       updatedAt: serverTimestamp(),
     });
   } catch {
-    return { ok: false, error: 'unknown', message: "Couldn't publish this Reel." };
+    return { ok: false, error: 'unknown', message: "Couldn't publish this post." };
   }
   const published = await fetchReel(reelId);
   if (!published) {
-    return { ok: false, error: 'unknown', message: 'Reel was published but could not be read back.' };
+    return { ok: false, error: 'unknown', message: 'Post was published but could not be read back.' };
   }
   return { ok: true, reel: published };
 }
@@ -472,7 +472,7 @@ export async function deleteMyReel(reelId: string): Promise<DeleteMyReelResult> 
   try {
     await httpsCallable(functions, 'deleteMyReel')({ reelId });
   } catch {
-    return { ok: false, message: "Couldn't delete this Reel." };
+    return { ok: false, message: "Couldn't delete this post." };
   }
   return { ok: true };
 }

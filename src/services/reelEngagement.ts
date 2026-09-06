@@ -49,7 +49,7 @@ type AssertPublishedReelResult = { ok: true; reel: Reel } | { ok: false; error: 
 async function assertPublishedReel(reelId: string): Promise<AssertPublishedReelResult> {
   const snapshot = await getDoc(reelRef(reelId));
   if (!snapshot.exists() || snapshot.data().status !== 'published') {
-    return { ok: false, error: 'not-found', message: "Couldn't find that Reel." };
+    return { ok: false, error: 'not-found', message: "Couldn't find that post." };
   }
   return { ok: true, reel: snapshot.data() as Reel };
 }
@@ -67,7 +67,7 @@ export async function likeReel(reelId: string, uid: string): Promise<LikeReelRes
   if (!trusted.ok) return trusted;
 
   const parent = await assertPublishedReel(reelId);
-  if (!parent.ok) return { ...parent, message: "Couldn't like this Reel." };
+  if (!parent.ok) return { ...parent, message: "Couldn't like this post." };
 
   const existing = await getDoc(reelLikeRef(reelId, uid));
   if (existing.exists()) {
@@ -106,7 +106,7 @@ export async function likeReel(reelId: string, uid: string): Promise<LikeReelRes
 
     await batch.commit();
   } catch {
-    return { ok: false, error: 'unknown', message: "Couldn't like this Reel." };
+    return { ok: false, error: 'unknown', message: "Couldn't like this post." };
   }
 
   return { ok: true, alreadyLiked: false };

@@ -142,7 +142,7 @@ export default function HomeScreen() {
         <ReelFeed
           reels={visibleFollowingReels}
           status={followingStatus}
-          errorTitle={`Couldn't load Reels in ${cityLabel}`}
+          errorTitle={`Couldn't load posts in ${cityLabel}`}
           onReload={loadFollowing}
           topOverlay={topOverlay}
           emptyState={
@@ -151,10 +151,10 @@ export default function HomeScreen() {
                 bare
                 icon="people-outline"
                 title="Your Following feed is empty"
-                body={`Follow people in ${cityLabel} to see their Reels here.`}
+                body={`Follow people in ${cityLabel} to see their posts here.`}
               />
             ) : (
-              <EmptyState bare icon="videocam-outline" title={`No new Reels from people you follow in ${cityLabel}.`} />
+              <EmptyState bare icon="videocam-outline" title={`No new posts from people you follow in ${cityLabel}.`} />
             )
           }
         />
@@ -173,20 +173,20 @@ export default function HomeScreen() {
       <ReelFeed
         reels={visibleForYouReels}
         status={forYouStatus}
-        errorTitle={`Couldn't load Reels in ${cityLabel}`}
+        errorTitle={`Couldn't load posts in ${cityLabel}`}
         onReload={loadForYou}
         topOverlay={topOverlay}
         emptyState={
           <EmptyState
             bare
             icon="videocam-outline"
-            title={`No Reels in ${cityLabel} yet`}
+            title={`No posts in ${cityLabel} yet`}
             body="Be the first to show what's happening."
             action={
               <>
-                <Button label="Create Reel" onPress={() => router.push('/create/reel')} />
+                <Button label="Create post" onPress={() => router.push('/create/reel')} />
                 {isExploringAnotherCity && homeCity ? (
-                  <Text style={styles.exploringHint}>Reels you create publish to your home city, {homeCity.cityName}.</Text>
+                  <Text style={styles.exploringHint}>Posts you create publish to your home city, {homeCity.cityName}.</Text>
                 ) : null}
               </>
             }

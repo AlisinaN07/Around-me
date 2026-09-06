@@ -173,7 +173,7 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
           ) : playbackFailed ? (
             <View style={styles.playbackErrorState}>
               <Ionicons name="alert-circle-outline" size={32} color={Colors.textSecondary} />
-              <Text style={styles.playbackErrorText}>Couldn&apos;t play this Reel</Text>
+              <Text style={styles.playbackErrorText}>Couldn&apos;t play this post</Text>
               <Pressable onPress={handleRetryPlayback} accessibilityRole="button">
                 <Text style={styles.retryLink}>Retry</Text>
               </Pressable>
@@ -202,7 +202,7 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
         <Ionicons name={muted ? 'volume-mute' : 'volume-high'} size={18} color={Colors.text} />
       </Pressable>
 
-      <Pressable style={styles.optionsButton} onPress={onOpenOptions} accessibilityRole="button" accessibilityLabel="Reel options">
+      <Pressable style={styles.optionsButton} onPress={onOpenOptions} accessibilityRole="button" accessibilityLabel="Post options">
         <Ionicons name="ellipsis-horizontal" size={20} color={Colors.text} />
       </Pressable>
 

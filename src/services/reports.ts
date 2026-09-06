@@ -112,10 +112,10 @@ export async function reportContent(reporterUid: string, contentId: string, reas
 export async function reportReel(reporterUid: string, reelId: string, reason: ReportReason, details?: string): Promise<ReportResult> {
   const reel = await fetchReel(reelId);
   if (!reel || reel.status !== 'published') {
-    return { ok: false, error: 'not-found', message: "Couldn't find that Reel." };
+    return { ok: false, error: 'not-found', message: "Couldn't find that post." };
   }
   if (reel.authorUid === reporterUid) {
-    return { ok: false, error: 'invalid-input', message: "You can't report your own Reel." };
+    return { ok: false, error: 'invalid-input', message: "You can't report your own post." };
   }
   const reportId = reelReportId(reporterUid, reelId);
   return submitReport(reportId, {

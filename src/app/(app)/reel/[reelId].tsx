@@ -203,29 +203,29 @@ export default function ReelDetailScreen() {
 
   const optionsMenuOptions: OptionsMenuOption[] = isOwnReel
     ? [
-        { label: 'Share Reel', onPress: handleShare },
+        { label: 'Share post', onPress: handleShare },
         { label: 'Copy link', onPress: handleCopyLink },
-        { label: 'Delete Reel', onPress: () => setIsDeleteConfirmOpen(true), destructive: true },
+        { label: 'Delete post', onPress: () => setIsDeleteConfirmOpen(true), destructive: true },
       ]
     : amIBlockingThem
       ? [
-          { label: 'Share Reel', onPress: handleShare },
+          { label: 'Share post', onPress: handleShare },
           { label: 'Copy link', onPress: handleCopyLink },
           { label: `Unblock ${reel?.authorDisplayName ?? 'this user'}`, onPress: handleUnblock },
-          { label: 'Report reel', onPress: () => setIsReportOpen(true) },
+          { label: 'Report post', onPress: () => setIsReportOpen(true) },
         ]
       : [
-          { label: 'Share Reel', onPress: handleShare },
+          { label: 'Share post', onPress: handleShare },
           { label: 'Copy link', onPress: handleCopyLink },
           { label: `Block ${reel?.authorDisplayName ?? 'this user'}`, onPress: () => setIsBlockConfirmOpen(true), destructive: true },
-          { label: 'Report reel', onPress: () => setIsReportOpen(true) },
+          { label: 'Report post', onPress: () => setIsReportOpen(true) },
         ];
 
   const categoryLabel = reel ? CATEGORY_LABEL_BY_ID.get(reel.categoryId) : undefined;
 
   return (
     <HeaderScreenLayout
-      title="Reel"
+      title="Post"
       headerRight={
         status === 'loaded' && reel ? (
           <Pressable
@@ -247,7 +247,7 @@ export default function ReelDetailScreen() {
       ) : status === 'error' || !reel ? (
         <View style={styles.centered}>
           <Ionicons name="alert-circle-outline" size={32} color={Colors.textSecondary} />
-          <Text style={styles.errorTitle}>Couldn&apos;t load this Reel.</Text>
+          <Text style={styles.errorTitle}>Couldn&apos;t load this post.</Text>
           <Button label="Try again" onPress={load} />
         </View>
       ) : (
@@ -262,7 +262,7 @@ export default function ReelDetailScreen() {
                 ) : (
                   <View style={styles.playbackErrorState}>
                     <Ionicons name="alert-circle-outline" size={32} color={Colors.textSecondary} />
-                    <Text style={styles.playbackErrorText}>Couldn&apos;t play this Reel</Text>
+                    <Text style={styles.playbackErrorText}>Couldn&apos;t play this post</Text>
                     <Pressable onPress={handleRetryPlayback} accessibilityRole="button">
                       <Text style={styles.retryLink}>Retry</Text>
                     </Pressable>
@@ -315,7 +315,7 @@ export default function ReelDetailScreen() {
 
       <ConfirmDialog
         visible={isDeleteConfirmOpen}
-        title="Delete reel?"
+        title="Delete post?"
         message={deleteError ?? "This can't be undone."}
         confirmLabel="Delete"
         isSubmitting={isDeleting}

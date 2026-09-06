@@ -21,7 +21,7 @@ export function ReelPreviewCard({ reel }: { reel: Reel }) {
       style={styles.card}
       onPress={() => router.push(`/reel/${reel.reelId}`)}
       accessibilityRole="button"
-      accessibilityLabel="View Reel"
+      accessibilityLabel="View post"
     >
       <MediaCard fallbackIcon="videocam" height="100%" radius={Radius.md}>
         <View style={styles.overlay}>

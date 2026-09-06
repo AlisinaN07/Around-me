@@ -1010,6 +1010,18 @@ Ran across two script executions (30 effective checks total — see the commit h
 
 No content editing of any kind (Post, Activity, Event, or Reel). No recycle bin, no grace period, no "restore" affordance. No new Rules exception. No `accountType`-based authorization at deletion time (a Business author deletes their own Event purely because `authorUid` matches, the same as every other type).
 
+## User-facing Post/Event terminology (Step 41.2A)
+
+Around Me's product vocabulary is being simplified to two user-facing concepts: **Post** (all social content) and **Event** (Business-created structured happening). This step is the first, narrowest slice of that change — a copy-only rename, no schema/route/Function changes.
+
+**What changed:** the video content users have always technically called a "Reel" is now labeled **Post** everywhere a user reads it — Home's empty/error states, the Create-video screen (`/create/reel`, title "Create post", "Publish post", upload/publish error copy), the Post detail screen (`/reel/[reelId]`, title "Post", Share/Delete/Report menu labels, playback error copy), the shared `ReelFeed` options menu and delete confirmation used by both Home and the standalone `/reels` route, notification copy ("liked your post" / "commented on your post"), the native share sheet text, report error messages, and the onboarding Personal-account description.
+
+**What intentionally did not change (technical names, kept for zero migration risk):** the `reels/{reelId}` Firestore collection, the `Reel`/`ReelLike`/`ReelComment` types, `reels.ts`/`reelEngagement.ts`, the `deleteMyReel`/`removeReportedReel` Cloud Functions, the `reel_like`/`reel_comment` notification-type enum values, the `reel` report `targetType`, and the `/create/reel`/`/reel/[reelId]`/`/reels` routes. A user-facing "Post" is, underneath, still exactly the same `reels` document it always was — see the Step 41.2 architecture audit (commit history) for the full reasoning on why renaming the backend would be pure migration risk with zero user-facing benefit.
+
+**Deliberately deferred to Step 41.2C** (not done in this pass): the Profile "Reels" tab label and its empty-state copy — Profile currently has a *separate* legacy text-Post tab already labeled "Posts," so renaming "Reels" → "Posts" now would produce two simultaneously-visible "Posts" tabs until they're actually merged into one. The Create hub's video option (still labeled "Reel") and the Business "you can still create Reels, Posts, and Activities" copy on the Event-blocked screen were left alone for the identical reason — the Create hub still separately lists a legacy text "Post" option, and renaming the video option to "Post" today would show two "Post" entries side by side. The Delete Account screen's "Your Reels" / "Your Posts" bullet pair has the same collision and is deferred alongside the Profile tab merge.
+
+**No behavior changed**: no query, upload, delete, report, block, follow, or notification logic was touched — this step is copy only.
+
 ## Reels (Cloud Storage — Step 18)
 
 Reels are short (≤60s), video-only posts with vertical, city-scoped playback — the first feature in this app to use Cloud Storage rather than Firestore alone. They live in their own root collection, `reels/{reelId}`, separate from `content/{contentId}` (posts/activities/events): a Reel has a media-upload lifecycle and Storage metadata that the other content types never had, and folding it into `content` would have meant giving every Post/Activity/Event query an upload-status field it never needs.

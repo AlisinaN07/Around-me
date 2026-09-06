@@ -34,11 +34,11 @@ function describeNotification(notification: Notification): string {
     case 'follow':
       return `${notification.actorDisplayName} started following you`;
     case 'reel_like':
-      return `${notification.actorDisplayName} liked your Reel`;
+      return `${notification.actorDisplayName} liked your post`;
     case 'reel_comment':
       return notification.previewText
-        ? `${notification.actorDisplayName} commented on your Reel: "${notification.previewText}"`
-        : `${notification.actorDisplayName} commented on your Reel`;
+        ? `${notification.actorDisplayName} commented on your post: "${notification.previewText}"`
+        : `${notification.actorDisplayName} commented on your post`;
     case 'event_response':
       return notification.responseStatus === 'going'
         ? `${notification.actorDisplayName} is going to your event`
