@@ -22,7 +22,6 @@ type CreateOption = {
 // not just another row in a flat menu.
 const SECONDARY_OPTIONS: CreateOption[] = [
   { id: 'post', icon: 'create-outline', label: 'Post', description: 'Share something with your city.', href: '/create/post' },
-  { id: 'activity', icon: 'people-outline', label: 'Activity', description: 'Create something people can join.', href: '/create/activity' },
 ];
 
 /**

@@ -8,7 +8,7 @@ import { Button } from '@/components/Button';
 import { EmptyState } from '@/components/EmptyState';
 import { ErrorState } from '@/components/ErrorState';
 import { EventCard } from '@/components/EventCard';
-import { EventFilterSheet, type EventTypeFilter } from '@/components/EventFilterSheet';
+import { EventFilterSheet } from '@/components/EventFilterSheet';
 import { LoadingState } from '@/components/LoadingState';
 import { Pill } from '@/components/Pill';
 import { SectionHeader } from '@/components/SectionHeader';
@@ -31,11 +31,13 @@ type LoadStatus = 'loading' | 'loaded' | 'error';
 const SECTION_LIMIT = 15;
 
 /**
- * Events — official/local Event & Activity discovery (Step 26 visual
- * reconstruction). Deliberately the ONLY place in the app that shows
- * event-style discovery content; Home is the separate user-generated Reel
- * feed (see src/app/(app)/(tabs)/index.tsx and the Step 25 product-
- * separation rule). Still backed entirely by the unchanged
+ * Events — Business Event discovery (Step 26 visual reconstruction; Step
+ * 41.2B retired the legacy user-created Activity content type from this
+ * screen — fetchDiscoverySections now filters Activity out at the source,
+ * see src/services/content.ts). Deliberately the ONLY place in the app
+ * that shows event-style discovery content; Home is the separate
+ * user-generated Post feed (see src/app/(app)/(tabs)/index.tsx and the
+ * Step 25 product-separation rule). Still backed by the same
  * fetchDiscoverySections/dateWindows architecture from Step 22 — this step
  * only redesigns layout, adds a real "This Weekend" split of the existing
  * Upcoming window, and moves Interested/Going/Join actions onto the
@@ -47,7 +49,6 @@ export default function EventsScreen() {
   const canCreateEventHere = canCreateEvent(profile);
   const [status, setStatus] = useState<LoadStatus>('loading');
   const [sections, setSections] = useState<DiscoverySections | null>(null);
-  const [typeFilter, setTypeFilter] = useState<EventTypeFilter>('all');
   const [categoryFilter, setCategoryFilter] = useState<string | null>(null);
   const [isFilterOpen, setIsFilterOpen] = useState(false);
 
@@ -79,12 +80,10 @@ export default function EventsScreen() {
 
   const matchesFilters = useCallback(
     (item: ActivityContent | EventContent) => {
-      if (typeFilter === 'events' && item.type !== 'event') return false;
-      if (typeFilter === 'activities' && item.type !== 'activity') return false;
       if (categoryFilter && item.categoryId !== categoryFilter) return false;
       return true;
     },
-    [typeFilter, categoryFilter]
+    [categoryFilter]
   );
 
   const happeningNow = useMemo(() => (sections ? sections.happeningNow.filter(matchesFilters) : []), [sections, matchesFilters]);
@@ -116,7 +115,7 @@ export default function EventsScreen() {
   const totalRealItems = sections ? sections.happeningNow.length + sections.today.length + sections.upcoming.length : 0;
   const totalFilteredItems = happeningNow.length + today.length + upcomingAll.length;
   const canCreateHere = !!homeCity && !isExploringAnotherCity;
-  const isFilterActive = typeFilter !== 'all' || categoryFilter !== null;
+  const isFilterActive = categoryFilter !== null;
 
   return (
     <SafeAreaView style={styles.safeArea} edges={['top']}>
@@ -240,8 +239,6 @@ export default function EventsScreen() {
 
       <EventFilterSheet
         visible={isFilterOpen}
-        typeFilter={typeFilter}
-        onChangeTypeFilter={setTypeFilter}
         categoryFilter={categoryFilter}
         onChangeCategoryFilter={setCategoryFilter}
         onClose={() => setIsFilterOpen(false)}

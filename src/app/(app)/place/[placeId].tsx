@@ -59,14 +59,21 @@ export default function PlaceDetailScreen() {
   // Splits the one bounded fetchPlaceContent result (already capped, see
   // content.ts) into Happening Now / Upcoming / everything else, client-side
   // — no extra queries. A Place typically has few linked items, so this is
-  // cheap; the general list below the two rails still shows posts and
-  // past Activities/Events, same as before this split.
+  // cheap; the general list below the two rails still shows posts, same as
+  // before this split.
+  //
+  // Step 41.2B: legacy Activity is filtered out entirely here rather than
+  // at fetchPlaceContent (left unchanged) — a Place page must not surface
+  // Activity in any section, including the general "Posts" list, which is
+  // why this excludes it up front rather than just narrowing
+  // isTimedContent's happening-now/upcoming check.
   const { happeningNow, upcoming, general } = useMemo(() => {
     const now = new Date();
+    const visibleContent = content.filter((item) => item.type !== 'activity');
     const happeningNowItems: (ActivityContent | EventContent)[] = [];
     const upcomingItems: (ActivityContent | EventContent)[] = [];
     const generalItems: Content[] = [];
-    for (const item of content) {
+    for (const item of visibleContent) {
       if (isTimedContent(item)) {
         if (isHappeningNow(item, now)) {
           happeningNowItems.push(item);

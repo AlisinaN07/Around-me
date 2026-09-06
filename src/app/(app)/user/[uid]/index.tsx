@@ -31,20 +31,22 @@ import type { PublicProfile } from '@/types/social';
 import { formatCityDisplayName } from '@/utils/cityDisplay';
 
 type LoadStatus = 'loading' | 'loaded' | 'error';
-type ProfileTab = ContentType | 'reel';
+// Step 41.2B: 'activity' deliberately excluded — the legacy authored-Activity
+// tab is retired. This is a screen-local UI type, not the domain
+// ContentType union (src/types/content.ts), which still includes 'activity'
+// unchanged for existing documents.
+type ProfileTab = Exclude<ContentType, 'activity'> | 'reel';
 
 const PROFILE_TABS: { id: ProfileTab; label: string }[] = [
   { id: 'reel', label: 'Reels' },
   { id: 'post', label: 'Posts' },
   { id: 'event', label: 'Events' },
-  { id: 'activity', label: 'Activities' },
 ];
 
 const EMPTY_TEXT: Record<ProfileTab, string> = {
   reel: 'No Reels yet',
   post: 'No posts yet',
   event: 'No events yet',
-  activity: 'No activities yet',
 };
 
 /**

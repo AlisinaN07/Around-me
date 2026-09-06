@@ -565,11 +565,22 @@ export async function fetchDiscoverySections(cityKey: string, limitCount = DEFAU
   const todayWindow = getTodayOrTonightWindow(now);
   const upcomingWindow = getUpcomingWindow(todayWindow.end);
 
-  const [happeningNow, todayCandidates, upcoming] = await Promise.all([
+  const [happeningNowAll, todayCandidatesAll, upcomingAll] = await Promise.all([
     fetchHappeningNow(cityKey, limitCount),
     fetchByStartsAtWindow(cityKey, todayWindow, limitCount),
     fetchByStartsAtWindow(cityKey, upcomingWindow, limitCount),
   ]);
+
+  // Step 41.2B: legacy Activity is retired from active discovery — Events
+  // is now Business-Event-only. Filtered once here, the single place every
+  // discovery screen already goes through, rather than duplicated per
+  // caller. fetchHappeningNow/fetchByStartsAtWindow themselves are left
+  // exactly as they were (still genuinely merge both types) since this is
+  // the only current caller and changing their own signature/behavior
+  // would be a wider, riskier edit than filtering their result here.
+  const happeningNow = happeningNowAll.filter((item) => item.type !== 'activity');
+  const todayCandidates = todayCandidatesAll.filter((item) => item.type !== 'activity');
+  const upcoming = upcomingAll.filter((item) => item.type !== 'activity');
 
   const happeningIds = new Set(happeningNow.map((item) => item.contentId));
   const nowMs = now.getTime();

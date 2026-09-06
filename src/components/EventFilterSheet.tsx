@@ -1,22 +1,11 @@
 import { Ionicons } from '@expo/vector-icons';
 import { Modal, Pressable, ScrollView, StyleSheet, Text } from 'react-native';
 
-import { SegmentedControl } from '@/components/SegmentedControl';
 import { KARLSTAD_LAUNCH_CATEGORIES } from '@/constants/launchCategories';
 import { Colors, Radius, Spacing, Typography } from '@/constants/theme';
 
-export type EventTypeFilter = 'all' | 'events' | 'activities';
-
-const TYPE_FILTER_OPTIONS: { id: EventTypeFilter; label: string }[] = [
-  { id: 'all', label: 'All' },
-  { id: 'events', label: 'Events' },
-  { id: 'activities', label: 'Activities' },
-];
-
 type EventFilterSheetProps = {
   visible: boolean;
-  typeFilter: EventTypeFilter;
-  onChangeTypeFilter: (value: EventTypeFilter) => void;
   /** null means "All categories". */
   categoryFilter: string | null;
   onChangeCategoryFilter: (categoryId: string | null) => void;
@@ -24,29 +13,18 @@ type EventFilterSheetProps = {
 };
 
 /**
- * Events-tab filter sheet (Step 26) — the exact same real filters the
- * previous inline SegmentedControl + category chip row offered (All/
- * Events/Activities, and the real Karlstad launch category shortlist),
- * just moved behind a header filter icon so the screen itself stays
- * visual/scannable instead of spending vertical space on filter chrome up
- * front. No speculative filters (price/distance/popularity/etc. — none of
- * that data exists).
+ * Events-tab filter sheet (Step 26). Category-only since Step 41.2B — the
+ * former All/Events/Activities type filter existed solely to separate
+ * Events from the now-retired legacy Activity content type; with Events
+ * discovery Event-only, that distinction no longer means anything, so it
+ * was removed rather than kept as a filter with a single meaningful value.
  */
-export function EventFilterSheet({
-  visible,
-  typeFilter,
-  onChangeTypeFilter,
-  categoryFilter,
-  onChangeCategoryFilter,
-  onClose,
-}: EventFilterSheetProps) {
+export function EventFilterSheet({ visible, categoryFilter, onChangeCategoryFilter, onClose }: EventFilterSheetProps) {
   return (
     <Modal visible={visible} animationType="slide" transparent onRequestClose={onClose}>
       <Pressable style={styles.backdrop} onPress={onClose} accessibilityRole="button" accessibilityLabel="Close">
         <Pressable style={styles.sheet} onPress={(event) => event.stopPropagation()}>
           <Text style={styles.title}>Filter</Text>
-
-          <SegmentedControl options={TYPE_FILTER_OPTIONS} value={typeFilter} onChange={onChangeTypeFilter} />
 
           <Text style={styles.subtitle}>Category</Text>
           <ScrollView style={styles.list} showsVerticalScrollIndicator={false}>
