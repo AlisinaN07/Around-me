@@ -19,6 +19,7 @@ import {
   collection,
   deleteDoc,
   doc,
+  getCountFromServer,
   getDoc,
   getDocs,
   limit,
@@ -430,6 +431,25 @@ export async function fetchProfileReels(uid: string, limitCount = DEFAULT_PROFIL
   );
   const snapshot = await getDocs(profileReelsQuery);
   return snapshot.docs.map((docSnapshot) => docSnapshot.data() as Reel);
+}
+
+/**
+ * The exact number of a user's own published video Posts (technically
+ * Reels) — half of the unified Profile "Posts" stat (Step 41.2C; the other
+ * half is fetchProfilePostCount's legacy-text-Post count in content.ts).
+ * A server-side aggregation, not derived from fetchProfileReels' bounded
+ * list — same reasoning as fetchProfilePostCount: a prolific author with
+ * more Reels than that list's limit would otherwise be undercounted. Reuses
+ * the existing (authorUid, status, publishedAt DESC) composite index —
+ * Firestore composite indexes can serve any query using a leading prefix
+ * of their fields, and authorUid+status is exactly that prefix, so no new
+ * index is needed for this equality-only count.
+ */
+export async function fetchProfileReelCount(uid: string): Promise<number> {
+  if (!firestore) return 0;
+  const countQuery = query(collection(firestore, REELS_COLLECTION), where('authorUid', '==', uid), where('status', '==', 'published'));
+  const snapshot = await getCountFromServer(countQuery);
+  return snapshot.data().count;
 }
 
 // ---------------------------------------------------------------------------

@@ -244,7 +244,6 @@ export function DeleteAccountFlow({ mode }: { mode: 'initial' | 'recovery' }) {
       <View style={styles.copyBlock}>
         <Text style={styles.sectionLabel}>This will delete:</Text>
         <Bullet text="Your profile and username" />
-        <Bullet text="Your Reels" />
         <Bullet text="Your Posts" />
         <Bullet text="Your Activities" />
         {isBusiness ? <Bullet text="Your published Events" /> : null}

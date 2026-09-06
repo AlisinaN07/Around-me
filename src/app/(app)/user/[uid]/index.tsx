@@ -24,27 +24,32 @@ import { fetchFollowerCount, fetchFollowingCount, followUser, isFollowing, unfol
 import { fetchConversation, getConversationId } from '@/services/messages';
 import { fetchMyNewMessagesFrom } from '@/services/privacySettings';
 import { fetchPublicProfile } from '@/services/publicProfile';
-import { fetchProfileReels } from '@/services/reels';
-import type { Content, ContentType } from '@/types/content';
+import { fetchProfileReelCount, fetchProfileReels } from '@/services/reels';
+import type { Content, EventContent, PostContent } from '@/types/content';
 import type { Reel } from '@/types/reel';
 import type { PublicProfile } from '@/types/social';
+import { isBusinessAccount } from '@/utils/accountCapabilities';
 import { formatCityDisplayName } from '@/utils/cityDisplay';
+import { mergeProfilePosts } from '@/utils/profilePosts';
 
 type LoadStatus = 'loading' | 'loaded' | 'error';
-// Step 41.2B: 'activity' deliberately excluded — the legacy authored-Activity
-// tab is retired. This is a screen-local UI type, not the domain
-// ContentType union (src/types/content.ts), which still includes 'activity'
-// unchanged for existing documents.
-type ProfileTab = Exclude<ContentType, 'activity'> | 'reel';
+// Step 41.2C — unified Posts tab: 'reel' (video Post) and legacy text
+// 'post' now merge into a single 'post' tab, so this is no longer a
+// per-technical-type selector, just Posts vs. (Business-only) Events.
+type ProfileTab = 'post' | 'event';
 
-const PROFILE_TABS: { id: ProfileTab; label: string }[] = [
-  { id: 'reel', label: 'Reels' },
+const PROFILE_TABS_PERSONAL: { id: ProfileTab; label: string }[] = [{ id: 'post', label: 'Posts' }];
+const PROFILE_TABS_BUSINESS: { id: ProfileTab; label: string }[] = [
   { id: 'post', label: 'Posts' },
   { id: 'event', label: 'Events' },
 ];
 
+// See src/app/(app)/(tabs)/profile.tsx's own PROFILE_CONTENT_LIMIT doc
+// comment — identical reasoning, kept as a separate local constant since
+// this is a separate screen with its own bounded mixed fetch.
+const PROFILE_CONTENT_LIMIT = 40;
+
 const EMPTY_TEXT: Record<ProfileTab, string> = {
-  reel: 'No Reels yet',
   post: 'No posts yet',
   event: 'No events yet',
 };
@@ -72,7 +77,7 @@ export default function PublicProfileScreen() {
   const [followError, setFollowError] = useState<string | null>(null);
   const [content, setContent] = useState<Content[]>([]);
   const [reels, setReels] = useState<Reel[]>([]);
-  const [contentTab, setContentTab] = useState<ProfileTab>('reel');
+  const [contentTab, setContentTab] = useState<ProfileTab>('post');
 
   // Safety state — see src/services/blocks.ts / privacySettings.ts.
   // canMessage is only ever used to proactively enable/disable the
@@ -89,28 +94,31 @@ export default function PublicProfileScreen() {
   // synchronously during the effect body below.
   const load = useCallback(async () => {
     try {
-      const [publicProfile, followers, following, posts, followingState, userContent, userReels, blockedByMe] = await Promise.all([
-        fetchPublicProfile(uid),
-        fetchFollowerCount(uid),
-        fetchFollowingCount(uid),
-        // Exact server-side aggregation — see fetchProfilePostCount's own
-        // doc comment. A failure here falls into the same catch as every
-        // other profile fetch below, so a failed count is never shown as
-        // a confident (wrong) 0 — the whole screen shows its error state
-        // instead, same as an own-profile load failure.
-        fetchProfilePostCount(uid),
-        !isOwnProfile && user ? isFollowing(user.uid, uid) : Promise.resolve(false),
-        // One mixed, limited query — then split into Posts/Activities/Events
-        // TABS in-memory below, rather than running three separate queries
-        // for a single profile page. This stays bounded on purpose; only
-        // the Posts STAT above is now exact (see fetchProfilePostCount).
-        fetchPublicUserContent(uid),
-        // Reels are a separate root collection from content/{contentId}
-        // (see src/types/reel.ts), so this is its own capped query, not
-        // part of the mixed content query above.
-        fetchProfileReels(uid),
-        !isOwnProfile && user ? isUserBlocked(user.uid, uid) : Promise.resolve(false),
-      ]);
+      const [publicProfile, followers, following, textPostCount, reelCount, followingState, userContent, userReels, blockedByMe] =
+        await Promise.all([
+          fetchPublicProfile(uid),
+          fetchFollowerCount(uid),
+          fetchFollowingCount(uid),
+          // Two exact server-side aggregations, summed — see
+          // fetchProfilePostCount's and fetchProfileReelCount's own doc
+          // comments. A failure here falls into the same catch as every
+          // other profile fetch below, so a failed count is never shown as
+          // a confident (wrong) 0 — the whole screen shows its error state
+          // instead, same as an own-profile load failure.
+          fetchProfilePostCount(uid),
+          fetchProfileReelCount(uid),
+          !isOwnProfile && user ? isFollowing(user.uid, uid) : Promise.resolve(false),
+          // One mixed, bounded query (see PROFILE_CONTENT_LIMIT) — split into
+          // the unified Posts tab's text-Post half and the Business Events
+          // tab in-memory below, rather than running separate queries. This
+          // stays bounded on purpose; only the Posts STAT above is exact.
+          fetchPublicUserContent(uid, PROFILE_CONTENT_LIMIT),
+          // Reels are a separate root collection from content/{contentId}
+          // (see src/types/reel.ts), so this is its own capped query, not
+          // part of the mixed content query above.
+          fetchProfileReels(uid),
+          !isOwnProfile && user ? isUserBlocked(user.uid, uid) : Promise.resolve(false),
+        ]);
       if (!publicProfile) {
         setStatus('error');
         return;
@@ -118,7 +126,7 @@ export default function PublicProfileScreen() {
       setProfile(publicProfile);
       setFollowerCount(followers);
       setFollowingCount(following);
-      setPostsCount(posts);
+      setPostsCount(textPostCount + reelCount);
       setAmFollowing(followingState);
       setContent(userContent);
       setReels(userReels);
@@ -194,11 +202,10 @@ export default function PublicProfileScreen() {
   };
 
   const cityLabel = profile?.cityName ? formatCityDisplayName(profile.cityName) : '';
-
-  const visibleContent = useMemo(
-    () => (contentTab === 'reel' ? [] : content.filter((item) => item.type === contentTab)),
-    [content, contentTab]
-  );
+  const tabs = isBusinessAccount(profile) ? PROFILE_TABS_BUSINESS : PROFILE_TABS_PERSONAL;
+  const textPosts = useMemo(() => content.filter((item): item is PostContent => item.type === 'post'), [content]);
+  const businessEvents = useMemo(() => content.filter((item): item is EventContent => item.type === 'event'), [content]);
+  const mergedPosts = useMemo(() => mergeProfilePosts(reels, textPosts), [reels, textPosts]);
 
   const optionsMenuOptions: OptionsMenuOption[] = amIBlockingThem
     ? [
@@ -280,30 +287,36 @@ export default function PublicProfileScreen() {
           <InterestPills interestIds={profile.interests} />
 
           <View style={styles.contentSection}>
-            <ProfileTabBar tabs={PROFILE_TABS} value={contentTab} onChange={setContentTab} />
+            <ProfileTabBar tabs={tabs} value={contentTab} onChange={setContentTab} />
 
-            {contentTab === 'reel' ? (
-              reels.length === 0 ? (
+            {contentTab === 'post' ? (
+              mergedPosts.length === 0 ? (
                 <EmptyState
                   bare
-                  icon="videocam-outline"
-                  title={EMPTY_TEXT.reel}
+                  icon="albums-outline"
+                  title={EMPTY_TEXT.post}
                   action={
-                    isOwnProfile ? <Button label="Create Reel" variant="secondary" onPress={() => router.push('/create/reel')} /> : undefined
+                    isOwnProfile ? <Button label="Create post" variant="secondary" onPress={() => router.push('/create/reel')} /> : undefined
                   }
                 />
               ) : (
-                <View style={styles.reelGrid}>
-                  {reels.map((reel) => (
-                    <ReelPreviewCard key={reel.reelId} reel={reel} />
-                  ))}
+                <View style={styles.postsGrid}>
+                  {mergedPosts.map((item) =>
+                    item.kind === 'reel' ? (
+                      <ReelPreviewCard key={`reel-${item.reel.reelId}`} reel={item.reel} />
+                    ) : (
+                      <View key={`text-${item.content.contentId}`} style={styles.fullRow}>
+                        <ContentCard item={item.content} currentUid={user?.uid ?? null} />
+                      </View>
+                    )
+                  )}
                 </View>
               )
-            ) : visibleContent.length === 0 ? (
-              <EmptyState bare icon="albums-outline" title={EMPTY_TEXT[contentTab]} />
+            ) : businessEvents.length === 0 ? (
+              <EmptyState bare icon="calendar-outline" title={EMPTY_TEXT.event} />
             ) : (
               <View style={styles.contentList}>
-                {visibleContent.map((item) => (
+                {businessEvents.map((item) => (
                   <ContentCard key={item.contentId} item={item} currentUid={user?.uid ?? null} />
                 ))}
               </View>
@@ -402,11 +415,14 @@ const styles = StyleSheet.create({
   contentSection: {
     gap: Spacing.md,
   },
-  reelGrid: {
+  postsGrid: {
     flexDirection: 'row',
     flexWrap: 'wrap',
     justifyContent: 'space-between',
     rowGap: Spacing.sm,
+  },
+  fullRow: {
+    width: '100%',
   },
   contentList: {
     gap: Spacing.md,

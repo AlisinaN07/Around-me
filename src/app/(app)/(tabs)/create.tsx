@@ -17,12 +17,12 @@ type CreateOption = {
   href: Href;
 };
 
-// Home is a Reel-first social feed (Step 25), so Reel is the visually
-// strongest option here too — a large hero card above the secondary list,
-// not just another row in a flat menu.
-const SECONDARY_OPTIONS: CreateOption[] = [
-  { id: 'post', icon: 'create-outline', label: 'Post', description: 'Share something with your city.', href: '/create/post' },
-];
+// Home is a Reel-first social feed (Step 25), so the video Post is the
+// visually strongest option here too — a large hero card above the
+// secondary list. Step 41.2C retired the legacy text-only Post creation
+// option entirely (see /create/post's redirect stub), so the hero card
+// below is now simply labeled "Post" with no secondary duplicate.
+const SECONDARY_OPTIONS: CreateOption[] = [];
 
 /**
  * Event creation is Business-only (Step 30 core rule: Business = Personal
@@ -63,7 +63,7 @@ export default function CreateScreen() {
           style={({ pressed }) => [styles.reelHero, pressed && styles.pressed]}
           onPress={() => router.push('/create/reel')}
           accessibilityRole="button"
-          accessibilityLabel="Reel"
+          accessibilityLabel="Post"
         >
           <LinearGradient
             colors={Gradients.accent}
@@ -75,7 +75,7 @@ export default function CreateScreen() {
             <Ionicons name="videocam" size={26} color={Colors.text} />
           </View>
           <View style={styles.reelHeroText}>
-            <Text style={styles.reelHeroTitle}>Reel</Text>
+            <Text style={styles.reelHeroTitle}>Post</Text>
             <Text style={styles.reelHeroDescription}>Share what&apos;s happening around you.</Text>
           </View>
           <Ionicons name="chevron-forward" size={20} color={Colors.text} />

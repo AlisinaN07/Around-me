@@ -122,7 +122,7 @@ export default function CreateEventScreen() {
           <Ionicons name="calendar-outline" size={32} color={Colors.textSecondary} />
           <Text style={styles.blockedTitle}>Event creation is for Business accounts</Text>
           <Text style={styles.blockedBody}>
-            Your account is Personal. You can still create Reels and Posts.
+            Your account is Personal. You can still create Posts.
           </Text>
           <Button label="Back to Create" variant="secondary" onPress={() => router.replace('/create')} />
         </View>

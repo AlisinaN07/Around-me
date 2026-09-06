@@ -1,139 +1,23 @@
 import { router } from 'expo-router';
-import { useState } from 'react';
-import { StyleSheet, Text, View } from 'react-native';
+import { useEffect } from 'react';
 
-import { Button } from '@/components/Button';
-import { CategorySelector } from '@/components/CategorySelector';
-import { HeaderScreenLayout } from '@/components/HeaderScreenLayout';
-import { FormField } from '@/components/FormField';
-import { PlaceSelector, type PlaceSelectorValue } from '@/components/PlaceSelector';
-import { Colors, Spacing } from '@/constants/theme';
-import { useAuth } from '@/hooks/useAuth';
-import { useProfile } from '@/hooks/useProfile';
-import { createPost } from '@/services/content';
-import { BODY_MAX_LENGTH } from '@/types/content';
-import { formatCityDisplayName } from '@/utils/cityDisplay';
-
+/**
+ * Legacy text-only Post creation is retired (Step 41.2C — the user-facing
+ * "Post" concept is now video-first, technically backed by reels/{reelId};
+ * see src/utils/profilePosts.ts). This route is kept only so an existing
+ * bookmark/link to /create/post doesn't dead-end on a missing route or a
+ * confusing 404 — it never renders the old text-Post form, it just sends
+ * the visitor straight to the real Post creation flow.
+ *
+ * This is UI-only: content/{contentId} documents with type == 'post' that
+ * already exist remain fully intact, readable, likeable, commentable,
+ * reportable, moderatable, and author-self-deletable — nothing about the
+ * backend changed, only this screen's ability to create a NEW one.
+ */
 export default function CreatePostScreen() {
-  const { user } = useAuth();
-  const { profile } = useProfile();
-  const [body, setBody] = useState('');
-  const [categoryId, setCategoryId] = useState<string | null>(null);
-  const [place, setPlace] = useState<PlaceSelectorValue>({ placeId: null, placeName: '' });
-  const [bodyError, setBodyError] = useState<string | null>(null);
-  const [categoryError, setCategoryError] = useState<string | null>(null);
-  const [formError, setFormError] = useState<string | null>(null);
-  const [isSubmitting, setIsSubmitting] = useState(false);
+  useEffect(() => {
+    router.replace('/create/reel');
+  }, []);
 
-  const handlePublish = async () => {
-    if (isSubmitting) return;
-
-    const trimmedBody = body.trim();
-    let hasError = false;
-    if (!trimmedBody) {
-      setBodyError("Write something before you publish.");
-      hasError = true;
-    } else if (trimmedBody.length > BODY_MAX_LENGTH) {
-      setBodyError(`Keep it under ${BODY_MAX_LENGTH} characters.`);
-      hasError = true;
-    } else {
-      setBodyError(null);
-    }
-    if (!categoryId) {
-      setCategoryError('Choose a category.');
-      hasError = true;
-    } else {
-      setCategoryError(null);
-    }
-    if (hasError) return;
-
-    if (!user) {
-      setFormError('You need to be signed in to post.');
-      return;
-    }
-
-    setIsSubmitting(true);
-    setFormError(null);
-
-    const result = await createPost({
-      uid: user.uid,
-      body: trimmedBody,
-      categoryId: categoryId!,
-      placeName: place.placeName.trim() || undefined,
-      placeId: place.placeId,
-    });
-
-    setIsSubmitting(false);
-
-    if (!result.ok) {
-      setFormError(result.message);
-      return;
-    }
-
-    router.replace('/');
-  };
-
-  return (
-    <HeaderScreenLayout title="Share a local note" subtitle="A thought, recommendation, or update from your city. Add a Place when it's about somewhere specific.">
-      <View>
-        <FormField
-          label="What's happening?"
-          placeholder="Share a thought, recommendation, or update..."
-          value={body}
-          onChangeText={(text) => {
-            setBody(text);
-            if (bodyError) setBodyError(null);
-          }}
-          error={bodyError ?? undefined}
-          multiline
-          numberOfLines={5}
-          maxLength={BODY_MAX_LENGTH}
-          style={styles.multilineInput}
-        />
-        <Text style={styles.charCount}>
-          {body.trim().length}/{BODY_MAX_LENGTH}
-        </Text>
-      </View>
-
-      <CategorySelector
-        value={categoryId}
-        onChange={(id) => {
-          setCategoryId(id);
-          setCategoryError(null);
-        }}
-        error={categoryError ?? undefined}
-      />
-
-      <PlaceSelector
-        label="Place (optional)"
-        cityKey={profile?.cityKey ?? ''}
-        cityLabel={profile?.cityName ? formatCityDisplayName(profile.cityName) : 'your city'}
-        value={place}
-        onChange={setPlace}
-      />
-
-      {formError ? <Text style={styles.formError}>{formError}</Text> : null}
-
-      <Button label="Publish post" onPress={handlePublish} loading={isSubmitting} />
-    </HeaderScreenLayout>
-  );
+  return null;
 }
-
-const styles = StyleSheet.create({
-  multilineInput: {
-    minHeight: 120,
-    textAlignVertical: 'top',
-    paddingTop: Spacing.md,
-  },
-  charCount: {
-    alignSelf: 'flex-end',
-    color: Colors.textSecondary,
-    fontSize: 12,
-    marginTop: 4,
-  },
-  formError: {
-    color: Colors.error,
-    fontSize: 13,
-    textAlign: 'center',
-  },
-});
