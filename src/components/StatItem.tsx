@@ -28,7 +28,10 @@ const styles = StyleSheet.create({
   item: {
     alignItems: 'center',
     gap: 2,
-    paddingHorizontal: Spacing.sm,
+    // Step 41.2H.4 — tightened from Spacing.sm to keep 4 columns (Posts,
+    // Following, Followers, Liked) comfortably clear of the narrowest
+    // supported phone widths without shrinking the text itself.
+    paddingHorizontal: Spacing.xs,
   },
   value: {
     color: Colors.text,

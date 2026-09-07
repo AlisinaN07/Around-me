@@ -1358,6 +1358,37 @@ A one-time, additive, resumable production migration that creates the `postLikes
 
 Rules, Functions, and indexes are all **unchanged** in this step — this is a data-only migration. **Liked is still not displayed anywhere on Profile** — that's Step 41.2H.4.
 
+## Lifetime Liked profile stat (Step 41.2H.4)
+
+Profile stats are now exactly **Posts | Following | Followers | Liked**, on personal and Business, own and public Profiles alike ([ProfileHeader.tsx](src/components/ProfileHeader.tsx)). **Liked** is public reputation: the lifetime count of valid, non-self Likes an account's Posts (video or legacy text) have ever received — never a count derived from currently-visible Posts, and never something the client computes itself.
+
+**Count source:** a new trusted callable, `fetchLifetimeLikedCount` (europe-north1, same region/conventions as every other callable in `functions/src/index.ts`). Given `{ profileUid }`, it runs one server-side Firestore aggregation — `postLikes.where('targetAuthorUid', '==', profileUid).count().get()` — and returns `{ ready: true, likedCount }`. No document is fetched, no relationship graph is exposed; `postLikes` itself remains completely unreadable by any client (`allow read: if false`, unchanged since Step 41.2H.1). The client service is [src/services/profileLiked.ts](src/services/profileLiked.ts).
+
+**No current-target filtering:** the aggregation's only filter is `targetAuthorUid` — it never re-checks whether the target Post/Reel, the real per-target Like, or the liker's own account still exist. By the locked Step 41.2H.2.1/41.2H.2.2 lifetime semantics, an existing `postLikes` row already **is** the earned credit regardless of any of those, so re-checking them would silently undercount legitimately-preserved historical credit.
+
+**Migration readiness gate:** before ever returning a count, the callable privileged-reads `systemMigrations/postLikesBackfillV1` (written once, read-only from here on) and requires `version == 1 && status == 'complete'`. If that marker is missing, malformed, or incomplete, the callable returns `{ ready: false }` — **never a fake `0`**. The client hides the Liked stat entirely in that case (`likedCount` prop simply omitted); once `ready` is `true`, `likedCount: 0` is rendered as a real `0`, because H.3's completion is exactly what makes it authoritative.
+
+**Profile existence & privacy:** the callable 404s (`not-found`) if `publicProfiles/{profileUid}` doesn't exist — the same canonical existence check every Profile screen already relies on. It adds **no block-based restriction**: `publicProfiles`' own read rule has none (a block only ever prevents *new* follow/like/comment/message interaction, never Profile visibility — see `isNotBlockedEitherWay`), and the public Profile screen already renders full stats for a blocked-either-way relationship today, so adding one here would make this one stat *more* restrictive than the screen it lives on.
+
+**Lifetime behavior, unchanged from H.2.1/H.2.2, now visible on Profile:**
+
+| Event | Liked total |
+|---|---|
+| Explicit Unlike | decreases |
+| Voluntary author Post/Reel deletion | unchanged |
+| Liker deletes their own account | unchanged |
+| Moderation removal of the target | decreases |
+| Author deletes their whole account | their Profile — and the stat — no longer exists |
+| Self-like, Event Like, legacy Activity Like | never counted |
+
+**Failure isolation:** unlike Posts/Following/Followers (whose fetch failures still fail the whole Profile load, unchanged), a Liked-count failure of any kind (network, permission, internal) is caught inside `fetchLifetimeLikedCount` and folded into `{ ready: false }` rather than thrown — unlike the other three stats, Liked is allowed to simply be absent for a given load rather than erroring the entire screen.
+
+**Production-verified** (disposable fixtures only, all cleaned and independently re-confirmed absent afterward): unauthenticated → denied; invalid `profileUid` → invalid-argument; nonexistent profile → not-found; a real, Rules-checked normal-client Like write plus two privileged-seeded historical rows (missing target; missing target **and** liker account) on one author → `likedCount: 3`; an unrelated author's row correctly excluded; a fresh profile with zero rows → `ready: true, likedCount: 0`; the author querying their own count → same result as any other caller; raw `postLikes` read by a normal client → still `403 PERMISSION_DENIED`.
+
+**Historical limitation** (see Step 41.2H.3): a Like whose target or liker was deleted *before* the lifetime `postLikes` model existed left no recoverable record and cannot be reconstructed — this is a permanent, documented boundary, not surfaced in the Profile UI itself.
+
+Rules, indexes, and every other Function are **unchanged** — this step deploys exactly one new callable.
+
 ## Reels (Cloud Storage — Step 18)
 
 Reels are short (≤60s), video-only posts with vertical, city-scoped playback — the first feature in this app to use Cloud Storage rather than Firestore alone. They live in their own root collection, `reels/{reelId}`, separate from `content/{contentId}` (posts/activities/events): a Reel has a media-upload lifecycle and Storage metadata that the other content types never had, and folding it into `content` would have meant giving every Post/Activity/Event query an upload-status field it never needs.

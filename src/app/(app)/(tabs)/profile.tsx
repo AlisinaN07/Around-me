@@ -21,6 +21,7 @@ import type { Content, EventContent, PostContent } from '@/types/content';
 import type { Reel } from '@/types/reel';
 import { fetchFollowerCount, fetchFollowingCount } from '@/services/following';
 import { fetchProfilePostCount, fetchPublicUserContent } from '@/services/content';
+import { fetchLifetimeLikedCount } from '@/services/profileLiked';
 import { fetchProfileActivities, type ProfileActivity } from '@/services/profileActivities';
 import { fetchProfileReelCount, fetchProfileReels } from '@/services/reels';
 import { fetchProfileReposts, type RepostedPostItem } from '@/services/reposts';
@@ -90,6 +91,9 @@ export default function ProfileScreen() {
   const [followerCount, setFollowerCount] = useState(0);
   const [followingCount, setFollowingCount] = useState(0);
   const [postsCount, setPostsCount] = useState(0);
+  // Step 41.2H.4 — undefined means "not (yet) ready/available", never a
+  // fake 0; see ProfileHeader's likedCount doc comment.
+  const [likedCount, setLikedCount] = useState<number | undefined>(undefined);
   const [content, setContent] = useState<Content[]>([]);
   const [reels, setReels] = useState<Reel[]>([]);
   const [repostedPosts, setRepostedPosts] = useState<RepostedPostItem[]>([]);
@@ -101,7 +105,7 @@ export default function ProfileScreen() {
     if (!user) return;
     setStatus('loading');
     try {
-      const [followers, following, textPostCount, reelCount, userContent, userReels, userReposts, userActivities, userSavedPosts] =
+      const [followers, following, textPostCount, reelCount, likedResult, userContent, userReels, userReposts, userActivities, userSavedPosts] =
         await Promise.all([
           fetchFollowerCount(user.uid),
           fetchFollowingCount(user.uid),
@@ -114,6 +118,11 @@ export default function ProfileScreen() {
           // error state instead.
           fetchProfilePostCount(user.uid),
           fetchProfileReelCount(user.uid),
+          // Step 41.2H.4 — the ONE stat allowed to be simply absent for a
+          // given load: fetchLifetimeLikedCount never throws (see its own
+          // doc comment), so its presence here doesn't put Liked on the
+          // same all-or-nothing footing as the counts above.
+          fetchLifetimeLikedCount(user.uid),
           // One bounded, mixed query (see PROFILE_CONTENT_LIMIT) — split
           // into the unified Posts tab's text-Post half and the Business
           // Events tab in-memory below, rather than running separate
@@ -137,6 +146,7 @@ export default function ProfileScreen() {
       setFollowerCount(followers);
       setFollowingCount(following);
       setPostsCount(textPostCount + reelCount);
+      setLikedCount(likedResult.ready ? likedResult.likedCount : undefined);
       setContent(userContent);
       setReels(userReels);
       setRepostedPosts(userReposts);
@@ -181,6 +191,7 @@ export default function ProfileScreen() {
                 postsCount={postsCount}
                 followersCount={followerCount}
                 followingCount={followingCount}
+                likedCount={likedCount}
                 onPressFollowers={() => user && router.push(`/user/${user.uid}/followers`)}
                 onPressFollowing={() => user && router.push(`/user/${user.uid}/following`)}
                 headerRight={

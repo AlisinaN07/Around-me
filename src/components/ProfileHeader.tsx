@@ -16,6 +16,15 @@ type ProfileHeaderProps = {
   postsCount: number;
   followersCount: number;
   followingCount: number;
+  /**
+   * Lifetime-earned, non-self Post Likes received (Step 41.2H.4) —
+   * authoritative only when present. `undefined` means the count isn't
+   * (yet) ready/available for this load and the whole stat is hidden;
+   * there is deliberately no default of 0, since 0 is only ever a real
+   * value once the caller has an actual server-verified count (see
+   * src/services/profileLiked.ts).
+   */
+  likedCount?: number;
   onPressFollowers?: () => void;
   onPressFollowing?: () => void;
   /** Absolutely-positioned top-right slot — settings gear (own) or overflow menu (public, non-self). */
@@ -24,10 +33,11 @@ type ProfileHeaderProps = {
 
 /**
  * Shared identity block — avatar, name, username, city, bio, Posts/
- * Following/Followers stats (Step 27, bio added Step 33). Used by both the
- * own Profile tab and the public profile route so they read as one visual
- * system rather than two (Step 27 Section 19). Deliberately carries no
- * likes-total/verification-badge slot — neither exists in the real schema.
+ * Following/Followers/Liked stats (Step 27, bio added Step 33, Liked added
+ * Step 41.2H.4). Used by both the own Profile tab and the public profile
+ * route so they read as one visual system rather than two (Step 27 Section
+ * 19). Carries no verification-badge slot — that doesn't exist in the real
+ * schema.
  */
 export function ProfileHeader({
   displayName,
@@ -37,6 +47,7 @@ export function ProfileHeader({
   postsCount,
   followersCount,
   followingCount,
+  likedCount,
   onPressFollowers,
   onPressFollowing,
   headerRight,
@@ -71,6 +82,12 @@ export function ProfileHeader({
         <StatItem value={followingCount} label="Following" onPress={onPressFollowing} />
         <View style={styles.statDivider} />
         <StatItem value={followersCount} label="Followers" onPress={onPressFollowers} />
+        {likedCount !== undefined ? (
+          <>
+            <View style={styles.statDivider} />
+            <StatItem value={likedCount} label="Liked" />
+          </>
+        ) : null}
       </View>
     </View>
   );

@@ -24,6 +24,7 @@ import { fetchProfilePostCount, fetchPublicUserContent } from '@/services/conten
 import { fetchFollowerCount, fetchFollowingCount, followUser, isFollowing, unfollowUser } from '@/services/following';
 import { fetchConversation, getConversationId } from '@/services/messages';
 import { fetchMyNewMessagesFrom } from '@/services/privacySettings';
+import { fetchLifetimeLikedCount } from '@/services/profileLiked';
 import { fetchPublicProfile } from '@/services/publicProfile';
 import { fetchProfileActivities, type ProfileActivity } from '@/services/profileActivities';
 import { fetchProfileReelCount, fetchProfileReels } from '@/services/reels';
@@ -88,6 +89,9 @@ export default function PublicProfileScreen() {
   const [followerCount, setFollowerCount] = useState(0);
   const [followingCount, setFollowingCount] = useState(0);
   const [postsCount, setPostsCount] = useState(0);
+  // Step 41.2H.4 — undefined means "not (yet) ready/available", never a
+  // fake 0; see ProfileHeader's likedCount doc comment.
+  const [likedCount, setLikedCount] = useState<number | undefined>(undefined);
   const [amFollowing, setAmFollowing] = useState(false);
   const [isFollowSubmitting, setIsFollowSubmitting] = useState(false);
   const [followError, setFollowError] = useState<string | null>(null);
@@ -118,6 +122,7 @@ export default function PublicProfileScreen() {
         following,
         textPostCount,
         reelCount,
+        likedResult,
         followingState,
         userContent,
         userReels,
@@ -136,6 +141,10 @@ export default function PublicProfileScreen() {
         // instead, same as an own-profile load failure.
         fetchProfilePostCount(uid),
         fetchProfileReelCount(uid),
+        // Step 41.2H.4 — the ONE stat allowed to be simply absent for a
+        // given load; fetchLifetimeLikedCount never throws (see its own
+        // doc comment), same reasoning as the own-Profile screen.
+        fetchLifetimeLikedCount(uid),
         !isOwnProfile && user ? isFollowing(user.uid, uid) : Promise.resolve(false),
         // One mixed, bounded query (see PROFILE_CONTENT_LIMIT) — split into
         // the unified Posts tab's text-Post half and the Business Events
@@ -164,6 +173,7 @@ export default function PublicProfileScreen() {
       setFollowerCount(followers);
       setFollowingCount(following);
       setPostsCount(textPostCount + reelCount);
+      setLikedCount(likedResult.ready ? likedResult.likedCount : undefined);
       setAmFollowing(followingState);
       setContent(userContent);
       setReels(userReels);
@@ -272,6 +282,7 @@ export default function PublicProfileScreen() {
             postsCount={postsCount}
             followersCount={followerCount}
             followingCount={followingCount}
+            likedCount={likedCount}
             onPressFollowers={() => router.push(`/user/${uid}/followers`)}
             onPressFollowing={() => router.push(`/user/${uid}/following`)}
             headerRight={

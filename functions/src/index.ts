@@ -642,6 +642,81 @@ export const fetchProfileActivities = onCall({ region: REGION }, async (request)
 });
 
 // ---------------------------------------------------------------------------
+// Step 41.2H.4 — trusted lifetime "Liked" count for Profile display.
+//
+// postLikes/{likeId} (Step 41.2H.1, historically backfilled by Step
+// 41.2H.3) is the sole source of truth: the Profile "Liked" stat is
+// exactly COUNT(postLikes where targetAuthorUid == profileUid). No
+// re-check of the target Post/Reel, the real per-target Like, or the
+// liker's own account is performed here — by the locked H.2.1/H.2.2
+// lifetime semantics, an existing postLikes row already IS the earned
+// credit, whether or not its target or liker still exist (see the
+// drainPairedPostLikesForTarget comment block above). postLikes itself
+// stays completely unreadable by any client (firestore.rules: `allow
+// read: if false`) — this callable exposes only the derived aggregate
+// count, never a row, a liker uid, or a target id, and grants no
+// visibility into the relationship graph itself.
+// ---------------------------------------------------------------------------
+
+const MAX_LIKED_COUNT_UID_LENGTH = 128;
+const POST_LIKES_BACKFILL_MARKER_PATH = 'systemMigrations/postLikesBackfillV1';
+
+export const fetchLifetimeLikedCount = onCall({ region: REGION }, async (request) => {
+  if (!request.auth) {
+    throw new HttpsError('unauthenticated', 'Sign in required.');
+  }
+  const profileUid = request.data?.profileUid;
+  if (typeof profileUid !== 'string' || profileUid.length === 0 || profileUid.length > MAX_LIKED_COUNT_UID_LENGTH) {
+    throw new HttpsError('invalid-argument', 'profileUid is required.');
+  }
+
+  const db = getFirestore();
+
+  // Profile existence — the same canonical public-profile source of truth
+  // every Profile screen already reads (src/services/publicProfile.ts). A
+  // fully deleted account's publicProfiles/{uid} is gone, so this
+  // naturally stops returning a count the moment the account is deleted —
+  // matching the locked "author deletes their whole account" rule (their
+  // Profile no longer exists to hold a lifetime value).
+  const profileSnap = await db.doc(`publicProfiles/${profileUid}`).get();
+  if (!profileSnap.exists) {
+    throw new HttpsError('not-found', 'No profile with that ID exists.');
+  }
+
+  // Blocking/privacy: firestore.rules' publicProfiles read rule (`allow
+  // read: if isSignedIn()`) carries no block check at all — a block only
+  // ever prevents NEW follow/like/comment/message interaction (see
+  // isNotBlockedEitherWay), never Profile visibility itself, and the
+  // public Profile screen (src/app/(app)/user/[uid]/index.tsx) renders
+  // full stats for a blocked-either-way profile today. Matching that
+  // exact existing policy: no block check is added here, since the screen
+  // this count feeds enforces none either — adding one would be a MORE
+  // restrictive policy than the product's own Profile screen, which
+  // Section 8 of this step's spec forbids just as much as being too
+  // permissive.
+
+  // Migration readiness gate — read-only; this marker is never rewritten
+  // here (see scripts/migrations/backfill-post-likes.cjs, Step 41.2H.3).
+  // A missing/malformed/incomplete/wrong-version marker returns a typed
+  // "not ready" result, never a fake 0 — the client hides the stat rather
+  // than showing a confident wrong number.
+  const markerSnap = await db.doc(POST_LIKES_BACKFILL_MARKER_PATH).get();
+  const marker = markerSnap.data();
+  if (!markerSnap.exists || marker?.version !== 1 || marker?.status !== 'complete') {
+    return { ready: false as const };
+  }
+
+  // Trusted server-side aggregation — one COUNT read, no documents
+  // transferred, no client-side scan. targetAuthorUid is the ONLY filter:
+  // no current-target/real-Like/liker-account re-validation, since the
+  // authoritative postLikes row is already the final source of truth for
+  // lifetime credit (Step 41.2H.2.1/41.2H.2.2).
+  const countSnap = await db.collection('postLikes').where('targetAuthorUid', '==', profileUid).count().get();
+
+  return { ready: true as const, likedCount: countSnap.data().count };
+});
+
+// ---------------------------------------------------------------------------
 // Step 39.1 — moderation authorization foundation.
 //
 // Admin identity is a Firebase Auth custom claim (admin: true), set only by
