@@ -1,4 +1,4 @@
-import { Pressable, StyleSheet, Text, View } from 'react-native';
+import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 
 import { Colors, Spacing } from '@/constants/theme';
 
@@ -7,6 +7,14 @@ type ProfileTabBarProps<T extends string> = {
   value: T;
   onChange: (id: T) => void;
 };
+
+// Step 41.2G — Business Own Profile now reaches 5 tabs. Above this many,
+// equal-flex tabs get too narrow for a label like "Activities" on a narrow
+// phone, so the row switches to horizontal scroll with a fixed per-tab
+// min-width instead of squeezing every label. At 4 tabs or fewer (every
+// other profile/account combination), the original equal-flex row is
+// unchanged — this threshold only ever fires for the one 5-tab case.
+const SCROLL_THRESHOLD = 4;
 
 /**
  * Underline content-tab bar for Profile screens (Step 27) — social/media-
@@ -17,27 +25,35 @@ type ProfileTabBarProps<T extends string> = {
  * without touching Home.
  */
 export function ProfileTabBar<T extends string>({ tabs, value, onChange }: ProfileTabBarProps<T>) {
-  return (
-    <View style={styles.row}>
-      {tabs.map((tab) => {
-        const active = tab.id === value;
-        return (
-          <Pressable
-            key={tab.id}
-            onPress={() => onChange(tab.id)}
-            style={styles.tab}
-            accessibilityRole="tab"
-            accessibilityState={{ selected: active }}
-          >
-            <Text style={[styles.label, active && styles.labelActive]} numberOfLines={1}>
-              {tab.label}
-            </Text>
-            {active ? <View style={styles.indicator} /> : null}
-          </Pressable>
-        );
-      })}
-    </View>
-  );
+  const scrollable = tabs.length > SCROLL_THRESHOLD;
+
+  const tabItems = tabs.map((tab) => {
+    const active = tab.id === value;
+    return (
+      <Pressable
+        key={tab.id}
+        onPress={() => onChange(tab.id)}
+        style={[styles.tab, scrollable && styles.tabScrollable]}
+        accessibilityRole="tab"
+        accessibilityState={{ selected: active }}
+      >
+        <Text style={[styles.label, active && styles.labelActive]} numberOfLines={1}>
+          {tab.label}
+        </Text>
+        {active ? <View style={styles.indicator} /> : null}
+      </Pressable>
+    );
+  });
+
+  if (scrollable) {
+    return (
+      <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.scrollRow} contentContainerStyle={styles.scrollContent}>
+        {tabItems}
+      </ScrollView>
+    );
+  }
+
+  return <View style={styles.row}>{tabItems}</View>;
 }
 
 const styles = StyleSheet.create({
@@ -46,11 +62,23 @@ const styles = StyleSheet.create({
     borderBottomWidth: 1,
     borderBottomColor: Colors.border,
   },
+  scrollRow: {
+    borderBottomWidth: 1,
+    borderBottomColor: Colors.border,
+  },
+  scrollContent: {
+    flexDirection: 'row',
+  },
   tab: {
     flex: 1,
     alignItems: 'center',
     gap: Spacing.sm,
     paddingBottom: Spacing.sm,
+  },
+  tabScrollable: {
+    flex: 0,
+    minWidth: 84,
+    paddingHorizontal: Spacing.md,
   },
   label: {
     color: Colors.textMuted,

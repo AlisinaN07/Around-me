@@ -8,6 +8,7 @@ import { ConfirmDialog } from '@/components/ConfirmDialog';
 import { ContentCard } from '@/components/ContentCard';
 import { EmptyState } from '@/components/EmptyState';
 import { ErrorState } from '@/components/ErrorState';
+import { EventCard } from '@/components/EventCard';
 import { HeaderScreenLayout } from '@/components/HeaderScreenLayout';
 import { InterestPills } from '@/components/InterestPills';
 import { LoadingState } from '@/components/LoadingState';
@@ -24,6 +25,7 @@ import { fetchFollowerCount, fetchFollowingCount, followUser, isFollowing, unfol
 import { fetchConversation, getConversationId } from '@/services/messages';
 import { fetchMyNewMessagesFrom } from '@/services/privacySettings';
 import { fetchPublicProfile } from '@/services/publicProfile';
+import { fetchProfileActivities, type ProfileActivity } from '@/services/profileActivities';
 import { fetchProfileReelCount, fetchProfileReels } from '@/services/reels';
 import { fetchProfileReposts, type RepostedPostItem } from '@/services/reposts';
 import type { Content, EventContent, PostContent } from '@/types/content';
@@ -36,20 +38,24 @@ import { mergeProfilePosts } from '@/utils/profilePosts';
 type LoadStatus = 'loading' | 'loaded' | 'error';
 // Step 41.2C — unified Posts tab: 'reel' (video Post) and legacy text
 // 'post' now merge into a single 'post' tab, so this is no longer a
-// per-technical-type selector, just Posts vs. 'repost' (Step 41.2F, PUBLIC
-// — shown here too) vs. (Business-only) Events. Saved (Step 41.2E) is
-// PRIVATE and never appears on this public profile route. Tab order is
-// locked: Posts, Reposts, (Events).
-type ProfileTab = 'post' | 'repost' | 'event';
+// per-technical-type selector, just Posts vs. 'repost' (Step 41.2F, PUBLIC)
+// vs. 'activity' (Step 41.2G, PUBLIC — Events this profile owner marked
+// Interested/Going, NOT the retired legacy content.type=='activity') vs.
+// (Business-only) Events. Saved (Step 41.2E) is PRIVATE and never appears
+// on this public profile route. Tab order is locked: Posts, Reposts,
+// (Events), Activities.
+type ProfileTab = 'post' | 'repost' | 'event' | 'activity';
 
 const PROFILE_TABS_PERSONAL: { id: ProfileTab; label: string }[] = [
   { id: 'post', label: 'Posts' },
   { id: 'repost', label: 'Reposts' },
+  { id: 'activity', label: 'Activities' },
 ];
 const PROFILE_TABS_BUSINESS: { id: ProfileTab; label: string }[] = [
   { id: 'post', label: 'Posts' },
   { id: 'repost', label: 'Reposts' },
   { id: 'event', label: 'Events' },
+  { id: 'activity', label: 'Activities' },
 ];
 
 // See src/app/(app)/(tabs)/profile.tsx's own PROFILE_CONTENT_LIMIT doc
@@ -61,6 +67,7 @@ const EMPTY_TEXT: Record<ProfileTab, string> = {
   post: 'No posts yet',
   repost: 'No reposts yet',
   event: 'No events yet',
+  activity: 'No activities yet',
 };
 
 /**
@@ -87,6 +94,7 @@ export default function PublicProfileScreen() {
   const [content, setContent] = useState<Content[]>([]);
   const [reels, setReels] = useState<Reel[]>([]);
   const [repostedPosts, setRepostedPosts] = useState<RepostedPostItem[]>([]);
+  const [activities, setActivities] = useState<ProfileActivity[]>([]);
   const [contentTab, setContentTab] = useState<ProfileTab>('post');
 
   // Safety state — see src/services/blocks.ts / privacySettings.ts.
@@ -104,35 +112,50 @@ export default function PublicProfileScreen() {
   // synchronously during the effect body below.
   const load = useCallback(async () => {
     try {
-      const [publicProfile, followers, following, textPostCount, reelCount, followingState, userContent, userReels, userReposts, blockedByMe] =
-        await Promise.all([
-          fetchPublicProfile(uid),
-          fetchFollowerCount(uid),
-          fetchFollowingCount(uid),
-          // Two exact server-side aggregations, summed — see
-          // fetchProfilePostCount's and fetchProfileReelCount's own doc
-          // comments. A failure here falls into the same catch as every
-          // other profile fetch below, so a failed count is never shown as
-          // a confident (wrong) 0 — the whole screen shows its error state
-          // instead, same as an own-profile load failure.
-          fetchProfilePostCount(uid),
-          fetchProfileReelCount(uid),
-          !isOwnProfile && user ? isFollowing(user.uid, uid) : Promise.resolve(false),
-          // One mixed, bounded query (see PROFILE_CONTENT_LIMIT) — split into
-          // the unified Posts tab's text-Post half and the Business Events
-          // tab in-memory below, rather than running separate queries. This
-          // stays bounded on purpose; only the Posts STAT above is exact.
-          fetchPublicUserContent(uid, PROFILE_CONTENT_LIMIT),
-          // Reels are a separate root collection from content/{contentId}
-          // (see src/types/reel.ts), so this is its own capped query, not
-          // part of the mixed content query above.
-          fetchProfileReels(uid),
-          // PUBLIC (Step 41.2F) — reposts/{repostId} is a public root
-          // collection, so this uid's Reposts are fetched exactly the same
-          // way whether this is the caller's own profile or someone else's.
-          fetchProfileReposts(uid),
-          !isOwnProfile && user ? isUserBlocked(user.uid, uid) : Promise.resolve(false),
-        ]);
+      const [
+        publicProfile,
+        followers,
+        following,
+        textPostCount,
+        reelCount,
+        followingState,
+        userContent,
+        userReels,
+        userReposts,
+        userActivities,
+        blockedByMe,
+      ] = await Promise.all([
+        fetchPublicProfile(uid),
+        fetchFollowerCount(uid),
+        fetchFollowingCount(uid),
+        // Two exact server-side aggregations, summed — see
+        // fetchProfilePostCount's and fetchProfileReelCount's own doc
+        // comments. A failure here falls into the same catch as every
+        // other profile fetch below, so a failed count is never shown as
+        // a confident (wrong) 0 — the whole screen shows its error state
+        // instead, same as an own-profile load failure.
+        fetchProfilePostCount(uid),
+        fetchProfileReelCount(uid),
+        !isOwnProfile && user ? isFollowing(user.uid, uid) : Promise.resolve(false),
+        // One mixed, bounded query (see PROFILE_CONTENT_LIMIT) — split into
+        // the unified Posts tab's text-Post half and the Business Events
+        // tab in-memory below, rather than running separate queries. This
+        // stays bounded on purpose; only the Posts STAT above is exact.
+        fetchPublicUserContent(uid, PROFILE_CONTENT_LIMIT),
+        // Reels are a separate root collection from content/{contentId}
+        // (see src/types/reel.ts), so this is its own capped query, not
+        // part of the mixed content query above.
+        fetchProfileReels(uid),
+        // PUBLIC (Step 41.2F) — reposts/{repostId} is a public root
+        // collection, so this uid's Reposts are fetched exactly the same
+        // way whether this is the caller's own profile or someone else's.
+        fetchProfileReposts(uid),
+        // PUBLIC (Step 41.2G) — same bounded collectionGroup query
+        // regardless of whose profile this is; see fetchProfileActivities'
+        // own doc comment for why this needs no Rules/index change.
+        fetchProfileActivities(uid),
+        !isOwnProfile && user ? isUserBlocked(user.uid, uid) : Promise.resolve(false),
+      ]);
       if (!publicProfile) {
         setStatus('error');
         return;
@@ -145,6 +168,7 @@ export default function PublicProfileScreen() {
       setContent(userContent);
       setReels(userReels);
       setRepostedPosts(userReposts);
+      setActivities(userActivities);
       setAmIBlockingThem(blockedByMe);
 
       if (!isOwnProfile && user && !blockedByMe) {
@@ -343,12 +367,22 @@ export default function PublicProfileScreen() {
                   )}
                 </View>
               )
-            ) : businessEvents.length === 0 ? (
-              <EmptyState bare icon="calendar-outline" title={EMPTY_TEXT.event} />
+            ) : contentTab === 'event' ? (
+              businessEvents.length === 0 ? (
+                <EmptyState bare icon="calendar-outline" title={EMPTY_TEXT.event} />
+              ) : (
+                <View style={styles.contentList}>
+                  {businessEvents.map((item) => (
+                    <ContentCard key={item.contentId} item={item} currentUid={user?.uid ?? null} />
+                  ))}
+                </View>
+              )
+            ) : activities.length === 0 ? (
+              <EmptyState bare icon="star-outline" title={EMPTY_TEXT.activity} />
             ) : (
               <View style={styles.contentList}>
-                {businessEvents.map((item) => (
-                  <ContentCard key={item.contentId} item={item} currentUid={user?.uid ?? null} />
+                {activities.map(({ event, responseStatus }) => (
+                  <EventCard key={event.contentId} item={event} variant="row" responseStatus={responseStatus} />
                 ))}
               </View>
             )}

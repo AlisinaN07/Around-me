@@ -9,7 +9,7 @@ import { MediaCard } from '@/components/MediaCard';
 import { Pill } from '@/components/Pill';
 import { INTERESTS } from '@/constants/interests';
 import { Colors, Radius, Spacing, Typography } from '@/constants/theme';
-import type { ActivityContent, EventContent } from '@/types/content';
+import type { ActivityContent, EventContent, EventResponseStatus } from '@/types/content';
 import { getCityDayWindow, isHappeningNow } from '@/utils/dateWindows';
 import { formatEventTime, formatTimePill } from '@/utils/timeFormat';
 
@@ -28,6 +28,16 @@ type EventCardProps = {
    * This Weekend & Coming Up).
    */
   variant?: EventCardVariant;
+  /**
+   * Step 41.2G — Profile Activities only. When set, the 'row' variant
+   * shows a static "Interested"/"Going" badge instead of the live,
+   * viewer's-own-response EventActionButtons control: an Activities item
+   * displays the PROFILE OWNER's response, which is never the viewer's own
+   * state and is never itself tappable here (the real, actionable control
+   * still lives only on the Event detail screen). Ignored by every other
+   * variant — fully backward-compatible, existing callers are unaffected.
+   */
+  responseStatus?: EventResponseStatus;
 };
 
 type Badge = { label: string; tone: 'now' | 'soon' };
@@ -44,9 +54,9 @@ function getBadge(item: ActivityContent | EventContent, now: Date, liveLabel: st
   return null;
 }
 
-export function EventCard({ item, now = new Date(), onPress, variant = 'compact' }: EventCardProps) {
+export function EventCard({ item, now = new Date(), onPress, variant = 'compact', responseStatus }: EventCardProps) {
   if (variant === 'hero') return <HeroCard item={item} now={now} onPress={onPress} />;
-  if (variant === 'row') return <RowCard item={item} now={now} onPress={onPress} />;
+  if (variant === 'row') return <RowCard item={item} now={now} onPress={onPress} responseStatus={responseStatus} />;
   if (variant === 'upcoming') return <UpcomingCard item={item} now={now} onPress={onPress} />;
   return <CompactCard item={item} now={now} onPress={onPress} />;
 }
@@ -113,8 +123,12 @@ function HeroCard({ item, now, onPress }: VariantCardProps) {
  * time/title/place/category, right real action(s) (two stacked pills for
  * an Event, one for an Activity — narrow row width can't fit two
  * side-by-side Event pills legibly).
+ *
+ * Step 41.2G: when `responseStatus` is passed (Profile Activities only),
+ * the trailing control is a static Interested/Going Pill instead of the
+ * live EventActionButtons — see EventCardProps' own doc comment for why.
  */
-function RowCard({ item, now, onPress }: VariantCardProps) {
+function RowCard({ item, now, onPress, responseStatus }: VariantCardProps & { responseStatus?: EventResponseStatus }) {
   const category = INTERESTS.find((interest) => interest.id === item.categoryId);
   const badge = getBadge(item, now, 'LIVE');
   const isActivity = item.type === 'activity';
@@ -143,7 +157,15 @@ function RowCard({ item, now, onPress }: VariantCardProps) {
         ) : null}
       </View>
 
-      <EventActionButtons item={item} direction="column" compact />
+      {responseStatus ? (
+        <Pill
+          label={responseStatus === 'going' ? 'Going' : 'Interested'}
+          tone={responseStatus === 'going' ? 'success' : 'accent'}
+          icon={responseStatus === 'going' ? 'checkmark-circle' : 'star'}
+        />
+      ) : (
+        <EventActionButtons item={item} direction="column" compact />
+      )}
     </Pressable>
   );
 }

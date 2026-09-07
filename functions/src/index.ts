@@ -421,6 +421,86 @@ export const deleteMyAccountData = onCall({ region: REGION, timeoutSeconds: 300,
 });
 
 // ---------------------------------------------------------------------------
+// Step 41.2G — Profile Activities (Events a profile owner marked
+// Interested/Going). NOT an admin/moderation callable — any signed-in user
+// may call this for any profileUid, exactly the same floor
+// firestore.rules already sets for content/{eventId}/responses/{uid}
+// itself ("allow read: if isSignedIn() && ..."). This exists as a trusted
+// backend call ONLY because collectionGroup() queries are denied outright
+// to client SDK callers in this Firebase project regardless of Rules
+// content (see README's "Event card interaction state", Step 26.1) — the
+// Admin SDK has no such restriction (already relied on by
+// deleteMyAccountData's own collectionGroup cross-user cleanup above).
+// This callable grants no privilege beyond what firestore.rules already
+// permits a real client to read one document at a time; it just runs the
+// one query type clients here structurally cannot run themselves.
+// ---------------------------------------------------------------------------
+
+const PROFILE_ACTIVITIES_LIMIT = 50;
+
+export const fetchProfileActivities = onCall({ region: REGION }, async (request) => {
+  if (!request.auth) {
+    throw new HttpsError('unauthenticated', 'Sign in required.');
+  }
+  const profileUid = request.data?.profileUid;
+  if (typeof profileUid !== 'string' || profileUid.length === 0) {
+    throw new HttpsError('invalid-argument', 'profileUid is required.');
+  }
+
+  const db = getFirestore();
+  const snap = await db.collectionGroup('responses').where('uid', '==', profileUid).limit(PROFILE_ACTIVITIES_LIMIT).get();
+
+  const activities: { event: Record<string, unknown>; responseStatus: string }[] = [];
+  for (const responseDoc of snap.docs) {
+    const responseData = responseDoc.data();
+    // content/{eventId}/responses/{uid} — the response doc's own parent
+    // document is always the exact Event it belongs to, so this never
+    // queries the whole content collection per response.
+    const eventId = responseDoc.ref.parent.parent?.id;
+    if (!eventId) continue;
+
+    const eventSnap = await db.doc(`content/${eventId}`).get();
+    if (!eventSnap.exists) continue;
+    const event = eventSnap.data()!;
+    if (event.type !== 'event' || event.status !== 'published') continue;
+    // Defensive exclusion (Section 29): a Business account should never
+    // see its own authored Event doubled into its own Activities tab.
+    if (event.authorUid === profileUid) continue;
+
+    activities.push({
+      event: {
+        contentId: eventId,
+        authorUid: event.authorUid,
+        authorDisplayName: event.authorDisplayName,
+        authorUsername: event.authorUsername,
+        cityName: event.cityName,
+        countryCode: event.countryCode,
+        cityKey: event.cityKey,
+        categoryId: event.categoryId,
+        status: event.status,
+        visibility: event.visibility,
+        placeId: event.placeId,
+        type: 'event',
+        title: event.title,
+        description: event.description,
+        placeName: event.placeName,
+        // Serialized as epoch milliseconds, not raw Timestamp objects —
+        // see src/services/profileActivities.ts's own doc comment for why
+        // the client reconstructs real Timestamps from these explicitly
+        // rather than relying on callable-transport auto-marshalling.
+        startsAt: (event.startsAt as FirebaseFirestore.Timestamp).toMillis(),
+        endsAt: (event.endsAt as FirebaseFirestore.Timestamp).toMillis(),
+        createdAt: (event.createdAt as FirebaseFirestore.Timestamp).toMillis(),
+        updatedAt: (event.updatedAt as FirebaseFirestore.Timestamp).toMillis(),
+      },
+      responseStatus: responseData.status as string,
+    });
+  }
+
+  return { activities };
+});
+
+// ---------------------------------------------------------------------------
 // Step 39.1 — moderation authorization foundation.
 //
 // Admin identity is a Firebase Auth custom claim (admin: true), set only by

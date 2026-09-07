@@ -8,6 +8,7 @@ import { Button } from '@/components/Button';
 import { ContentCard } from '@/components/ContentCard';
 import { EmptyState } from '@/components/EmptyState';
 import { ErrorState } from '@/components/ErrorState';
+import { EventCard } from '@/components/EventCard';
 import { InterestPills } from '@/components/InterestPills';
 import { LoadingState } from '@/components/LoadingState';
 import { ProfileHeader } from '@/components/ProfileHeader';
@@ -20,6 +21,7 @@ import type { Content, EventContent, PostContent } from '@/types/content';
 import type { Reel } from '@/types/reel';
 import { fetchFollowerCount, fetchFollowingCount } from '@/services/following';
 import { fetchProfilePostCount, fetchPublicUserContent } from '@/services/content';
+import { fetchProfileActivities, type ProfileActivity } from '@/services/profileActivities';
 import { fetchProfileReelCount, fetchProfileReels } from '@/services/reels';
 import { fetchProfileReposts, type RepostedPostItem } from '@/services/reposts';
 import { fetchSavedPosts, type SavedPostItem } from '@/services/saved';
@@ -31,21 +33,24 @@ type LoadStatus = 'loading' | 'loaded' | 'error';
 // Step 41.2C — unified Posts tab: 'reel' (video Post) and legacy text
 // 'post' now merge into a single 'post' tab, so this is no longer a
 // per-technical-type selector, just Posts vs. (Business-only) Events vs.
-// 'repost' (Step 41.2F, PUBLIC — also shown on the public profile route)
-// vs. 'saved' (Step 41.2E, PRIVATE — own Profile only, never shown on the
-// public profile route). Tab order is locked: Posts, Reposts, (Events),
-// Saved.
-type ProfileTab = 'post' | 'repost' | 'event' | 'saved';
+// 'repost' (Step 41.2F, PUBLIC) vs. 'activity' (Step 41.2G, PUBLIC — Events
+// this profile owner marked Interested/Going, NOT the retired legacy
+// content.type=='activity') vs. 'saved' (Step 41.2E, PRIVATE — own Profile
+// only, never shown on the public profile route). Tab order is locked:
+// Posts, Reposts, (Events), Activities, Saved.
+type ProfileTab = 'post' | 'repost' | 'event' | 'activity' | 'saved';
 
 const PROFILE_TABS_PERSONAL: { id: ProfileTab; label: string }[] = [
   { id: 'post', label: 'Posts' },
   { id: 'repost', label: 'Reposts' },
+  { id: 'activity', label: 'Activities' },
   { id: 'saved', label: 'Saved' },
 ];
 const PROFILE_TABS_BUSINESS: { id: ProfileTab; label: string }[] = [
   { id: 'post', label: 'Posts' },
   { id: 'repost', label: 'Reposts' },
   { id: 'event', label: 'Events' },
+  { id: 'activity', label: 'Activities' },
   { id: 'saved', label: 'Saved' },
 ];
 
@@ -62,6 +67,7 @@ const EMPTY_TEXT: Record<ProfileTab, string> = {
   post: 'No posts yet',
   repost: 'No reposts yet',
   event: 'No events yet',
+  activity: 'No activities yet',
   saved: 'No saved posts yet',
 };
 
@@ -87,6 +93,7 @@ export default function ProfileScreen() {
   const [content, setContent] = useState<Content[]>([]);
   const [reels, setReels] = useState<Reel[]>([]);
   const [repostedPosts, setRepostedPosts] = useState<RepostedPostItem[]>([]);
+  const [activities, setActivities] = useState<ProfileActivity[]>([]);
   const [savedPosts, setSavedPosts] = useState<SavedPostItem[]>([]);
   const [activeTab, setActiveTab] = useState<ProfileTab>('post');
 
@@ -94,41 +101,46 @@ export default function ProfileScreen() {
     if (!user) return;
     setStatus('loading');
     try {
-      const [followers, following, textPostCount, reelCount, userContent, userReels, userReposts, userSavedPosts] = await Promise.all([
-        fetchFollowerCount(user.uid),
-        fetchFollowingCount(user.uid),
-        // Two exact server-side aggregations, summed — see
-        // fetchProfilePostCount's and fetchProfileReelCount's own doc
-        // comments for why neither is ever derived from the bounded
-        // mixed/Reel queries below. A failure here falls into the same
-        // catch as every other profile fetch, so a failed count is never
-        // shown as a confident (wrong) 0 — the whole screen shows its
-        // error state instead.
-        fetchProfilePostCount(user.uid),
-        fetchProfileReelCount(user.uid),
-        // One bounded, mixed query (see PROFILE_CONTENT_LIMIT) — split
-        // into the unified Posts tab's text-Post half and the Business
-        // Events tab in-memory below, rather than running separate
-        // queries. The Posts TAB stays bounded by this same fetch (merged
-        // with the separately-bounded Reels fetch below); only the Posts
-        // STAT above is exact.
-        fetchPublicUserContent(user.uid, PROFILE_CONTENT_LIMIT),
-        fetchProfileReels(user.uid),
-        // PUBLIC (Step 41.2F) — same query a visitor's public profile view
-        // would run for this uid; fetched here unconditionally like every
-        // other tab's data, regardless of which tab is currently active.
-        fetchProfileReposts(user.uid),
-        // Private to this account (Step 41.2E) — fetched here unconditionally,
-        // same as every other own-Profile tab's data, regardless of which tab
-        // is currently active; never fetched on the public profile route.
-        fetchSavedPosts(user.uid),
-      ]);
+      const [followers, following, textPostCount, reelCount, userContent, userReels, userReposts, userActivities, userSavedPosts] =
+        await Promise.all([
+          fetchFollowerCount(user.uid),
+          fetchFollowingCount(user.uid),
+          // Two exact server-side aggregations, summed — see
+          // fetchProfilePostCount's and fetchProfileReelCount's own doc
+          // comments for why neither is ever derived from the bounded
+          // mixed/Reel queries below. A failure here falls into the same
+          // catch as every other profile fetch, so a failed count is never
+          // shown as a confident (wrong) 0 — the whole screen shows its
+          // error state instead.
+          fetchProfilePostCount(user.uid),
+          fetchProfileReelCount(user.uid),
+          // One bounded, mixed query (see PROFILE_CONTENT_LIMIT) — split
+          // into the unified Posts tab's text-Post half and the Business
+          // Events tab in-memory below, rather than running separate
+          // queries. The Posts TAB stays bounded by this same fetch (merged
+          // with the separately-bounded Reels fetch below); only the Posts
+          // STAT above is exact.
+          fetchPublicUserContent(user.uid, PROFILE_CONTENT_LIMIT),
+          fetchProfileReels(user.uid),
+          // PUBLIC (Step 41.2F) — same query a visitor's public profile view
+          // would run for this uid; fetched here unconditionally like every
+          // other tab's data, regardless of which tab is currently active.
+          fetchProfileReposts(user.uid),
+          // PUBLIC (Step 41.2G) — one bounded collectionGroup query; see
+          // fetchProfileActivities' own doc comment.
+          fetchProfileActivities(user.uid),
+          // Private to this account (Step 41.2E) — fetched here unconditionally,
+          // same as every other own-Profile tab's data, regardless of which tab
+          // is currently active; never fetched on the public profile route.
+          fetchSavedPosts(user.uid),
+        ]);
       setFollowerCount(followers);
       setFollowingCount(following);
       setPostsCount(textPostCount + reelCount);
       setContent(userContent);
       setReels(userReels);
       setRepostedPosts(userReposts);
+      setActivities(userActivities);
       setSavedPosts(userSavedPosts);
       setStatus('loaded');
     } catch {
@@ -239,6 +251,21 @@ export default function ProfileScreen() {
                     <View style={styles.contentList}>
                       {businessEvents.map((item) => (
                         <ContentCard key={item.contentId} item={item} currentUid={user?.uid ?? null} />
+                      ))}
+                    </View>
+                  )
+                ) : activeTab === 'activity' ? (
+                  activities.length === 0 ? (
+                    <EmptyState
+                      bare
+                      icon="star-outline"
+                      title={EMPTY_TEXT.activity}
+                      body="Events you're interested in or going to will appear here."
+                    />
+                  ) : (
+                    <View style={styles.contentList}>
+                      {activities.map(({ event, responseStatus }) => (
+                        <EventCard key={event.contentId} item={event} variant="row" responseStatus={responseStatus} />
                       ))}
                     </View>
                   )
