@@ -80,7 +80,7 @@ export default function TabsLayout() {
             // the profile has loaded.
             if (isConfidentlyPersonal) {
               event.preventDefault();
-              router.push('/create/reel');
+              router.push('/create/reel/camera');
             }
           },
         }}

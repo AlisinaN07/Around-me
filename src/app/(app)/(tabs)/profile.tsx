@@ -175,7 +175,7 @@ export default function ProfileScreen() {
                       bare
                       icon="albums-outline"
                       title={EMPTY_TEXT.post}
-                      action={<Button label="Create post" variant="secondary" onPress={() => router.push('/create/reel')} />}
+                      action={<Button label="Create post" variant="secondary" onPress={() => router.push('/create/reel/camera')} />}
                     />
                   ) : (
                     <View style={styles.postsGrid}>

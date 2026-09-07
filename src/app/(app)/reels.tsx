@@ -76,7 +76,7 @@ export default function ReelsScreen() {
           body={`Be the first to show what's happening in ${cityLabel}.`}
           action={
             <>
-              <Button label="Create post" onPress={() => router.push('/create/reel')} />
+              <Button label="Create post" onPress={() => router.push('/create/reel/camera')} />
               {isExploringAnotherCity && homeCity ? (
                 <Text style={styles.exploringHint}>Posts you create publish to your home city, {homeCity.cityName}.</Text>
               ) : null}

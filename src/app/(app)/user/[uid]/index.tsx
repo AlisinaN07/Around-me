@@ -296,7 +296,7 @@ export default function PublicProfileScreen() {
                   icon="albums-outline"
                   title={EMPTY_TEXT.post}
                   action={
-                    isOwnProfile ? <Button label="Create post" variant="secondary" onPress={() => router.push('/create/reel')} /> : undefined
+                    isOwnProfile ? <Button label="Create post" variant="secondary" onPress={() => router.push('/create/reel/camera')} /> : undefined
                   }
                 />
               ) : (

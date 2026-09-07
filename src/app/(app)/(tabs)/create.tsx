@@ -12,13 +12,15 @@ import { useCity } from '@/providers/CityProvider';
 import { isBusinessAccount } from '@/utils/accountCapabilities';
 
 /**
- * Create hub — Step 41.2D. There are now exactly two user-facing creatable
- * concepts: Post (video, technically a Reel — see /create/reel) and Event
- * (Business-only). Personal has only one, so this screen is not a chooser
- * for Personal at all: once the already-loaded profile confirms
- * accountType, it immediately `router.replace`s to /create/reel rather than
- * showing a "chooser" with a single real option. Business sees a two-option
- * Post/Event chooser below.
+ * Create hub — Step 41.2D, entry point updated in Step 41.2D.1. There are
+ * exactly two user-facing creatable concepts: Post (video, technically a
+ * Reel — canonical creation entry is /create/reel/camera, the camera-first
+ * capture/preview flow) and Event (Business-only). Personal has only one,
+ * so this screen is not a chooser for Personal at all: once the
+ * already-loaded profile confirms accountType, it immediately
+ * `router.replace`s straight to the camera rather than showing a "chooser"
+ * with a single real option. Business sees a two-option Post/Event chooser
+ * below, and its Post option also goes straight to the camera.
  *
  * The tab bar's + button (see (tabs)/_layout.tsx) skips this screen
  * entirely for Personal when accountType is already confidently known —
@@ -35,7 +37,7 @@ export default function CreateScreen() {
 
   useEffect(() => {
     if (!isProfileLoading && !isBusiness) {
-      router.replace('/create/reel');
+      router.replace('/create/reel/camera');
     }
   }, [isProfileLoading, isBusiness]);
 
@@ -72,7 +74,7 @@ export default function CreateScreen() {
             title="Post"
             description="Share a video with your city."
             accessibilityLabel="Post"
-            onPress={() => router.push('/create/reel')}
+            onPress={() => router.push('/create/reel/camera')}
           />
           <CreateOptionCard
             icon="calendar"
