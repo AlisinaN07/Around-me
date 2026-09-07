@@ -298,6 +298,69 @@ service cloud.firestore {
         && data.keys().hasOnly(['followerUid', 'followingUid', 'createdAt']);
     }
 
+    // reposts/{repostId} — Step 41.2F. PUBLIC repost relationships: a user
+    // publicly republishing another account's Post (video or legacy text)
+    // onto their own Profile's Reposts tab. Deliberately a public ROOT
+    // collection (not users/{uid}/reposts) — a public Profile must be able
+    // to query "everything this uid has reposted" without touching anyone's
+    // private users/{uid} subtree. NEVER confuse this with the private
+    // Saved relationships in users/{uid}/saved (Step 41.2E) — Saved stays
+    // exactly as private as it already was; this is a separate,
+    // intentionally public collection with a different read policy.
+    match /reposts/{repostId} {
+      // Same public-social read policy as follows/{followId} above — a
+      // Repost is, by definition, something its owner chose to show on
+      // their public Profile, so any signed-in user may read it.
+      allow read: if isSignedIn();
+
+      allow create: if isSignedIn() && isValidRepostCreate(repostId, request.resource.data);
+
+      allow update: if false;
+
+      // Only the reposting user can ever remove their own Repost — never
+      // the original author, never anyone else.
+      allow delete: if isOwner(resource.data.userUid);
+    }
+
+    function repostReelTarget(targetId) {
+      return get(/databases/$(database)/documents/reels/$(targetId)).data;
+    }
+
+    function repostContentTarget(targetId) {
+      return get(/databases/$(database)/documents/content/$(targetId)).data;
+    }
+
+    // Rejects: a missing target, an unpublished/draft Reel, a non-'post'
+    // legacy content document (Event, Activity), an unpublished legacy
+    // Post, reposting your own Post either way (data.targetAuthorUid !=
+    // request.auth.uid, combined with targetAuthorUid being verified below
+    // to equal the target's REAL authorUid, together rule out both a
+    // directly-spoofed self-repost and a spoofed targetAuthorUid that would
+    // otherwise let someone launder around that check), and a malformed/
+    // mismatched targetType or repostId.
+    function isValidRepostCreate(repostId, data) {
+      return data.userUid == request.auth.uid
+        && data.targetType is string
+        && data.targetId is string
+        && data.targetId.size() > 0
+        && data.targetAuthorUid is string
+        && data.targetAuthorUid != request.auth.uid
+        && repostId == (data.userUid + '_' + data.targetType + '_' + data.targetId)
+        && isServerTimestamp(data.createdAt)
+        && data.keys().hasOnly(['userUid', 'targetType', 'targetId', 'targetAuthorUid', 'createdAt'])
+        && (
+          (data.targetType == 'reel'
+            && exists(/databases/$(database)/documents/reels/$(data.targetId))
+            && repostReelTarget(data.targetId).status == 'published'
+            && repostReelTarget(data.targetId).authorUid == data.targetAuthorUid)
+          || (data.targetType == 'post'
+            && exists(/databases/$(database)/documents/content/$(data.targetId))
+            && repostContentTarget(data.targetId).type == 'post'
+            && repostContentTarget(data.targetId).status == 'published'
+            && repostContentTarget(data.targetId).authorUid == data.targetAuthorUid)
+        );
+    }
+
     // places/{placeId} — real public physical locations (see
     // src/types/place.ts). Ordinary users can only READ active Places.
     // Step 13 has no place-creation UI at all — Places are seeded only by

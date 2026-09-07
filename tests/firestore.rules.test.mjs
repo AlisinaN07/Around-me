@@ -304,6 +304,14 @@ function validSaved(targetType, targetId, overrides = {}) {
   return { targetType, targetId, savedAt: serverTimestamp(), ...overrides };
 }
 
+// Same deterministic ID scheme as repostId in src/services/reposts.ts.
+function repostDocId(userUid, targetType, targetId) {
+  return `${userUid}_${targetType}_${targetId}`;
+}
+function validRepost(userUid, targetType, targetId, targetAuthorUid, overrides = {}) {
+  return { userUid, targetType, targetId, targetAuthorUid, createdAt: serverTimestamp(), ...overrides };
+}
+
 // Same deterministic ID schemes as src/services/reports.ts.
 function userReportId(reporterUid, targetUid) {
   return `user_${reporterUid}_${targetUid}`;
@@ -4106,6 +4114,136 @@ async function main() {
     // --- L: DENY another account deleting the owner's Saved relationship. ---
     await check('DENY: author deletes a Saved relationship belonging to the saver', async () => {
       await assertFails(deleteDoc(doc(s41ea, 'users', 's41eb', 'saved', savedDocId('reel', 'reel-41e-1'))));
+    });
+
+    // =========================================================================
+    // reposts/{repostId} — PUBLIC Repost relationships (Step 41.2F). s41fa is
+    // the original-content author; s41fb is the reposter. Fresh fixtures
+    // (not reused from the Saved block above) so this section's state is
+    // fully independent. A published Reel, a published legacy text Post, an
+    // Activity, and an Event are seeded once via the same privileged helpers
+    // used for Saved above — the Activity/Event fixtures exist purely to
+    // prove Repost rejects them as targets.
+    // =========================================================================
+    await seedProfile(testEnv, 's41fa', 's41fa_handle', { displayName: 'Step41F Alpha' });
+    await seedProfile(testEnv, 's41fb', 's41fb_handle', { displayName: 'Step41F Bravo' });
+    await seedReel(testEnv, 's41fa', 'Step41F Alpha', 's41fa_handle', 'reel-41f-1');
+    await seedPost(testEnv, 's41fa', 'Step41F Alpha', 's41fa_handle', 'post-41f-1');
+    await seedActivity(testEnv, 's41fa', 'Step41F Alpha', 's41fa_handle', 'activity-41f-1');
+    await testEnv.withSecurityRulesDisabled(async (adminContext) => {
+      await setDoc(
+        doc(adminContext.firestore(), 'content', 'event-41f-1'),
+        validEvent('s41fa', 'Step41F Alpha', 's41fa_handle', 'event-41f-1')
+      );
+    });
+
+    const s41fa = testEnv.authenticatedContext('s41fa').firestore();
+    const s41fb = testEnv.authenticatedContext('s41fb').firestore();
+
+    // --- A: ALLOW reposting another account's published Reel. ---
+    await check('ALLOW: reposter reposts author\'s published Reel', async () => {
+      await assertSucceeds(
+        setDoc(doc(s41fb, 'reposts', repostDocId('s41fb', 'reel', 'reel-41f-1')), validRepost('s41fb', 'reel', 'reel-41f-1', 's41fa'))
+      );
+    });
+
+    // --- B: ALLOW reposting another account's legacy text Post. ---
+    await check('ALLOW: reposter reposts author\'s legacy text Post', async () => {
+      await assertSucceeds(
+        setDoc(doc(s41fb, 'reposts', repostDocId('s41fb', 'post', 'post-41f-1')), validRepost('s41fb', 'post', 'post-41f-1', 's41fa'))
+      );
+    });
+
+    // --- C: DENY reposting your own Reel. ---
+    await check('DENY: author reposts their own Reel', async () => {
+      await assertFails(
+        setDoc(doc(s41fa, 'reposts', repostDocId('s41fa', 'reel', 'reel-41f-1')), validRepost('s41fa', 'reel', 'reel-41f-1', 's41fa'))
+      );
+    });
+
+    // --- D: DENY reposting your own legacy text Post. ---
+    await check('DENY: author reposts their own legacy text Post', async () => {
+      await assertFails(
+        setDoc(doc(s41fa, 'reposts', repostDocId('s41fa', 'post', 'post-41f-1')), validRepost('s41fa', 'post', 'post-41f-1', 's41fa'))
+      );
+    });
+
+    // --- E: DENY a target that doesn't exist. ---
+    await check('DENY: reposter reposts a nonexistent Reel', async () => {
+      await assertFails(
+        setDoc(
+          doc(s41fb, 'reposts', repostDocId('s41fb', 'reel', 'reel-missing-41f')),
+          validRepost('s41fb', 'reel', 'reel-missing-41f', 's41fa')
+        )
+      );
+    });
+
+    // --- F: DENY an Event target. ---
+    await check('DENY: reposter reposts an Event', async () => {
+      await assertFails(
+        setDoc(doc(s41fb, 'reposts', repostDocId('s41fb', 'post', 'event-41f-1')), validRepost('s41fb', 'post', 'event-41f-1', 's41fa'))
+      );
+    });
+
+    // --- G: DENY a legacy Activity target. ---
+    await check('DENY: reposter reposts an Activity', async () => {
+      await assertFails(
+        setDoc(
+          doc(s41fb, 'reposts', repostDocId('s41fb', 'post', 'activity-41f-1')),
+          validRepost('s41fb', 'post', 'activity-41f-1', 's41fa')
+        )
+      );
+    });
+
+    // --- H: DENY a spoofed userUid (data.userUid must equal the real caller). ---
+    await check('DENY: reposter creates a Repost with a spoofed userUid', async () => {
+      await assertFails(
+        setDoc(doc(s41fb, 'reposts', repostDocId('s41fa', 'post', 'post-41f-1')), validRepost('s41fa', 'post', 'post-41f-1', 's41fa'))
+      );
+    });
+
+    // --- I: DENY a spoofed targetAuthorUid (must equal the target's real authorUid). ---
+    await check('DENY: reposter creates a Repost with a spoofed targetAuthorUid', async () => {
+      await assertFails(
+        setDoc(
+          doc(s41fb, 'reposts', repostDocId('s41fb', 'post', 'post-41f-1')),
+          validRepost('s41fb', 'post', 'post-41f-1', 'some-unrelated-uid')
+        )
+      );
+    });
+
+    // --- J: DENY a repostId that doesn't match the deterministic identity. ---
+    await check('DENY: repostId does not match userUid_targetType_targetId', async () => {
+      await assertFails(setDoc(doc(s41fb, 'reposts', 'mismatched-repost-id'), validRepost('s41fb', 'reel', 'reel-41f-1', 's41fa')));
+    });
+
+    // --- K: ALLOW any authenticated user to read a public Repost — even the original author. ---
+    await check('ALLOW: author reads reposter\'s public Repost', async () => {
+      await assertSucceeds(getDoc(doc(s41fa, 'reposts', repostDocId('s41fb', 'reel', 'reel-41f-1'))));
+    });
+
+    // --- N: DENY updating an existing Repost (create/delete only). ---
+    await check('DENY: reposter updates their own existing Repost', async () => {
+      await assertFails(updateDoc(doc(s41fb, 'reposts', repostDocId('s41fb', 'reel', 'reel-41f-1')), { targetId: 'post-41f-1' }));
+    });
+
+    // --- M: DENY another account deleting someone else's Repost. ---
+    await check('DENY: author deletes reposter\'s Repost', async () => {
+      await assertFails(deleteDoc(doc(s41fa, 'reposts', repostDocId('s41fb', 'reel', 'reel-41f-1'))));
+    });
+
+    // --- O: the deterministic ID guarantees at most one relationship per (user, target) pair —
+    // reposting the same target again lands on the SAME document, which is a
+    // Rules "update" (denied above), never a second/duplicate "create".
+    await check('DENY: reposting the same target again cannot create a duplicate relationship', async () => {
+      await assertFails(
+        setDoc(doc(s41fb, 'reposts', repostDocId('s41fb', 'reel', 'reel-41f-1')), validRepost('s41fb', 'reel', 'reel-41f-1', 's41fa'))
+      );
+    });
+
+    // --- L: ALLOW the owner to remove their own Repost. ---
+    await check('ALLOW: reposter removes their own Repost', async () => {
+      await assertSucceeds(deleteDoc(doc(s41fb, 'reposts', repostDocId('s41fb', 'post', 'post-41f-1'))));
     });
 
     await testEnv.clearFirestore();

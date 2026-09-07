@@ -1189,6 +1189,44 @@ A private bookmark list: any account can save another account's Post to a person
 
 **Explicitly not implemented this step:** Reposts, new (non-legacy) Activities, or any "Liked" total — none of those exist anywhere in this codebase.
 
+## Public Reposts (Step 41.2F)
+
+Any account can publicly republish another account's Post (video or legacy text) onto their own Profile's Reposts tab. Unlike Saved (Step 41.2E, private), a Repost is a public, social action — anyone can see it on the reposting account's Profile.
+
+**Data model:** `reposts/{repostId}` — a PUBLIC root collection, not a subcollection of `users/{uid}`, since a public Profile must be able to query "everything this uid has reposted" without ever touching anyone's private `users/{uid}` subtree. `repostId` = deterministic `${userUid}_${targetType}_${targetId}`, fields `{ userUid, targetType: 'reel'|'post', targetId, targetAuthorUid, createdAt: serverTimestamp() }`. `targetAuthorUid` is redundant with the target's own `authorUid` (Rules verify they match on create) but is stored anyway so a Profile listing never has to fetch each original just to know who not to misattribute a repost to.
+
+**Read policy:** any signed-in user may read any Repost — the same public-social read policy `follows/{followId}` already uses. A Repost is, by definition, something its owner chose to show publicly.
+
+**Firestore Rules (create):** `isValidRepostCreate` requires `data.userUid == request.auth.uid`, an exact schema, `repostId` matching the deterministic identity, a real existing target (`get()`-verified), the target published (and `type=='post'` for legacy content), and `data.targetAuthorUid` equal to the target's REAL `authorUid` while also `!= request.auth.uid` — together these two checks reject both a directly-spoofed self-repost and a spoofed `targetAuthorUid` that would otherwise launder around it. Update is always denied; delete is owner-only (`resource.data.userUid`).
+
+**Saveable targets:** the same two representations as Saved — a published video Post (`reels/{reelId}`) and a published legacy text Post (`content/{contentId}`, `type=='post'`). Rejects: your own Post, Event, Activity, a missing target, an unpublished target, a spoofed `userUid`, a spoofed `targetAuthorUid`, and a malformed/mismatched `repostId`.
+
+**Service:** `src/services/reposts.ts` — `repostPost`/`undoRepost`/`isPostReposted`/`fetchProfileReposts`, narrow to these two Post types like `saved.ts`. Idempotent (deterministic ID, create-or-delete only) — reposting twice or undoing twice is a no-op success, never a duplicate or an error.
+
+**Profile tabs, locked order — Posts, Reposts, (Events), Saved:** Personal own: Posts \| Reposts \| Saved. Personal public: Posts \| Reposts. Business own: Posts \| Reposts \| Events \| Saved. Business public: Posts \| Reposts \| Events. Reposts appears on BOTH own and public Profiles (it's public data); Saved still never appears anywhere but its owner's own Profile. `fetchProfileReposts(uid)` runs identically regardless of whose Profile is being viewed. `ProfileTabBar`'s existing `flex: 1`-per-tab layout needed no changes at 4 tabs (own Business Profile) — labels stay comfortably single-line at normal phone widths; revisit if/when Activities adds a 5th tab.
+
+**Rendering:** reuses the exact same `ReelPreviewCard`/`ContentCard` components already used for the unified Posts tab and Saved — no separate rendering system. Ordered by the Repost relationship's own `createdAt` (most-recently-reposted-first), never the original Post's publish time. A Repost whose original was deleted or moderated is silently skipped — never a broken card. Empty state: "No reposts yet" (own Profile adds "Posts you repost will appear here."; public Profile shows the title only).
+
+**Video Post / legacy text Post actions:** "Repost" / "Undo repost" — added to the options menu everywhere "Save" already is (Home/Reels feed, Reel detail, legacy Post detail), for other accounts' Posts only, never your own. Save and Repost are fully independent: separate Firestore documents, separate state, separate toasts — saving never reposts and reposting never saves.
+
+**No repost count in profile stats** — top Profile stats are unchanged; a "Liked" total is a separate, not-yet-implemented step.
+
+**Home is unaffected** — Reposts do not enter Home's For You/Following feeds in this step; Home stays original video Posts only. This is locked for v1.
+
+**Cleanup on original deletion:** `deleteContentDocumentAndSubcollections`/`deleteReelDocumentAndSubcollections` (the shared per-document primitives already used by `deleteMyContent`, `deleteMyReel`, `removeReportedContent`, and `removeReportedReel`) now also drain `reposts` matching `targetType`+`targetId` for the document being deleted — a pure-equality compound query needing no composite index, bounded to exactly the reposts of that one document. Because `deleteOwnContent`/`deleteOwnReels` (used by account deletion) call the same shared primitives per-document, "reposts of an account's own authored Posts" are cleaned up as a natural side effect, with no separate broad query.
+
+**Cleanup on account deletion:** `deleteMyAccountData` additionally drains `reposts` where `userUid == uid` — the account's own outgoing Reposts — via the same `drainQuery` primitive already used for follows/blocks. Combined with the per-document cleanup above, both directions (Reposts this account made, and Reposts of content this account authored) are cleaned up, all via cheap single- or compound-equality queries.
+
+**Deferred (documented, not implemented):** a Repost whose original disappeared through some path other than the four listed above (there isn't one in this codebase today) would remain as an orphan reference — invisible in the UI (never rendered), but not proactively swept. No collection-group cleanup job exists.
+
+**Indexes:** one composite index added — `reposts`: `userUid` ASC, `createdAt` DESC — required because `fetchProfileReposts` combines an equality filter with an `orderBy` on a different field (pure-equality-only queries don't need one; this one does). Deployed and empirically confirmed working in production (the exact query shape ran without an index error).
+
+**Rules tests:** `tests/firestore.rules.test.mjs` covers the full A–O matrix (reel/post repost ALLOW; own-target DENY; missing/Event/Activity target DENY; spoofed `userUid`/`targetAuthorUid` DENY; malformed `repostId` DENY; public read ALLOW even for the original author; update DENY; another-account delete DENY; duplicate-create-lands-on-same-doc DENY; owner delete ALLOW).
+
+**Emulator verification: OUTSTANDING ENVIRONMENT LIMITATION**, not green — `npm run test:rules` reproduced the same sandbox `TypeError: fetch failed` / `ECONNRESET` documented since Step 41.2B.2; not retried per that precedent, emulator shut down cleanly, `node --check tests/firestore.rules.test.mjs` passed.
+
+**Production verification:** a disposable author and a disposable reposter (no admin claims, never the owner account, no media upload; Reel/legacy Post/Event/Activity targets privileged-seeded) ran the full 12-point matrix against live production Rules — all 12 passed — plus the composite-index query, the `deleteMyContent` repost-cascade cleanup (verified a Repost of the deleted Post disappeared while an unrelated Repost of a different Post stayed untouched), and the `deleteMyAccountData` own-repost drain. All fixtures (5 Firestore content/Reel docs, up to 6 Repost relationships, 2 Auth accounts) were deleted by exact ID afterward and independently re-verified absent; no Storage objects were ever created.
+
 ## Reels (Cloud Storage — Step 18)
 
 Reels are short (≤60s), video-only posts with vertical, city-scoped playback — the first feature in this app to use Cloud Storage rather than Firestore alone. They live in their own root collection, `reels/{reelId}`, separate from `content/{contentId}` (posts/activities/events): a Reel has a media-upload lifecycle and Storage metadata that the other content types never had, and folding it into `content` would have meant giving every Post/Activity/Event query an upload-status field it never needs.

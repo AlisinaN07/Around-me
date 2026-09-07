@@ -13,6 +13,7 @@ import { Colors, Radius, Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
 import { blockUser } from '@/services/blocks';
 import { deleteMyReel } from '@/services/reels';
+import { isPostReposted, repostPost, undoRepost } from '@/services/reposts';
 import { isPostSaved, savePost, unsavePost } from '@/services/saved';
 import { buildReelShareUrl, shareReel } from '@/utils/reelShare';
 import type { Reel } from '@/types/reel';
@@ -47,6 +48,7 @@ export function ReelFeed({ reels, status, errorTitle, emptyState, onReload, topO
 
   const [optionsReel, setOptionsReel] = useState<Reel | null>(null);
   const [isOptionsReelSaved, setIsOptionsReelSaved] = useState(false);
+  const [isOptionsReelReposted, setIsOptionsReelReposted] = useState(false);
   const [reportReel, setReportReel] = useState<Reel | null>(null);
   const [blockTarget, setBlockTarget] = useState<Reel | null>(null);
   const [isBlockSubmitting, setIsBlockSubmitting] = useState(false);
@@ -102,6 +104,24 @@ export function ReelFeed({ reels, status, errorTitle, emptyState, onReload, topO
     };
   }, [optionsReel, user]);
 
+  // Same reflect-current-state pattern as Saved above, independently —
+  // Repost is public (Step 41.2F), Saved is private (Step 41.2E); neither
+  // reads or writes the other's state.
+  useEffect(() => {
+    let cancelled = false;
+    if (!optionsReel || !user || optionsReel.authorUid === user.uid) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setIsOptionsReelReposted(false);
+      return;
+    }
+    isPostReposted(user.uid, 'reel', optionsReel.reelId).then((reposted) => {
+      if (!cancelled) setIsOptionsReelReposted(reposted);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [optionsReel, user]);
+
   const handleToggleSave = useCallback(
     async (reel: Reel) => {
       if (!user) return;
@@ -115,6 +135,23 @@ export function ReelFeed({ reels, status, errorTitle, emptyState, onReload, topO
       showToast(wasSaved ? 'Removed from saved' : 'Saved');
     },
     [user, isOptionsReelSaved, showToast]
+  );
+
+  const handleToggleRepost = useCallback(
+    async (reel: Reel) => {
+      if (!user) return;
+      const wasReposted = isOptionsReelReposted;
+      const result = wasReposted
+        ? await undoRepost(user.uid, 'reel', reel.reelId)
+        : await repostPost(user.uid, 'reel', reel.reelId, reel.authorUid);
+      if (!result.ok) {
+        showToast(result.message);
+        return;
+      }
+      setIsOptionsReelReposted(!wasReposted);
+      showToast(wasReposted ? 'Undid repost' : 'Reposted');
+    },
+    [user, isOptionsReelReposted, showToast]
   );
 
   const handleCopyLink = useCallback(
@@ -144,6 +181,7 @@ export function ReelFeed({ reels, status, errorTitle, emptyState, onReload, topO
         ]
       : [
           { label: isOptionsReelSaved ? 'Remove from saved' : 'Save', onPress: () => handleToggleSave(optionsReel) },
+          { label: isOptionsReelReposted ? 'Undo repost' : 'Repost', onPress: () => handleToggleRepost(optionsReel) },
           { label: 'Share post', onPress: () => handleShare(optionsReel) },
           { label: 'Copy link', onPress: () => handleCopyLink(optionsReel) },
           { label: 'Report post', onPress: () => setReportReel(optionsReel) },

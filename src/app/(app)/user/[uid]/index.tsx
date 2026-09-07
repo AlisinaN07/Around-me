@@ -25,6 +25,7 @@ import { fetchConversation, getConversationId } from '@/services/messages';
 import { fetchMyNewMessagesFrom } from '@/services/privacySettings';
 import { fetchPublicProfile } from '@/services/publicProfile';
 import { fetchProfileReelCount, fetchProfileReels } from '@/services/reels';
+import { fetchProfileReposts, type RepostedPostItem } from '@/services/reposts';
 import type { Content, EventContent, PostContent } from '@/types/content';
 import type { Reel } from '@/types/reel';
 import type { PublicProfile } from '@/types/social';
@@ -35,12 +36,19 @@ import { mergeProfilePosts } from '@/utils/profilePosts';
 type LoadStatus = 'loading' | 'loaded' | 'error';
 // Step 41.2C — unified Posts tab: 'reel' (video Post) and legacy text
 // 'post' now merge into a single 'post' tab, so this is no longer a
-// per-technical-type selector, just Posts vs. (Business-only) Events.
-type ProfileTab = 'post' | 'event';
+// per-technical-type selector, just Posts vs. 'repost' (Step 41.2F, PUBLIC
+// — shown here too) vs. (Business-only) Events. Saved (Step 41.2E) is
+// PRIVATE and never appears on this public profile route. Tab order is
+// locked: Posts, Reposts, (Events).
+type ProfileTab = 'post' | 'repost' | 'event';
 
-const PROFILE_TABS_PERSONAL: { id: ProfileTab; label: string }[] = [{ id: 'post', label: 'Posts' }];
+const PROFILE_TABS_PERSONAL: { id: ProfileTab; label: string }[] = [
+  { id: 'post', label: 'Posts' },
+  { id: 'repost', label: 'Reposts' },
+];
 const PROFILE_TABS_BUSINESS: { id: ProfileTab; label: string }[] = [
   { id: 'post', label: 'Posts' },
+  { id: 'repost', label: 'Reposts' },
   { id: 'event', label: 'Events' },
 ];
 
@@ -51,6 +59,7 @@ const PROFILE_CONTENT_LIMIT = 40;
 
 const EMPTY_TEXT: Record<ProfileTab, string> = {
   post: 'No posts yet',
+  repost: 'No reposts yet',
   event: 'No events yet',
 };
 
@@ -77,6 +86,7 @@ export default function PublicProfileScreen() {
   const [followError, setFollowError] = useState<string | null>(null);
   const [content, setContent] = useState<Content[]>([]);
   const [reels, setReels] = useState<Reel[]>([]);
+  const [repostedPosts, setRepostedPosts] = useState<RepostedPostItem[]>([]);
   const [contentTab, setContentTab] = useState<ProfileTab>('post');
 
   // Safety state — see src/services/blocks.ts / privacySettings.ts.
@@ -94,7 +104,7 @@ export default function PublicProfileScreen() {
   // synchronously during the effect body below.
   const load = useCallback(async () => {
     try {
-      const [publicProfile, followers, following, textPostCount, reelCount, followingState, userContent, userReels, blockedByMe] =
+      const [publicProfile, followers, following, textPostCount, reelCount, followingState, userContent, userReels, userReposts, blockedByMe] =
         await Promise.all([
           fetchPublicProfile(uid),
           fetchFollowerCount(uid),
@@ -117,6 +127,10 @@ export default function PublicProfileScreen() {
           // (see src/types/reel.ts), so this is its own capped query, not
           // part of the mixed content query above.
           fetchProfileReels(uid),
+          // PUBLIC (Step 41.2F) — reposts/{repostId} is a public root
+          // collection, so this uid's Reposts are fetched exactly the same
+          // way whether this is the caller's own profile or someone else's.
+          fetchProfileReposts(uid),
           !isOwnProfile && user ? isUserBlocked(user.uid, uid) : Promise.resolve(false),
         ]);
       if (!publicProfile) {
@@ -130,6 +144,7 @@ export default function PublicProfileScreen() {
       setAmFollowing(followingState);
       setContent(userContent);
       setReels(userReels);
+      setRepostedPosts(userReposts);
       setAmIBlockingThem(blockedByMe);
 
       if (!isOwnProfile && user && !blockedByMe) {
@@ -306,6 +321,22 @@ export default function PublicProfileScreen() {
                       <ReelPreviewCard key={`reel-${item.reel.reelId}`} reel={item.reel} />
                     ) : (
                       <View key={`text-${item.content.contentId}`} style={styles.fullRow}>
+                        <ContentCard item={item.content} currentUid={user?.uid ?? null} />
+                      </View>
+                    )
+                  )}
+                </View>
+              )
+            ) : contentTab === 'repost' ? (
+              repostedPosts.length === 0 ? (
+                <EmptyState bare icon="repeat-outline" title={EMPTY_TEXT.repost} />
+              ) : (
+                <View style={styles.postsGrid}>
+                  {repostedPosts.map((item) =>
+                    item.kind === 'reel' ? (
+                      <ReelPreviewCard key={`repost-reel-${item.repostId}`} reel={item.reel} />
+                    ) : (
+                      <View key={`repost-text-${item.repostId}`} style={styles.fullRow}>
                         <ContentCard item={item.content} currentUid={user?.uid ?? null} />
                       </View>
                     )

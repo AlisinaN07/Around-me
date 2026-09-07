@@ -200,6 +200,19 @@ async function deleteContentDocumentAndSubcollections(db: Firestore, contentId: 
   await drainCollection(db, `content/${contentId}/participants`);
   await drainCollection(db, `content/${contentId}/responses`);
   await db.doc(`content/${contentId}/stats/activity`).delete().catch(() => undefined);
+  // reposts/{repostId} (Step 41.2F) is a public ROOT collection, not a
+  // subcollection of content/{contentId} — but any Repost pointing at this
+  // exact contentId is now pointing at nothing, so it's cleaned up here too.
+  // A compound-equality query (targetType == 'post' && targetId ==
+  // contentId) needs no composite index — Firestore serves any number of
+  // pure equality filters from its automatic single-field indexes — and is
+  // bounded to exactly the reposts of this one document, never a broader
+  // scan. Sharing this in the one primitive both deleteMyContent and
+  // removeReportedContent already call means it also runs for free
+  // whenever deleteOwnContent (called from deleteMyAccountData) deletes an
+  // author's own content — covering "reposts OF their authored Posts"
+  // without a separate targetAuthorUid query.
+  await drainQuery(db, () => db.collection('reposts').where('targetType', '==', 'post').where('targetId', '==', contentId));
   await db.doc(`content/${contentId}`).delete();
 }
 
@@ -238,6 +251,10 @@ async function deleteReelDocumentAndSubcollections(
 ): Promise<{ storageDeleted: boolean }> {
   await drainCollection(db, `reels/${reelId}/likes`);
   await drainCollection(db, `reels/${reelId}/comments`);
+  // Same reasoning as deleteContentDocumentAndSubcollections's repost
+  // cleanup above — a compound-equality query, no composite index, bounded
+  // to exactly the reposts of this one Reel.
+  await drainQuery(db, () => db.collection('reposts').where('targetType', '==', 'reel').where('targetId', '==', reelId));
 
   let storageDeleted = false;
   if (storagePath) {
@@ -350,6 +367,13 @@ export const deleteMyAccountData = onCall({ region: REGION, timeoutSeconds: 300,
   const followingOf = await drainQuery(db, () => db.collection('follows').where('followingUid', '==', uid));
   const blockerOf = await drainQuery(db, () => db.collection('blocks').where('blockerUid', '==', uid));
   const blockedOf = await drainQuery(db, () => db.collection('blocks').where('blockedUid', '==', uid));
+  // reposts/{repostId} this account itself created (Step 41.2F) — a public
+  // ROOT collection, so unlike Saved it isn't reached by deleteProfileDocuments'
+  // users/{uid} subtree cleanup. Reposts OF this account's own authored
+  // Posts/Reels are handled separately, for free, inside
+  // deleteContentDocumentAndSubcollections/deleteReelDocumentAndSubcollections
+  // as deleteOwnContent/deleteOwnReels run below.
+  const ownRepostsOf = await drainQuery(db, () => db.collection('reposts').where('userUid', '==', uid));
 
   // No counter is paired with likes/comments/responses (see firestore.rules
   // — like/comment counts are aggregation queries, and Event responses have
@@ -375,6 +399,7 @@ export const deleteMyAccountData = onCall({ region: REGION, timeoutSeconds: 300,
     uid,
     follows: { asFollowerRemoved: followerOf.total, asFollowingRemoved: followingOf.total },
     blocks: { asBlockerRemoved: blockerOf.total, asBlockedRemoved: blockedOf.total },
+    ownRepostsRemoved: ownRepostsOf.total,
     crossUser: {
       likesRemoved: crossUserLikes.total,
       likesRemovedByRoot: crossUserLikes.roots,

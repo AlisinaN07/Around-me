@@ -21,6 +21,7 @@ import type { Reel } from '@/types/reel';
 import { fetchFollowerCount, fetchFollowingCount } from '@/services/following';
 import { fetchProfilePostCount, fetchPublicUserContent } from '@/services/content';
 import { fetchProfileReelCount, fetchProfileReels } from '@/services/reels';
+import { fetchProfileReposts, type RepostedPostItem } from '@/services/reposts';
 import { fetchSavedPosts, type SavedPostItem } from '@/services/saved';
 import { isBusinessAccount } from '@/utils/accountCapabilities';
 import { formatCityDisplayName } from '@/utils/cityDisplay';
@@ -30,16 +31,20 @@ type LoadStatus = 'loading' | 'loaded' | 'error';
 // Step 41.2C — unified Posts tab: 'reel' (video Post) and legacy text
 // 'post' now merge into a single 'post' tab, so this is no longer a
 // per-technical-type selector, just Posts vs. (Business-only) Events vs.
-// (Step 41.2E, own Profile only — never shown on the public profile route)
-// the caller's own private Saved list.
-type ProfileTab = 'post' | 'event' | 'saved';
+// 'repost' (Step 41.2F, PUBLIC — also shown on the public profile route)
+// vs. 'saved' (Step 41.2E, PRIVATE — own Profile only, never shown on the
+// public profile route). Tab order is locked: Posts, Reposts, (Events),
+// Saved.
+type ProfileTab = 'post' | 'repost' | 'event' | 'saved';
 
 const PROFILE_TABS_PERSONAL: { id: ProfileTab; label: string }[] = [
   { id: 'post', label: 'Posts' },
+  { id: 'repost', label: 'Reposts' },
   { id: 'saved', label: 'Saved' },
 ];
 const PROFILE_TABS_BUSINESS: { id: ProfileTab; label: string }[] = [
   { id: 'post', label: 'Posts' },
+  { id: 'repost', label: 'Reposts' },
   { id: 'event', label: 'Events' },
   { id: 'saved', label: 'Saved' },
 ];
@@ -55,6 +60,7 @@ const PROFILE_CONTENT_LIMIT = 40;
 
 const EMPTY_TEXT: Record<ProfileTab, string> = {
   post: 'No posts yet',
+  repost: 'No reposts yet',
   event: 'No events yet',
   saved: 'No saved posts yet',
 };
@@ -80,6 +86,7 @@ export default function ProfileScreen() {
   const [postsCount, setPostsCount] = useState(0);
   const [content, setContent] = useState<Content[]>([]);
   const [reels, setReels] = useState<Reel[]>([]);
+  const [repostedPosts, setRepostedPosts] = useState<RepostedPostItem[]>([]);
   const [savedPosts, setSavedPosts] = useState<SavedPostItem[]>([]);
   const [activeTab, setActiveTab] = useState<ProfileTab>('post');
 
@@ -87,7 +94,7 @@ export default function ProfileScreen() {
     if (!user) return;
     setStatus('loading');
     try {
-      const [followers, following, textPostCount, reelCount, userContent, userReels, userSavedPosts] = await Promise.all([
+      const [followers, following, textPostCount, reelCount, userContent, userReels, userReposts, userSavedPosts] = await Promise.all([
         fetchFollowerCount(user.uid),
         fetchFollowingCount(user.uid),
         // Two exact server-side aggregations, summed — see
@@ -107,6 +114,10 @@ export default function ProfileScreen() {
         // STAT above is exact.
         fetchPublicUserContent(user.uid, PROFILE_CONTENT_LIMIT),
         fetchProfileReels(user.uid),
+        // PUBLIC (Step 41.2F) — same query a visitor's public profile view
+        // would run for this uid; fetched here unconditionally like every
+        // other tab's data, regardless of which tab is currently active.
+        fetchProfileReposts(user.uid),
         // Private to this account (Step 41.2E) — fetched here unconditionally,
         // same as every other own-Profile tab's data, regardless of which tab
         // is currently active; never fetched on the public profile route.
@@ -117,6 +128,7 @@ export default function ProfileScreen() {
       setPostsCount(textPostCount + reelCount);
       setContent(userContent);
       setReels(userReels);
+      setRepostedPosts(userReposts);
       setSavedPosts(userSavedPosts);
       setStatus('loaded');
     } catch {
@@ -198,6 +210,22 @@ export default function ProfileScreen() {
                           <ReelPreviewCard key={`reel-${item.reel.reelId}`} reel={item.reel} />
                         ) : (
                           <View key={`text-${item.content.contentId}`} style={styles.fullRow}>
+                            <ContentCard item={item.content} currentUid={user?.uid ?? null} />
+                          </View>
+                        )
+                      )}
+                    </View>
+                  )
+                ) : activeTab === 'repost' ? (
+                  repostedPosts.length === 0 ? (
+                    <EmptyState bare icon="repeat-outline" title={EMPTY_TEXT.repost} body="Posts you repost will appear here." />
+                  ) : (
+                    <View style={styles.postsGrid}>
+                      {repostedPosts.map((item) =>
+                        item.kind === 'reel' ? (
+                          <ReelPreviewCard key={`repost-reel-${item.repostId}`} reel={item.reel} />
+                        ) : (
+                          <View key={`repost-text-${item.repostId}`} style={styles.fullRow}>
                             <ContentCard item={item.content} currentUid={user?.uid ?? null} />
                           </View>
                         )

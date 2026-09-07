@@ -17,6 +17,7 @@ import { ReportModal } from '@/components/ReportModal';
 import { Colors, Layout, Radius, Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
 import { deleteMyContent, fetchContentById } from '@/services/content';
+import { isPostReposted, repostPost, undoRepost } from '@/services/reposts';
 import { isPostSaved, savePost, unsavePost } from '@/services/saved';
 import type { ActivityContent, Content, EventContent } from '@/types/content';
 
@@ -39,6 +40,7 @@ export default function ContentDetailScreen() {
   const [isDeleting, setIsDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [isSaved, setIsSaved] = useState(false);
+  const [isReposted, setIsReposted] = useState(false);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -52,11 +54,15 @@ export default function ContentDetailScreen() {
         return;
       }
       setContent(result);
-      // Save is only ever a legacy text Post concept (Step 41.2E) — Event
-      // and Activity documents never get a Saved-state check.
+      // Save/Repost are only ever a legacy text Post concept here — Event
+      // and Activity documents never get a Saved/Reposted-state check.
       if (user && result.type === 'post' && result.authorUid !== user.uid) {
-        const saved = await isPostSaved(user.uid, 'post', result.contentId);
+        const [saved, reposted] = await Promise.all([
+          isPostSaved(user.uid, 'post', result.contentId),
+          isPostReposted(user.uid, 'post', result.contentId),
+        ]);
         setIsSaved(saved);
+        setIsReposted(reposted);
       }
       setStatus('loaded');
     } catch {
@@ -93,6 +99,20 @@ export default function ContentDetailScreen() {
     showToast(wasSaved ? 'Removed from saved' : 'Saved');
   };
 
+  const handleToggleRepost = async () => {
+    if (!content || !user) return;
+    const wasReposted = isReposted;
+    const result = wasReposted
+      ? await undoRepost(user.uid, 'post', content.contentId)
+      : await repostPost(user.uid, 'post', content.contentId, content.authorUid);
+    if (!result.ok) {
+      showToast(result.message);
+      return;
+    }
+    setIsReposted(!wasReposted);
+    showToast(wasReposted ? 'Undid repost' : 'Reposted');
+  };
+
   const isOwnContent = !!user && !!content && content.authorUid === user.uid;
   const canSaveContent = !isOwnContent && content?.type === 'post';
 
@@ -101,6 +121,7 @@ export default function ContentDetailScreen() {
     : canSaveContent
       ? [
           { label: isSaved ? 'Remove from saved' : 'Save', onPress: handleToggleSave },
+          { label: isReposted ? 'Undo repost' : 'Repost', onPress: handleToggleRepost },
           { label: 'Report', onPress: () => setIsReportOpen(true) },
         ]
       : [{ label: 'Report', onPress: () => setIsReportOpen(true) }];
