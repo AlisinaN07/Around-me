@@ -1,4 +1,5 @@
 import { Ionicons } from '@expo/vector-icons';
+import * as Clipboard from 'expo-clipboard';
 import { router } from 'expo-router';
 import { useEffect, useState } from 'react';
 import { ActivityIndicator, Pressable, StyleSheet, Text, View } from 'react-native';
@@ -11,7 +12,9 @@ import { INTERESTS } from '@/constants/interests';
 import { useAuth } from '@/hooks/useAuth';
 import { fetchReelCommentCount, fetchReelLikeCount, isReelLiked, likeReel, unlikeReel } from '@/services/reelEngagement';
 import { resolveReelPlaybackUrl } from '@/services/reels';
+import { isPostSaved, savePost, unsavePost } from '@/services/saved';
 import type { Reel } from '@/types/reel';
+import { buildReelShareUrl, shareReel } from '@/utils/reelShare';
 
 type ReelFeedItemProps = {
   reel: Reel;
@@ -27,6 +30,8 @@ type ReelFeedItemProps = {
    */
   shouldPrepare: boolean;
   onOpenOptions: () => void;
+  /** Brief transient confirmation (e.g. "Saved") — rendered once by the shared parent feed, not per-item. */
+  onToast: (message: string) => void;
 };
 
 const CATEGORY_LABEL_BY_ID = new Map(INTERESTS.map((interest) => [interest.id, `${interest.emoji} ${interest.label}`]));
@@ -37,17 +42,23 @@ const CATEGORY_LABEL_BY_ID = new Map(INTERESTS.map((interest) => [interest.id, `
  * `shouldPrepare`) — see ReelsScreen for how activity/prepare windows are
  * tracked and how only one item is ever active at a time.
  */
-export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOptions }: ReelFeedItemProps) {
+export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOptions, onToast }: ReelFeedItemProps) {
   const { user } = useAuth();
   const [playbackUrl, setPlaybackUrl] = useState<string | null>(null);
   const [urlStatus, setUrlStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
   const [playbackFailed, setPlaybackFailed] = useState(false);
-  const [muted, setMuted] = useState(true);
 
   const [isLiked, setIsLiked] = useState(false);
   const [likeCount, setLikeCount] = useState(0);
   const [commentCount, setCommentCount] = useState(0);
   const [isLikeSubmitting, setIsLikeSubmitting] = useState(false);
+
+  // Save has no meaning on the author's own Reel (same as the retired
+  // Save option never appearing in the own-Reel options menu) — see the
+  // `isOwnReel` guard below and in the effect that reflects current state.
+  const [isSaved, setIsSaved] = useState(false);
+  const [isSaveSubmitting, setIsSaveSubmitting] = useState(false);
+  const isOwnReel = !!user && reel.authorUid === user.uid;
 
   useEffect(() => {
     let cancelled = false;
@@ -95,12 +106,32 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
     };
   }, [reel.reelId, user]);
 
+  // Reflects the correct current Saved state for THIS item independently
+  // (same "reflect current state" reasoning as the like effect above) —
+  // never shown/fetched for the viewer's own Reel.
+  useEffect(() => {
+    let cancelled = false;
+    if (isOwnReel || !user) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setIsSaved(false);
+      return;
+    }
+    isPostSaved(user.uid, 'reel', reel.reelId).then((saved) => {
+      if (!cancelled) setIsSaved(saved);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [reel.reelId, user, isOwnReel]);
+
   const player = useVideoPlayer(playbackUrl, (p) => {
     p.loop = true;
-    // Muted by default — browser autoplay policy blocks unmuted autoplay
-    // (see the Step 18 spec's web-autoplay note). The mute control below
-    // lets the viewer opt into sound once a video is already playing.
-    p.muted = true;
+    // Sound is always on — no mute control, no muted-by-default (owner
+    // decision). Note: this can make unattended web autoplay unreliable
+    // under a strict browser autoplay policy (some browsers block
+    // autoplaying unmuted media without prior user interaction on the
+    // origin) — native iOS/Android playback is unaffected.
+    p.muted = false;
   });
 
   useEffect(() => {
@@ -154,6 +185,33 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
     }
   };
 
+  const handleToggleSave = async () => {
+    if (!user || isOwnReel || isSaveSubmitting) return;
+    const wasSaved = isSaved;
+    setIsSaveSubmitting(true);
+    const result = wasSaved ? await unsavePost(user.uid, 'reel', reel.reelId) : await savePost(user.uid, 'reel', reel.reelId);
+    setIsSaveSubmitting(false);
+    if (!result.ok) {
+      onToast(result.message);
+      return;
+    }
+    setIsSaved(!wasSaved);
+    onToast(wasSaved ? 'Removed from saved' : 'Saved');
+  };
+
+  // Same fallback reasoning as the retired options-menu "Share post"
+  // entry: the native share sheet can fail for reasons other than the
+  // person cancelling it (e.g. no share target configured on web), in
+  // which case silently copying the link is a better outcome than
+  // nothing happening at all. A genuine cancel stays quiet.
+  const handleShare = async () => {
+    const result = await shareReel(reel.reelId);
+    if (!result.ok && !/cancel/i.test(result.message)) {
+      await Clipboard.setStringAsync(buildReelShareUrl(reel.reelId));
+      onToast('Link copied');
+    }
+  };
+
   const categoryLabel = CATEGORY_LABEL_BY_ID.get(reel.categoryId);
 
   return (
@@ -184,29 +242,10 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
         </View>
       )}
 
-      <Pressable
-        style={styles.muteButton}
-        onPress={() => {
-          const next = !muted;
-          setMuted(next);
-          // expo-video's player is an imperative external handle (a
-          // SharedObject) — setting properties like `muted` directly is
-          // its documented API, not React state; this mutation belongs in
-          // an event handler, not a render body or effect.
-          // eslint-disable-next-line react-hooks/immutability
-          player.muted = next;
-        }}
-        accessibilityRole="button"
-        accessibilityLabel={muted ? 'Unmute' : 'Mute'}
-      >
-        <Ionicons name={muted ? 'volume-mute' : 'volume-high'} size={18} color={Colors.text} />
-      </Pressable>
-
-      <Pressable style={styles.optionsButton} onPress={onOpenOptions} accessibilityRole="button" accessibilityLabel="Post options">
-        <Ionicons name="ellipsis-horizontal" size={20} color={Colors.text} />
-      </Pressable>
-
       <View style={styles.actionRail}>
+        <AuthorLink uid={reel.authorUid} style={styles.actionAvatar}>
+          <Avatar name={reel.authorDisplayName} size={40} />
+        </AuthorLink>
         <Pressable
           onPress={handleToggleLike}
           disabled={!user || isLikeSubmitting}
@@ -227,15 +266,29 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
           <Ionicons name="chatbubble-outline" size={27} color={Colors.text} />
           <Text style={styles.actionCount}>{commentCount}</Text>
         </Pressable>
+        {!isOwnReel ? (
+          <Pressable
+            onPress={handleToggleSave}
+            disabled={!user || isSaveSubmitting}
+            style={styles.actionButton}
+            accessibilityRole="button"
+            accessibilityLabel={isSaved ? 'Remove from saved' : 'Save'}
+            accessibilityState={{ selected: isSaved }}
+          >
+            <Ionicons name={isSaved ? 'bookmark' : 'bookmark-outline'} size={27} color={isSaved ? Colors.accent : Colors.text} />
+          </Pressable>
+        ) : null}
+        <Pressable onPress={handleShare} style={styles.actionButton} accessibilityRole="button" accessibilityLabel="Share post">
+          <Ionicons name="share-outline" size={27} color={Colors.text} />
+        </Pressable>
+        <Pressable onPress={onOpenOptions} style={styles.actionButton} accessibilityRole="button" accessibilityLabel="Post options">
+          <Ionicons name="ellipsis-horizontal" size={27} color={Colors.text} />
+        </Pressable>
       </View>
 
       <View style={styles.overlay} pointerEvents="box-none">
         <AuthorLink uid={reel.authorUid} style={styles.authorRow}>
-          <Avatar name={reel.authorDisplayName} size={36} />
-          <View>
-            <Text style={styles.authorName}>{reel.authorDisplayName}</Text>
-            <Text style={styles.authorUsername}>@{reel.authorUsername}</Text>
-          </View>
+          <Text style={styles.authorName}>{reel.authorDisplayName}</Text>
         </AuthorLink>
 
         {reel.caption ? <Text style={styles.caption}>{reel.caption}</Text> : null}
@@ -275,34 +328,15 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontWeight: '700',
   },
-  muteButton: {
-    position: 'absolute',
-    top: Spacing.lg,
-    right: Spacing.lg,
-    width: 36,
-    height: 36,
-    borderRadius: 18,
-    alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: 'rgba(11, 11, 15, 0.55)',
-  },
-  optionsButton: {
-    position: 'absolute',
-    top: Spacing.lg,
-    right: Spacing.lg + 44,
-    width: 36,
-    height: 36,
-    borderRadius: 18,
-    alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: 'rgba(11, 11, 15, 0.55)',
-  },
   actionRail: {
     position: 'absolute',
     right: Spacing.lg,
     bottom: Spacing.xxl * 2,
     alignItems: 'center',
     gap: Spacing.lg,
+  },
+  actionAvatar: {
+    alignItems: 'center',
   },
   actionButton: {
     alignItems: 'center',
@@ -319,19 +353,12 @@ const styles = StyleSheet.create({
     gap: Spacing.sm,
   },
   authorRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: Spacing.sm,
     alignSelf: 'flex-start',
   },
   authorName: {
     color: Colors.text,
     fontSize: 15,
     fontWeight: '700',
-  },
-  authorUsername: {
-    color: 'rgba(245, 245, 247, 0.75)',
-    fontSize: 13,
   },
   caption: {
     color: Colors.text,

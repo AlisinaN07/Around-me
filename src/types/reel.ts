@@ -25,6 +25,15 @@ export const REEL_MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024;
  */
 export const REEL_MAX_DURATION_MS = 60_000;
 
+/** Hard Storage-enforced cap on an uploaded device-audio music file — generous relative to REEL_MAX_FILE_SIZE_BYTES since a full song, not just the looped portion actually heard, is uploaded (see ReelMusicSourceType's doc comment — there is no trim step yet). */
+export const REEL_MUSIC_MAX_FILE_SIZE_BYTES = 20 * 1024 * 1024;
+
+/** Generous cap on a picked music file's own declared length (most songs are 2-6 minutes) — NOT the Reel's own duration; only the first REEL_MAX_DURATION_MS of it is ever heard per loop (see ReelFeedItem.tsx). */
+export const REEL_MUSIC_MAX_DURATION_MS = 600_000;
+
+/** Hard Storage-enforced cap on the uploaded cover-thumbnail image — a single still frame, always far smaller than the video/music caps above. */
+export const REEL_THUMBNAIL_MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024;
+
 /**
  * reels/{reelId}. authorDisplayName/authorUsername/cityName/countryCode/
  * cityKey are a PUBLIC-SAFE SNAPSHOT of the author's private users/{uid}
@@ -39,6 +48,38 @@ export const REEL_MAX_DURATION_MS = 60_000;
  * getDownloadURL() token URL. Playback URLs are resolved from
  * storagePath at runtime, not persisted.
  */
+/**
+ * Background music attached to a Reel at capture time. 'none' is the
+ * overwhelming default — every OTHER music field is always present too
+ * (never conditionally omitted, matching this app's existing "always
+ * present, neutral sentinel when unused" convention — see e.g. `bio` on
+ * users/publicProfiles), just holding empty-string/0 sentinels when
+ * `musicSourceType == 'none'`. 'device' is the only real source today —
+ * the user's own on-device audio file, picked via a system file picker
+ * (see src/app/(app)/create/reel/camera.tsx) — never a licensed catalog,
+ * which doesn't exist yet (a future `musicSourceType` value, e.g.
+ * 'catalog', is intentionally NOT reserved here — adding one later is an
+ * additive Rules/type change, not a breaking one).
+ *
+ * ARCHITECTURE NOTE — real server-side muxing, not two synced files:
+ * recording with music selected mutes the camera's own mic (`CameraView`'s
+ * `mute` prop) so the chosen track is the only audio captured for that
+ * take. The client uploads the silent video and the raw music file as two
+ * separate Storage objects, then calls the trusted `muxReelMusic` Cloud
+ * Function (functions/src/index.ts) before publishing — it runs real
+ * `ffmpeg` (via `ffmpeg-static`) to merge them into ONE video file whose
+ * audio track is the music, looped and cut to exactly the video's own
+ * length, and deletes the now-redundant standalone music object. The
+ * published Reel's video file therefore DOES carry a real audio track of
+ * its own — it travels with the file everywhere (download, share outside
+ * the app, etc.), unlike an earlier version of this feature that played
+ * two separately-synced files instead (see git history if that's ever
+ * relevant again). The only place two separately-synced players still
+ * exist is the LOCAL capture/preview screen (camera.tsx), before the merge
+ * has happened — see its own `musicPlayer` doc comment.
+ */
+export type ReelMusicSourceType = 'none' | 'device';
+
 export type Reel = {
   reelId: string;
   authorUid: string;
@@ -65,6 +106,34 @@ export type Reel = {
   height: number;
   status: ReelStatus;
   visibility: ReelVisibility;
+  /** See ReelMusicSourceType's own doc comment above for the full music model. */
+  musicSourceType: ReelMusicSourceType;
+  /** The picked file's display name (e.g. "Song.mp3") — '' when musicSourceType is 'none'. Never a real song/artist title; there is no metadata source for that with a device-picked file. */
+  musicTitle: string;
+  /** reels/{authorUid}/{reelId}/music — deterministic, mirrors `storagePath`. '' when musicSourceType is 'none'. */
+  musicStorageAudioPath: string;
+  musicStorageContentType: string;
+  musicFileSizeBytes: number;
+  /** Declared duration in milliseconds from the picked audio file — same client-declared caveat as `durationMs` above. 0 when musicSourceType is 'none'. */
+  musicDurationMs: number;
+  /**
+   * A real still frame from THIS Reel's own video, chosen by the author
+   * at capture time (see camera.tsx's cover-frame picker) — never a
+   * generic placeholder or an unrelated image. `reels/{authorUid}/
+   * {reelId}/thumbnail`, mirroring `storagePath` exactly. Always present
+   * on every Reel created after this field was introduced; a Reel
+   * published BEFORE it (if any still exist) simply won't have this key
+   * in its stored document at all despite the type here claiming a
+   * string — display code must treat a missing/empty value as "no
+   * thumbnail available" and fall back gracefully (see
+   * ReelPreviewCard.tsx), never assume the field is truly guaranteed at
+   * runtime just because the type says so.
+   */
+  thumbnailStoragePath: string;
+  thumbnailStorageContentType: string;
+  thumbnailFileSizeBytes: number;
+  thumbnailWidth: number;
+  thumbnailHeight: number;
   createdAt: Timestamp;
   updatedAt: Timestamp;
   publishedAt: Timestamp | null;
@@ -129,4 +198,39 @@ export type SelectedReelVideo = {
   width: number | null;
   height: number | null;
   mimeType: string | null;
+};
+
+/**
+ * UI/runtime-only state for a music file the user picked from their own
+ * device to record over (see the camera screen's "Music" control and
+ * ReelMusicSourceType's own doc comment for the full model). `null` means
+ * no music selected — the camera's mic stays on. Cleared whenever the
+ * captured/picked video changes, exactly like SelectedReelVideo itself.
+ */
+export type SelectedReelMusic = {
+  uri: string;
+  title: string;
+  fileSizeBytes: number;
+  mimeType: string;
+  /** Not always known up front (expo-document-picker returns no duration) — filled in by a real probe, same reasoning as SelectedReelVideo's camera-sourced durationMs. */
+  durationMs: number | null;
+};
+
+/**
+ * The real cover-frame image for a Post, ready to upload. Chosen entirely
+ * automatically, never by the user: the camera screen extracts several
+ * candidate frames from the recorded/picked video (see
+ * src/utils/reelThumbnailCandidates.ts) and always uses the middle one
+ * (~50% into the clip) — there is no cover-picker UI shown to the person
+ * posting. Generation happens silently in the background as soon as a
+ * video is selected, or on demand as a fallback if it hasn't finished yet
+ * by the time Next is pressed (see camera.tsx's `handleNext`) — either
+ * way, publishing always has a real `SelectedReelThumbnail` by this point.
+ */
+export type SelectedReelThumbnail = {
+  uri: string;
+  fileSizeBytes: number;
+  mimeType: string;
+  width: number;
+  height: number;
 };

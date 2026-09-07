@@ -1,20 +1,22 @@
 import { Ionicons } from '@expo/vector-icons';
 import { router } from 'expo-router';
+import { useEffect, useState } from 'react';
 import { Pressable, StyleSheet, Text, View, type StyleProp, type ViewStyle } from 'react-native';
 
 import { MediaCard } from '@/components/MediaCard';
 import { Colors, Radius, Spacing } from '@/constants/theme';
+import { resolveReelPlaybackUrl } from '@/services/reels';
 import type { Reel } from '@/types/reel';
 import { formatTimeAgo } from '@/utils/timeFormat';
 
 /**
  * A compact preview for one published Reel — used on Profile's unified
- * Posts tab (own and public, Step 41.2C). No thumbnail generation
- * (explicitly out of scope for Step 19): the same dark-gradient +
- * accent-glow fallback introduced for Event cards in Step 26 (via
- * MediaCard) stands in for a real video frame, so this never has to
- * load/decode any video just to render a grid — a premium "media-first"
- * look without inventing media.
+ * Posts tab (own and public, Step 41.2C). Shows the real cover frame the
+ * author chose at capture time (see Reel.thumbnailStoragePath's own doc
+ * comment) — a legacy Reel published before that field existed simply has
+ * an empty/missing path, so this falls back to the same dark-gradient +
+ * accent-glow placeholder introduced for Event cards in Step 26 (via
+ * MediaCard) rather than assuming a thumbnail is always there.
  *
  * `style` is optional and additive to the default 3-column grid tile
  * width below — Step 41.2C's merged Posts list overrides it to a
@@ -23,6 +25,24 @@ import { formatTimeAgo } from '@/utils/timeFormat';
  * anything about that context.
  */
 export function ReelPreviewCard({ reel, style }: { reel: Reel; style?: StyleProp<ViewStyle> }) {
+  const [thumbnailUrl, setThumbnailUrl] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    // Resets fresh whenever the underlying Reel (or its thumbnail path)
+    // changes — same prop-driven-reset pattern as ReportModal/ReelFeedItem.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setThumbnailUrl(null);
+    if (reel.thumbnailStoragePath) {
+      resolveReelPlaybackUrl(reel.thumbnailStoragePath).then((url) => {
+        if (!cancelled) setThumbnailUrl(url);
+      });
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [reel.thumbnailStoragePath]);
+
   return (
     <Pressable
       style={[styles.card, style]}
@@ -30,7 +50,7 @@ export function ReelPreviewCard({ reel, style }: { reel: Reel; style?: StyleProp
       accessibilityRole="button"
       accessibilityLabel="View post"
     >
-      <MediaCard fallbackIcon="videocam" height="100%" radius={Radius.md}>
+      <MediaCard source={thumbnailUrl} fallbackIcon="videocam" height="100%" radius={Radius.md}>
         <View style={styles.overlay}>
           <View style={styles.playBadge}>
             <Ionicons name="play" size={16} color={Colors.text} />

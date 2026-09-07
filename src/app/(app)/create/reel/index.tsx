@@ -10,11 +10,20 @@ import { HeaderScreenLayout } from '@/components/HeaderScreenLayout';
 import { LoadingState } from '@/components/LoadingState';
 import { Colors, Radius, Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
-import { createReelDraft, discardReelDraft, publishReel, uploadReelVideo, type UploadReelVideoHandle } from '@/services/reels';
-import { takePendingSelectedVideo } from '@/services/reelCameraHandoff';
-import { REEL_CAPTION_MAX_LENGTH, type Reel, type SelectedReelVideo } from '@/types/reel';
+import {
+  createReelDraft,
+  discardReelDraft,
+  muxReelMusic,
+  publishReel,
+  uploadReelMusicAudio,
+  uploadReelThumbnail,
+  uploadReelVideo,
+  type UploadReelVideoHandle,
+} from '@/services/reels';
+import { takePendingSelectedMusic, takePendingSelectedThumbnail, takePendingSelectedVideo } from '@/services/reelCameraHandoff';
+import { REEL_CAPTION_MAX_LENGTH, type Reel, type SelectedReelMusic, type SelectedReelThumbnail, type SelectedReelVideo } from '@/types/reel';
 
-type Stage = 'ready' | 'creating' | 'uploading' | 'publishing';
+type Stage = 'ready' | 'creating' | 'uploading' | 'uploadingThumbnail' | 'uploadingMusic' | 'merging' | 'publishing';
 
 /**
  * Post creation Stage 3 (caption + category + Post) — Step 41.2D.1. Only
@@ -29,6 +38,8 @@ type Stage = 'ready' | 'creating' | 'uploading' | 'publishing';
 export default function CreateReelScreen() {
   const { user } = useAuth();
   const [video, setVideo] = useState<SelectedReelVideo | null>(null);
+  const [music, setMusic] = useState<SelectedReelMusic | null>(null);
+  const [thumbnail, setThumbnail] = useState<SelectedReelThumbnail | null>(null);
   const [hasCheckedHandoff, setHasCheckedHandoff] = useState(false);
   const [caption, setCaption] = useState('');
   const [categoryId, setCategoryId] = useState<string | null>(null);
@@ -55,10 +66,14 @@ export default function CreateReelScreen() {
 
   useEffect(() => {
     const pending = takePendingSelectedVideo();
-    // Reads the one-shot handoff exactly once on mount — this screen is
+    const pendingMusic = takePendingSelectedMusic();
+    const pendingThumbnail = takePendingSelectedThumbnail();
+    // Reads the one-shot handoffs exactly once on mount — this screen is
     // always a fresh push, never reused across selections.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     if (pending) setVideo(pending);
+    setMusic(pendingMusic);
+    setThumbnail(pendingThumbnail);
     setHasCheckedHandoff(true);
   }, []);
 
@@ -68,14 +83,23 @@ export default function CreateReelScreen() {
     }
   }, [hasCheckedHandoff, video]);
 
-  const isBusy = stage === 'creating' || stage === 'uploading' || stage === 'publishing';
+  const isBusy =
+    stage === 'creating' ||
+    stage === 'uploading' ||
+    stage === 'uploadingThumbnail' ||
+    stage === 'uploadingMusic' ||
+    stage === 'merging' ||
+    stage === 'publishing';
 
   const resetAfterFailure = async (message: string, { keepFailureBanner = false }: { keepFailureBanner?: boolean } = {}) => {
     const draft = draftRef.current;
     draftRef.current = null;
     uploadHandleRef.current = null;
     if (draft) {
-      await discardReelDraft(draft.reelId, draft.storagePath);
+      // musicStorageAudioPath is '' when no music was attached — see
+      // ReelMusicSourceType's doc comment; discardReelDraft treats an
+      // empty/falsy path as "nothing to delete," not an error.
+      await discardReelDraft(draft.reelId, draft.storagePath, draft.thumbnailStoragePath, draft.musicStorageAudioPath || undefined);
     }
     setError(message);
     setUploadFailed(keepFailureBanner);
@@ -97,6 +121,20 @@ export default function CreateReelScreen() {
       setError("Couldn't verify this video's details — try a different video.");
       return;
     }
+    if (music && (music.fileSizeBytes <= 0 || music.durationMs === null || music.durationMs <= 0 || !music.mimeType)) {
+      // Same "should be unreachable" defensive guard as the video check
+      // above — camera.tsx only ever hands off music that already passed
+      // validateSelectedReelMusic.
+      setError("Couldn't verify this music file's details — try a different file.");
+      return;
+    }
+    if (!thumbnail || thumbnail.fileSizeBytes <= 0 || !thumbnail.mimeType || !thumbnail.width || !thumbnail.height) {
+      // Same "should be unreachable" defensive guard — camera.tsx always
+      // hands off a chosen cover frame before pushing here (see
+      // SelectedReelThumbnail's own doc comment).
+      setError("Couldn't verify this post's cover image — go back and choose one again.");
+      return;
+    }
     setCategoryError(null);
     setError(null);
     setUploadFailed(false);
@@ -112,6 +150,20 @@ export default function CreateReelScreen() {
       durationMs: video.durationMs,
       width: video.width,
       height: video.height,
+      music: music
+        ? {
+            title: music.title,
+            storageContentType: music.mimeType,
+            fileSizeBytes: music.fileSizeBytes,
+            durationMs: music.durationMs!,
+          }
+        : undefined,
+      thumbnail: {
+        storageContentType: thumbnail.mimeType,
+        fileSizeBytes: thumbnail.fileSizeBytes,
+        width: thumbnail.width,
+        height: thumbnail.height,
+      },
     });
     if (!draftResult.ok) {
       setError(draftResult.message);
@@ -120,6 +172,17 @@ export default function CreateReelScreen() {
     }
     draftRef.current = draftResult.reel;
     setStage('uploading');
+
+    const finishPublish = async () => {
+      setStage('publishing');
+      const publishResult = await publishReel(draftResult.reel.reelId);
+      if (!publishResult.ok) {
+        await resetAfterFailure("Couldn't upload post.", { keepFailureBanner: true });
+        return;
+      }
+      draftRef.current = null;
+      router.replace(`/reel/${draftResult.reel.reelId}`);
+    };
 
     uploadHandleRef.current = uploadReelVideo(
       draftResult.reel,
@@ -130,14 +193,58 @@ export default function CreateReelScreen() {
           await resetAfterFailure("Couldn't upload post.", { keepFailureBanner: true });
           return;
         }
-        setStage('publishing');
-        const publishResult = await publishReel(draftResult.reel.reelId);
-        if (!publishResult.ok) {
-          await resetAfterFailure("Couldn't upload post.", { keepFailureBanner: true });
-          return;
-        }
-        draftRef.current = null;
-        router.replace(`/reel/${draftResult.reel.reelId}`);
+
+        // The cover image is a SEPARATE Storage object from the video —
+        // always uploaded next, whether or not music is attached.
+        setStage('uploadingThumbnail');
+        setProgress(0);
+        uploadHandleRef.current = uploadReelThumbnail(
+          draftResult.reel,
+          thumbnail.uri,
+          (percent) => setProgress(percent),
+          async (thumbnailUploadResult) => {
+            if (!thumbnailUploadResult.ok) {
+              await resetAfterFailure("Couldn't upload post.", { keepFailureBanner: true });
+              return;
+            }
+
+            // Music is a SEPARATE Storage object from the video (see
+            // ReelMusicSourceType's doc comment) — uploaded as its own step
+            // once the video and thumbnail have both succeeded, only when
+            // one was attached.
+            if (music) {
+              setStage('uploadingMusic');
+              setProgress(0);
+              uploadHandleRef.current = uploadReelMusicAudio(
+                draftResult.reel,
+                music.uri,
+                (percent) => setProgress(percent),
+                async (musicUploadResult) => {
+                  if (!musicUploadResult.ok) {
+                    await resetAfterFailure("Couldn't upload post.", { keepFailureBanner: true });
+                    return;
+                  }
+                  uploadHandleRef.current = null;
+                  // All files are uploaded — now merge the music into the
+                  // video itself (see muxReelMusic's own doc comment in
+                  // functions/src/index.ts). Only after this succeeds does
+                  // the published Reel actually carry the sound.
+                  setStage('merging');
+                  const muxResult = await muxReelMusic(draftResult.reel.reelId);
+                  if (!muxResult.ok) {
+                    await resetAfterFailure("Couldn't add music to this post.", { keepFailureBanner: true });
+                    return;
+                  }
+                  await finishPublish();
+                }
+              );
+              return;
+            }
+
+            uploadHandleRef.current = null;
+            await finishPublish();
+          }
+        );
       }
     );
   };
@@ -225,17 +332,23 @@ export default function CreateReelScreen() {
             <Text style={styles.progressText}>
               {stage === 'creating'
                 ? 'Creating post…'
-                : stage === 'publishing'
-                  ? 'Publishing…'
-                  : `Uploading ${progress}%`}
+                : stage === 'merging'
+                  ? 'Adding music…'
+                  : stage === 'publishing'
+                    ? 'Publishing…'
+                    : stage === 'uploadingMusic'
+                      ? `Uploading music ${progress}%`
+                      : stage === 'uploadingThumbnail'
+                        ? `Uploading cover ${progress}%`
+                        : `Uploading ${progress}%`}
             </Text>
-            {stage === 'uploading' && (
+            {(stage === 'uploading' || stage === 'uploadingThumbnail' || stage === 'uploadingMusic') && (
               <Pressable onPress={handleCancelUpload} accessibilityRole="button">
                 <Text style={styles.cancelText}>Cancel</Text>
               </Pressable>
             )}
           </View>
-          {stage === 'uploading' ? (
+          {stage === 'uploading' || stage === 'uploadingThumbnail' || stage === 'uploadingMusic' ? (
             <View style={styles.progressTrack}>
               <View style={[styles.progressFill, { width: `${progress}%` }]} />
             </View>
@@ -248,11 +361,17 @@ export default function CreateReelScreen() {
           label={
             stage === 'creating'
               ? 'Creating post…'
-              : stage === 'publishing'
-                ? 'Publishing…'
-                : stage === 'uploading'
-                  ? `Uploading ${progress}%`
-                  : 'Post'
+              : stage === 'merging'
+                ? 'Adding music…'
+                : stage === 'publishing'
+                  ? 'Publishing…'
+                  : stage === 'uploadingMusic'
+                    ? `Uploading music ${progress}%`
+                    : stage === 'uploadingThumbnail'
+                      ? `Uploading cover ${progress}%`
+                      : stage === 'uploading'
+                        ? `Uploading ${progress}%`
+                        : 'Post'
           }
           onPress={handlePublish}
           disabled={!canPublish}

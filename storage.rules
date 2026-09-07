@@ -107,6 +107,73 @@ service firebase.storage {
         && reelDoc(reelId).status == 'uploading';
     }
 
+    // reels/{authorUid}/{reelId}/music — device-picked background music
+    // (see src/types/reel.ts's ReelMusicSourceType), a SEPARATE object
+    // from /source above, only ever present when the Firestore document's
+    // own musicSourceType == 'device'. Otherwise an exact structural
+    // mirror of /source's own rules — same ownership/deterministic-path/
+    // status checks, just against the music fields instead of the video
+    // ones.
+    match /reels/{authorUid}/{reelId}/music {
+      allow read: if isSignedIn()
+        && reelExists(reelId)
+        && reelDoc(reelId).status == 'published';
+
+      allow create: if isSignedIn()
+        && request.auth.uid == authorUid
+        && resource == null
+        && request.resource.size > 0
+        && request.resource.size <= 20 * 1024 * 1024
+        && request.resource.contentType.matches('audio/.*')
+        && reelExists(reelId)
+        && reelDoc(reelId).authorUid == authorUid
+        && reelDoc(reelId).reelId == reelId
+        && reelDoc(reelId).status == 'uploading'
+        && reelDoc(reelId).musicSourceType == 'device'
+        && reelDoc(reelId).musicStorageAudioPath == 'reels/' + authorUid + '/' + reelId + '/music';
+
+      allow update: if false;
+
+      allow delete: if isSignedIn()
+        && request.auth.uid == authorUid
+        && reelExists(reelId)
+        && reelDoc(reelId).authorUid == authorUid
+        && reelDoc(reelId).status == 'uploading';
+    }
+
+    // reels/{authorUid}/{reelId}/thumbnail — the real still frame the
+    // author chose from their own video as its cover (see
+    // src/utils/reelThumbnailCandidates.ts and Reel.thumbnailStoragePath's
+    // own doc comment). Always present on every Reel created after this
+    // field was introduced — unlike /music, never conditional on a source
+    // type. Otherwise an exact structural mirror of /source and /music
+    // above, against the thumbnail fields instead.
+    match /reels/{authorUid}/{reelId}/thumbnail {
+      allow read: if isSignedIn()
+        && reelExists(reelId)
+        && reelDoc(reelId).status == 'published';
+
+      allow create: if isSignedIn()
+        && request.auth.uid == authorUid
+        && resource == null
+        && request.resource.size > 0
+        && request.resource.size <= 5 * 1024 * 1024
+        && request.resource.contentType.matches('image/.*')
+        && reelExists(reelId)
+        && reelDoc(reelId).authorUid == authorUid
+        && reelDoc(reelId).reelId == reelId
+        && reelDoc(reelId).status == 'uploading'
+        && reelDoc(reelId).thumbnailStoragePath == 'reels/' + authorUid + '/' + reelId + '/thumbnail';
+
+      allow update: if false;
+
+      allow delete: if isSignedIn()
+        && request.auth.uid == authorUid
+        && reelExists(reelId)
+        && reelDoc(reelId).authorUid == authorUid
+        && reelDoc(reelId).status == 'uploading';
+    }
+
     // Everything else — including the bucket root and any other path —
     // is denied by default. No public/open bucket access of any kind.
     match /{allPaths=**} {

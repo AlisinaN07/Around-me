@@ -1,5 +1,7 @@
 import { Ionicons } from '@expo/vector-icons';
+import { useAudioPlayer } from 'expo-audio';
 import { CameraView, useCameraPermissions, useMicrophonePermissions } from 'expo-camera';
+import * as DocumentPicker from 'expo-document-picker';
 import { File } from 'expo-file-system';
 import * as ImagePicker from 'expo-image-picker';
 import { router } from 'expo-router';
@@ -9,9 +11,12 @@ import { ActivityIndicator, Platform, Pressable, SafeAreaView, StyleSheet, Text,
 
 import { Button } from '@/components/Button';
 import { Colors, Spacing } from '@/constants/theme';
-import { setPendingSelectedVideo } from '@/services/reelCameraHandoff';
-import { REEL_MAX_DURATION_MS, type SelectedReelVideo } from '@/types/reel';
+import { setPendingSelectedMusic, setPendingSelectedThumbnail, setPendingSelectedVideo } from '@/services/reelCameraHandoff';
+import { REEL_MAX_DURATION_MS, type SelectedReelMusic, type SelectedReelThumbnail, type SelectedReelVideo } from '@/types/reel';
+import { resolveAudioDurationMs } from '@/utils/audioMetadata';
 import { resolveCameraVideoMetadata } from '@/utils/cameraVideoMetadata';
+import { validateSelectedReelMusic } from '@/utils/reelMusicValidation';
+import { generateReelThumbnailCandidates, type ReelThumbnailCandidate } from '@/utils/reelThumbnailCandidates';
 import { validateSelectedReelVideo } from '@/utils/reelVideoValidation';
 
 const MAX_DURATION_SECONDS = REEL_MAX_DURATION_MS / 1000;
@@ -64,12 +69,16 @@ export default function CreateReelCameraScreen() {
   const [permissionRequested, setPermissionRequested] = useState(false);
   // Front camera by default — selfie-first capture is the expected entry
   // state for Post creation; the flip control (bottom-right of the capture
-  // stage) still lets the user switch to the rear camera freely. expo-camera
-  // (57.x) records the underlying file in its natural, non-mirrored
-  // orientation regardless of which camera is active or how the live
-  // preview renders it — no manual mirror/scaleX transform is applied
-  // anywhere in this app, so front-camera recordings are never flipped in
-  // the resulting Post.
+  // stage) still lets the user switch to the rear camera freely.
+  //
+  // CameraView's `mirror` prop (below) is set to true only for the front
+  // camera — without it, iOS mirrors the LIVE PREVIEW but saves the
+  // recorded file un-mirrored by default, so what the user sees while
+  // framing themselves doesn't match the finished Post (the previous
+  // version of this comment claimed recordings were "never flipped" — that
+  // was wrong for iOS, which is exactly the bug this prop fixes). Setting
+  // `mirror` explicitly keeps the preview and the saved recording
+  // consistent with each other on both iOS and Android.
   const [facing, setFacing] = useState<'front' | 'back'>('front');
   const [isCameraReady, setIsCameraReady] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
@@ -81,6 +90,22 @@ export default function CreateReelCameraScreen() {
   const [error, setError] = useState<string | null>(null);
   const [isPreviewPlaying, setIsPreviewPlaying] = useState(true);
 
+  // Device-picked background music (see the "Music" control below and
+  // ReelMusicSourceType's doc comment in src/types/reel.ts). `null` means
+  // no music — the camera's mic stays on (`mute={!!music}` below). Only
+  // meaningful for camera recording, never for a library-picked video
+  // (which already has its own audio) — cleared in handleChooseFromLibrary.
+  const [music, setMusic] = useState<SelectedReelMusic | null>(null);
+  const [isMusicLoading, setIsMusicLoading] = useState(false);
+
+  // The real cover-frame image for this Post — always picked automatically
+  // from the middle of the video (see reelThumbnailCandidates.ts), never by
+  // the user. Generated silently in the background as soon as a video is
+  // selected; if it isn't ready yet by the time Next is tapped,
+  // handleNext generates it on demand instead of blocking on a picker UI.
+  const [autoThumbnail, setAutoThumbnail] = useState<ReelThumbnailCandidate | null>(null);
+  const [isPreparingNext, setIsPreparingNext] = useState(false);
+
   const cameraRef = useRef<CameraView>(null);
   const elapsedTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -91,9 +116,39 @@ export default function CreateReelCameraScreen() {
     p.muted = true;
   });
 
+  // Synced playback companion for `music`, LOCAL PREVIEW ONLY — the real
+  // merge (muxReelMusic, functions/src/index.ts) hasn't run yet at this
+  // point, so this is still two separately-played files here (unlike
+  // every published-playback surface, which just plays the one real
+  // merged file). Deliberately NOT `loop = true` on the music itself: the
+  // track is almost always much longer than the recorded video, so
+  // letting it free-loop on its own natural length would drift out of
+  // sync with the video's own (much shorter) loop almost immediately —
+  // it would just keep playing underneath, never stopping in step with
+  // the video, exactly the bug this avoids. Instead the video's own
+  // `playToEnd` event (below) explicitly restarts the music every time
+  // the video itself loops, so the two stay aligned the same way the
+  // final merged file is aligned (see muxReelMusic's own `-shortest`
+  // doc comment).
+  const musicPlayer = useAudioPlayer(music?.uri ?? null);
+
+  useEffect(() => {
+    const subscription = player.addListener('playToEnd', () => {
+      if (music) {
+        musicPlayer.seekTo(0);
+        musicPlayer.play();
+      }
+    });
+    return () => subscription.remove();
+  }, [player, music, musicPlayer]);
+
   useEffect(() => {
     if (stage === 'preview' && video) {
       player.play();
+      if (music) {
+        musicPlayer.seekTo(0);
+        musicPlayer.play();
+      }
       // Resets fresh whenever a new video is selected — same prop-driven-
       // reset pattern as ReportModal/ReelFeedItem.
       // eslint-disable-next-line react-hooks/set-state-in-effect
@@ -101,6 +156,30 @@ export default function CreateReelCameraScreen() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [stage, video]);
+
+  // Real cover-frame extraction — runs once per newly-selected video,
+  // entirely in the background (no picker, no loading UI, nothing that
+  // gates Next — see handleNext's own on-demand fallback for the case
+  // where this hasn't resolved yet).
+  useEffect(() => {
+    if (!video || video.durationMs === null) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setAutoThumbnail(null);
+      return;
+    }
+    let cancelled = false;
+    setAutoThumbnail(null);
+    generateReelThumbnailCandidates(video.uri, video.durationMs).then((candidates) => {
+      if (cancelled || candidates.length === 0) return;
+      // The middle candidate is the video's ~50% mark — always the one
+      // used, automatically, never a user choice.
+      setAutoThumbnail(candidates[Math.floor(candidates.length / 2)]);
+    });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [video?.uri]);
 
   // Requested only once this screen is actually reached — i.e. only after
   // the user tapped + (Personal) or Post (Business) — same minimum-
@@ -139,6 +218,15 @@ export default function CreateReelCameraScreen() {
       setElapsedMs((prev) => prev + 200);
     }, 200);
 
+    // Starts in sync with the camera's own recordAsync call just below —
+    // the mic is already off for this take (CameraView's `mute` prop, set
+    // from `!!music`), so this is the only audio being captured live by
+    // the person recording, matching what they'll hear back later.
+    if (music) {
+      musicPlayer.seekTo(0);
+      musicPlayer.play();
+    }
+
     try {
       const result = await cameraRef.current?.recordAsync({ maxDuration: MAX_DURATION_SECONDS });
       if (result?.uri) {
@@ -153,6 +241,10 @@ export default function CreateReelCameraScreen() {
       if (elapsedTimerRef.current) {
         clearInterval(elapsedTimerRef.current);
         elapsedTimerRef.current = null;
+      }
+      if (music) {
+        musicPlayer.pause();
+        musicPlayer.seekTo(0);
       }
     }
   };
@@ -191,6 +283,11 @@ export default function CreateReelCameraScreen() {
 
   const handleChooseFromLibrary = async () => {
     setError(null);
+    // A library-picked video already has its own audio track — music is
+    // only ever meaningful for a fresh camera recording (see `music`'s own
+    // doc comment above), so any prior pick is cleared here rather than
+    // left as confusing latent state.
+    setMusic(null);
     // Requested only when the user explicitly chooses a video — never on
     // screen mount (see the Step 18 spec's minimum-permissions rule).
     const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
@@ -231,8 +328,60 @@ export default function CreateReelCameraScreen() {
     setStage('preview');
   };
 
+  /**
+   * Opens the system file picker restricted to audio, for the user's own
+   * on-device music (see ReelMusicSourceType's doc comment in
+   * src/types/reel.ts for the exact source model and its known iOS
+   * limitation — this reaches the Files app, not the actual Apple Music
+   * library). Picking a track mutes the camera's mic for the NEXT
+   * recording (`mute={!!music}` below) — this never touches a take
+   * already in progress.
+   */
+  const handlePickMusic = async () => {
+    if (isRecording) return;
+    setError(null);
+    setIsMusicLoading(true);
+    try {
+      const result = await DocumentPicker.getDocumentAsync({ type: 'audio/*', copyToCacheDirectory: true });
+      if (result.canceled || result.assets.length === 0) return;
+
+      const asset = result.assets[0];
+      const mimeType = asset.mimeType ?? null;
+      if (!mimeType || !mimeType.startsWith('audio/')) {
+        setError('Choose an audio file.');
+        return;
+      }
+      const fileSizeBytes = asset.size && asset.size > 0 ? asset.size : new File(asset.uri).size || 0;
+      const durationMs = await resolveAudioDurationMs(asset.uri);
+
+      const candidate: SelectedReelMusic = {
+        uri: asset.uri,
+        title: asset.name,
+        fileSizeBytes,
+        mimeType,
+        durationMs,
+      };
+
+      const validation = validateSelectedReelMusic(candidate);
+      if (!validation.ok) {
+        setError(validation.message);
+        return;
+      }
+
+      setMusic(candidate);
+    } finally {
+      setIsMusicLoading(false);
+    }
+  };
+
+  const handleRemoveMusic = () => {
+    musicPlayer.pause();
+    setMusic(null);
+  };
+
   const handleRetake = () => {
     player.pause();
+    musicPlayer.pause();
     setVideo(null);
     setError(null);
     setStage('capture');
@@ -241,15 +390,42 @@ export default function CreateReelCameraScreen() {
   const togglePreviewPlayback = () => {
     if (isPreviewPlaying) {
       player.pause();
+      if (music) musicPlayer.pause();
     } else {
       player.play();
+      if (music) musicPlayer.play();
     }
     setIsPreviewPlaying((prev) => !prev);
   };
 
-  const handleNext = () => {
-    if (!video) return;
+  const handleNext = async () => {
+    if (!video || isPreparingNext) return;
+    // The background effect above almost always already has this ready by
+    // the time Next is tapped — this is just a safety net for the rare
+    // case it hasn't resolved yet, never a picker the user interacts with.
+    let chosen = autoThumbnail;
+    if (!chosen) {
+      setIsPreparingNext(true);
+      const candidates = await generateReelThumbnailCandidates(video.uri, video.durationMs ?? 0);
+      chosen = candidates[Math.floor(candidates.length / 2)] ?? candidates[0] ?? null;
+      setIsPreparingNext(false);
+    }
+    if (!chosen) {
+      setError("Couldn't prepare this video's cover image — try again.");
+      return;
+    }
+    const thumbnail: SelectedReelThumbnail = {
+      uri: chosen.uri,
+      fileSizeBytes: new File(chosen.uri).size || 0,
+      // expo-video-thumbnails always produces a JPEG file — it has no
+      // format option to request anything else (see its own .d.ts).
+      mimeType: 'image/jpeg',
+      width: chosen.width,
+      height: chosen.height,
+    };
     setPendingSelectedVideo(video);
+    setPendingSelectedMusic(music);
+    setPendingSelectedThumbnail(thumbnail);
     router.push('/create/reel');
   };
 
@@ -288,7 +464,7 @@ export default function CreateReelCameraScreen() {
               <Text style={styles.retakeText}>{video.source === 'camera' ? 'Retake' : 'Choose another'}</Text>
             </Pressable>
             <View style={styles.nextButtonWrap}>
-              <Button label="Next" onPress={handleNext} />
+              <Button label="Next" onPress={handleNext} loading={isPreparingNext} />
             </View>
           </View>
         </SafeAreaView>
@@ -379,7 +555,12 @@ export default function CreateReelCameraScreen() {
         ref={cameraRef}
         style={StyleSheet.absoluteFill}
         facing={facing}
+        mirror={facing === 'front'}
         mode="video"
+        // Music selected -> mic off (the chosen track is the only audio
+        // for this take); no music -> mic on, unchanged default. See
+        // ReelMusicSourceType's doc comment in src/types/reel.ts.
+        mute={!!music}
         onCameraReady={() => setIsCameraReady(true)}
         onMountError={(event) => setMountError(event.message)}
       />
@@ -396,7 +577,30 @@ export default function CreateReelCameraScreen() {
                 {formatDuration(elapsedMs)} / {formatDuration(REEL_MAX_DURATION_MS)}
               </Text>
             </View>
-          ) : null}
+          ) : !music ? (
+            <Pressable
+              onPress={handlePickMusic}
+              disabled={isMusicLoading}
+              hitSlop={12}
+              accessibilityRole="button"
+              accessibilityLabel="Add music"
+              style={styles.iconButton}
+            >
+              {isMusicLoading ? <ActivityIndicator size="small" color={Colors.text} /> : <Ionicons name="musical-notes-outline" size={22} color={Colors.text} />}
+            </Pressable>
+          ) : (
+            <View style={styles.musicPill}>
+              <Pressable onPress={handlePickMusic} disabled={isMusicLoading} style={styles.musicPillLabel} accessibilityRole="button" accessibilityLabel="Change music">
+                <Ionicons name="musical-notes" size={14} color={Colors.text} />
+                <Text style={styles.musicPillText} numberOfLines={1}>
+                  {music.title}
+                </Text>
+              </Pressable>
+              <Pressable onPress={handleRemoveMusic} hitSlop={8} accessibilityRole="button" accessibilityLabel="Remove music">
+                <Ionicons name="close" size={16} color={Colors.text} />
+              </Pressable>
+            </View>
+          )}
           <View style={styles.iconButtonSpacer} />
         </View>
 
@@ -534,6 +738,29 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontWeight: '700',
     fontVariant: ['tabular-nums'],
+  },
+  musicPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    maxWidth: 180,
+    backgroundColor: 'rgba(11, 11, 15, 0.65)',
+    borderRadius: 999,
+    paddingLeft: Spacing.md,
+    paddingRight: Spacing.sm,
+    paddingVertical: 6,
+  },
+  musicPillLabel: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    flexShrink: 1,
+  },
+  musicPillText: {
+    color: Colors.text,
+    fontSize: 13,
+    fontWeight: '600',
+    flexShrink: 1,
   },
   errorBanner: {
     marginHorizontal: Spacing.xl,

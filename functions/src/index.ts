@@ -47,6 +47,12 @@ import {
 import { initializeApp } from 'firebase-admin/app';
 import { getStorage } from 'firebase-admin/storage';
 import { HttpsError, onCall, type CallableRequest } from 'firebase-functions/v2/https';
+import { execFile } from 'node:child_process';
+import { mkdtemp, rm, stat } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { promisify } from 'node:util';
+import ffmpegPath from 'ffmpeg-static';
 
 initializeApp();
 
@@ -1285,4 +1291,137 @@ export const deleteMyReel = onCall({ region: REGION, timeoutSeconds: 300, memory
   await deleteReelDocumentAndSubcollections(db, bucket, reelId, storagePath, 'preserve');
 
   return { reelId, deleted: true as const };
+});
+
+// ---------------------------------------------------------------------------
+// Step — device-picked camera music, merged into the video itself.
+//
+// The client records with the mic muted and the chosen track playing, then
+// uploads BOTH the silent video (reel.storagePath) and the raw music file
+// (reel.musicStorageAudioPath) separately (see camera.tsx and reels.ts) —
+// neither expo-camera/expo-video nor anything else in this project's
+// managed Expo toolchain can combine two audio sources into one video file
+// on-device, and the on-device native alternative (a custom Swift/Kotlin
+// module) needs a full native rebuild this project doesn't have. This
+// callable does the actual merge server-side with real ffmpeg (via
+// ffmpeg-static's bundled Linux binary — Cloud Functions' own build runs
+// on Linux regardless of the machine that deployed it, so the correct
+// binary is what actually gets installed and shipped, unrelated to the
+// now-retired ffmpeg-kit-react-native React Native wrapper).
+//
+// "-stream_loop -1" on the music input reproduces exactly what the person
+// heard while recording (the track restarting from 0 for the whole take —
+// see camera.tsx's handleStartRecording), and "-shortest" (with the video
+// as the only fixed-length input) cuts that looped audio to precisely the
+// video's own length — i.e. only the part of the music actually used, never
+// the full original track. "-c:v copy" re-uses the original video stream
+// byte-for-byte (fast, lossless remux, no re-encode) — only the audio is
+// (re-)encoded.
+//
+// Only ever called between the two uploads finishing and publishReel (see
+// index.tsx's Stage 3) — the Reel is still "uploading" the whole time, so
+// overwriting reel.storagePath's Storage object in place, and updating its
+// declared fileSizeBytes/storageContentType to match the real merged file,
+// changes nothing a client could otherwise not already control at this
+// stage (Rules' isValidReelPublish only requires these fields stay
+// byte-identical FROM HERE ON, which they do). The now-redundant standalone
+// music object is deleted afterward — the merged video is the only copy of
+// the sound from this point on.
+// ---------------------------------------------------------------------------
+
+const execFileAsync = promisify(execFile);
+
+export const muxReelMusic = onCall({ region: REGION, timeoutSeconds: 300, memory: '1GiB' }, async (request) => {
+  if (!request.auth) {
+    throw new HttpsError('unauthenticated', 'Sign in required.');
+  }
+  const reelId = parseReelIdParam(request);
+  const uid = request.auth.uid;
+
+  const db = getFirestore();
+  const reelDocRef = db.doc(`reels/${reelId}`);
+  const reelSnap = await reelDocRef.get();
+  if (!reelSnap.exists) {
+    throw new HttpsError('not-found', 'No Reel with that ID exists.');
+  }
+  const reel = reelSnap.data()!;
+  if (reel.authorUid !== uid) {
+    throw new HttpsError('permission-denied', 'You can only merge music into your own post.');
+  }
+  if (reel.status !== 'uploading') {
+    throw new HttpsError('failed-precondition', 'This post is not awaiting a music merge.');
+  }
+  if (reel.musicSourceType !== 'device') {
+    throw new HttpsError('failed-precondition', 'This post has no music to merge.');
+  }
+  if (!ffmpegPath) {
+    // Genuinely unexpected (ffmpeg-static failed to resolve a binary for
+    // this runtime) — never silently skip the merge and publish a silent
+    // video as if it had music.
+    throw new HttpsError('internal', "Couldn't process this post's music.");
+  }
+
+  const bucket = getStorage().bucket();
+  const videoStoragePath = reel.storagePath as string;
+  const musicStoragePath = reel.musicStorageAudioPath as string;
+  const videoFile = bucket.file(videoStoragePath);
+  const musicFile = bucket.file(musicStoragePath);
+
+  const [[videoExists], [musicExists]] = await Promise.all([videoFile.exists(), musicFile.exists()]);
+  if (!videoExists || !musicExists) {
+    throw new HttpsError('failed-precondition', 'Both the video and music must finish uploading before merging.');
+  }
+
+  const workDir = await mkdtemp(join(tmpdir(), `reel-mux-${reelId}-`));
+  const localVideoPath = join(workDir, 'input-video');
+  const localMusicPath = join(workDir, 'input-music');
+  const localOutputPath = join(workDir, 'output.mp4');
+
+  try {
+    await Promise.all([videoFile.download({ destination: localVideoPath }), musicFile.download({ destination: localMusicPath })]);
+
+    await execFileAsync(
+      ffmpegPath,
+      [
+        '-y',
+        '-i', localVideoPath,
+        '-stream_loop', '-1',
+        '-i', localMusicPath,
+        '-map', '0:v:0',
+        '-map', '1:a:0',
+        '-c:v', 'copy',
+        '-c:a', 'aac',
+        '-b:a', '192k',
+        '-shortest',
+        localOutputPath,
+      ],
+      { timeout: 240_000 }
+    );
+
+    const outputStat = await stat(localOutputPath);
+    if (outputStat.size <= 0) {
+      throw new HttpsError('internal', "Couldn't process this post's music.");
+    }
+
+    await bucket.upload(localOutputPath, { destination: videoStoragePath, metadata: { contentType: 'video/mp4' } });
+
+    // The standalone music object is now redundant — the merged video is
+    // the only copy of the sound from here on. Best-effort: a failure here
+    // leaves an orphaned object, never a broken post (same reasoning as
+    // discardReelDraft's own Storage cleanup on the client).
+    await musicFile.delete({ ignoreNotFound: true }).catch(() => undefined);
+
+    await reelDocRef.update({
+      storageContentType: 'video/mp4',
+      fileSizeBytes: outputStat.size,
+      updatedAt: FieldValue.serverTimestamp(),
+    });
+  } catch (error) {
+    if (error instanceof HttpsError) throw error;
+    throw new HttpsError('internal', "Couldn't process this post's music.");
+  } finally {
+    await rm(workDir, { recursive: true, force: true });
+  }
+
+  return { reelId, merged: true as const };
 });

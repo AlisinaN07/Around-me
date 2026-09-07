@@ -1,5 +1,6 @@
 import * as Clipboard from 'expo-clipboard';
 import { LinearGradient } from 'expo-linear-gradient';
+import { useIsFocused } from 'expo-router';
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { ActivityIndicator, FlatList, StyleSheet, Text, View, type ViewToken } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
@@ -14,8 +15,7 @@ import { useAuth } from '@/hooks/useAuth';
 import { blockUser } from '@/services/blocks';
 import { deleteMyReel } from '@/services/reels';
 import { isPostReposted, repostPost, undoRepost } from '@/services/reposts';
-import { isPostSaved, savePost, unsavePost } from '@/services/saved';
-import { buildReelShareUrl, shareReel } from '@/utils/reelShare';
+import { buildReelShareUrl } from '@/utils/reelShare';
 import type { Reel } from '@/types/reel';
 
 type LoadStatus = 'loading' | 'loaded' | 'error';
@@ -45,9 +45,17 @@ export function ReelFeed({ reels, status, errorTitle, emptyState, onReload, topO
   const { user } = useAuth();
   const [containerHeight, setContainerHeight] = useState(0);
   const [activeIndex, setActiveIndex] = useState(0);
+  // Home and the standalone /reels screen are both persistent tab
+  // screens — Expo Router keeps them mounted (just hidden) when the user
+  // switches to a different tab, so scroll-position-based `activeIndex`
+  // alone never changes when that happens. Without this, whichever Reel
+  // was playing keeps playing — silently while it had no audio, now
+  // audibly for a Reel with music merged in — in a tab the user can no
+  // longer see. Folded into `isActive` below rather than a separate prop,
+  // so ReelFeedItem's own play/pause effect needs no change at all.
+  const isScreenFocused = useIsFocused();
 
   const [optionsReel, setOptionsReel] = useState<Reel | null>(null);
-  const [isOptionsReelSaved, setIsOptionsReelSaved] = useState(false);
   const [isOptionsReelReposted, setIsOptionsReelReposted] = useState(false);
   const [reportReel, setReportReel] = useState<Reel | null>(null);
   const [blockTarget, setBlockTarget] = useState<Reel | null>(null);
@@ -86,25 +94,11 @@ export function ReelFeed({ reels, status, errorTitle, emptyState, onReload, topO
     };
   }, []);
 
-  // Reflects the correct current Saved state whenever the options menu is
-  // opened for a different Reel — never requires leaving/reopening this
-  // screen for the label to be accurate (Step 41.2E Section 18).
-  useEffect(() => {
-    let cancelled = false;
-    if (!optionsReel || !user || optionsReel.authorUid === user.uid) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
-      setIsOptionsReelSaved(false);
-      return;
-    }
-    isPostSaved(user.uid, 'reel', optionsReel.reelId).then((saved) => {
-      if (!cancelled) setIsOptionsReelSaved(saved);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [optionsReel, user]);
-
-  // Same reflect-current-state pattern as Saved above, independently —
+  // Save moved out of this menu into its own always-visible action-rail
+  // icon per item (ReelFeedItem owns its own Saved state/toggle now) — see
+  // that component for the equivalent "reflect current state" effect.
+  //
+  // Same reflect-current-state pattern as Save used to follow, independently —
   // Repost is public (Step 41.2F), Saved is private (Step 41.2E); neither
   // reads or writes the other's state.
   useEffect(() => {
@@ -121,21 +115,6 @@ export function ReelFeed({ reels, status, errorTitle, emptyState, onReload, topO
       cancelled = true;
     };
   }, [optionsReel, user]);
-
-  const handleToggleSave = useCallback(
-    async (reel: Reel) => {
-      if (!user) return;
-      const wasSaved = isOptionsReelSaved;
-      const result = wasSaved ? await unsavePost(user.uid, 'reel', reel.reelId) : await savePost(user.uid, 'reel', reel.reelId);
-      if (!result.ok) {
-        showToast(result.message);
-        return;
-      }
-      setIsOptionsReelSaved(!wasSaved);
-      showToast(wasSaved ? 'Removed from saved' : 'Saved');
-    },
-    [user, isOptionsReelSaved, showToast]
-  );
 
   const handleToggleRepost = useCallback(
     async (reel: Reel) => {
@@ -162,27 +141,17 @@ export function ReelFeed({ reels, status, errorTitle, emptyState, onReload, topO
     [showToast]
   );
 
-  const handleShare = useCallback(
-    async (reel: Reel) => {
-      const result = await shareReel(reel.reelId);
-      if (!result.ok && !/cancel/i.test(result.message)) {
-        await handleCopyLink(reel);
-      }
-    },
-    [handleCopyLink]
-  );
-
+  // Share moved out of this menu into its own always-visible action-rail
+  // icon per item (ReelFeedItem owns the share/copy-link-fallback flow
+  // now) — "Copy link" stays here as a separate, explicit menu action.
   const optionsMenuOptions: OptionsMenuOption[] = optionsReel
     ? optionsReel.authorUid === user?.uid
       ? [
-          { label: 'Share post', onPress: () => handleShare(optionsReel) },
           { label: 'Copy link', onPress: () => handleCopyLink(optionsReel) },
           { label: 'Delete post', onPress: () => setDeleteTarget(optionsReel), destructive: true },
         ]
       : [
-          { label: isOptionsReelSaved ? 'Remove from saved' : 'Save', onPress: () => handleToggleSave(optionsReel) },
           { label: isOptionsReelReposted ? 'Undo repost' : 'Repost', onPress: () => handleToggleRepost(optionsReel) },
-          { label: 'Share post', onPress: () => handleShare(optionsReel) },
           { label: 'Copy link', onPress: () => handleCopyLink(optionsReel) },
           { label: 'Report post', onPress: () => setReportReel(optionsReel) },
           { label: `Block ${optionsReel.authorDisplayName}`, onPress: () => setBlockTarget(optionsReel), destructive: true },
@@ -247,9 +216,10 @@ export function ReelFeed({ reels, status, errorTitle, emptyState, onReload, topO
               <ReelFeedItem
                 reel={item}
                 height={containerHeight}
-                isActive={index === activeIndex}
+                isActive={index === activeIndex && isScreenFocused}
                 shouldPrepare={Math.abs(index - activeIndex) <= 1}
                 onOpenOptions={() => setOptionsReel(item)}
+                onToast={showToast}
               />
             )}
             pagingEnabled

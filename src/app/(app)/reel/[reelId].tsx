@@ -1,6 +1,6 @@
 import { Ionicons } from '@expo/vector-icons';
 import * as Clipboard from 'expo-clipboard';
-import { router, useLocalSearchParams } from 'expo-router';
+import { router, useIsFocused, useLocalSearchParams } from 'expo-router';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Pressable, StyleSheet, Text, View } from 'react-native';
 import { VideoView, useVideoPlayer } from 'expo-video';
@@ -33,6 +33,13 @@ const PLAYER_HEIGHT = 480;
 export default function ReelDetailScreen() {
   const { reelId } = useLocalSearchParams<{ reelId: string }>();
   const { user } = useAuth();
+  // This screen is a pushed route on top of whichever tab's stack it was
+  // opened from — Expo Router keeps that stack (and this screen) mounted,
+  // just hidden, if the user switches to a different bottom tab, so
+  // playback would otherwise keep going (audibly, for a Reel with music
+  // merged in) in a tab no longer visible. See the play/pause effect
+  // below.
+  const isScreenFocused = useIsFocused();
 
   const [status, setStatus] = useState<LoadStatus>('loading');
   const [reel, setReel] = useState<Reel | null>(null);
@@ -122,10 +129,12 @@ export default function ReelDetailScreen() {
   }, [player]);
 
   useEffect(() => {
-    if (urlStatus === 'ready' && !playbackFailed) {
+    if (isScreenFocused && urlStatus === 'ready' && !playbackFailed) {
       player.play();
+    } else {
+      player.pause();
     }
-  }, [urlStatus, playbackFailed, player]);
+  }, [isScreenFocused, urlStatus, playbackFailed, player]);
 
   const handleRetryPlayback = async () => {
     // Forces the player to actually release and recreate (see

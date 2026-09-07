@@ -997,8 +997,60 @@ service cloud.firestore {
         'reelId', 'authorUid', 'authorDisplayName', 'authorUsername',
         'cityName', 'countryCode', 'cityKey', 'categoryId', 'caption',
         'storagePath', 'storageContentType', 'fileSizeBytes', 'durationMs',
-        'width', 'height', 'status', 'visibility', 'createdAt', 'updatedAt', 'publishedAt'
+        'width', 'height', 'status', 'visibility',
+        'musicSourceType', 'musicTitle', 'musicStorageAudioPath',
+        'musicStorageContentType', 'musicFileSizeBytes', 'musicDurationMs',
+        'thumbnailStoragePath', 'thumbnailStorageContentType',
+        'thumbnailFileSizeBytes', 'thumbnailWidth', 'thumbnailHeight',
+        'createdAt', 'updatedAt', 'publishedAt'
       ];
+    }
+
+    // A real still frame from the Reel's own video, chosen by the author
+    // at capture time (see src/types/reel.ts's Reel.thumbnailStoragePath
+    // doc comment) — REQUIRED on every Reel, unlike optional music.
+    function isValidReelThumbnail(reelId, authorUid, data) {
+      return data.thumbnailStoragePath == 'reels/' + authorUid + '/' + reelId + '/thumbnail'
+        && data.thumbnailStorageContentType is string
+        && data.thumbnailStorageContentType.matches('image/.*')
+        && data.thumbnailFileSizeBytes is int
+        && data.thumbnailFileSizeBytes > 0
+        && data.thumbnailFileSizeBytes <= 5242880
+        && data.thumbnailWidth is number
+        && data.thumbnailWidth > 0
+        && data.thumbnailHeight is number
+        && data.thumbnailHeight > 0;
+    }
+
+    // Device-picked background music (see src/types/reel.ts's
+    // ReelMusicSourceType doc comment) — 'none' is the overwhelming
+    // default; every music field is always present (never conditionally
+    // omitted, same convention as every other Reel field), holding
+    // empty-string/0 sentinels when unused. 'device' is the only real
+    // source today — a future catalog source is an additive change here,
+    // not a breaking one.
+    function isValidReelMusic(reelId, authorUid, data) {
+      return (
+        data.musicSourceType == 'none'
+        && data.musicTitle == ''
+        && data.musicStorageAudioPath == ''
+        && data.musicStorageContentType == ''
+        && data.musicFileSizeBytes == 0
+        && data.musicDurationMs == 0
+      ) || (
+        data.musicSourceType == 'device'
+        && data.musicTitle is string
+        && data.musicTitle.size() <= 200
+        && data.musicStorageAudioPath == 'reels/' + authorUid + '/' + reelId + '/music'
+        && data.musicStorageContentType is string
+        && data.musicStorageContentType.matches('audio/.*')
+        && data.musicFileSizeBytes is int
+        && data.musicFileSizeBytes > 0
+        && data.musicFileSizeBytes <= 20971520
+        && data.musicDurationMs is int
+        && data.musicDurationMs > 0
+        && data.musicDurationMs <= 600000
+      );
     }
 
     function isValidReelCreate(reelId, data) {
@@ -1032,6 +1084,8 @@ service cloud.firestore {
         && data.status == 'uploading'
         && data.visibility == 'city'
         && data.publishedAt == null
+        && isValidReelMusic(reelId, request.auth.uid, data)
+        && isValidReelThumbnail(reelId, request.auth.uid, data)
         && isServerTimestamp(data.createdAt)
         && isServerTimestamp(data.updatedAt)
         && data.keys().hasOnly(reelBaseKeys());
@@ -1041,7 +1095,8 @@ service cloud.firestore {
     // byte-identical to what create validated — this is what actually
     // enforces "no caption editing, no city changing, no storage path
     // changing, no author changing" from the Step 18 spec, not just the
-    // status-transition check by itself.
+    // status-transition check by itself. Music fields are equally
+    // immutable once created — no swapping the track after publish.
     function isValidReelPublish(newData, oldData) {
       return oldData.status == 'uploading'
         && newData.status == 'published'
@@ -1064,6 +1119,17 @@ service cloud.firestore {
         && newData.width == oldData.width
         && newData.height == oldData.height
         && newData.visibility == oldData.visibility
+        && newData.musicSourceType == oldData.musicSourceType
+        && newData.musicTitle == oldData.musicTitle
+        && newData.musicStorageAudioPath == oldData.musicStorageAudioPath
+        && newData.musicStorageContentType == oldData.musicStorageContentType
+        && newData.musicFileSizeBytes == oldData.musicFileSizeBytes
+        && newData.musicDurationMs == oldData.musicDurationMs
+        && newData.thumbnailStoragePath == oldData.thumbnailStoragePath
+        && newData.thumbnailStorageContentType == oldData.thumbnailStorageContentType
+        && newData.thumbnailFileSizeBytes == oldData.thumbnailFileSizeBytes
+        && newData.thumbnailWidth == oldData.thumbnailWidth
+        && newData.thumbnailHeight == oldData.thumbnailHeight
         && newData.createdAt == oldData.createdAt
         && newData.keys().hasOnly(reelBaseKeys());
     }

@@ -39,6 +39,9 @@ import {
   REEL_CAPTION_MAX_LENGTH,
   REEL_MAX_DURATION_MS,
   REEL_MAX_FILE_SIZE_BYTES,
+  REEL_MUSIC_MAX_DURATION_MS,
+  REEL_MUSIC_MAX_FILE_SIZE_BYTES,
+  REEL_THUMBNAIL_MAX_FILE_SIZE_BYTES,
   type Reel,
 } from '@/types/reel';
 
@@ -70,6 +73,16 @@ export function reelStoragePath(authorUid: string, reelId: string): string {
   return `reels/${authorUid}/${reelId}/source`;
 }
 
+/** reels/{authorUid}/{reelId}/music — deterministic, mirrors reelStoragePath exactly (see ReelMusicSourceType's doc comment in src/types/reel.ts). */
+export function reelMusicStoragePath(authorUid: string, reelId: string): string {
+  return `reels/${authorUid}/${reelId}/music`;
+}
+
+/** reels/{authorUid}/{reelId}/thumbnail — deterministic, mirrors reelStoragePath exactly (see Reel.thumbnailStoragePath's doc comment in src/types/reel.ts). */
+export function reelThumbnailStoragePath(authorUid: string, reelId: string): string {
+  return `reels/${authorUid}/${reelId}/thumbnail`;
+}
+
 function isValidCategoryId(categoryId: string): boolean {
   return VALID_CATEGORY_IDS.has(categoryId);
 }
@@ -98,6 +111,31 @@ export type CreateReelDraftInput = {
   durationMs: number;
   width: number;
   height: number;
+  /**
+   * The device-audio file picked alongside the camera recording (see
+   * camera.tsx's "Music" control) — `undefined`/omitted for the ordinary
+   * case (no music, or a library-picked video, which never has this).
+   * See ReelMusicSourceType's doc comment in src/types/reel.ts for the
+   * full model this maps onto.
+   */
+  music?: {
+    title: string;
+    storageContentType: string;
+    fileSizeBytes: number;
+    durationMs: number;
+  };
+  /**
+   * The real still frame from this video the author picked as its cover
+   * (see camera.tsx's cover-frame picker and Reel.thumbnailStoragePath's
+   * own doc comment in src/types/reel.ts) — REQUIRED, unlike `music`:
+   * every Reel needs a real thumbnail.
+   */
+  thumbnail: {
+    storageContentType: string;
+    fileSizeBytes: number;
+    width: number;
+    height: number;
+  };
 };
 
 export type ReelDraftError = 'not-configured' | 'no-profile' | 'invalid-input' | 'unknown';
@@ -132,6 +170,30 @@ export async function createReelDraft(input: CreateReelDraftInput): Promise<Crea
   if (!Number.isFinite(input.width) || input.width <= 0 || !Number.isFinite(input.height) || input.height <= 0) {
     return { ok: false, error: 'invalid-input', message: "Couldn't read this video's dimensions." };
   }
+  if (input.music) {
+    if (!input.music.storageContentType.startsWith('audio/')) {
+      return { ok: false, error: 'invalid-input', message: 'Music must be an audio file.' };
+    }
+    if (!Number.isFinite(input.music.fileSizeBytes) || input.music.fileSizeBytes <= 0 || input.music.fileSizeBytes > REEL_MUSIC_MAX_FILE_SIZE_BYTES) {
+      return { ok: false, error: 'invalid-input', message: 'Music file must be under 20 MB.' };
+    }
+    if (!Number.isFinite(input.music.durationMs) || input.music.durationMs <= 0 || input.music.durationMs > REEL_MUSIC_MAX_DURATION_MS) {
+      return { ok: false, error: 'invalid-input', message: 'Music file must be 10 minutes or shorter.' };
+    }
+  }
+  if (!input.thumbnail.storageContentType.startsWith('image/')) {
+    return { ok: false, error: 'invalid-input', message: 'Cover image must be a real image file.' };
+  }
+  if (
+    !Number.isFinite(input.thumbnail.fileSizeBytes) ||
+    input.thumbnail.fileSizeBytes <= 0 ||
+    input.thumbnail.fileSizeBytes > REEL_THUMBNAIL_MAX_FILE_SIZE_BYTES
+  ) {
+    return { ok: false, error: 'invalid-input', message: 'Cover image must be under 5 MB.' };
+  }
+  if (!Number.isFinite(input.thumbnail.width) || input.thumbnail.width <= 0 || !Number.isFinite(input.thumbnail.height) || input.thumbnail.height <= 0) {
+    return { ok: false, error: 'invalid-input', message: "Couldn't read the cover image's dimensions." };
+  }
 
   const draftRef = doc(collection(firestore, REELS_COLLECTION));
   const data = {
@@ -152,6 +214,20 @@ export async function createReelDraft(input: CreateReelDraftInput): Promise<Crea
     height: input.height,
     status: 'uploading',
     visibility: 'city',
+    // See ReelMusicSourceType's doc comment (src/types/reel.ts) — always
+    // present, 'none'/empty/0 sentinels when no music was picked, exactly
+    // like every other Reel field (never conditionally omitted).
+    musicSourceType: input.music ? 'device' : 'none',
+    musicTitle: input.music?.title ?? '',
+    musicStorageAudioPath: input.music ? reelMusicStoragePath(profile.uid, draftRef.id) : '',
+    musicStorageContentType: input.music?.storageContentType ?? '',
+    musicFileSizeBytes: input.music?.fileSizeBytes ?? 0,
+    musicDurationMs: input.music?.durationMs ?? 0,
+    thumbnailStoragePath: reelThumbnailStoragePath(profile.uid, draftRef.id),
+    thumbnailStorageContentType: input.thumbnail.storageContentType,
+    thumbnailFileSizeBytes: input.thumbnail.fileSizeBytes,
+    thumbnailWidth: input.thumbnail.width,
+    thumbnailHeight: input.thumbnail.height,
     createdAt: serverTimestamp(),
     updatedAt: serverTimestamp(),
     publishedAt: null,
@@ -247,6 +323,150 @@ export function uploadReelVideo(
   };
 }
 
+/**
+ * Same shape/pattern as uploadReelVideo, for the separate music object at
+ * `reel.musicStorageAudioPath` — only ever called when
+ * `reel.musicSourceType === 'device'` (an empty path otherwise; see
+ * createReelDraft). This is a SEPARATE Storage object from the video, not
+ * muxed into it — see ReelMusicSourceType's doc comment in
+ * src/types/reel.ts for why.
+ */
+export function uploadReelMusicAudio(
+  reel: Reel,
+  localUri: string,
+  onProgress: (percent: number) => void,
+  onComplete: (result: { ok: true } | { ok: false; message: string }) => void
+): UploadReelVideoHandle {
+  let cancelled = false;
+  let task: UploadTask | null = null;
+
+  (async () => {
+    if (!storage) {
+      onComplete({ ok: false, message: 'Storage is not available.' });
+      return;
+    }
+
+    let blob: Blob;
+    try {
+      const response = await fetch(localUri);
+      blob = await response.blob();
+    } catch {
+      onComplete({ ok: false, message: "Couldn't read this audio file." });
+      return;
+    }
+    if (cancelled) return;
+
+    const objectRef = ref(storage, reel.musicStorageAudioPath);
+    task = uploadBytesResumable(objectRef, blob, { contentType: reel.musicStorageContentType });
+
+    task.on(
+      'state_changed',
+      (snapshot) => {
+        const percent = snapshot.totalBytes > 0 ? Math.round((snapshot.bytesTransferred / snapshot.totalBytes) * 100) : 0;
+        onProgress(percent);
+      },
+      (error) => {
+        if (error.code === 'storage/canceled') {
+          onComplete({ ok: false, message: 'Upload cancelled.' });
+          return;
+        }
+        onComplete({ ok: false, message: "Couldn't upload this audio file." });
+      },
+      () => {
+        onComplete({ ok: true });
+      }
+    );
+  })();
+
+  return {
+    cancel: () => {
+      cancelled = true;
+      task?.cancel();
+    },
+  };
+}
+
+/** Same shape/pattern as uploadReelVideo/uploadReelMusicAudio, for the cover-frame image at `reel.thumbnailStoragePath` — always uploaded, unlike music. */
+export function uploadReelThumbnail(
+  reel: Reel,
+  localUri: string,
+  onProgress: (percent: number) => void,
+  onComplete: (result: { ok: true } | { ok: false; message: string }) => void
+): UploadReelVideoHandle {
+  let cancelled = false;
+  let task: UploadTask | null = null;
+
+  (async () => {
+    if (!storage) {
+      onComplete({ ok: false, message: 'Storage is not available.' });
+      return;
+    }
+
+    let blob: Blob;
+    try {
+      const response = await fetch(localUri);
+      blob = await response.blob();
+    } catch {
+      onComplete({ ok: false, message: "Couldn't read the cover image." });
+      return;
+    }
+    if (cancelled) return;
+
+    const objectRef = ref(storage, reel.thumbnailStoragePath);
+    task = uploadBytesResumable(objectRef, blob, { contentType: reel.thumbnailStorageContentType });
+
+    task.on(
+      'state_changed',
+      (snapshot) => {
+        const percent = snapshot.totalBytes > 0 ? Math.round((snapshot.bytesTransferred / snapshot.totalBytes) * 100) : 0;
+        onProgress(percent);
+      },
+      (error) => {
+        if (error.code === 'storage/canceled') {
+          onComplete({ ok: false, message: 'Upload cancelled.' });
+          return;
+        }
+        onComplete({ ok: false, message: "Couldn't upload the cover image." });
+      },
+      () => {
+        onComplete({ ok: true });
+      }
+    );
+  })();
+
+  return {
+    cancel: () => {
+      cancelled = true;
+      task?.cancel();
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2.5 — merge the uploaded music into the video itself (only when
+// musicSourceType === 'device') — a trusted backend callable, not a client
+// operation: overwriting the video's own Storage object in place needs
+// real server-side video processing (ffmpeg), which no client SDK/library
+// available to this project can do. See functions/src/index.ts's
+// muxReelMusic for the full explanation — this is what actually turns
+// "silent video + separate music file" into one real merged file, so it
+// must run, and succeed, before publishReel.
+// ---------------------------------------------------------------------------
+
+export type MuxReelMusicResult = { ok: true } | { ok: false; message: string };
+
+export async function muxReelMusic(reelId: string): Promise<MuxReelMusicResult> {
+  if (!functions) {
+    return { ok: false, message: 'This feature is not available right now.' };
+  }
+  try {
+    await httpsCallable(functions, 'muxReelMusic')({ reelId });
+  } catch {
+    return { ok: false, message: "Couldn't add music to this post." };
+  }
+  return { ok: true };
+}
+
 // ---------------------------------------------------------------------------
 // Phase 3 — publish (the only allowed update on a Reel)
 // ---------------------------------------------------------------------------
@@ -285,7 +505,12 @@ export async function publishReel(reelId: string): Promise<PublishReelResult> {
 // scripts/delete-test-documents.cjs's pattern) rather than hidden.
 // ---------------------------------------------------------------------------
 
-export async function discardReelDraft(reelId: string, storagePath: string): Promise<void> {
+export async function discardReelDraft(
+  reelId: string,
+  storagePath: string,
+  thumbnailStoragePath: string,
+  musicStoragePath?: string
+): Promise<void> {
   if (storage) {
     try {
       await deleteObject(ref(storage, storagePath));
@@ -296,6 +521,37 @@ export async function discardReelDraft(reelId: string, storagePath: string): Pro
             'it may be left orphaned and require cleanup via trusted CLI tooling. Error:',
           error
         );
+      }
+    }
+    // Unlike music, the thumbnail path always exists on the draft (see
+    // createReelDraft) — but the actual upload may not have happened yet
+    // by the time discard runs, so a "not found" here is expected and
+    // harmless, same as the video's own delete above.
+    try {
+      await deleteObject(ref(storage, thumbnailStoragePath));
+    } catch (error) {
+      if (__DEV__) {
+        console.warn(
+          `[reels] Could not delete thumbnail Storage object at "${thumbnailStoragePath}" while discarding Reel "${reelId}" — ` +
+            'it may be left orphaned and require cleanup via trusted CLI tooling. Error:',
+          error
+        );
+      }
+    }
+    // The music object only ever exists if musicSourceType was 'device'
+    // (see createReelDraft) — an empty/absent path here means there is
+    // nothing to delete, not an error.
+    if (musicStoragePath) {
+      try {
+        await deleteObject(ref(storage, musicStoragePath));
+      } catch (error) {
+        if (__DEV__) {
+          console.warn(
+            `[reels] Could not delete music Storage object at "${musicStoragePath}" while discarding Reel "${reelId}" — ` +
+              'it may be left orphaned and require cleanup via trusted CLI tooling. Error:',
+            error
+          );
+        }
       }
     }
   }
