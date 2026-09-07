@@ -1,7 +1,7 @@
 import { Ionicons } from '@expo/vector-icons';
 import { router, useFocusEffect } from 'expo-router';
 import { useCallback, useMemo, useState } from 'react';
-import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { Pressable, ScrollView, StyleSheet, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { Button } from '@/components/Button';
@@ -162,17 +162,6 @@ export default function ProfileScreen() {
                 <Button label="Edit profile" variant="secondary" onPress={() => router.push('/profile/edit')} />
               </View>
 
-              {cityLabel ? (
-                <Pressable
-                  onPress={() => router.push('/cities')}
-                  style={styles.exploreCityLink}
-                  accessibilityRole="button"
-                  accessibilityLabel="Explore another city"
-                >
-                  <Text style={styles.exploreCityLinkText}>Explore another city</Text>
-                </Pressable>
-              ) : null}
-
               <View style={styles.interestsSection}>
                 <InterestPills interestIds={profile?.interests ?? []} />
               </View>
@@ -246,15 +235,6 @@ const styles = StyleSheet.create({
   editProfileButton: {
     alignSelf: 'center',
     width: '100%',
-  },
-  exploreCityLink: {
-    alignSelf: 'center',
-    marginTop: -Spacing.sm,
-  },
-  exploreCityLinkText: {
-    color: Colors.accent,
-    fontSize: 13,
-    fontWeight: '600',
   },
   interestsSection: {
     alignItems: 'center',
