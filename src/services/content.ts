@@ -591,6 +591,129 @@ export async function fetchDiscoverySections(cityKey: string, limitCount = DEFAU
   return { happeningNow, todayLabel: todayWindow.label, today, upcoming };
 }
 
+// ---------------------------------------------------------------------------
+// Events "Following" tab — Business Events from companies `currentUid`
+// follows only (Events are Business-only, so "people the caller follows
+// that make events" always means followed Business accounts). Deliberately
+// a SEPARATE set of queries from fetchDiscoverySections above rather than
+// a mode flag threaded through it: these need one extra equality filter
+// (authorUid 'in' a followed-uid chunk) that the "for everyone" rails never
+// use, and never touch the retired legacy Activity type at all (Events are
+// the only content type Following-scoped discovery ever shows).
+// ---------------------------------------------------------------------------
+
+/**
+ * Chunked, authorUid-scoped variant of fetchHappeningNowByType, Events
+ * only. Reuses the same (type, cityKey, status, startsAt) index shape as
+ * fetchDiscoverySections, with authorUid folded into the equality group
+ * ahead of startsAt — see the dedicated
+ * (type, cityKey, status, authorUid, startsAt) index in
+ * firestore.indexes.json, the one new index this feature adds.
+ */
+async function fetchFollowingHappeningNowEvents(authorUidChunks: string[][], cityKey: string, limitCount: number): Promise<EventContent[]> {
+  if (!firestore || authorUidChunks.length === 0) return [];
+  const db = firestore;
+  const now = Timestamp.now();
+  const chunkResults = await Promise.all(
+    authorUidChunks.map((chunk) =>
+      getDocs(
+        query(
+          collection(db, CONTENT_COLLECTION),
+          where('type', '==', 'event'),
+          where('cityKey', '==', cityKey),
+          where('status', '==', 'published'),
+          where('authorUid', 'in', chunk),
+          where('startsAt', '<=', now),
+          orderBy('startsAt', 'asc'),
+          limit(limitCount)
+        )
+      )
+    )
+  );
+  const items = chunkResults.flatMap((snapshot) => snapshot.docs.map((docSnapshot) => docSnapshot.data() as EventContent));
+  return items.filter((item) => item.endsAt.toMillis() >= now.toMillis());
+}
+
+/** Chunked, authorUid-scoped variant of fetchByStartsAtWindowByType, Events only — same index note as fetchFollowingHappeningNowEvents above. */
+async function fetchFollowingEventsByStartsAtWindow(
+  authorUidChunks: string[][],
+  cityKey: string,
+  window: { start: Date; end: Date },
+  limitCount: number
+): Promise<EventContent[]> {
+  if (!firestore || authorUidChunks.length === 0) return [];
+  const db = firestore;
+  const chunkResults = await Promise.all(
+    authorUidChunks.map((chunk) =>
+      getDocs(
+        query(
+          collection(db, CONTENT_COLLECTION),
+          where('type', '==', 'event'),
+          where('cityKey', '==', cityKey),
+          where('status', '==', 'published'),
+          where('authorUid', 'in', chunk),
+          where('startsAt', '>=', Timestamp.fromDate(window.start)),
+          where('startsAt', '<', Timestamp.fromDate(window.end)),
+          orderBy('startsAt', 'asc'),
+          limit(limitCount)
+        )
+      )
+    )
+  );
+  return chunkResults.flatMap((snapshot) => snapshot.docs.map((docSnapshot) => docSnapshot.data() as EventContent));
+}
+
+export type FollowingDiscoverySections = {
+  sections: DiscoverySections;
+  /** Same "distinguish don't-follow-anyone from follow-nobody-with-events" reasoning as FollowingReelsResult in src/services/reels.ts. */
+  followsAnyone: boolean;
+};
+
+/**
+ * The Following-scoped equivalent of fetchDiscoverySections — same three
+ * time-based rails (Happening Now / Today-or-Tonight / Upcoming) and the
+ * same precedence/dedup rules, restricted to published Events authored by
+ * companies `currentUid` follows. Mirrors fetchFollowingReels' own
+ * resolve-uids-then-chunk-query pattern exactly, including its
+ * MAX_FOLLOWED_UIDS_PER_FEED_PAGE/FOLLOWING_UID_CHUNK_SIZE bounds — a v1
+ * limitation this inherits rather than solves independently (someone
+ * following more than 30 accounts simply has the rest not considered
+ * here yet).
+ */
+export async function fetchFollowingDiscoverySections(
+  currentUid: string,
+  cityKey: string,
+  limitCount = DEFAULT_DISCOVERY_SECTION_LIMIT
+): Promise<FollowingDiscoverySections> {
+  const emptySections: DiscoverySections = { happeningNow: [], todayLabel: 'Today', today: [], upcoming: [] };
+  if (!firestore) return { sections: emptySections, followsAnyone: false };
+
+  const followedUids = await fetchFollowingUids(currentUid, MAX_FOLLOWED_UIDS_PER_FEED_PAGE);
+  if (followedUids.length === 0) {
+    return { sections: emptySections, followsAnyone: false };
+  }
+  const chunks = chunkArray(followedUids, FOLLOWING_UID_CHUNK_SIZE);
+
+  const now = new Date();
+  const todayWindow = getTodayOrTonightWindow(now);
+  const upcomingWindow = getUpcomingWindow(todayWindow.end);
+
+  const [happeningNow, todayCandidates, upcoming] = await Promise.all([
+    fetchFollowingHappeningNowEvents(chunks, cityKey, limitCount),
+    fetchFollowingEventsByStartsAtWindow(chunks, cityKey, todayWindow, limitCount),
+    fetchFollowingEventsByStartsAtWindow(chunks, cityKey, upcomingWindow, limitCount),
+  ]);
+
+  const happeningIds = new Set(happeningNow.map((item) => item.contentId));
+  const nowMs = now.getTime();
+  const today = todayCandidates.filter((item) => !happeningIds.has(item.contentId) && item.endsAt.toMillis() >= nowMs);
+
+  return {
+    sections: { happeningNow, todayLabel: todayWindow.label, today, upcoming },
+    followsAnyone: true,
+  };
+}
+
 /**
  * "Happening now" — startsAt <= now AND endsAt >= now.
  *

@@ -13,14 +13,16 @@ import { LoadingState } from '@/components/LoadingState';
 import { Pill } from '@/components/Pill';
 import { SectionHeader } from '@/components/SectionHeader';
 import { Colors, Layout, Radius, Spacing, Typography } from '@/constants/theme';
+import { useAuth } from '@/hooks/useAuth';
 import { useProfile } from '@/hooks/useProfile';
 import { useCity } from '@/providers/CityProvider';
-import { fetchDiscoverySections, type DiscoverySections } from '@/services/content';
+import { fetchDiscoverySections, fetchFollowingDiscoverySections, type DiscoverySections } from '@/services/content';
 import type { ActivityContent, EventContent } from '@/types/content';
 import { canCreateEvent } from '@/utils/accountCapabilities';
 import { getWeekendWindow } from '@/utils/dateWindows';
 
 type LoadStatus = 'loading' | 'loaded' | 'error';
+type EventsMode = 'forYou' | 'following';
 
 // Bounded per section (happening/today/upcoming), matching the "30
 // initial, no infinite scroll" recommendation for this screen — see
@@ -38,45 +40,78 @@ const SECTION_LIMIT = 15;
  * that shows event-style discovery content; Home is the separate
  * user-generated Post feed (see src/app/(app)/(tabs)/index.tsx and the
  * Step 25 product-separation rule). Still backed by the same
- * fetchDiscoverySections/dateWindows architecture from Step 22 — this step
- * only redesigns layout, adds a real "This Weekend" split of the existing
- * Upcoming window, and moves Interested/Going/Join actions onto the
- * discovery cards themselves.
+ * fetchDiscoverySections/dateWindows architecture from Step 22.
+ *
+ * Following/For You (mirrors Home's own mode split): "For You" is the
+ * original all-Events-in-this-city view; "Following" restricts the exact
+ * same three rails to Events authored by companies (Business accounts)
+ * the caller follows, via fetchFollowingDiscoverySections. Non-persisted,
+ * resets to "For You" on fresh mount — same as Home's own mode.
  */
 export default function EventsScreen() {
+  const { user } = useAuth();
   const { activeCity, homeCity, isExploringAnotherCity, isReady: isCityReady } = useCity();
   const { profile } = useProfile();
   const canCreateEventHere = canCreateEvent(profile);
-  const [status, setStatus] = useState<LoadStatus>('loading');
-  const [sections, setSections] = useState<DiscoverySections | null>(null);
+
+  const [mode, setMode] = useState<EventsMode>('forYou');
   const [categoryFilter, setCategoryFilter] = useState<string | null>(null);
   const [isFilterOpen, setIsFilterOpen] = useState(false);
 
+  const [forYouSections, setForYouSections] = useState<DiscoverySections | null>(null);
+  const [forYouStatus, setForYouStatus] = useState<LoadStatus>('loading');
+
+  const [followingSections, setFollowingSections] = useState<DiscoverySections | null>(null);
+  const [followsAnyone, setFollowsAnyone] = useState(true);
+  const [followingStatus, setFollowingStatus] = useState<LoadStatus>('loading');
+
   const cityLabel = activeCity?.cityName ?? 'your city';
 
-  const load = useCallback(async () => {
+  const loadForYou = useCallback(async () => {
     if (!activeCity) return;
-    setStatus('loading');
+    setForYouStatus('loading');
     // Clears the previous city's sections immediately so a city switch
     // never leaves a stale city's cards on screen during the fetch (same
     // rule every other discovery surface in this app follows).
-    setSections(null);
+    setForYouSections(null);
     try {
       const result = await fetchDiscoverySections(activeCity.cityKey, SECTION_LIMIT);
-      setSections(result);
-      setStatus('loaded');
+      setForYouSections(result);
+      setForYouStatus('loaded');
     } catch {
-      setStatus('error');
+      setForYouStatus('error');
     }
   }, [activeCity]);
+
+  const loadFollowing = useCallback(async () => {
+    if (!activeCity || !user) return;
+    setFollowingStatus('loading');
+    setFollowingSections(null);
+    try {
+      const result = await fetchFollowingDiscoverySections(user.uid, activeCity.cityKey, SECTION_LIMIT);
+      setFollowingSections(result.sections);
+      setFollowsAnyone(result.followsAnyone);
+      setFollowingStatus('loaded');
+    } catch {
+      setFollowingStatus('error');
+    }
+  }, [activeCity, user]);
 
   useFocusEffect(
     useCallback(() => {
       if (!isCityReady) return;
-      load();
+      if (mode === 'forYou') {
+        loadForYou();
+      } else {
+        loadFollowing();
+      }
       // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [activeCity?.cityKey, isCityReady])
+    }, [activeCity?.cityKey, isCityReady, mode])
   );
+
+  const status = mode === 'forYou' ? forYouStatus : followingStatus;
+  const sections = mode === 'forYou' ? forYouSections : followingSections;
+  const load = mode === 'forYou' ? loadForYou : loadFollowing;
 
   const matchesFilters = useCallback(
     (item: ActivityContent | EventContent) => {
@@ -127,9 +162,10 @@ export default function EventsScreen() {
           <Ionicons name="chevron-down" size={16} color={Colors.text} />
         </Pressable>
 
-        <Text style={styles.headerTitle} numberOfLines={1}>
-          Events
-        </Text>
+        <View style={styles.modeTabs}>
+          <ModeTab label="Following" active={mode === 'following'} onPress={() => setMode('following')} />
+          <ModeTab label="For You" active={mode === 'forYou'} onPress={() => setMode('forYou')} />
+        </View>
 
         <Pressable onPress={() => setIsFilterOpen(true)} style={styles.filterButton} accessibilityRole="button" accessibilityLabel="Filter events">
           <Ionicons name="options-outline" size={20} color={Colors.text} />
@@ -141,13 +177,26 @@ export default function EventsScreen() {
         <View style={styles.page}>
           {status === 'error' ? (
             <View style={styles.statusPad}>
-              <ErrorState title={`Couldn't load events in ${cityLabel}.`} onRetry={load} />
+              <ErrorState
+                title={mode === 'forYou' ? `Couldn't load events in ${cityLabel}.` : "Couldn't load your Following events."}
+                onRetry={load}
+              />
             </View>
           ) : status === 'loading' ? (
             <LoadingState size="large" />
           ) : totalRealItems === 0 ? (
             <View style={styles.statusPad}>
-              {isExploringAnotherCity ? (
+              {mode === 'following' ? (
+                !followsAnyone ? (
+                  <EmptyState
+                    icon="people-outline"
+                    title="Your Following feed is empty"
+                    body={`Follow businesses in ${cityLabel} to see their events here.`}
+                  />
+                ) : (
+                  <EmptyState icon="calendar-outline" title="No upcoming events from businesses you follow." />
+                )
+              ) : isExploringAnotherCity ? (
                 <EmptyState
                   icon="calendar-outline"
                   title={`No upcoming events in ${cityLabel} yet.`}
@@ -222,7 +271,7 @@ export default function EventsScreen() {
             </>
           )}
 
-          {status === 'loaded' && totalRealItems > 0 && canCreateEventHere ? (
+          {mode === 'forYou' && status === 'loaded' && totalRealItems > 0 && canCreateEventHere ? (
             <View style={styles.createFooter}>
               <Button
                 label={canCreateHere ? 'Create event' : `Create in ${homeCity?.cityName ?? 'your home city'}`}
@@ -244,6 +293,16 @@ export default function EventsScreen() {
         onClose={() => setIsFilterOpen(false)}
       />
     </SafeAreaView>
+  );
+}
+
+/** Same visual pattern as Home's own inline ModeTab — deliberately duplicated in this small a form rather than shared, so restyling one never risks the other (see ProfileTabBar's own doc comment for the same reasoning). */
+function ModeTab({ label, active, onPress }: { label: string; active: boolean; onPress: () => void }) {
+  return (
+    <Pressable onPress={onPress} style={styles.modeTab} accessibilityRole="tab" accessibilityState={{ selected: active }}>
+      <Text style={[styles.modeTabText, active && styles.modeTabTextActive]}>{label}</Text>
+      {active ? <View style={styles.modeTabIndicator} /> : null}
+    </Pressable>
   );
 }
 
@@ -270,9 +329,28 @@ const styles = StyleSheet.create({
     color: Colors.text,
     ...Typography.cardTitle,
   },
-  headerTitle: {
+  modeTabs: {
+    flexDirection: 'row',
+    gap: 18,
+  },
+  modeTab: {
+    alignItems: 'center',
+    gap: 4,
+    paddingVertical: 2,
+  },
+  modeTabText: {
+    color: Colors.textMuted,
+    fontSize: 15,
+    fontWeight: '700',
+  },
+  modeTabTextActive: {
     color: Colors.text,
-    ...Typography.sectionTitle,
+  },
+  modeTabIndicator: {
+    width: 18,
+    height: 2,
+    borderRadius: 1,
+    backgroundColor: Colors.text,
   },
   filterButton: {
     width: 32,
