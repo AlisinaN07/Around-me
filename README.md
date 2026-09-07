@@ -1342,6 +1342,22 @@ States B and C can overlap on the same row. A `postLikes` row is only ever actua
 
 Rules were **not changed** in this step either — this is trusted Admin-side cleanup policy only, and `postLikes` remains completely unreadable by any client.
 
+## Backfill historical Post Like relationships (Step 41.2H.3)
+
+A one-time, additive, resumable production migration that creates the `postLikes` relationship (introduced in Step 41.2H.1) for any real, non-self, eligible Like that predates that model and never got one. Script: [scripts/migrations/backfill-post-likes.cjs](scripts/migrations/backfill-post-likes.cjs).
+
+**Privileged access:** reuses the firebase-tools CLI OAuth session already established for this project (`firebase-tools/lib/auth`'s `getGlobalDefaultAccount()` + `apiv2.Client`) — not the Admin SDK, not a service account (neither exists in this environment). Genuine Firestore REST transactions (`beginTransaction`/`batchGet`/`commit`/`rollback`) are used for every create, so concurrent Unlikes, target deletions, and races with a live client Like are all handled by re-validating inside the transaction rather than by any read-then-write gap.
+
+**Modes:** `--dry-run` (default, read-only), `--verify` (read-only, checks forward completeness and reverse structural integrity, exits nonzero on failure), `--apply` (creates missing relationships, then re-runs both verification passes, then writes the completion marker — only if everything passed).
+
+**Scope:** published Reels and published legacy `content` Posts only, their `likes` subcollections, excluding self-likes (never had a `postLikes` row) and Event/Activity Likes (out of scope entirely — never scanned). A created relationship preserves the **original real Like's own `createdAt`**, never the migration's run time.
+
+**Historical limitation (permanent, by design):** a Like whose target Post/Reel was already deleted, or whose liker account was already deleted, *before* Step 41.2H.1 existed, left no real Like doc and no other recoverable record (its notification, if any, was deleted in the very same operation) — this backfill cannot and does not reconstruct it. It only recovers Likes that still have a live, real Like document to read. The completion marker's meaning is scoped accordingly: it certifies that every **authoritatively recoverable** eligible historical Like has been migrated, never that every Like ever given has been.
+
+**Result of the real production run:** the migration found genuinely nothing to do — 4 published Reels and 8 published legacy Posts, zero Likes on any of them, so `created: 0`. Forward verification found `postLikesMissing: 0`; reverse verification found `STRUCTURALLY_INVALID: 0` over an (empty) `postLikes` collection. The completion marker at `systemMigrations/postLikesBackfillV1` (fields: `version`, `status`, `completedAt`, forward/reverse counts) was written last, and — like every other `postLikes`-adjacent document — is unreadable by a normal client (confirmed against production: a disposable non-admin account got `403 PERMISSION_DENIED` reading it). No Rules change was needed or made for this, since the collection was already unreadable by default.
+
+Rules, Functions, and indexes are all **unchanged** in this step — this is a data-only migration. **Liked is still not displayed anywhere on Profile** — that's Step 41.2H.4.
+
 ## Reels (Cloud Storage — Step 18)
 
 Reels are short (≤60s), video-only posts with vertical, city-scoped playback — the first feature in this app to use Cloud Storage rather than Firestore alone. They live in their own root collection, `reels/{reelId}`, separate from `content/{contentId}` (posts/activities/events): a Reel has a media-upload lifecycle and Storage metadata that the other content types never had, and folding it into `content` would have meant giving every Post/Activity/Event query an upload-status field it never needs.
