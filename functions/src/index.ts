@@ -91,23 +91,34 @@ async function drainCollection(db: Firestore, collectionPath: string): Promise<n
 }
 
 // ---------------------------------------------------------------------------
-// postLikes/{likeId} (Step 41.2H.1) paired trusted cleanup (Step 41.2H.2).
+// postLikes/{likeId} (Step 41.2H.1) paired trusted cleanup for TARGET
+// removal (Step 41.2H.2, refined by 41.2H.2.1/41.2H.2.2).
+//
+// postLikes is lifetime-earned social credit, not a live-only edge — it
+// survives both a voluntary author Post/Reel deletion (41.2H.2.1) and a
+// liker's own account deletion (41.2H.2.2). The ONLY trusted-cleanup path
+// that still removes a received postLikes row is target removal under
+// 'remove' policy (moderation, or an author's own content being swept
+// during THEIR OWN account deletion — see ReceivedPostLikesPolicy's own
+// doc comment above deleteContentDocumentAndSubcollections). There is
+// deliberately no "drain everything a given liker gave" helper any more —
+// see deleteMyAccountData's own comment for why that would now be wrong.
 //
 // Admin SDK writes BYPASS Firestore Rules entirely — the atomic
 // create/delete pairing between a postLikes row and its real per-target
 // Like (reels/{id}/likes/{uid} or content/{id}/likes/{uid}) that
 // firestore.rules enforces for ordinary client writes is NOT automatically
-// preserved here. A naive "drain postLikes, then separately drain likes"
-// (in either order) would leave a real transient window where one half of
-// a pair exists without the other — exactly the inconsistency this
-// primitive exists to avoid. Both functions below always delete a
-// postLikes row and its paired real Like in the SAME Admin batch.
+// preserved here. When this DOES remove a postLikes row (the 'remove'
+// policy case), it always deletes it together with its paired real Like
+// in the SAME Admin batch — a naive "drain postLikes, then separately
+// drain likes" (in either order) would leave a real transient window
+// where one half of a pair exists without the other.
 //
-// Neither function assumes every real Like has a postLikes row — a
-// generic `drainCollection(...likes...)` (self-likes, Event/Activity
-// Likes, and — until Step 41.2H.3's backfill runs — historical Likes
-// predating this relationship model) still runs afterward at every call
-// site below to remove whatever these paired passes don't cover.
+// This does not assume every real Like has a postLikes row — a generic
+// `drainCollection(...likes...)` (self-likes, Event/Activity Likes, and —
+// until Step 41.2H.3's backfill runs — historical Likes predating this
+// relationship model) still runs afterward at every call site to remove
+// whatever this paired pass doesn't cover, or deliberately skips.
 // ---------------------------------------------------------------------------
 
 function likeDocPath(targetType: 'reel' | 'post', targetId: string, likerUid: string): string {
@@ -137,28 +148,6 @@ async function drainPairedPostLikesForTarget(db: Firestore, targetType: 'reel' |
       const likerUid = docSnap.data().likerUid as string;
       batch.delete(docSnap.ref);
       batch.delete(db.doc(likeDocPath(targetType, targetId, likerUid)));
-    }
-    await batch.commit();
-    total += snap.size;
-  }
-  return total;
-}
-
-/**
- * Removes every postLikes relationship one account GAVE (as the liker),
- * across every target, pairing each removal with the corresponding real
- * per-target Like in the same batch. Bounded/paginated the same way.
- */
-async function drainPairedPostLikesForLiker(db: Firestore, likerUid: string): Promise<number> {
-  let total = 0;
-  for (;;) {
-    const snap = await db.collection('postLikes').where('likerUid', '==', likerUid).limit(BATCH_DELETE_SIZE).get();
-    if (snap.empty) break;
-    const batch = db.batch();
-    for (const docSnap of snap.docs) {
-      const data = docSnap.data() as { targetType: 'reel' | 'post'; targetId: string };
-      batch.delete(docSnap.ref);
-      batch.delete(db.doc(likeDocPath(data.targetType, data.targetId, likerUid)));
     }
     await batch.commit();
     total += snap.size;
@@ -514,20 +503,23 @@ export const deleteMyAccountData = onCall({ region: REGION, timeoutSeconds: 300,
   // as deleteOwnContent/deleteOwnReels run below.
   const ownRepostsOf = await drainQuery(db, () => db.collection('reposts').where('userUid', '==', uid));
 
-  // Step 41.2H.2 — this account's own outgoing postLikes (Likes it GAVE to
-  // other people's Posts/Reels), each paired with its real per-target Like
-  // in the same Admin batch — see drainPairedPostLikesForLiker's own doc
-  // comment for why Admin SDK writes must preserve that pairing themselves
-  // (Admin SDK bypasses Rules). Runs BEFORE the crossUserLikes residual
-  // drain just below, which then only has to clean up what this pass
-  // doesn't cover: Event/Activity Likes, self-likes, and (pre-Step-41.2H.3
-  // backfill) historical Likes with no postLikes row.
-  const ownOutgoingPostLikes = await drainPairedPostLikesForLiker(db, uid);
-
-  // No counter is paired with likes/comments/responses (see firestore.rules
-  // — like/comment counts are aggregation queries, and Event responses have
-  // no stored count at all), so these are plain deletes across both content
-  // and reels roots at once — see Step 34.1's proven collectionGroup finding.
+  // Step 41.2H.2.2 — CORRECTION to Step 41.2H.2: this account's own
+  // outgoing postLikes (Likes it GAVE to other people's Posts/Reels) are
+  // now deliberately NOT removed here. Liked is lifetime-earned social
+  // credit for the RECIPIENT — a Like this account gave before deleting
+  // itself already earned its recipient real credit, and the owner has
+  // locked that a liker's account disappearing must not retroactively
+  // erase it (contrast with an explicit Unlike, which still removes it
+  // atomically via H.1's normal client path). The real nested Like docs
+  // this account left behind on other people's content are still cleaned
+  // up below by the existing crossUserLikes drain — only the postLikes
+  // row (the credit itself) survives, now referencing a liker account
+  // that no longer exists. That is intentional, not an orphan bug (see
+  // the README). No counter is paired with likes/comments/responses (see
+  // firestore.rules — like/comment counts are aggregation queries, and
+  // Event responses have no stored count at all), so these are plain
+  // deletes across both content and reels roots at once — see Step
+  // 34.1's proven collectionGroup finding.
   const crossUserLikes = await drainQuery(db, () => db.collectionGroup('likes').where('uid', '==', uid));
   const crossUserComments = await drainQuery(db, () => db.collectionGroup('comments').where('authorUid', '==', uid));
   const crossUserResponses = await drainQuery(db, () => db.collectionGroup('responses').where('uid', '==', uid));
@@ -549,7 +541,6 @@ export const deleteMyAccountData = onCall({ region: REGION, timeoutSeconds: 300,
     follows: { asFollowerRemoved: followerOf.total, asFollowingRemoved: followingOf.total },
     blocks: { asBlockerRemoved: blockerOf.total, asBlockedRemoved: blockedOf.total },
     ownRepostsRemoved: ownRepostsOf.total,
-    ownOutgoingPostLikesRemoved: ownOutgoingPostLikes,
     crossUser: {
       likesRemoved: crossUserLikes.total,
       likesRemovedByRoot: crossUserLikes.roots,

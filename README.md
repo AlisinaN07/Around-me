@@ -1299,7 +1299,7 @@ Trusted (Admin SDK) deletion now maintains the `postLikes` relationships introdu
 - **Voluntary author self-delete** (`deleteMyContent` for `type=='post'`, `deleteMyReel`) now **preserves** every `postLikes` row the deleted Post/Reel had already earned. The real nested `likes` subcollection still disappears with the target (there is no more UI to unlike through anyway); only the normalized `postLikes` credit survives, now pointing at a target that no longer exists — **this is intentional, not an orphan bug**. Reposts/comments/notifications cleanup for the target is completely unchanged.
 - **Moderation removal** (`removeReportedContent`, `removeReportedReel`) still **removes** received `postLikes` — moderated content never earned legitimate reputation to begin with. This is a deliberate, locked distinction: voluntary delete preserves, moderation removes.
 - **Author account deletion** (`deleteMyAccountData`'s own-content/own-Reel sweep) still **removes** received `postLikes` — once the account and its Profile are gone, there is no lifetime value left to preserve credit for.
-- **Liker account deletion:** unchanged from Step 41.2H.2 — Likes a deleted account gave to others are removed; a recipient's Liked total may decrease as a result. This is the one case where deleting *your own* content isn't what's happening — the recipient's Post is untouched, only a relationship that's no longer valid is gone.
+- **Liker account deletion:** ~~unchanged from Step 41.2H.2~~ — **corrected again in Step 41.2H.2.2, see below.** Likes a deleted liker gave to others now also survive as lifetime credit.
 
 **Implementation:** the two shared per-document primitives now take an explicit `receivedPostLikesPolicy: 'preserve' | 'remove'` parameter — no default, so every one of the five call sites states its intent outright: `deleteMyContent`/`deleteMyReel` pass `'preserve'`; `removeReportedContent`/`removeReportedReel`/the account-deletion own-content sweep pass `'remove'`.
 
@@ -1310,6 +1310,37 @@ Trusted (Admin SDK) deletion now maintains the `postLikes` relationships introdu
 **Consequence for the eventual Profile Liked count (not yet built):** it will be `COUNT(postLikes where targetAuthorUid == profileUid)` — full stop, independent of whether the target Post still exists. It will never need to load, or filter against, an account's current Posts.
 
 Rules were **not changed** in this step — this is trusted Admin-side cleanup policy only.
+
+## Liked survives the liker's own account deletion too (Step 41.2H.2.2)
+
+**Second correction**, made before backfill or Profile UI: if a person Likes another account's Post and later deletes their own account, that Like's credit must **still** count toward the recipient's lifetime Liked — a Post that earned 100 valid Likes stays at 100 even if 10 of those likers later delete their accounts.
+
+**Locked lifetime rules, final form:**
+
+| Event | Liked total |
+|---|---|
+| Explicit Unlike | **decreases** |
+| Voluntary author Post/Reel deletion | unchanged (Step 41.2H.2.1) |
+| **Liker deletes their own account** | **unchanged** (this step) |
+| Moderation removal of the target | **decreases** |
+| Author deletes their whole account | their received `postLikes` are removed — their Profile no longer exists to hold a lifetime value |
+| Self-like, Event Like, legacy Activity Like | never counted in the first place |
+
+**What changed:** `deleteMyAccountData` no longer drains the deleting account's own outgoing `postLikes`. It still removes everything else account-deletion always removed for that account — the user/profile documents, the real nested Like docs it left on other people's content (via the pre-existing `collectionGroup('likes')` cross-user drain), notifications, follows, blocks. Only the normalized `postLikes` row — the credit itself — survives, now referencing a liker account that no longer exists. The now-unused `drainPairedPostLikesForLiker` helper was removed entirely rather than left dead.
+
+**Three legitimate `postLikes` lifecycle states now exist**, none of them an orphan bug:
+
+- **A — live:** target exists, real Like exists, postLike exists.
+- **B — author voluntarily deleted the target** (Step 41.2H.2.1): target missing, real Like missing, postLike exists.
+- **C — liker deleted their account** (this step): real Like and liker account both missing, postLike exists (target may still exist or not).
+
+States B and C can overlap on the same row. A `postLikes` row is only ever actually removed by an explicit Unlike, a moderation removal, or the recipient/author's own full account deletion — never merely because time passed or an unrelated account disappeared.
+
+**Consequence for Step 41.2H.3 (backfill, not yet built):** integrity/reverse-audit logic must not treat a missing target, a missing liker account, or a missing real Like as proof of an invalid row — any one of them, or all three at once, can be a legitimate historical record.
+
+**Consequence for the eventual Profile Liked count (not yet built):** still exactly `COUNT(postLikes where targetAuthorUid == profileUid)`, with no dependency on the liker's account still existing either.
+
+Rules were **not changed** in this step either — this is trusted Admin-side cleanup policy only, and `postLikes` remains completely unreadable by any client.
 
 ## Reels (Cloud Storage — Step 18)
 
