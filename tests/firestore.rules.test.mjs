@@ -296,6 +296,14 @@ function validPrivacySettings(uid, newMessagesFrom, overrides = {}) {
   return { uid, newMessagesFrom, createdAt: serverTimestamp(), updatedAt: serverTimestamp(), ...overrides };
 }
 
+// Same deterministic ID scheme as savedId in src/services/saved.ts.
+function savedDocId(targetType, targetId) {
+  return `${targetType}_${targetId}`;
+}
+function validSaved(targetType, targetId, overrides = {}) {
+  return { targetType, targetId, savedAt: serverTimestamp(), ...overrides };
+}
+
 // Same deterministic ID schemes as src/services/reports.ts.
 function userReportId(reporterUid, targetUid) {
   return `user_${reporterUid}_${targetUid}`;
@@ -3977,6 +3985,127 @@ async function main() {
       await assertSucceeds(deleteDoc(doc(s19a, 'blocks', blockId('s19a', 's19b'))));
       await assertSucceeds(setDoc(doc(s19b, 'reels', 'reel-19-1', 'likes', 's19b'), validLike('s19b')));
       await assertSucceeds(deleteDoc(doc(s19b, 'reels', 'reel-19-1', 'likes', 's19b')));
+    });
+
+    // =========================================================================
+    // users/{uid}/saved/{savedId} — private Saved Posts (Step 41.2E).
+    // s41ea is the original-content author; s41eb is the saver. A published
+    // Reel, a published legacy text Post, an Activity, and an Event are all
+    // seeded once via the existing privileged helpers (see seedReel/seedPost/
+    // seedActivity's own doc comments) — the Activity and Event fixtures
+    // exist purely to prove Saved rejects them as targets, never to test
+    // their own create/read/engagement Rules (already covered elsewhere).
+    // =========================================================================
+    await seedProfile(testEnv, 's41ea', 's41ea_handle', { displayName: 'Step41E Alpha' });
+    await seedProfile(testEnv, 's41eb', 's41eb_handle', { displayName: 'Step41E Bravo' });
+    await seedReel(testEnv, 's41ea', 'Step41E Alpha', 's41ea_handle', 'reel-41e-1');
+    await seedPost(testEnv, 's41ea', 'Step41E Alpha', 's41ea_handle', 'post-41e-1');
+    await seedActivity(testEnv, 's41ea', 'Step41E Alpha', 's41ea_handle', 'activity-41e-1');
+    // No seedEvent() helper exists (Event creation isn't otherwise exercised
+    // by a reusable fixture in this suite) — seeded inline the same
+    // privileged way seedActivity/seedPost do it internally.
+    await testEnv.withSecurityRulesDisabled(async (adminContext) => {
+      await setDoc(
+        doc(adminContext.firestore(), 'content', 'event-41e-1'),
+        validEvent('s41ea', 'Step41E Alpha', 's41ea_handle', 'event-41e-1')
+      );
+    });
+
+    const s41ea = testEnv.authenticatedContext('s41ea').firestore();
+    const s41eb = testEnv.authenticatedContext('s41eb').firestore();
+
+    // --- A: ALLOW saving another account's published Reel. ---
+    await check('ALLOW: saver saves another account\'s published Reel', async () => {
+      await assertSucceeds(
+        setDoc(doc(s41eb, 'users', 's41eb', 'saved', savedDocId('reel', 'reel-41e-1')), validSaved('reel', 'reel-41e-1'))
+      );
+    });
+
+    // --- B: ALLOW saving another account's legacy text Post. ---
+    await check('ALLOW: saver saves another account\'s legacy text Post', async () => {
+      await assertSucceeds(
+        setDoc(doc(s41eb, 'users', 's41eb', 'saved', savedDocId('post', 'post-41e-1')), validSaved('post', 'post-41e-1'))
+      );
+    });
+
+    // --- C: DENY saving your own Reel. ---
+    await check('DENY: author saves their own Reel', async () => {
+      await assertFails(
+        setDoc(doc(s41ea, 'users', 's41ea', 'saved', savedDocId('reel', 'reel-41e-1')), validSaved('reel', 'reel-41e-1'))
+      );
+    });
+
+    // --- D: DENY saving your own legacy text Post. ---
+    await check('DENY: author saves their own legacy text Post', async () => {
+      await assertFails(
+        setDoc(doc(s41ea, 'users', 's41ea', 'saved', savedDocId('post', 'post-41e-1')), validSaved('post', 'post-41e-1'))
+      );
+    });
+
+    // --- E: DENY a target that doesn't exist. ---
+    await check('DENY: saver saves a nonexistent Reel', async () => {
+      await assertFails(
+        setDoc(doc(s41eb, 'users', 's41eb', 'saved', savedDocId('reel', 'reel-missing-1')), validSaved('reel', 'reel-missing-1'))
+      );
+    });
+
+    // --- F: DENY an Event target (Saved only ever supports video/legacy-text Posts). ---
+    await check('DENY: saver attempts to save an Event', async () => {
+      await assertFails(
+        setDoc(doc(s41eb, 'users', 's41eb', 'saved', savedDocId('post', 'event-41e-1')), validSaved('post', 'event-41e-1'))
+      );
+    });
+
+    // --- G: DENY a legacy Activity target. ---
+    await check('DENY: saver attempts to save an Activity', async () => {
+      await assertFails(
+        setDoc(doc(s41eb, 'users', 's41eb', 'saved', savedDocId('post', 'activity-41e-1')), validSaved('post', 'activity-41e-1'))
+      );
+    });
+
+    // --- H: DENY creating a Saved relationship under someone else's uid, both directions. ---
+    await check('DENY: saver creates a Saved doc under the author\'s uid path', async () => {
+      await assertFails(
+        setDoc(doc(s41eb, 'users', 's41ea', 'saved', savedDocId('reel', 'reel-41e-1')), validSaved('reel', 'reel-41e-1'))
+      );
+    });
+    await check('DENY: author creates a Saved doc under the saver\'s uid path', async () => {
+      await assertFails(
+        setDoc(doc(s41ea, 'users', 's41eb', 'saved', savedDocId('post', 'post-41e-1')), validSaved('post', 'post-41e-1'))
+      );
+    });
+
+    // --- I: ALLOW the owner to read their own Saved relationship. ---
+    await check('ALLOW: saver reads their own Saved relationship', async () => {
+      await assertSucceeds(getDoc(doc(s41eb, 'users', 's41eb', 'saved', savedDocId('reel', 'reel-41e-1'))));
+    });
+
+    // --- J: DENY another account reading (get or list) the owner's Saved relationships. ---
+    await check('DENY: author reads a single Saved doc belonging to the saver', async () => {
+      await assertFails(getDoc(doc(s41ea, 'users', 's41eb', 'saved', savedDocId('reel', 'reel-41e-1'))));
+    });
+    await check('DENY: author lists the saver\'s Saved collection', async () => {
+      await assertFails(getDocs(collection(s41ea, 'users', 's41eb', 'saved')));
+    });
+
+    // --- M: DENY updating an existing Saved relationship (create/delete only). ---
+    await check('DENY: saver updates their own existing Saved relationship', async () => {
+      await assertFails(updateDoc(doc(s41eb, 'users', 's41eb', 'saved', savedDocId('reel', 'reel-41e-1')), { targetId: 'post-41e-1' }));
+    });
+
+    // --- N: DENY a savedId that doesn't match targetType_targetId. ---
+    await check('DENY: savedId does not match targetType_targetId', async () => {
+      await assertFails(setDoc(doc(s41eb, 'users', 's41eb', 'saved', 'mismatched-id'), validSaved('reel', 'reel-41e-1')));
+    });
+
+    // --- K: ALLOW the owner to remove their own Saved relationship. ---
+    await check('ALLOW: saver removes their own Saved relationship', async () => {
+      await assertSucceeds(deleteDoc(doc(s41eb, 'users', 's41eb', 'saved', savedDocId('post', 'post-41e-1'))));
+    });
+
+    // --- L: DENY another account deleting the owner's Saved relationship. ---
+    await check('DENY: author deletes a Saved relationship belonging to the saver', async () => {
+      await assertFails(deleteDoc(doc(s41ea, 'users', 's41eb', 'saved', savedDocId('reel', 'reel-41e-1'))));
     });
 
     await testEnv.clearFirestore();

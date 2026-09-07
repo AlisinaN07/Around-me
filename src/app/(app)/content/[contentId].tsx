@@ -1,7 +1,7 @@
 import { Ionicons } from '@expo/vector-icons';
 import { router, useLocalSearchParams } from 'expo-router';
-import { useCallback, useEffect, useState } from 'react';
-import { Pressable, ScrollView, StyleSheet, View } from 'react-native';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { ActivityDetail } from '@/components/ActivityDetail';
@@ -14,9 +14,10 @@ import { LoadingState, SkeletonBlock } from '@/components/LoadingState';
 import { OptionsMenu } from '@/components/OptionsMenu';
 import { PostDetail } from '@/components/PostDetail';
 import { ReportModal } from '@/components/ReportModal';
-import { Colors, Layout, Spacing } from '@/constants/theme';
+import { Colors, Layout, Radius, Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
 import { deleteMyContent, fetchContentById } from '@/services/content';
+import { isPostSaved, savePost, unsavePost } from '@/services/saved';
 import type { ActivityContent, Content, EventContent } from '@/types/content';
 
 type LoadStatus = 'loading' | 'loaded' | 'error';
@@ -37,6 +38,9 @@ export default function ContentDetailScreen() {
   const [isDeleteConfirmOpen, setIsDeleteConfirmOpen] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [isSaved, setIsSaved] = useState(false);
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // load() never calls setState before its first await, so nothing runs
   // synchronously during the effect body below.
@@ -48,22 +52,58 @@ export default function ContentDetailScreen() {
         return;
       }
       setContent(result);
+      // Save is only ever a legacy text Post concept (Step 41.2E) — Event
+      // and Activity documents never get a Saved-state check.
+      if (user && result.type === 'post' && result.authorUid !== user.uid) {
+        const saved = await isPostSaved(user.uid, 'post', result.contentId);
+        setIsSaved(saved);
+      }
       setStatus('loaded');
     } catch {
       setStatus('error');
     }
-  }, [contentId]);
+  }, [contentId, user]);
 
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect
     load();
   }, [load]);
 
+  const showToast = useCallback((message: string) => {
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    setToastMessage(message);
+    toastTimerRef.current = setTimeout(() => setToastMessage(null), 2500);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    };
+  }, []);
+
+  const handleToggleSave = async () => {
+    if (!content || !user) return;
+    const wasSaved = isSaved;
+    const result = wasSaved ? await unsavePost(user.uid, 'post', content.contentId) : await savePost(user.uid, 'post', content.contentId);
+    if (!result.ok) {
+      showToast(result.message);
+      return;
+    }
+    setIsSaved(!wasSaved);
+    showToast(wasSaved ? 'Removed from saved' : 'Saved');
+  };
+
   const isOwnContent = !!user && !!content && content.authorUid === user.uid;
+  const canSaveContent = !isOwnContent && content?.type === 'post';
 
   const optionsMenuOptions = isOwnContent
     ? [{ label: 'Delete', destructive: true, onPress: () => setIsDeleteConfirmOpen(true) }]
-    : [{ label: 'Report', onPress: () => setIsReportOpen(true) }];
+    : canSaveContent
+      ? [
+          { label: isSaved ? 'Remove from saved' : 'Save', onPress: handleToggleSave },
+          { label: 'Report', onPress: () => setIsReportOpen(true) },
+        ]
+      : [{ label: 'Report', onPress: () => setIsReportOpen(true) }];
 
   // Permanent — no recycle bin, no restore (locked Step 40.1 policy). The
   // backend independently re-verifies content.authorUid == request.auth.uid
@@ -166,6 +206,12 @@ export default function ContentDetailScreen() {
         <PostDetail content={content} />
       ) : null}
 
+      {toastMessage ? (
+        <View style={styles.toast} pointerEvents="none">
+          <Text style={styles.toastText}>{toastMessage}</Text>
+        </View>
+      ) : null}
+
       <OptionsMenu visible={isOptionsMenuOpen} onClose={() => setIsOptionsMenuOpen(false)} options={optionsMenuOptions} />
 
       {user && content ? (
@@ -253,5 +299,19 @@ const styles = StyleSheet.create({
     height: 40,
     alignItems: 'center',
     justifyContent: 'center',
+  },
+  toast: {
+    position: 'absolute',
+    bottom: Spacing.xxl,
+    alignSelf: 'center',
+    backgroundColor: 'rgba(11, 11, 15, 0.9)',
+    borderRadius: Radius.full,
+    paddingHorizontal: Spacing.md,
+    paddingVertical: Spacing.sm,
+  },
+  toastText: {
+    color: Colors.text,
+    fontSize: 13,
+    fontWeight: '600',
   },
 });

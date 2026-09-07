@@ -13,6 +13,7 @@ import { Colors, Radius, Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
 import { blockUser } from '@/services/blocks';
 import { deleteMyReel } from '@/services/reels';
+import { isPostSaved, savePost, unsavePost } from '@/services/saved';
 import { buildReelShareUrl, shareReel } from '@/utils/reelShare';
 import type { Reel } from '@/types/reel';
 
@@ -45,6 +46,7 @@ export function ReelFeed({ reels, status, errorTitle, emptyState, onReload, topO
   const [activeIndex, setActiveIndex] = useState(0);
 
   const [optionsReel, setOptionsReel] = useState<Reel | null>(null);
+  const [isOptionsReelSaved, setIsOptionsReelSaved] = useState(false);
   const [reportReel, setReportReel] = useState<Reel | null>(null);
   const [blockTarget, setBlockTarget] = useState<Reel | null>(null);
   const [isBlockSubmitting, setIsBlockSubmitting] = useState(false);
@@ -82,6 +84,39 @@ export function ReelFeed({ reels, status, errorTitle, emptyState, onReload, topO
     };
   }, []);
 
+  // Reflects the correct current Saved state whenever the options menu is
+  // opened for a different Reel — never requires leaving/reopening this
+  // screen for the label to be accurate (Step 41.2E Section 18).
+  useEffect(() => {
+    let cancelled = false;
+    if (!optionsReel || !user || optionsReel.authorUid === user.uid) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setIsOptionsReelSaved(false);
+      return;
+    }
+    isPostSaved(user.uid, 'reel', optionsReel.reelId).then((saved) => {
+      if (!cancelled) setIsOptionsReelSaved(saved);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [optionsReel, user]);
+
+  const handleToggleSave = useCallback(
+    async (reel: Reel) => {
+      if (!user) return;
+      const wasSaved = isOptionsReelSaved;
+      const result = wasSaved ? await unsavePost(user.uid, 'reel', reel.reelId) : await savePost(user.uid, 'reel', reel.reelId);
+      if (!result.ok) {
+        showToast(result.message);
+        return;
+      }
+      setIsOptionsReelSaved(!wasSaved);
+      showToast(wasSaved ? 'Removed from saved' : 'Saved');
+    },
+    [user, isOptionsReelSaved, showToast]
+  );
+
   const handleCopyLink = useCallback(
     async (reel: Reel) => {
       await Clipboard.setStringAsync(buildReelShareUrl(reel.reelId));
@@ -108,6 +143,7 @@ export function ReelFeed({ reels, status, errorTitle, emptyState, onReload, topO
           { label: 'Delete post', onPress: () => setDeleteTarget(optionsReel), destructive: true },
         ]
       : [
+          { label: isOptionsReelSaved ? 'Remove from saved' : 'Save', onPress: () => handleToggleSave(optionsReel) },
           { label: 'Share post', onPress: () => handleShare(optionsReel) },
           { label: 'Copy link', onPress: () => handleCopyLink(optionsReel) },
           { label: 'Report post', onPress: () => setReportReel(optionsReel) },

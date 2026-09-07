@@ -18,6 +18,7 @@ import { Colors, Radius, Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
 import { blockUser, isUserBlocked, unblockUser } from '@/services/blocks';
 import { deleteMyReel, fetchReel, resolveReelPlaybackUrl } from '@/services/reels';
+import { isPostSaved, savePost, unsavePost } from '@/services/saved';
 import type { Reel } from '@/types/reel';
 import { buildReelShareUrl, shareReel } from '@/utils/reelShare';
 import { formatTimeAgo } from '@/utils/timeFormat';
@@ -38,6 +39,7 @@ export default function ReelDetailScreen() {
   const [urlStatus, setUrlStatus] = useState<UrlStatus>('loading');
   const [playbackFailed, setPlaybackFailed] = useState(false);
 
+  const [isSaved, setIsSaved] = useState(false);
   const [amIBlockingThem, setAmIBlockingThem] = useState(false);
   const [isBlockSubmitting, setIsBlockSubmitting] = useState(false);
   const [isOptionsMenuOpen, setIsOptionsMenuOpen] = useState(false);
@@ -63,8 +65,9 @@ export default function ReelDetailScreen() {
       }
       setReel(result);
       if (user && result.authorUid !== user.uid) {
-        const blocked = await isUserBlocked(user.uid, result.authorUid);
+        const [blocked, saved] = await Promise.all([isUserBlocked(user.uid, result.authorUid), isPostSaved(user.uid, 'reel', result.reelId)]);
         setAmIBlockingThem(blocked);
+        setIsSaved(saved);
       }
       setStatus('loaded');
     } catch {
@@ -179,6 +182,18 @@ export default function ReelDetailScreen() {
     showToast('Link copied');
   };
 
+  const handleToggleSave = async () => {
+    if (!reel || !user) return;
+    const wasSaved = isSaved;
+    const result = wasSaved ? await unsavePost(user.uid, 'reel', reel.reelId) : await savePost(user.uid, 'reel', reel.reelId);
+    if (!result.ok) {
+      showToast(result.message);
+      return;
+    }
+    setIsSaved(!wasSaved);
+    showToast(wasSaved ? 'Removed from saved' : 'Saved');
+  };
+
   // Permanent — no recycle bin, no restore (locked Step 40.1 policy). The
   // backend independently re-verifies reel.authorUid == request.auth.uid
   // server-side, so this is never trusted client-side beyond gating which
@@ -209,12 +224,14 @@ export default function ReelDetailScreen() {
       ]
     : amIBlockingThem
       ? [
+          { label: isSaved ? 'Remove from saved' : 'Save', onPress: handleToggleSave },
           { label: 'Share post', onPress: handleShare },
           { label: 'Copy link', onPress: handleCopyLink },
           { label: `Unblock ${reel?.authorDisplayName ?? 'this user'}`, onPress: handleUnblock },
           { label: 'Report post', onPress: () => setIsReportOpen(true) },
         ]
       : [
+          { label: isSaved ? 'Remove from saved' : 'Save', onPress: handleToggleSave },
           { label: 'Share post', onPress: handleShare },
           { label: 'Copy link', onPress: handleCopyLink },
           { label: `Block ${reel?.authorDisplayName ?? 'this user'}`, onPress: () => setIsBlockConfirmOpen(true), destructive: true },

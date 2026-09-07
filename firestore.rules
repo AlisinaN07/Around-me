@@ -83,6 +83,63 @@ service cloud.firestore {
           'cityName', 'countryCode', 'cityKey', 'interests', 'bio',
           'accountType', 'onboardingCompleted', 'createdAt', 'updatedAt'
         ]);
+
+      // users/{uid}/saved/{savedId} — Step 41.2E. A private bookmark list:
+      // ONLY the owner may ever read, create, or delete their own Saved
+      // relationships — security does not depend on the Saved tab being
+      // hidden from other users' own-profile views (it already is, but
+      // that's UI, not the actual guarantee). No update is ever allowed —
+      // a Saved relationship is create-or-delete only, exactly like a
+      // Follow/Block/Like edge elsewhere in this file, so there is nothing
+      // to "edit" and no way to silently mutate one into pointing at a
+      // different target.
+      match /saved/{savedId} {
+        allow read: if isOwner(uid);
+
+        allow create: if isOwner(uid) && isValidSavedCreate(uid, savedId, request.resource.data);
+
+        allow update: if false;
+
+        allow delete: if isOwner(uid);
+      }
+    }
+
+    // Step 41.2E — target validation for a new Saved relationship. Rejects:
+    // a missing target (exists() short-circuits before either get() below
+    // ever runs against a nonexistent document), an unpublished/draft Reel,
+    // a non-'post' legacy content document (Event, Activity — this is the
+    // enforcement point that keeps Saved video-Post/text-Post-only), an
+    // unpublished legacy Post, saving your own Post either way, and a
+    // malformed/mismatched targetType or savedId. Firestore Rules cache
+    // repeated get() calls to the same path within one evaluation, so
+    // calling savedReelTarget/savedContentTarget more than once below costs
+    // only one real read each.
+    function savedReelTarget(targetId) {
+      return get(/databases/$(database)/documents/reels/$(targetId)).data;
+    }
+
+    function savedContentTarget(targetId) {
+      return get(/databases/$(database)/documents/content/$(targetId)).data;
+    }
+
+    function isValidSavedCreate(uid, savedId, data) {
+      return data.targetType is string
+        && data.targetId is string
+        && data.targetId.size() > 0
+        && savedId == (data.targetType + '_' + data.targetId)
+        && isServerTimestamp(data.savedAt)
+        && data.keys().hasOnly(['targetType', 'targetId', 'savedAt'])
+        && (
+          (data.targetType == 'reel'
+            && exists(/databases/$(database)/documents/reels/$(data.targetId))
+            && savedReelTarget(data.targetId).status == 'published'
+            && savedReelTarget(data.targetId).authorUid != uid)
+          || (data.targetType == 'post'
+            && exists(/databases/$(database)/documents/content/$(data.targetId))
+            && savedContentTarget(data.targetId).type == 'post'
+            && savedContentTarget(data.targetId).status == 'published'
+            && savedContentTarget(data.targetId).authorUid != uid)
+        );
     }
 
     // usernames/{usernameLower} — a uniqueness index. Any signed-in user

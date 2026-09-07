@@ -288,6 +288,7 @@ async function deleteProfileDocuments(db: Firestore, uid: string) {
     publicProfileDeleted: false,
     usernameReservationDeleted: false,
     usernameReservationMismatch: false,
+    savedRelationshipsDeleted: 0,
     userDocDeleted: false,
   };
 
@@ -296,6 +297,15 @@ async function deleteProfileDocuments(db: Firestore, uid: string) {
 
   await db.doc(`publicProfiles/${uid}`).delete().catch(() => undefined);
   result.publicProfileDeleted = true;
+
+  // users/{uid}/saved (Step 41.2E) — a subcollection, which Firestore never
+  // cascade-deletes with its parent document, so it must be drained
+  // explicitly before users/{uid} itself is removed below. Private to the
+  // owner and never referenced from anywhere else, so a plain bounded
+  // drainCollection (no cross-user counter, no notification pairing) is
+  // all this needs — same primitive already used for every other owned
+  // subcollection in this file.
+  result.savedRelationshipsDeleted = await drainCollection(db, `users/${uid}/saved`);
 
   const userRef = db.doc(`users/${uid}`);
   const userSnap = await userRef.get();

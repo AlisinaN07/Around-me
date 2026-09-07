@@ -21,6 +21,7 @@ import type { Reel } from '@/types/reel';
 import { fetchFollowerCount, fetchFollowingCount } from '@/services/following';
 import { fetchProfilePostCount, fetchPublicUserContent } from '@/services/content';
 import { fetchProfileReelCount, fetchProfileReels } from '@/services/reels';
+import { fetchSavedPosts, type SavedPostItem } from '@/services/saved';
 import { isBusinessAccount } from '@/utils/accountCapabilities';
 import { formatCityDisplayName } from '@/utils/cityDisplay';
 import { mergeProfilePosts } from '@/utils/profilePosts';
@@ -28,13 +29,19 @@ import { mergeProfilePosts } from '@/utils/profilePosts';
 type LoadStatus = 'loading' | 'loaded' | 'error';
 // Step 41.2C — unified Posts tab: 'reel' (video Post) and legacy text
 // 'post' now merge into a single 'post' tab, so this is no longer a
-// per-technical-type selector, just Posts vs. (Business-only) Events.
-type ProfileTab = 'post' | 'event';
+// per-technical-type selector, just Posts vs. (Business-only) Events vs.
+// (Step 41.2E, own Profile only — never shown on the public profile route)
+// the caller's own private Saved list.
+type ProfileTab = 'post' | 'event' | 'saved';
 
-const PROFILE_TABS_PERSONAL: { id: ProfileTab; label: string }[] = [{ id: 'post', label: 'Posts' }];
+const PROFILE_TABS_PERSONAL: { id: ProfileTab; label: string }[] = [
+  { id: 'post', label: 'Posts' },
+  { id: 'saved', label: 'Saved' },
+];
 const PROFILE_TABS_BUSINESS: { id: ProfileTab; label: string }[] = [
   { id: 'post', label: 'Posts' },
   { id: 'event', label: 'Events' },
+  { id: 'saved', label: 'Saved' },
 ];
 
 // Bumped above fetchPublicUserContent's own DEFAULT_FEED_LIMIT (20) for
@@ -49,6 +56,7 @@ const PROFILE_CONTENT_LIMIT = 40;
 const EMPTY_TEXT: Record<ProfileTab, string> = {
   post: 'No posts yet',
   event: 'No events yet',
+  saved: 'No saved posts yet',
 };
 
 /**
@@ -72,13 +80,14 @@ export default function ProfileScreen() {
   const [postsCount, setPostsCount] = useState(0);
   const [content, setContent] = useState<Content[]>([]);
   const [reels, setReels] = useState<Reel[]>([]);
+  const [savedPosts, setSavedPosts] = useState<SavedPostItem[]>([]);
   const [activeTab, setActiveTab] = useState<ProfileTab>('post');
 
   const load = useCallback(async () => {
     if (!user) return;
     setStatus('loading');
     try {
-      const [followers, following, textPostCount, reelCount, userContent, userReels] = await Promise.all([
+      const [followers, following, textPostCount, reelCount, userContent, userReels, userSavedPosts] = await Promise.all([
         fetchFollowerCount(user.uid),
         fetchFollowingCount(user.uid),
         // Two exact server-side aggregations, summed — see
@@ -98,12 +107,17 @@ export default function ProfileScreen() {
         // STAT above is exact.
         fetchPublicUserContent(user.uid, PROFILE_CONTENT_LIMIT),
         fetchProfileReels(user.uid),
+        // Private to this account (Step 41.2E) — fetched here unconditionally,
+        // same as every other own-Profile tab's data, regardless of which tab
+        // is currently active; never fetched on the public profile route.
+        fetchSavedPosts(user.uid),
       ]);
       setFollowerCount(followers);
       setFollowingCount(following);
       setPostsCount(textPostCount + reelCount);
       setContent(userContent);
       setReels(userReels);
+      setSavedPosts(userSavedPosts);
       setStatus('loaded');
     } catch {
       setStatus('error');
@@ -190,13 +204,29 @@ export default function ProfileScreen() {
                       )}
                     </View>
                   )
-                ) : businessEvents.length === 0 ? (
-                  <EmptyState bare icon="calendar-outline" title={EMPTY_TEXT.event} />
+                ) : activeTab === 'event' ? (
+                  businessEvents.length === 0 ? (
+                    <EmptyState bare icon="calendar-outline" title={EMPTY_TEXT.event} />
+                  ) : (
+                    <View style={styles.contentList}>
+                      {businessEvents.map((item) => (
+                        <ContentCard key={item.contentId} item={item} currentUid={user?.uid ?? null} />
+                      ))}
+                    </View>
+                  )
+                ) : savedPosts.length === 0 ? (
+                  <EmptyState bare icon="bookmark-outline" title={EMPTY_TEXT.saved} body="Posts you save will appear here." />
                 ) : (
-                  <View style={styles.contentList}>
-                    {businessEvents.map((item) => (
-                      <ContentCard key={item.contentId} item={item} currentUid={user?.uid ?? null} />
-                    ))}
+                  <View style={styles.postsGrid}>
+                    {savedPosts.map((item) =>
+                      item.kind === 'reel' ? (
+                        <ReelPreviewCard key={`saved-reel-${item.savedId}`} reel={item.reel} />
+                      ) : (
+                        <View key={`saved-text-${item.savedId}`} style={styles.fullRow}>
+                          <ContentCard item={item.content} currentUid={user?.uid ?? null} />
+                        </View>
+                      )
+                    )}
                   </View>
                 )}
               </View>
