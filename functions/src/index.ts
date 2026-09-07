@@ -91,6 +91,82 @@ async function drainCollection(db: Firestore, collectionPath: string): Promise<n
 }
 
 // ---------------------------------------------------------------------------
+// postLikes/{likeId} (Step 41.2H.1) paired trusted cleanup (Step 41.2H.2).
+//
+// Admin SDK writes BYPASS Firestore Rules entirely — the atomic
+// create/delete pairing between a postLikes row and its real per-target
+// Like (reels/{id}/likes/{uid} or content/{id}/likes/{uid}) that
+// firestore.rules enforces for ordinary client writes is NOT automatically
+// preserved here. A naive "drain postLikes, then separately drain likes"
+// (in either order) would leave a real transient window where one half of
+// a pair exists without the other — exactly the inconsistency this
+// primitive exists to avoid. Both functions below always delete a
+// postLikes row and its paired real Like in the SAME Admin batch.
+//
+// Neither function assumes every real Like has a postLikes row — a
+// generic `drainCollection(...likes...)` (self-likes, Event/Activity
+// Likes, and — until Step 41.2H.3's backfill runs — historical Likes
+// predating this relationship model) still runs afterward at every call
+// site below to remove whatever these paired passes don't cover.
+// ---------------------------------------------------------------------------
+
+function likeDocPath(targetType: 'reel' | 'post', targetId: string, likerUid: string): string {
+  return targetType === 'reel' ? `reels/${targetId}/likes/${likerUid}` : `content/${targetId}/likes/${likerUid}`;
+}
+
+/**
+ * Removes every postLikes relationship pointing at one exact target
+ * (a single Reel or a single legacy text Post), pairing each removal with
+ * its real per-target Like in the same batch. Bounded/paginated exactly
+ * like drainQuery — never an unlimited scan, and the query's two equality
+ * filters (targetType + targetId) mean it can never touch a postLikes row
+ * for any other target.
+ */
+async function drainPairedPostLikesForTarget(db: Firestore, targetType: 'reel' | 'post', targetId: string): Promise<number> {
+  let total = 0;
+  for (;;) {
+    const snap = await db
+      .collection('postLikes')
+      .where('targetType', '==', targetType)
+      .where('targetId', '==', targetId)
+      .limit(BATCH_DELETE_SIZE)
+      .get();
+    if (snap.empty) break;
+    const batch = db.batch();
+    for (const docSnap of snap.docs) {
+      const likerUid = docSnap.data().likerUid as string;
+      batch.delete(docSnap.ref);
+      batch.delete(db.doc(likeDocPath(targetType, targetId, likerUid)));
+    }
+    await batch.commit();
+    total += snap.size;
+  }
+  return total;
+}
+
+/**
+ * Removes every postLikes relationship one account GAVE (as the liker),
+ * across every target, pairing each removal with the corresponding real
+ * per-target Like in the same batch. Bounded/paginated the same way.
+ */
+async function drainPairedPostLikesForLiker(db: Firestore, likerUid: string): Promise<number> {
+  let total = 0;
+  for (;;) {
+    const snap = await db.collection('postLikes').where('likerUid', '==', likerUid).limit(BATCH_DELETE_SIZE).get();
+    if (snap.empty) break;
+    const batch = db.batch();
+    for (const docSnap of snap.docs) {
+      const data = docSnap.data() as { targetType: 'reel' | 'post'; targetId: string };
+      batch.delete(docSnap.ref);
+      batch.delete(db.doc(likeDocPath(data.targetType, data.targetId, likerUid)));
+    }
+    await batch.commit();
+    total += snap.size;
+  }
+  return total;
+}
+
+// ---------------------------------------------------------------------------
 // Cross-user Activity participation — the one cross-user artifact with a
 // paired invariant (content/{contentId}/stats/activity.participantCount)
 // that must move atomically with the participant doc's removal.
@@ -195,6 +271,21 @@ async function cleanupCrossUserParticipants(db: Firestore, uid: string): Promise
 // ---------------------------------------------------------------------------
 
 async function deleteContentDocumentAndSubcollections(db: Firestore, contentId: string): Promise<void> {
+  // Step 41.2H.2 — postLikes/{likeId} only ever exists for a legacy text
+  // Post (never Event/Activity — see firestore.rules' isValidPostLikeCreate,
+  // which requires content.type == 'post'). One read of the content doc's
+  // own type is enough to skip running a provably-empty query for every
+  // other type — cheaper than always attempting it, and reuses the exact
+  // same read this function needs regardless (see below). The paired
+  // cleanup runs BEFORE the residual drainCollection just after it, so
+  // whatever real Likes it doesn't cover (self-likes, or historical Likes
+  // predating Step 41.2H.1) are still removed by that generic pass.
+  const contentSnap = await db.doc(`content/${contentId}`).get();
+  const contentType = contentSnap.exists ? (contentSnap.data()?.type as string | undefined) : undefined;
+  if (contentType === 'post') {
+    await drainPairedPostLikesForTarget(db, 'post', contentId);
+  }
+
   await drainCollection(db, `content/${contentId}/likes`);
   await drainCollection(db, `content/${contentId}/comments`);
   await drainCollection(db, `content/${contentId}/participants`);
@@ -249,6 +340,13 @@ async function deleteReelDocumentAndSubcollections(
   reelId: string,
   storagePath: string | undefined
 ): Promise<{ storageDeleted: boolean }> {
+  // Step 41.2H.2 — every Reel is inherently a social Post (no Event/
+  // Activity equivalent exists for Reels), so this paired cleanup always
+  // runs, unconditionally, before the residual drainCollection just after
+  // it (which still removes self-likes and any historical Likes predating
+  // Step 41.2H.1).
+  await drainPairedPostLikesForTarget(db, 'reel', reelId);
+
   await drainCollection(db, `reels/${reelId}/likes`);
   await drainCollection(db, `reels/${reelId}/comments`);
   // Same reasoning as deleteContentDocumentAndSubcollections's repost
@@ -375,6 +473,16 @@ export const deleteMyAccountData = onCall({ region: REGION, timeoutSeconds: 300,
   // as deleteOwnContent/deleteOwnReels run below.
   const ownRepostsOf = await drainQuery(db, () => db.collection('reposts').where('userUid', '==', uid));
 
+  // Step 41.2H.2 — this account's own outgoing postLikes (Likes it GAVE to
+  // other people's Posts/Reels), each paired with its real per-target Like
+  // in the same Admin batch — see drainPairedPostLikesForLiker's own doc
+  // comment for why Admin SDK writes must preserve that pairing themselves
+  // (Admin SDK bypasses Rules). Runs BEFORE the crossUserLikes residual
+  // drain just below, which then only has to clean up what this pass
+  // doesn't cover: Event/Activity Likes, self-likes, and (pre-Step-41.2H.3
+  // backfill) historical Likes with no postLikes row.
+  const ownOutgoingPostLikes = await drainPairedPostLikesForLiker(db, uid);
+
   // No counter is paired with likes/comments/responses (see firestore.rules
   // — like/comment counts are aggregation queries, and Event responses have
   // no stored count at all), so these are plain deletes across both content
@@ -400,6 +508,7 @@ export const deleteMyAccountData = onCall({ region: REGION, timeoutSeconds: 300,
     follows: { asFollowerRemoved: followerOf.total, asFollowingRemoved: followingOf.total },
     blocks: { asBlockerRemoved: blockerOf.total, asBlockedRemoved: blockedOf.total },
     ownRepostsRemoved: ownRepostsOf.total,
+    ownOutgoingPostLikesRemoved: ownOutgoingPostLikes,
     crossUser: {
       likesRemoved: crossUserLikes.total,
       likesRemovedByRoot: crossUserLikes.roots,
