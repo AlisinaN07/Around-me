@@ -23,12 +23,14 @@ import {
 
 import type { Notification } from '@/types/notification';
 import { NOTIFICATION_PREVIEW_MAX_LENGTH } from '@/types/notification';
+import type { PostLike } from '@/types/postLikes';
 import type { Reel, ReelComment, ReelLike } from '@/types/reel';
 import { REEL_COMMENT_BODY_MAX_LENGTH } from '@/types/reel';
 
 import { resolveTrustedFields, type EngagementError, type EngagementResult } from './engagement';
 import { firestore } from './firestore';
 import { buildNotificationId, notificationRef } from './notifications';
+import { postLikeRef } from './postLikes';
 import { reelRef } from './reels';
 
 const REELS_COLLECTION = 'reels';
@@ -75,9 +77,13 @@ export async function likeReel(reelId: string, uid: string): Promise<LikeReelRes
   }
 
   try {
-    // Like + notification land atomically — see firestore.rules, which
-    // requires the like doc to exist (existsAfter) for the notification
-    // create to be valid. Never notify yourself for your own like.
+    // Like + notification + postLikes relationship land atomically — see
+    // firestore.rules, which requires the like doc to exist (existsAfter)
+    // for both the notification AND the postLikes create to be valid.
+    // Never notify yourself for your own like, and never create a
+    // postLikes relationship for a self-like either (Step 41.2H.1 — a
+    // self-Like still behaves exactly as before, it just never
+    // contributes to the author's future "Liked" total).
     const batch = writeBatch(firestore);
     batch.set(reelLikeRef(reelId, uid), {
       uid,
@@ -102,6 +108,14 @@ export async function likeReel(reelId: string, uid: string): Promise<LikeReelRes
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       } satisfies WithFieldValue<Notification>);
+
+      batch.set(postLikeRef(uid, 'reel', reelId), {
+        likerUid: uid,
+        targetAuthorUid: parent.reel.authorUid,
+        targetType: 'reel',
+        targetId: reelId,
+        createdAt: serverTimestamp(),
+      } satisfies WithFieldValue<PostLike>);
     }
 
     await batch.commit();
@@ -115,13 +129,19 @@ export async function likeReel(reelId: string, uid: string): Promise<LikeReelRes
 export async function unlikeReel(reelId: string, uid: string): Promise<{ ok: true } | { ok: false; error: EngagementError; message: string }> {
   if (!firestore) return { ok: false, error: 'not-configured', message: 'Firestore is not available.' };
   try {
-    // Removing the like and its notification (if any — self-likes never
-    // had one) land in the same batch, so a notification can never outlive
-    // the like it was for. Allowed even if the two users became blocked
-    // after the like was created — unliking must never trap a stale like.
+    // Removing the like, its notification (if any — self-likes never had
+    // one), and its postLikes relationship (Step 41.2H.1 — same caveat:
+    // self-likes never had one either) all land in the same batch, so
+    // neither can ever outlive the like it was for. Allowed even if the
+    // two users became blocked after the like was created — unliking must
+    // never trap a stale like. The postLikes delete is unconditional and
+    // safe even when no such row ever existed (self-like, or a Like
+    // created before this Rules change) — firestore.rules explicitly
+    // allows deleting an already-absent postLikes doc as a no-op.
     const reelSnapshot = await getDoc(reelRef(reelId));
     const batch = writeBatch(firestore);
     batch.delete(reelLikeRef(reelId, uid));
+    batch.delete(postLikeRef(uid, 'reel', reelId));
     if (reelSnapshot.exists() && reelSnapshot.data().authorUid !== uid) {
       batch.delete(notificationRef(buildNotificationId('reel_like', { reelId, actorUid: uid })));
     }

@@ -1257,6 +1257,26 @@ Any account can publicly republish another account's Post (video or legacy text)
 
 **Production verification:** a disposable Business author and Personal responder (no admin claims, never the owner account, no media upload) ran a 7-point end-to-end matrix against live production — Event creation, Interested response, own-Activities resolution, cross-user public read of the response, Interested→Going with no duplicate, Business's-own-Event exclusion, and deleted-Event graceful disappearance (via the real `deleteMyContent`) — all passed. All fixtures were deleted by exact ID afterward and independently re-verified absent; no Storage objects were ever created.
 
+## Authoritative received-Like relationships (Step 41.2H.1)
+
+The first of several steps toward a real Profile "Liked" stat (the exact count of Likes RECEIVED across a profile's current authored video Posts and legacy text Posts). This step is data model + write consistency only — **Liked is not displayed anywhere yet**, and the historical backfill has not been run.
+
+**Schema:** `postLikes/{likeId}`, `likeId = ${likerUid}_${targetType}_${targetId}`, fields `{ likerUid, targetAuthorUid, targetType: 'reel'|'post', targetId, createdAt: serverTimestamp() }`.
+
+**Privacy — not public, not even owner-readable:** unlike Reposts (Step 41.2F), `postLikes` has `allow read: if false` unconditionally. The app only ever needs the aggregate Liked *number*, never a browsable list of who liked what, so the raw relationship rows are never exposed to any client, including the liker themselves.
+
+**Self-like semantics unchanged:** liking your own Post/Reel still behaves exactly as it did before this step — the existing per-target Like is created normally. It simply never produces a `postLikes` row, and will never count toward the author's own Liked total.
+
+**Event/legacy Activity unaffected:** their Likes continue using the exact same `content/{contentId}/likes/{uid}` subcollection and behavior as before — a `postLikes` row is only ever created for `targetType=='reel'` or a legacy `content` document with `type=='post'`.
+
+**Symmetric atomic consistency (the core of this step):** a non-self Like on a social Post now REQUIRES its `postLikes` row to exist in the very same write, and a `postLikes` row can only ever be created when the real per-target Like already exists in that same write — enforced with `existsAfter()`, the identical Rules idiom this file already used to pair a Like with its notification, extended one hop further. The reverse holds for delete: unliking a social Post requires its `postLikes` row to be gone in the same write, and a `postLikes` row can only be deleted when the real Like is already gone. A modified client cannot create one half of the pair without the other, in either direction. `likeReel`/`unlikeReel`/`likeContent`/`unlikeContent` all still use a single `writeBatch` — this step only adds one more `set`/`delete` to the batch they already had; the existing Like+notification pairing is completely unchanged.
+
+**No spoofing:** `targetAuthorUid` is never trusted from the client — Rules independently `get()` the real target document and require it to match, closing the same anti-spoof gap already proven for Reposts.
+
+**Deletion cleanup is a separate, later step:** Post/Reel self-delete, moderation, and account deletion do not yet drain `postLikes` — that's Step 41.2H.2, deliberately sequenced after normal write consistency is proven in isolation.
+
+**Backfill:** not run. Historical Likes (created before this deployment) have no `postLikes` row yet; a bounded, additive, one-time script is designed for a later step and has not been executed.
+
 ## Reels (Cloud Storage — Step 18)
 
 Reels are short (≤60s), video-only posts with vertical, city-scoped playback — the first feature in this app to use Cloud Storage rather than Firestore alone. They live in their own root collection, `reels/{reelId}`, separate from `content/{contentId}` (posts/activities/events): a Reel has a media-upload lifecycle and Storage metadata that the other content types never had, and folding it into `content` would have meant giving every Post/Activity/Event query an upload-status field it never needs.

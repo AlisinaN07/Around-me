@@ -22,10 +22,12 @@ import type { Content, ContentComment, ContentLike } from '@/types/content';
 import { COMMENT_BODY_MAX_LENGTH } from '@/types/content';
 import type { Notification } from '@/types/notification';
 import { NOTIFICATION_PREVIEW_MAX_LENGTH } from '@/types/notification';
+import type { PostLike } from '@/types/postLikes';
 
 import { contentDocRef, resolveTrustedFields, type EngagementError, type EngagementResult } from './engagement';
 import { firestore } from './firestore';
 import { buildNotificationId, notificationRef } from './notifications';
+import { postLikeRef } from './postLikes';
 
 const CONTENT_COLLECTION = 'content';
 const DEFAULT_COMMENT_LIMIT = 30;
@@ -73,9 +75,15 @@ export async function likeContent(contentId: string, uid: string): Promise<LikeC
   }
 
   try {
-    // Like + notification land atomically — see firestore.rules, which
-    // requires the like doc to exist (existsAfter) for the notification
-    // create to be valid. Never notify yourself for your own like.
+    // Like + notification + postLikes relationship land atomically — see
+    // firestore.rules, which requires the like doc to exist (existsAfter)
+    // for both the notification AND the postLikes create to be valid.
+    // Never notify yourself for your own like. A postLikes relationship is
+    // ONLY ever created for a non-self Like on type=='post' — Event and
+    // legacy Activity Likes are completely unaffected (Step 41.2H.1 — a
+    // self-Like, or an Event/Activity Like, still behaves exactly as
+    // before; it just never contributes to the author's future "Liked"
+    // total).
     const batch = writeBatch(firestore);
     batch.set(likeRef(contentId, uid), {
       uid,
@@ -100,6 +108,16 @@ export async function likeContent(contentId: string, uid: string): Promise<LikeC
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       } satisfies WithFieldValue<Notification>);
+
+      if (parent.content.type === 'post') {
+        batch.set(postLikeRef(uid, 'post', contentId), {
+          likerUid: uid,
+          targetAuthorUid: parent.content.authorUid,
+          targetType: 'post',
+          targetId: contentId,
+          createdAt: serverTimestamp(),
+        } satisfies WithFieldValue<PostLike>);
+      }
     }
 
     await batch.commit();
@@ -115,10 +133,17 @@ export async function unlikeContent(contentId: string, uid: string): Promise<{ o
   try {
     // Removing the like and its notification (if any — self-likes never
     // had one) land in the same batch, so a notification can never outlive
-    // the like it was for.
+    // the like it was for. The postLikes delete (Step 41.2H.1) is only
+    // attempted for type=='post' — Event/Activity Likes never had one to
+    // begin with — and is safe even when no such row exists (self-like, or
+    // a Like created before this Rules change): firestore.rules explicitly
+    // allows deleting an already-absent postLikes doc as a no-op.
     const contentSnapshot = await getDoc(contentDocRef(contentId));
     const batch = writeBatch(firestore);
     batch.delete(likeRef(contentId, uid));
+    if (contentSnapshot.exists() && contentSnapshot.data().type === 'post') {
+      batch.delete(postLikeRef(uid, 'post', contentId));
+    }
     if (contentSnapshot.exists() && contentSnapshot.data().authorUid !== uid) {
       batch.delete(notificationRef(buildNotificationId('like', { contentId, actorUid: uid })));
     }

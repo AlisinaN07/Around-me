@@ -361,6 +361,94 @@ service cloud.firestore {
         );
     }
 
+    // postLikes/{likeId} — Step 41.2H.1. The authoritative, NORMALIZED
+    // relationship behind Profile's future "Liked" stat: exactly one
+    // non-self Like on one current, published, original social Post
+    // (video Post or legacy text Post — never Event, never legacy
+    // Activity). Unlike reposts/{repostId} (Step 41.2F), this is
+    // deliberately NOT publicly readable, and not even owner-readable —
+    // the app only ever needs the AGGREGATE COUNT of a profile's received
+    // Likes, never a browsable list of who liked what, so there is no
+    // reason to expose likerUid/targetAuthorUid/targetId/targetType as an
+    // enumerable relationship graph. Reading the count itself is a later
+    // step (41.2H.3+); this step is data model + write consistency only.
+    match /postLikes/{likeId} {
+      allow read: if false;
+
+      allow create: if isSignedIn() && isValidPostLikeCreate(likeId, request.resource.data);
+
+      allow update: if false;
+
+      // Symmetric with the create-side pairing below: a postLikes row may
+      // only be removed in the SAME atomic write that also removes the
+      // real per-target Like it represents. The `!exists(...)` branch
+      // (checked against THIS document's own path, never dereferencing
+      // `resource.data`) makes deleting an ALREADY-ABSENT postLikes row an
+      // unconditional no-op — required so the client's unlike batch can
+      // always include this delete unconditionally (self-Likes and any
+      // pre-migration Like created before this Rules change never had a
+      // paired row to begin with) without ever crashing this rule on a
+      // null `resource`.
+      allow delete: if !exists(/databases/$(database)/documents/postLikes/$(likeId))
+        || (isOwner(resource.data.likerUid) && isValidPostLikeDelete(resource.data));
+    }
+
+    function postLikeReelTarget(targetId) {
+      return get(/databases/$(database)/documents/reels/$(targetId)).data;
+    }
+
+    function postLikeContentTarget(targetId) {
+      return get(/databases/$(database)/documents/content/$(targetId)).data;
+    }
+
+    // Rejects: a missing target, an unpublished/draft Reel, a non-'post'
+    // legacy content document (Event, Activity), an unpublished legacy
+    // Post, a self-Like either way (data.targetAuthorUid !=
+    // request.auth.uid, combined with targetAuthorUid being verified below
+    // to equal the target's REAL authorUid — same anti-spoof pairing
+    // already proven for reposts' isValidRepostCreate), a malformed/
+    // mismatched targetType or likeId, and — critically — any write that
+    // isn't happening in the SAME atomic batch as the real per-target
+    // Like: existsAfter() below requires that Like to already be present
+    // in the proposed post-write state, exactly the idiom this file
+    // already uses to pair a Like with its notification (see
+    // isValidNotificationDelete's existsAfter() checks), one hop further.
+    function isValidPostLikeCreate(likeId, data) {
+      return data.likerUid == request.auth.uid
+        && data.targetType is string
+        && data.targetId is string
+        && data.targetId.size() > 0
+        && data.targetAuthorUid is string
+        && data.targetAuthorUid != request.auth.uid
+        && likeId == (data.likerUid + '_' + data.targetType + '_' + data.targetId)
+        && isServerTimestamp(data.createdAt)
+        && data.keys().hasOnly(['likerUid', 'targetAuthorUid', 'targetType', 'targetId', 'createdAt'])
+        && (
+          (data.targetType == 'reel'
+            && exists(/databases/$(database)/documents/reels/$(data.targetId))
+            && postLikeReelTarget(data.targetId).status == 'published'
+            && postLikeReelTarget(data.targetId).authorUid == data.targetAuthorUid
+            && existsAfter(/databases/$(database)/documents/reels/$(data.targetId)/likes/$(request.auth.uid)))
+          || (data.targetType == 'post'
+            && exists(/databases/$(database)/documents/content/$(data.targetId))
+            && postLikeContentTarget(data.targetId).type == 'post'
+            && postLikeContentTarget(data.targetId).status == 'published'
+            && postLikeContentTarget(data.targetId).authorUid == data.targetAuthorUid
+            && existsAfter(/databases/$(database)/documents/content/$(data.targetId)/likes/$(request.auth.uid)))
+        );
+    }
+
+    // The reverse pairing: a postLikes row may only be deleted in the same
+    // write that also removes the real per-target Like — never leaving a
+    // phantom relationship behind. (A live Like with no postLikes row is
+    // the harmless direction — it just undercounts until the next
+    // like/unlike; the dangerous direction, a postLikes row surviving with
+    // no real Like behind it, is the one this function makes impossible.)
+    function isValidPostLikeDelete(data) {
+      return (data.targetType == 'reel' && !existsAfter(/databases/$(database)/documents/reels/$(data.targetId)/likes/$(data.likerUid)))
+        || (data.targetType == 'post' && !existsAfter(/databases/$(database)/documents/content/$(data.targetId)/likes/$(data.likerUid)));
+    }
+
     // places/{placeId} — real public physical locations (see
     // src/types/place.ts). Ordinary users can only READ active Places.
     // Step 13 has no place-creation UI at all — Places are seeded only by
@@ -701,14 +789,37 @@ service cloud.firestore {
           && isNotBlockedEitherWay(request.auth.uid, likeParent().authorUid)
           && request.resource.data.uid == request.auth.uid
           && isServerTimestamp(request.resource.data.createdAt)
-          && request.resource.data.keys().hasOnly(['uid', 'createdAt']);
+          && request.resource.data.keys().hasOnly(['uid', 'createdAt'])
+          // Step 41.2H.1 — a non-self Like on an original social Post
+          // (type=='post' only; Event/Activity Likes are completely
+          // unaffected) must land atomically with its postLikes
+          // relationship. existsAfter() mirrors the exact pairing this
+          // file already uses for Like+notification, one hop further.
+          && (
+            likeParent().type != 'post'
+            || likeParent().authorUid == request.auth.uid
+            || existsAfter(/databases/$(database)/documents/postLikes/$(request.auth.uid + '_post_' + contentId))
+          );
 
         // Re-liking an existing Like doc is an update, not a create — denying
         // update here is what actually prevents a duplicate/overwritten Like,
         // not a separate "already exists" check on create.
         allow update: if false;
 
-        allow delete: if isOwner(uid);
+        // Step 41.2H.1 — symmetric with the create-side pairing: unliking
+        // a non-self social Post must remove its postLikes relationship
+        // in the same write. The `!exists(parent)` branch guards against
+        // calling likeParent() on an already-deleted content document —
+        // if the parent is gone, unlike is unconditionally allowed
+        // (never traps a stale Like, same philosophy as the existing
+        // block-tolerant behavior below).
+        allow delete: if isOwner(uid)
+          && (
+            !exists(/databases/$(database)/documents/content/$(contentId))
+            || likeParent().type != 'post'
+            || likeParent().authorUid == uid
+            || !existsAfter(/databases/$(database)/documents/postLikes/$(uid + '_post_' + contentId))
+          );
       }
 
       // content/{contentId}/comments/{commentId} — top-level comments only
@@ -813,7 +924,15 @@ service cloud.firestore {
           && isNotBlockedEitherWay(request.auth.uid, reelLikeParent().authorUid)
           && request.resource.data.uid == request.auth.uid
           && isServerTimestamp(request.resource.data.createdAt)
-          && request.resource.data.keys().hasOnly(['uid', 'createdAt']);
+          && request.resource.data.keys().hasOnly(['uid', 'createdAt'])
+          // Step 41.2H.1 — same pairing as content Likes, one hop simpler
+          // since every Reel is inherently a social Post (no Event/
+          // Activity equivalent exists for Reels) — only a self-Like is
+          // exempt.
+          && (
+            reelLikeParent().authorUid == request.auth.uid
+            || existsAfter(/databases/$(database)/documents/postLikes/$(request.auth.uid + '_reel_' + reelId))
+          );
 
         // Re-liking an existing Like doc is an update, not a create — same
         // reasoning as content Likes: denying update is what actually
@@ -823,7 +942,14 @@ service cloud.firestore {
         // Only the Like's own owner may remove it — allowed even if a
         // Block was created after the Like, so unliking never traps a
         // stale Like (see the Step 19 spec's explicit requirement).
-        allow delete: if isOwner(uid);
+        // Step 41.2H.1 — symmetric postLikes pairing, same `!exists(parent)`
+        // guard as content Likes above.
+        allow delete: if isOwner(uid)
+          && (
+            !exists(/databases/$(database)/documents/reels/$(reelId))
+            || reelLikeParent().authorUid == uid
+            || !existsAfter(/databases/$(database)/documents/postLikes/$(uid + '_reel_' + reelId))
+          );
       }
 
       // reels/{reelId}/comments/{commentId} — top-level comments only, no

@@ -158,6 +158,39 @@ function validLike(uid, overrides = {}) {
   return { uid, createdAt: serverTimestamp(), ...overrides };
 }
 
+// Same deterministic ID scheme as postLikeId in src/services/postLikes.ts.
+function postLikeId(likerUid, targetType, targetId) {
+  return `${likerUid}_${targetType}_${targetId}`;
+}
+function validPostLike(likerUid, targetAuthorUid, targetType, targetId, overrides = {}) {
+  return { likerUid, targetAuthorUid, targetType, targetId, createdAt: serverTimestamp(), ...overrides };
+}
+function likeDocPath(targetType, targetId, likerUid) {
+  return targetType === 'reel' ? ['reels', targetId, 'likes', likerUid] : ['content', targetId, 'likes', likerUid];
+}
+
+// Step 41.2H.1 — a non-self Like on a social Post (Reel, or legacy
+// content type=='post') now requires its postLikes relationship to land
+// in the SAME atomic write (see firestore.rules' isValidPostLikeCreate).
+// Every existing test that likes such a target as a DIFFERENT user from
+// its author uses this helper instead of a bare setDoc from here on.
+// Self-likes and Event/Activity Likes are UNAFFECTED and keep using plain
+// setDoc(likeRef, validLike(uid)) — no postLikes exists for those.
+function likeSocialPost(db, likerUid, targetAuthorUid, targetType, targetId) {
+  const batch = writeBatch(db);
+  batch.set(doc(db, ...likeDocPath(targetType, targetId, likerUid)), validLike(likerUid));
+  batch.set(doc(db, 'postLikes', postLikeId(likerUid, targetType, targetId)), validPostLike(likerUid, targetAuthorUid, targetType, targetId));
+  return batch.commit();
+}
+
+// Symmetric unlike — same reasoning, same exemptions.
+function unlikeSocialPost(db, likerUid, targetType, targetId) {
+  const batch = writeBatch(db);
+  batch.delete(doc(db, ...likeDocPath(targetType, targetId, likerUid)));
+  batch.delete(doc(db, 'postLikes', postLikeId(likerUid, targetType, targetId)));
+  return batch.commit();
+}
+
 function validPublicProfile(uid, displayName, username, overrides = {}) {
   return {
     uid,
@@ -1070,7 +1103,9 @@ async function main() {
     // earlier in the suite (all still exist — content delete is disabled).
     // =========================================================================
     await check('ALLOW: completed user Likes a published Post', async () => {
-      await assertSucceeds(setDoc(doc(bob, 'content', 'post-alice-1', 'likes', 'bob'), validLike('bob')));
+      // Step 41.2H.1 — a non-self Like on a social Post (type=='post')
+      // now requires its paired postLikes relationship in the same batch.
+      await assertSucceeds(likeSocialPost(bob, 'bob', 'alice', 'post', 'post-alice-1'));
     });
 
     await check('ALLOW: Likes a published Activity', async () => {
@@ -1093,7 +1128,9 @@ async function main() {
     });
 
     await check('ALLOW: user deletes their own Like', async () => {
-      await assertSucceeds(deleteDoc(doc(bob, 'content', 'post-alice-1', 'likes', 'bob')));
+      // Symmetric with the create above — unliking a social Post now
+      // requires the postLikes relationship to be gone in the same batch.
+      await assertSucceeds(unlikeSocialPost(bob, 'bob', 'post', 'post-alice-1'));
     });
 
     await check('DENY: unauthenticated Like', async () => {
@@ -1146,11 +1183,11 @@ async function main() {
 
     await check('AGGREGATION: Like count 0 -> 1 -> 2 -> 1', async () => {
       assert.equal(await likeCount(bob, 'post-agg-1'), 0);
-      await assertSucceeds(setDoc(doc(bob, 'content', 'post-agg-1', 'likes', 'bob'), validLike('bob')));
+      await assertSucceeds(likeSocialPost(bob, 'bob', 'alice', 'post', 'post-agg-1'));
       assert.equal(await likeCount(bob, 'post-agg-1'), 1);
-      await assertSucceeds(setDoc(doc(carol, 'content', 'post-agg-1', 'likes', 'carol'), validLike('carol')));
+      await assertSucceeds(likeSocialPost(carol, 'carol', 'alice', 'post', 'post-agg-1'));
       assert.equal(await likeCount(bob, 'post-agg-1'), 2);
-      await assertSucceeds(deleteDoc(doc(bob, 'content', 'post-agg-1', 'likes', 'bob')));
+      await assertSucceeds(unlikeSocialPost(bob, 'bob', 'post', 'post-agg-1'));
       assert.equal(await likeCount(bob, 'post-agg-1'), 1);
     });
 
@@ -1869,6 +1906,9 @@ async function main() {
       const notificationId = likeNotificationId('post-notif-1', 'notifb');
       const batch = writeBatch(notifB);
       batch.set(doc(notifB, 'content', 'post-notif-1', 'likes', 'notifb'), validLike('notifb'));
+      // Step 41.2H.1 — a non-self Like on a social Post also requires its
+      // paired postLikes relationship in the same atomic write.
+      batch.set(doc(notifB, 'postLikes', postLikeId('notifb', 'post', 'post-notif-1')), validPostLike('notifb', 'notifa', 'post', 'post-notif-1'));
       batch.set(
         doc(notifB, 'notifications', notificationId),
         validNotification(notificationId, 'notifa', 'notifb', 'Notif Bravo', 'notifb_handle', 'like', { contentId: 'post-notif-1' })
@@ -2017,6 +2057,8 @@ async function main() {
       const notificationId = likeNotificationId('post-notif-1', 'notifb');
       const batch = writeBatch(notifB);
       batch.delete(doc(notifB, 'content', 'post-notif-1', 'likes', 'notifb'));
+      // Step 41.2H.1 — symmetric with the create above.
+      batch.delete(doc(notifB, 'postLikes', postLikeId('notifb', 'post', 'post-notif-1')));
       batch.delete(doc(notifB, 'notifications', notificationId));
       await assertSucceeds(batch.commit());
 
@@ -2956,7 +2998,7 @@ async function main() {
     });
 
     await check('ALLOW: B can like A\'s post after being unblocked', async () => {
-      await assertSucceeds(setDoc(doc(s17b, 'content', 'post-s17a-1', 'likes', 's17b'), validLike('s17b')));
+      await assertSucceeds(likeSocialPost(s17b, 's17b', 's17a', 'post', 'post-s17a-1'));
     });
 
     // --- BLOCK TEST — FOLLOW: pre-existing edges removed, counts correct ---
@@ -3637,7 +3679,9 @@ async function main() {
     });
 
     await check('ALLOW: B likes A\'s published Reel', async () => {
-      await assertSucceeds(setDoc(doc(s19b, 'reels', 'reel-19-1', 'likes', 's19b'), validLike('s19b')));
+      // Step 41.2H.1 — a non-self Reel Like also requires its paired
+      // postLikes relationship in the same atomic write.
+      await assertSucceeds(likeSocialPost(s19b, 's19b', 's19a', 'reel', 'reel-19-1'));
     });
 
     await check('ALLOW: self-like (A likes own Reel) — same product behavior as content Likes', async () => {
@@ -3657,7 +3701,8 @@ async function main() {
     });
 
     await check('ALLOW: B unlikes (deletes their own Reel Like)', async () => {
-      await assertSucceeds(deleteDoc(doc(s19b, 'reels', 'reel-19-1', 'likes', 's19b')));
+      // Symmetric with the create above.
+      await assertSucceeds(unlikeSocialPost(s19b, 's19b', 'reel', 'reel-19-1'));
     });
 
     await check('ALLOW: A removes their own self-like', async () => {
@@ -3775,6 +3820,9 @@ async function main() {
       const notificationId = reelLikeNotificationId('reel-notif-1', 's19b');
       const batch = writeBatch(s19b);
       batch.set(doc(s19b, 'reels', 'reel-notif-1', 'likes', 's19b'), validLike('s19b'));
+      // Step 41.2H.1 — a non-self Reel Like also requires its paired
+      // postLikes relationship in the same atomic write.
+      batch.set(doc(s19b, 'postLikes', postLikeId('s19b', 'reel', 'reel-notif-1')), validPostLike('s19b', 's19a', 'reel', 'reel-notif-1'));
       batch.set(
         doc(s19b, 'notifications', notificationId),
         validNotification(notificationId, 's19a', 's19b', 'Step19 Bravo', 's19b_handle', 'reel_like', { reelId: 'reel-notif-1' })
@@ -3934,6 +3982,8 @@ async function main() {
     await check('ALLOW: B unlikes + deletes the paired reel_like notification atomically', async () => {
       const batch = writeBatch(s19b);
       batch.delete(doc(s19b, 'reels', 'reel-notif-1', 'likes', 's19b'));
+      // Step 41.2H.1 — symmetric with the create above.
+      batch.delete(doc(s19b, 'postLikes', postLikeId('s19b', 'reel', 'reel-notif-1')));
       batch.delete(doc(s19b, 'notifications', reelLikeNotificationId('reel-notif-1', 's19b')));
       await assertSucceeds(batch.commit());
     });
@@ -3950,7 +4000,7 @@ async function main() {
     await seedReel(testEnv, 's19b', 'Step19 Bravo', 's19b_handle', 'reel-19-2');
 
     await check('setup: B likes A\'s Reel before any block exists', async () => {
-      await assertSucceeds(setDoc(doc(s19b, 'reels', 'reel-19-1', 'likes', 's19b'), validLike('s19b')));
+      await assertSucceeds(likeSocialPost(s19b, 's19b', 's19a', 'reel', 'reel-19-1'));
     });
 
     await check('setup: A blocks B for Reel engagement block tests', async () => {
@@ -3960,7 +4010,7 @@ async function main() {
     await check('ALLOW: B can still unlike a pre-existing Like even after being blocked', async () => {
       // Explicit Step 19 requirement: a Block only stops NEW interaction —
       // it must never trap a stale Like the unliker can no longer remove.
-      await assertSucceeds(deleteDoc(doc(s19b, 'reels', 'reel-19-1', 'likes', 's19b')));
+      await assertSucceeds(unlikeSocialPost(s19b, 's19b', 'reel', 'reel-19-1'));
     });
 
     await check('DENY: B likes A\'s Reel while blocked', async () => {
@@ -3991,8 +4041,8 @@ async function main() {
 
     await check('ALLOW: A unblocks B, ordinary Reel interaction works again', async () => {
       await assertSucceeds(deleteDoc(doc(s19a, 'blocks', blockId('s19a', 's19b'))));
-      await assertSucceeds(setDoc(doc(s19b, 'reels', 'reel-19-1', 'likes', 's19b'), validLike('s19b')));
-      await assertSucceeds(deleteDoc(doc(s19b, 'reels', 'reel-19-1', 'likes', 's19b')));
+      await assertSucceeds(likeSocialPost(s19b, 's19b', 's19a', 'reel', 'reel-19-1'));
+      await assertSucceeds(unlikeSocialPost(s19b, 's19b', 'reel', 'reel-19-1'));
     });
 
     // =========================================================================
@@ -4244,6 +4294,178 @@ async function main() {
     // --- L: ALLOW the owner to remove their own Repost. ---
     await check('ALLOW: reposter removes their own Repost', async () => {
       await assertSucceeds(deleteDoc(doc(s41fb, 'reposts', repostDocId('s41fb', 'post', 'post-41f-1'))));
+    });
+
+    // =========================================================================
+    // postLikes/{likeId} — authoritative received-Like relationships (Step
+    // 41.2H.1), the future basis for Profile's "Liked" stat. s41ha is the
+    // original-content author; s41hb exercises the full, correctly-paired
+    // Like/Unlike lifecycle; s41hc is reused across every "unpaired
+    // attempt" DENY case below — each attempt fails outright and leaves no
+    // state behind, so reusing one uid across many independent DENY checks
+    // is safe. A published Reel, a published legacy text Post, an
+    // Activity, and an Event are seeded once via the existing privileged
+    // helpers — the Activity/Event fixtures exist purely to prove
+    // postLikes rejects them as targets while their OWN existing Like
+    // behavior stays completely unaffected.
+    // =========================================================================
+    await seedProfile(testEnv, 's41ha', 's41ha_handle', { displayName: 'Step41H Alpha' });
+    await seedProfile(testEnv, 's41hb', 's41hb_handle', { displayName: 'Step41H Bravo' });
+    await seedProfile(testEnv, 's41hc', 's41hc_handle', { displayName: 'Step41H Charlie' });
+    await seedReel(testEnv, 's41ha', 'Step41H Alpha', 's41ha_handle', 'reel-41h-1');
+    await seedPost(testEnv, 's41ha', 'Step41H Alpha', 's41ha_handle', 'post-41h-1');
+    await seedActivity(testEnv, 's41ha', 'Step41H Alpha', 's41ha_handle', 'activity-41h-1');
+    await testEnv.withSecurityRulesDisabled(async (adminContext) => {
+      await setDoc(
+        doc(adminContext.firestore(), 'content', 'event-41h-1'),
+        validEvent('s41ha', 'Step41H Alpha', 's41ha_handle', 'event-41h-1')
+      );
+    });
+
+    const s41ha = testEnv.authenticatedContext('s41ha').firestore();
+    const s41hb = testEnv.authenticatedContext('s41hb').firestore();
+    const s41hc = testEnv.authenticatedContext('s41hc').firestore();
+
+    // --- A: ALLOW a non-self Reel Like paired with its postLike, same batch. ---
+    await check('ALLOW: other user likes published Reel WITH paired postLike in same batch', async () => {
+      await assertSucceeds(likeSocialPost(s41hb, 's41hb', 's41ha', 'reel', 'reel-41h-1'));
+    });
+
+    // --- B: DENY a Reel Like created without its postLike. ---
+    await check('DENY: other user creates Reel Like WITHOUT postLike', async () => {
+      await assertFails(setDoc(doc(s41hc, 'reels', 'reel-41h-1', 'likes', 's41hc'), validLike('s41hc')));
+    });
+
+    // --- C: DENY a postLike created without a real Reel Like. ---
+    await check('DENY: postLike create WITHOUT real Reel Like', async () => {
+      await assertFails(
+        setDoc(doc(s41hc, 'postLikes', postLikeId('s41hc', 'reel', 'reel-41h-1')), validPostLike('s41hc', 's41ha', 'reel', 'reel-41h-1'))
+      );
+    });
+
+    // --- E: DENY deleting the real Reel Like while leaving its postLike behind. ---
+    await check('DENY: delete Reel Like while leaving postLike', async () => {
+      await assertFails(deleteDoc(doc(s41hb, 'reels', 'reel-41h-1', 'likes', 's41hb')));
+    });
+
+    // --- F: DENY deleting postLike while leaving the real Reel Like intact. ---
+    await check('DENY: delete postLike while leaving Reel Like', async () => {
+      await assertFails(deleteDoc(doc(s41hb, 'postLikes', postLikeId('s41hb', 'reel', 'reel-41h-1'))));
+    });
+
+    // --- D: ALLOW unliking the Reel + deleting postLike, same batch. ---
+    await check('ALLOW: other user unlikes Reel + deletes postLike same batch', async () => {
+      await assertSucceeds(unlikeSocialPost(s41hb, 's41hb', 'reel', 'reel-41h-1'));
+    });
+
+    // --- G: ALLOW a non-self legacy text Post Like paired with its postLike. ---
+    await check('ALLOW: other user likes legacy text Post with paired postLike', async () => {
+      await assertSucceeds(likeSocialPost(s41hb, 's41hb', 's41ha', 'post', 'post-41h-1'));
+    });
+
+    // --- H: DENY a legacy Post Like created without its postLike. ---
+    await check('DENY: legacy Post Like without postLike', async () => {
+      await assertFails(setDoc(doc(s41hc, 'content', 'post-41h-1', 'likes', 's41hc'), validLike('s41hc')));
+    });
+
+    // --- I: DENY a postLike created without a real legacy Post Like. ---
+    await check('DENY: postLike for legacy Post without real Like', async () => {
+      await assertFails(
+        setDoc(doc(s41hc, 'postLikes', postLikeId('s41hc', 'post', 'post-41h-1')), validPostLike('s41hc', 's41ha', 'post', 'post-41h-1'))
+      );
+    });
+
+    // --- J: ALLOW unliking the legacy Post + deleting postLike, same batch. ---
+    await check('ALLOW: legacy Post unlike + postLike delete', async () => {
+      await assertSucceeds(unlikeSocialPost(s41hb, 's41hb', 'post', 'post-41h-1'));
+    });
+
+    // --- K: Event Like continues working WITHOUT postLike, per current policy. ---
+    await check('ALLOW: Event Like continues working WITHOUT postLike', async () => {
+      await assertSucceeds(setDoc(doc(s41hb, 'content', 'event-41h-1', 'likes', 's41hb'), validLike('s41hb')));
+      await assertSucceeds(deleteDoc(doc(s41hb, 'content', 'event-41h-1', 'likes', 's41hb')));
+    });
+
+    // --- L: legacy Activity Like continues working WITHOUT postLike, per current compatibility policy. ---
+    await check('ALLOW: legacy Activity Like continues working WITHOUT postLike', async () => {
+      await assertSucceeds(setDoc(doc(s41hb, 'content', 'activity-41h-1', 'likes', 's41hb'), validLike('s41hb')));
+      await assertSucceeds(deleteDoc(doc(s41hb, 'content', 'activity-41h-1', 'likes', 's41hb')));
+    });
+
+    // --- M: DENY an Event-target postLike. ---
+    await check('DENY: Event-target postLike', async () => {
+      await assertFails(
+        setDoc(doc(s41hc, 'postLikes', postLikeId('s41hc', 'post', 'event-41h-1')), validPostLike('s41hc', 's41ha', 'post', 'event-41h-1'))
+      );
+    });
+
+    // --- N: DENY an Activity-target postLike. ---
+    await check('DENY: Activity-target postLike', async () => {
+      await assertFails(
+        setDoc(doc(s41hc, 'postLikes', postLikeId('s41hc', 'post', 'activity-41h-1')), validPostLike('s41hc', 's41ha', 'post', 'activity-41h-1'))
+      );
+    });
+
+    // --- O: self Reel Like per current existing policy — no postLike required or created. ---
+    await check('ALLOW: self Reel Like per current policy, no postLike created', async () => {
+      await assertSucceeds(setDoc(doc(s41ha, 'reels', 'reel-41h-1', 'likes', 's41ha'), validLike('s41ha')));
+      await testEnv.withSecurityRulesDisabled(async (adminContext) => {
+        const snapshot = await getDoc(doc(adminContext.firestore(), 'postLikes', postLikeId('s41ha', 'reel', 'reel-41h-1')));
+        assert.equal(snapshot.exists(), false);
+      });
+      await assertSucceeds(deleteDoc(doc(s41ha, 'reels', 'reel-41h-1', 'likes', 's41ha')));
+    });
+
+    // --- P: self legacy text Post Like — same semantics, no postLike created. ---
+    await check('ALLOW: self legacy Post Like per current policy, no postLike created', async () => {
+      await assertSucceeds(setDoc(doc(s41ha, 'content', 'post-41h-1', 'likes', 's41ha'), validLike('s41ha')));
+      await testEnv.withSecurityRulesDisabled(async (adminContext) => {
+        const snapshot = await getDoc(doc(adminContext.firestore(), 'postLikes', postLikeId('s41ha', 'post', 'post-41h-1')));
+        assert.equal(snapshot.exists(), false);
+      });
+      await assertSucceeds(deleteDoc(doc(s41ha, 'content', 'post-41h-1', 'likes', 's41ha')));
+    });
+
+    // --- Q: DENY a spoofed targetAuthorUid (paired with a genuine real Like, to isolate this one check). ---
+    await check('DENY: spoofed targetAuthorUid', async () => {
+      const batch = writeBatch(s41hc);
+      batch.set(doc(s41hc, 'reels', 'reel-41h-1', 'likes', 's41hc'), validLike('s41hc'));
+      batch.set(doc(s41hc, 'postLikes', postLikeId('s41hc', 'reel', 'reel-41h-1')), validPostLike('s41hc', 's41hb', 'reel', 'reel-41h-1'));
+      await assertFails(batch.commit());
+    });
+
+    // --- R: DENY a spoofed likerUid. ---
+    await check('DENY: spoofed likerUid', async () => {
+      const batch = writeBatch(s41hc);
+      batch.set(doc(s41hc, 'reels', 'reel-41h-1', 'likes', 's41hc'), validLike('s41hc'));
+      batch.set(doc(s41hc, 'postLikes', postLikeId('s41hb', 'reel', 'reel-41h-1')), validPostLike('s41hb', 's41ha', 'reel', 'reel-41h-1'));
+      await assertFails(batch.commit());
+    });
+
+    // --- S: DENY a malformed deterministic postLike ID. ---
+    await check('DENY: malformed deterministic postLike ID', async () => {
+      const batch = writeBatch(s41hc);
+      batch.set(doc(s41hc, 'reels', 'reel-41h-1', 'likes', 's41hc'), validLike('s41hc'));
+      batch.set(doc(s41hc, 'postLikes', 'mismatched-id'), validPostLike('s41hc', 's41ha', 'reel', 'reel-41h-1'));
+      await assertFails(batch.commit());
+    });
+
+    await check('setup: re-pair s41hb\'s Reel Like for the UPDATE/READ checks below', async () => {
+      await assertSucceeds(likeSocialPost(s41hb, 's41hb', 's41ha', 'reel', 'reel-41h-1'));
+    });
+
+    // --- T: DENY updating an existing postLikes relationship. ---
+    await check('DENY: postLikes UPDATE', async () => {
+      await assertFails(updateDoc(doc(s41hb, 'postLikes', postLikeId('s41hb', 'reel', 'reel-41h-1')), { targetId: 'post-41h-1' }));
+    });
+
+    // --- U: DENY a direct client READ of postLikes, even by its own owner. ---
+    await check('DENY: direct client READ of postLikes, even the owner', async () => {
+      await assertFails(getDoc(doc(s41hb, 'postLikes', postLikeId('s41hb', 'reel', 'reel-41h-1'))));
+    });
+
+    await check('cleanup: s41hb unlikes the Reel', async () => {
+      await assertSucceeds(unlikeSocialPost(s41hb, 's41hb', 'reel', 'reel-41h-1'));
     });
 
     await testEnv.clearFirestore();
