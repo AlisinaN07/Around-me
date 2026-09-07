@@ -1283,15 +1283,33 @@ Trusted (Admin SDK) deletion now maintains the `postLikes` relationships introdu
 
 **Why a dedicated paired helper, not just two separate drains:** Admin SDK writes bypass Firestore Rules entirely, so the atomic create/delete pairing between a `postLikes` row and its real per-target Like that Rules enforce for ordinary client writes isn't automatically preserved by trusted backend code. Draining one side and then the other (in either order) would leave a real transient window where one half of a pair exists without the other. `drainPairedPostLikesForTarget`/`drainPairedPostLikesForLiker` (`functions/src/index.ts`) always delete a `postLikes` row and its paired real Like in the **same** Admin `WriteBatch`, bounded/paginated exactly like the existing `drainQuery`.
 
-**Target deletion** (`deleteContentDocumentAndSubcollections`/`deleteReelDocumentAndSubcollections`, shared by `deleteMyContent`, `deleteMyReel`, `removeReportedContent`, `removeReportedReel`, and the own-content/own-Reel sweep inside `deleteMyAccountData`): runs the paired cleanup for the exact target first, then the existing generic `drainCollection(...likes...)` as a residual pass for whatever the paired cleanup doesn't cover — self-likes, and (until Step 41.2H.3's backfill) historical Likes predating the `postLikes` model. For legacy `content/{contentId}`, the paired cleanup only runs when the document's own `type == 'post'` (one extra read, reused for nothing else) — Event and legacy Activity Likes never had a `postLikes` row and are untouched. Every Reel is inherently a social Post, so its paired cleanup always runs.
+**Target deletion** (`deleteContentDocumentAndSubcollections`/`deleteReelDocumentAndSubcollections`, shared by `deleteMyContent`, `deleteMyReel`, `removeReportedContent`, `removeReportedReel`, and the own-content/own-Reel sweep inside `deleteMyAccountData`): runs the paired cleanup for the exact target — **conditionally, per caller; see Step 41.2H.2.1 below** — then the existing generic `drainCollection(...likes...)` as a residual pass for whatever the paired cleanup doesn't cover, or deliberately skips — self-likes, and (until Step 41.2H.3's backfill) historical Likes predating the `postLikes` model. For legacy `content/{contentId}`, the paired cleanup only ever runs when the document's own `type == 'post'` (one extra read, reused for nothing else) — Event and legacy Activity Likes never had a `postLikes` row and are untouched. Every Reel is inherently a social Post, so whether its paired cleanup runs depends only on the caller's policy, never on Reel-vs-Post.
 
-**Liker account deletion** (`deleteMyAccountData`): now drains the deleting account's own outgoing `postLikes` (paired with their real per-target Likes) *before* the existing cross-user `collectionGroup('likes')` residual drain, which still catches Event/Activity Likes, self-likes, and historical Likes with no `postLikes` row.
-
-**Author account deletion:** received `postLikes` disappear as a side effect of the author's own content/Reels being deleted through the same shared primitives above — no separate `targetAuthorUid` sweep exists or is needed.
+**Liker account deletion** (`deleteMyAccountData`): drains the deleting account's own outgoing `postLikes` (paired with their real per-target Likes) *before* the existing cross-user `collectionGroup('likes')` residual drain, which still catches Event/Activity Likes, self-likes, and historical Likes with no `postLikes` row.
 
 **Pre-backfill compatibility:** verified explicitly in production — a historical-style real Like seeded with no `postLikes` row is still removed by the residual drain when its target (or its liker's account) is deleted.
 
 **Indexes:** none added. Both new queries (`postLikes` filtered by `targetType`+`targetId`, and by `likerUid` alone) are pure-equality and ran successfully in production without any index error, confirming the Step 41.2H audit's expectation.
+
+## Liked is lifetime-earned, not target-dependent (Step 41.2H.2.1)
+
+**Correction to Step 41.2H.2's own behavior**, made before any backfill or Profile UI existed to depend on it: Profile **Liked** is a lifetime-earned social reputation value — the count of valid, non-self Likes an account's Posts have ever received. **Voluntarily deleting your own Post must not erase Likes it already earned.**
+
+- **Unlike** (explicit, by the liker) still removes the credit immediately — H.1's atomic Like/Unlike pairing is completely unchanged.
+- **Voluntary author self-delete** (`deleteMyContent` for `type=='post'`, `deleteMyReel`) now **preserves** every `postLikes` row the deleted Post/Reel had already earned. The real nested `likes` subcollection still disappears with the target (there is no more UI to unlike through anyway); only the normalized `postLikes` credit survives, now pointing at a target that no longer exists — **this is intentional, not an orphan bug**. Reposts/comments/notifications cleanup for the target is completely unchanged.
+- **Moderation removal** (`removeReportedContent`, `removeReportedReel`) still **removes** received `postLikes` — moderated content never earned legitimate reputation to begin with. This is a deliberate, locked distinction: voluntary delete preserves, moderation removes.
+- **Author account deletion** (`deleteMyAccountData`'s own-content/own-Reel sweep) still **removes** received `postLikes` — once the account and its Profile are gone, there is no lifetime value left to preserve credit for.
+- **Liker account deletion:** unchanged from Step 41.2H.2 — Likes a deleted account gave to others are removed; a recipient's Liked total may decrease as a result. This is the one case where deleting *your own* content isn't what's happening — the recipient's Post is untouched, only a relationship that's no longer valid is gone.
+
+**Implementation:** the two shared per-document primitives now take an explicit `receivedPostLikesPolicy: 'preserve' | 'remove'` parameter — no default, so every one of the five call sites states its intent outright: `deleteMyContent`/`deleteMyReel` pass `'preserve'`; `removeReportedContent`/`removeReportedReel`/the account-deletion own-content sweep pass `'remove'`.
+
+**No new fields:** a historical `postLikes` row keeps exactly its original `likerUid`/`targetAuthorUid`/`targetType`/`targetId`/`createdAt` — no `deletedAt`, no `archived`, no snapshot of the vanished target. It remains exactly as private as ever (`allow read: if false`, unchanged).
+
+**Consequence for Step 41.2H.3 (backfill, not yet built):** a `postLikes` row whose target no longer exists is no longer automatically invalid — it may be either a live relationship or a legitimate historical one. The eventual backfill/reverse-integrity pass must account for both.
+
+**Consequence for the eventual Profile Liked count (not yet built):** it will be `COUNT(postLikes where targetAuthorUid == profileUid)` — full stop, independent of whether the target Post still exists. It will never need to load, or filter against, an account's current Posts.
+
+Rules were **not changed** in this step — this is trusted Admin-side cleanup policy only.
 
 ## Reels (Cloud Storage — Step 18)
 

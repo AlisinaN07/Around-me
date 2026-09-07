@@ -270,19 +270,51 @@ async function cleanupCrossUserParticipants(db: Firestore, uid: string): Promise
 // moderation's scope beyond the one target a report actually named.
 // ---------------------------------------------------------------------------
 
-async function deleteContentDocumentAndSubcollections(db: Firestore, contentId: string): Promise<void> {
+/**
+ * Step 41.2H.2.1 — whether a target's RECEIVED postLikes should be removed
+ * along with the target, or left standing as historical earned-Like
+ * relationships. Required explicitly at every call site (no default) so
+ * intent is never ambiguous:
+ *
+ *   'preserve' — voluntary author self-delete (deleteMyContent/deleteMyReel).
+ *                Liked is a lifetime-earned reputation value; deleting your
+ *                own Post must not erase Likes it already earned. The real
+ *                nested Like docs still disappear with the target (a Like
+ *                on a Post that no longer exists can't be un-liked through
+ *                the normal UI either way) — only the normalized
+ *                postLikes row, which represents the credit itself,
+ *                survives, now referencing a target that no longer exists.
+ *                That is intentional, not an orphan bug (see the README).
+ *
+ *   'remove'   — moderation (removeReportedContent/removeReportedReel) and
+ *                an author's own account deletion (deleteOwnContent/
+ *                deleteOwnReels, via deleteMyAccountData). Moderated
+ *                content was never legitimately earned reputation to begin
+ *                with, and a deleted account has no Profile left for a
+ *                lifetime value to belong to — so received postLikes are
+ *                removed in both cases, exactly like Step 41.2H.2's
+ *                original behavior.
+ */
+type ReceivedPostLikesPolicy = 'preserve' | 'remove';
+
+async function deleteContentDocumentAndSubcollections(
+  db: Firestore,
+  contentId: string,
+  receivedPostLikesPolicy: ReceivedPostLikesPolicy
+): Promise<void> {
   // Step 41.2H.2 — postLikes/{likeId} only ever exists for a legacy text
   // Post (never Event/Activity — see firestore.rules' isValidPostLikeCreate,
   // which requires content.type == 'post'). One read of the content doc's
   // own type is enough to skip running a provably-empty query for every
   // other type — cheaper than always attempting it, and reuses the exact
-  // same read this function needs regardless (see below). The paired
-  // cleanup runs BEFORE the residual drainCollection just after it, so
-  // whatever real Likes it doesn't cover (self-likes, or historical Likes
-  // predating Step 41.2H.1) are still removed by that generic pass.
+  // same read this function needs regardless (see below). When the paired
+  // cleanup does run, it runs BEFORE the residual drainCollection just
+  // after it, so whatever real Likes it doesn't cover (self-likes, or
+  // historical Likes predating Step 41.2H.1) are still removed by that
+  // generic pass either way.
   const contentSnap = await db.doc(`content/${contentId}`).get();
   const contentType = contentSnap.exists ? (contentSnap.data()?.type as string | undefined) : undefined;
-  if (contentType === 'post') {
+  if (contentType === 'post' && receivedPostLikesPolicy === 'remove') {
     await drainPairedPostLikesForTarget(db, 'post', contentId);
   }
 
@@ -313,7 +345,10 @@ async function deleteOwnContent(db: Firestore, uid: string): Promise<{ deleted: 
     const snap = await db.collection('content').where('authorUid', '==', uid).limit(OWNED_DOC_PAGE_SIZE).get();
     if (snap.empty) break;
     for (const docSnap of snap.docs) {
-      await deleteContentDocumentAndSubcollections(db, docSnap.id);
+      // Step 41.2H.2.1 — this is the author's own ACCOUNT being deleted;
+      // their Profile is going away entirely, so there is no lifetime
+      // value left to preserve credit for.
+      await deleteContentDocumentAndSubcollections(db, docSnap.id, 'remove');
       deleted += 1;
     }
   }
@@ -338,14 +373,18 @@ async function deleteReelDocumentAndSubcollections(
   db: Firestore,
   bucket: ReturnType<ReturnType<typeof getStorage>['bucket']>,
   reelId: string,
-  storagePath: string | undefined
+  storagePath: string | undefined,
+  receivedPostLikesPolicy: ReceivedPostLikesPolicy
 ): Promise<{ storageDeleted: boolean }> {
   // Step 41.2H.2 — every Reel is inherently a social Post (no Event/
-  // Activity equivalent exists for Reels), so this paired cleanup always
-  // runs, unconditionally, before the residual drainCollection just after
-  // it (which still removes self-likes and any historical Likes predating
-  // Step 41.2H.1).
-  await drainPairedPostLikesForTarget(db, 'reel', reelId);
+  // Activity equivalent exists for Reels), so this paired cleanup runs
+  // whenever the caller asks to actually remove received credit (see
+  // ReceivedPostLikesPolicy's own doc comment), before the residual
+  // drainCollection just after it (which still removes self-likes and any
+  // historical Likes predating Step 41.2H.1 either way).
+  if (receivedPostLikesPolicy === 'remove') {
+    await drainPairedPostLikesForTarget(db, 'reel', reelId);
+  }
 
   await drainCollection(db, `reels/${reelId}/likes`);
   await drainCollection(db, `reels/${reelId}/comments`);
@@ -380,7 +419,9 @@ async function deleteOwnReels(
     if (snap.empty) break;
     for (const docSnap of snap.docs) {
       const storagePath = docSnap.data()?.storagePath as string | undefined;
-      const result = await deleteReelDocumentAndSubcollections(db, bucket, docSnap.id, storagePath);
+      // Step 41.2H.2.1 — same reasoning as deleteOwnContent's own call
+      // site: the author's account is going away entirely.
+      const result = await deleteReelDocumentAndSubcollections(db, bucket, docSnap.id, storagePath, 'remove');
       if (storagePath) {
         if (result.storageDeleted) storageDeleted += 1;
         else storageAlreadyMissing += 1;
@@ -794,7 +835,9 @@ export const removeReportedContent = onCall({ region: REGION, timeoutSeconds: 30
   const contentSnap = await db.doc(`content/${contentId}`).get();
   const targetAlreadyMissing = !contentSnap.exists;
   if (contentSnap.exists) {
-    await deleteContentDocumentAndSubcollections(db, contentId);
+    // Step 41.2H.2.1 — moderation removal, unlike voluntary self-delete,
+    // never earned legitimate reputation credit to begin with.
+    await deleteContentDocumentAndSubcollections(db, contentId, 'remove');
   }
   await drainNotificationsByField(db, 'contentId', contentId);
   await resolveReport(db, reportId, adminUid);
@@ -860,7 +903,9 @@ export const removeReportedReel = onCall({ region: REGION, timeoutSeconds: 300, 
 
   if (reelSnap.exists) {
     const storagePath = reelSnap.data()?.storagePath as string | undefined;
-    await deleteReelDocumentAndSubcollections(db, bucket, reelId, storagePath);
+    // Step 41.2H.2.1 — moderation removal never earned legitimate
+    // reputation credit to begin with.
+    await deleteReelDocumentAndSubcollections(db, bucket, reelId, storagePath, 'remove');
   } else {
     const inferredStoragePath = `reels/${reportedAuthorUid}/${reelId}/source`;
     await bucket.file(inferredStoragePath).delete({ ignoreNotFound: true });
@@ -1132,7 +1177,10 @@ export const deleteMyContent = onCall({ region: REGION, timeoutSeconds: 300, mem
   }
 
   await drainNotificationsByField(db, 'contentId', contentId);
-  await deleteContentDocumentAndSubcollections(db, contentId);
+  // Step 41.2H.2.1 — voluntary author self-delete: Liked is a lifetime-
+  // earned reputation value, so received postLikes on this Post survive
+  // even though the Post itself, and its real nested Like docs, do not.
+  await deleteContentDocumentAndSubcollections(db, contentId, 'preserve');
 
   return { contentId, type, deleted: true as const };
 });
@@ -1166,7 +1214,9 @@ export const deleteMyReel = onCall({ region: REGION, timeoutSeconds: 300, memory
   const storagePath = reel.storagePath as string | undefined;
 
   await drainNotificationsByField(db, 'reelId', reelId);
-  await deleteReelDocumentAndSubcollections(db, bucket, reelId, storagePath);
+  // Step 41.2H.2.1 — voluntary author self-delete: same reasoning as
+  // deleteMyContent above — received postLikes survive.
+  await deleteReelDocumentAndSubcollections(db, bucket, reelId, storagePath, 'preserve');
 
   return { reelId, deleted: true as const };
 });
