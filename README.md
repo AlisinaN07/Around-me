@@ -2,6 +2,84 @@
 
 Location-based social network organized around cities — "See what's happening around you, right now."
 
+## Around Me v1 — Owner Approved Baseline
+
+**Owner approval date:** 2026-09-08 ("Jag godkänner Around Me v1")
+**Technical product baseline before freeze:** `366cb70` — Add Events Following and For You feeds
+**Final audit result (Step 41.2I):** READY FOR OWNER FINAL APPROVAL
+**Owner approval:** APPROVED
+**P0 blockers:** 0
+**P1 blockers:** 0
+
+This is the approved v1 product baseline. Everything below in this section documents that baseline as of the freeze — it is authoritative over any earlier, now-superseded status language elsewhere in this file (this README is a chronological build log; sections below this one describe the state *at the time each step shipped*, and are not rewritten just because a later step supersedes them).
+
+**Owner approval of v1 does not automatically start:** marketing, growth campaigns, company onboarding, monetization rollout, city expansion, or launch operations. Those remain separate owner decisions. The approved v1 code is now the baseline future phases build from.
+
+### Bottom navigation
+
+Home · Events · **+** (Create) · Inbox · Profile.
+
+### Create
+
+- **Personal:** `+` → the front-camera-first Post flow directly (no chooser).
+- **Business:** `+` → a Post | Event chooser.
+- **Post flow:** Camera/Library → Preview → Next → Caption + Category → Publish.
+- Current video Post behavior includes: front camera default, the front-camera mirror fix, an automatic video cover thumbnail (no manual picker), optional device music for camera-recorded Posts, a server-side `muxReelMusic` ffmpeg merge, and a real Profile-grid thumbnail.
+
+### Home
+
+Video Posts only. **For You:** Active City. **Following:** followed authors. No Reposts distributed into Home in v1.
+
+### Events
+
+**Following | For You** header toggle. **For You:** Business Events in Active City. **Following:** Business Events from followed accounts, in Active City. Current v1 Following limitation: bounded to the currently-supported followed-account fetch scope (not a blocker — see Post-v1 technical debt below).
+
+### Profile stats
+
+Posts | Following | Followers | Liked. **Liked** is the lifetime-earned count of valid, non-self Likes an account's Posts have ever received.
+
+**Personal profile — own:** Posts | Reposts | Activities | Saved. **Public:** Posts | Reposts | Activities.
+**Business profile — own:** Posts | Reposts | Events | Activities | Saved. **Public:** Posts | Reposts | Events | Activities.
+
+**Activities** means Events the profile owner marked Interested or Going — not legacy user-created Activity content. **Saved** is private to the account owner. **Reposts** is a public Profile relationship, not distributed into Home in v1.
+
+### Liked semantics (locked)
+
+- A valid, non-self Post Like → +1 lifetime Liked.
+- An explicit Unlike → removes that earned Like.
+- The author voluntarily deleting their own Post → the earned Like remains.
+- The liker later deleting their account → the earned Like remains (credit belongs to the recipient).
+- Moderation removing the target → earned Likes from that target are removed.
+- The recipient/author deleting their full account → their incoming `postLikes` are removed with the deleted profile.
+- An Event Like, a legacy Activity Like, or a self-like → never counts.
+- Raw `postLikes` documents are private (client-unreadable); the count is a trusted server-side aggregation (`fetchLifetimeLikedCount`).
+
+### Legacy compatibility
+
+- **Legacy text Posts:** existing documents are retained and fully supported (readable, likeable, commentable, saveable, repostable, reportable, moderatable, account-deletable); new creation is retired.
+- **Legacy Activities:** existing documents retain compatibility support where required (detail, join/leave, report, moderation, self-delete, account deletion); new creation is retired and they are not part of the active discovery/Profile content model.
+- Technical `Reel` naming may remain internally (`reels`, `/create/reel`, `deleteMyReel`, etc.). User-facing product terminology is **Post**.
+
+### Owner mobile QA (recorded, physical device, Expo)
+
+Current integrated build: **PASS**. Front-camera physical iPhone: **PASS**. Front-camera mirror behavior: **PASS**. Automatic thumbnail native flow: **PASS**. Music: **PASS**. Reel focus/playback: **PASS**. Events Following / For You: **PASS**. (One real device run per feature through the ordinary flow — not exhaustive automated native coverage.)
+
+### Post-v1 technical debt (accepted, non-blocking)
+
+**A. Reel deletion Storage cleanup (P2).** Deleting a Reel (self-delete, moderation, or full account deletion) removes the main video Storage object but can leave its thumbnail Storage object orphaned; a residual music object can similarly survive in the narrow case of an abandoned "uploading" draft caught up in account deletion. These objects become inaccessible through the app's own Storage Rules the moment the Reel document is gone (the read rule requires the Firestore document to still exist and be published) — inert, unreachable bytes, not a live leak. **Future fix:** extend the shared trusted Reel-deletion primitive (`deleteReelDocumentAndSubcollections` in `functions/src/index.ts`) to also delete `thumbnailStoragePath` and `musicStorageAudioPath` when present.
+
+**B. Rules test fixture maintenance (test-maintenance / P2).** `tests/firestore.rules.test.mjs`'s `validReel()` fixture does not yet include the 11 music/thumbnail fields the current Rules require, so Reel-creation tests would fail once the suite can run. The real production code path (`createReelDraft` in `src/services/reels.ts`) already uses the correct schema — this is a test-fixture gap only, not a product defect.
+
+**C. Rules emulator verification debt.** `npm run test:rules` cannot currently complete in this sandbox — it consistently fails during emulator connection setup with `ECONNRESET`/`fetch failed`, before any individual test runs. This is an environment limitation, not a Rules or code failure.
+
+**D. SDK patch-version drift (non-blocking).** `expo-doctor` reports ~12 packages with available patch-level updates within the same Expo SDK 57 train (e.g. `expo`, `expo-router`, `react-native`). Known, unrelated to any feature in this baseline, not addressed here.
+
+**E. Events Following bounded scope (accepted v1 limitation).** Following is currently bounded to the first ~30 followed accounts (`MAX_FOLLOWED_UIDS_PER_FEED_PAGE`), with no pagination/continuation beyond that — the same limitation Home's own Following feed already has. Not new to this feature, and not a blocker for v1.
+
+**F. Historical unrecoverable pre-lifetime Likes (accepted migration limitation).** A Like whose target or liker account was deleted before the lifetime-preservation architecture existed left no recoverable trace anywhere in the system; this cannot be reconstructed and is a documented, accepted limitation of the backfill itself.
+
+---
+
 Email/password authentication, onboarding (name, username, city, interests), a full tab-based application shell (Home, Reels, Create, Inbox, Profile), and the real Firestore content backend (posts, activities, events) are implemented. Create → Post/Activity/Event → Publish is wired to that backend, and Home's Around You / Happening Now sections render the real city feed. Every content type has a real detail screen — Activity with Join/Leave, Event with Interested/Going, and all three with Likes and Comments — backed by Firestore transactions/writes and security rules. Every user also has a public social profile (separate from their private account data) with real Follow/Unfollow and follower/following lists, private 1:1 Direct Messages, and Block/Report safety controls (see the Reels section below for the newest addition — city-scoped short-video publishing and playback, backed by Cloud Storage).
 
 ## Stack
