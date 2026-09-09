@@ -3,8 +3,11 @@
   "configurations": [
     {
       "name": "around-me-web",
-      "runtimeExecutable": "npx",
-      "runtimeArgs": ["expo", "start", "--web"],
+      "runtimeExecutable": "/bin/zsh",
+      "runtimeArgs": [
+        "-c",
+        "PATH=/Users/alian7/.nvm/versions/node/v20.19.5/bin:$PATH npx expo start --web"
+      ],
       "port": 8081
     }
   ]

@@ -154,12 +154,23 @@ export type ReelLike = {
 export const REEL_COMMENT_BODY_MAX_LENGTH = 500;
 
 /**
- * reels/{reelId}/comments/{commentId} — top-level comments only, no
- * replies/threads, no edit — structurally parallel to
- * content/{contentId}/comments/{commentId} (see src/types/content.ts's
- * ContentComment). authorDisplayName/authorUsername are a public-safe
- * snapshot of the commenter's own profile, verified against it by
- * Firestore rules on create.
+ * reels/{reelId}/comments/{commentId} — one flat subcollection holding
+ * both top-level comments AND their replies (no edit either way) —
+ * structurally parallel to content/{contentId}/comments/{commentId} (see
+ * src/types/content.ts's ContentComment), just with one extra field.
+ * authorDisplayName/authorUsername are a public-safe snapshot of the
+ * commenter's own profile, verified against it by Firestore rules on
+ * create.
+ *
+ * `parentCommentId` is `null` for an ordinary top-level comment, or the
+ * `commentId` of the comment being replied to — anyone may reply to any
+ * top-level comment. Deliberately capped at one level: a reply's own
+ * `parentCommentId` must point to a comment that is ITSELF top-level (see
+ * firestore.rules' isValidReelCommentCreate) — there is no reply-to-a-
+ * reply nesting, matching the simple "comment + its replies" UI this
+ * feeds (src/components/ReelCommentsSheet.tsx), not a full thread tree.
+ * Always present, never conditionally omitted, same convention as every
+ * other Reel-adjacent field in this app.
  */
 export type ReelComment = {
   commentId: string;
@@ -167,8 +178,28 @@ export type ReelComment = {
   authorDisplayName: string;
   authorUsername: string;
   body: string;
+  parentCommentId: string | null;
   createdAt: Timestamp;
   updatedAt: Timestamp;
+};
+
+export type ReelCommentReactionType = 'like' | 'dislike';
+
+/**
+ * reels/{reelId}/comments/{commentId}/reactions/{uid} — one document per
+ * user per comment, exclusive (a user has either a 'like' or a 'dislike'
+ * on a given comment, never both): switching from one to the other simply
+ * overwrites `type` on the same doc rather than needing two separate
+ * subcollections kept in sync. Deliberately separate from ReelLike (Reel-
+ * level likes) — a comment reaction never feeds the lifetime "Liked"
+ * profile stat (that's specifically for social Posts, see
+ * postLikes/{likeId}'s own doc comment) and never generates a
+ * notification; it's a lightweight, purely-informational reaction count.
+ */
+export type ReelCommentReaction = {
+  uid: string;
+  type: ReelCommentReactionType;
+  createdAt: Timestamp;
 };
 
 /**

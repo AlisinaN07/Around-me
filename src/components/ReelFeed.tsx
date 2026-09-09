@@ -31,6 +31,27 @@ type ReelFeedProps = {
   onReload: () => void;
   /** Absolutely-positioned content over a subtle top scrim — city selector, tabs, filter, back button, etc. */
   topOverlay?: ReactNode;
+  /**
+   * Called instead of onReload right after a successful self-delete, only
+   * when provided — Home/`/reels` don't pass this (removing the deleted
+   * item from their own list via the normal onReload refetch is enough),
+   * but a single-Reel detail view (src/app/(app)/reel/[reelId].tsx) has
+   * nothing left to reload once its one Reel is gone, so it uses this to
+   * navigate away instead.
+   */
+  onReelDeleted?: (reelId: string) => void;
+  /**
+   * Which index of the FIRST populated `reels` list to start scrolled to
+   * and playing — Home/`/reels` never pass this (they always start at the
+   * top). The single-Reel detail view passes the tapped Reel's position
+   * within its author's own Post list, so opening one Post from a Profile
+   * grid lands exactly there, with the rest of that profile's Posts
+   * swipeable above/below it, same as this component's usual paging.
+   * Applied only once, the first time `reels` becomes non-empty — a
+   * LATER reels change (a block/reload) resets to the top as usual, same
+   * as when this prop isn't provided at all.
+   */
+  initialIndex?: number;
 };
 
 /**
@@ -41,10 +62,13 @@ type ReelFeedProps = {
  * scope) and pass the resulting `reels`/`status`; everything about
  * rendering and interacting with them lives here.
  */
-export function ReelFeed({ reels, status, errorTitle, emptyState, onReload, topOverlay }: ReelFeedProps) {
+export function ReelFeed({ reels, status, errorTitle, emptyState, onReload, topOverlay, onReelDeleted, initialIndex }: ReelFeedProps) {
   const { user } = useAuth();
   const [containerHeight, setContainerHeight] = useState(0);
-  const [activeIndex, setActiveIndex] = useState(0);
+  const [activeIndex, setActiveIndex] = useState(initialIndex ?? 0);
+  // Guards initialIndex so it's ever honored exactly once (the first time
+  // `reels` populates) — see the prop's own doc comment.
+  const hasAppliedInitialIndexRef = useRef(false);
   // Home and the standalone /reels screen are both persistent tab
   // screens — Expo Router keeps them mounted (just hidden) when the user
   // switches to a different tab, so scroll-position-based `activeIndex`
@@ -69,11 +93,18 @@ export function ReelFeed({ reels, status, errorTitle, emptyState, onReload, topO
   // Resets paging to the top whenever the underlying list is swapped out
   // for a different one (city switch, tab switch between For You/
   // Following) — otherwise activeIndex could point past the new list's end
-  // and nothing would ever report itself as active.
+  // and nothing would ever report itself as active. The very first time
+  // reels populates with a real initialIndex pending, that's honored
+  // instead (see the prop's own doc comment) — every later reels change
+  // still resets to the top as before.
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
+    if (!hasAppliedInitialIndexRef.current && initialIndex != null && reels.length > 0) {
+      hasAppliedInitialIndexRef.current = true;
+      setActiveIndex(Math.min(Math.max(initialIndex, 0), reels.length - 1));
+      return;
+    }
     setActiveIndex(0);
-  }, [reels]);
+  }, [reels, initialIndex]);
 
   const onViewableItemsChanged = useCallback(({ viewableItems }: { viewableItems: ViewToken[] }) => {
     const firstVisible = viewableItems.find((item) => item.isViewable);
@@ -172,7 +203,10 @@ export function ReelFeed({ reels, status, errorTitle, emptyState, onReload, topO
   // Permanent — no recycle bin, no restore (locked Step 40.1 policy).
   // Reusing the same onReload() the feed already calls after a successful
   // block is the smallest way to make a deleted Reel disappear from this
-  // list — no separate local-state removal path needed.
+  // list — no separate local-state removal path needed. A caller that
+  // passed onReelDeleted (the single-Reel detail view — see this prop's
+  // own doc comment) gets that instead, since there's nothing left here
+  // for it to reload.
   const handleConfirmDelete = async () => {
     if (!deleteTarget || isDeleteSubmitting) return;
     setIsDeleteSubmitting(true);
@@ -183,8 +217,10 @@ export function ReelFeed({ reels, status, errorTitle, emptyState, onReload, topO
       setDeleteError(result.message);
       return;
     }
+    const deletedReelId = deleteTarget.reelId;
     setDeleteTarget(null);
-    onReload();
+    if (onReelDeleted) onReelDeleted(deletedReelId);
+    else onReload();
   };
 
   return (
@@ -212,6 +248,13 @@ export function ReelFeed({ reels, status, errorTitle, emptyState, onReload, topO
           <FlatList
             data={reels}
             keyExtractor={(item) => item.reelId}
+            // Only meaningful on this first real mount (reels is already
+            // the full loaded list by the time this FlatList exists at
+            // all — see the containerHeight/reels.length gating above) —
+            // matches activeIndex's own initial state so the right item is
+            // both scrolled-to and marked active/playing from the start,
+            // not just scrolled-to.
+            initialScrollIndex={initialIndex != null ? Math.min(Math.max(initialIndex, 0), reels.length - 1) : undefined}
             renderItem={({ item, index }) => (
               <ReelFeedItem
                 reel={item}

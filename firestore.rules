@@ -36,6 +36,10 @@ service cloud.firestore {
         && request.resource.data.interests is list
         && request.resource.data.bio is string
         && request.resource.data.bio.size() <= 160
+        && request.resource.data.photoURL is string
+        && request.resource.data.photoURL.size() <= 2048
+        && request.resource.data.coverPhotoURL is string
+        && request.resource.data.coverPhotoURL.size() <= 2048
         // Step 30: Around Me supports exactly two account types, chosen
         // once during onboarding — no arbitrary string (e.g. 'admin',
         // 'organizer', 'verified_business') is ever accepted. accountType
@@ -48,16 +52,18 @@ service cloud.firestore {
         && isServerTimestamp(request.resource.data.updatedAt)
         && request.resource.data.keys().hasOnly([
           'uid', 'email', 'displayName', 'username', 'usernameLower',
-          'cityName', 'countryCode', 'cityKey', 'interests', 'bio',
+          'cityName', 'countryCode', 'cityKey', 'interests', 'bio', 'photoURL', 'coverPhotoURL',
           'accountType', 'onboardingCompleted', 'createdAt', 'updatedAt'
         ]);
 
       // Step 33 — Edit Profile. Only displayName, username/usernameLower
-      // (always updated as a matched pair — see updateMyProfile), bio, and
-      // interests may change. Every other field must be byte-identical to
-      // its prior value: uid/email/cityName/countryCode/cityKey (Home City
-      // is not editable in this step — Section 15), accountType (still
-      // immutable — Section 14), onboardingCompleted, and createdAt.
+      // (always updated as a matched pair — see updateMyProfile), bio,
+      // interests, photoURL (see updateMyProfilePhoto), and coverPhotoURL
+      // (see updateMyProfileCoverPhoto) may change. Every other field must
+      // be byte-identical to its prior value: uid/email/cityName/
+      // countryCode/cityKey (Home City is not editable in this step —
+      // Section 15), accountType (still immutable — Section 14),
+      // onboardingCompleted, and createdAt.
       allow update: if isOwner(uid)
         && request.resource.data.uid == resource.data.uid
         && request.resource.data.email == resource.data.email
@@ -77,10 +83,14 @@ service cloud.firestore {
         && request.resource.data.interests.size() <= 8
         && request.resource.data.bio is string
         && request.resource.data.bio.size() <= 160
+        && request.resource.data.photoURL is string
+        && request.resource.data.photoURL.size() <= 2048
+        && request.resource.data.coverPhotoURL is string
+        && request.resource.data.coverPhotoURL.size() <= 2048
         && isServerTimestamp(request.resource.data.updatedAt)
         && request.resource.data.keys().hasOnly([
           'uid', 'email', 'displayName', 'username', 'usernameLower',
-          'cityName', 'countryCode', 'cityKey', 'interests', 'bio',
+          'cityName', 'countryCode', 'cityKey', 'interests', 'bio', 'photoURL', 'coverPhotoURL',
           'accountType', 'onboardingCompleted', 'createdAt', 'updatedAt'
         ]);
 
@@ -214,12 +224,14 @@ service cloud.firestore {
         && data.cityKey == profile.cityKey
         && data.interests == profile.interests
         && data.bio == profile.bio
+        && data.photoURL == profile.photoURL
+        && data.coverPhotoURL == profile.coverPhotoURL
         && data.accountType == profile.accountType
         && isServerTimestamp(data.createdAt)
         && isServerTimestamp(data.updatedAt)
         && data.keys().hasOnly([
           'uid', 'displayName', 'username', 'usernameLower', 'cityName',
-          'countryCode', 'cityKey', 'interests', 'bio', 'accountType', 'createdAt', 'updatedAt'
+          'countryCode', 'cityKey', 'interests', 'bio', 'photoURL', 'coverPhotoURL', 'accountType', 'createdAt', 'updatedAt'
         ]);
     }
 
@@ -243,10 +255,12 @@ service cloud.firestore {
         && data.usernameLower == profile.usernameLower
         && data.interests == profile.interests
         && data.bio == profile.bio
+        && data.photoURL == profile.photoURL
+        && data.coverPhotoURL == profile.coverPhotoURL
         && isServerTimestamp(data.updatedAt)
         && data.keys().hasOnly([
           'uid', 'displayName', 'username', 'usernameLower', 'cityName',
-          'countryCode', 'cityKey', 'interests', 'bio', 'accountType', 'createdAt', 'updatedAt'
+          'countryCode', 'cityKey', 'interests', 'bio', 'photoURL', 'coverPhotoURL', 'accountType', 'createdAt', 'updatedAt'
         ]);
     }
 
@@ -967,10 +981,77 @@ service cloud.firestore {
         // Comment editing is not part of Step 19, same as content comments.
         allow update: if false;
 
-        // Only the comment's own author may delete it — allowed even if a
-        // Block was created after the comment was posted.
-        allow delete: if isOwner(resource.data.authorUid);
+        // The comment's own author may always delete it — allowed even if
+        // a Block was created after the comment was posted. If this
+        // document is itself a REPLY (parentCommentId != null), the
+        // author of the comment it replies to may also delete it — this
+        // is what lets deleteReelComment (src/services/reelEngagement.ts)
+        // cascade-delete a top-level comment's own replies in the same
+        // batch as deleting the comment itself, so a reply never survives
+        // (orphaned, parentless) the comment it replied to.
+        allow delete: if isOwner(resource.data.authorUid)
+          || (
+            // .get() with a default, not plain dot-notation — a comment
+            // created before parentCommentId existed has no such key at
+            // all, and must be treated as "not a reply" here, same
+            // reasoning as this codebase's other legacy-field reads.
+            resource.data.get('parentCommentId', null) != null
+            && isOwner(get(/databases/$(database)/documents/reels/$(reelId)/comments/$(resource.data.get('parentCommentId', null))).data.authorUid)
+          );
+
+        // reels/{reelId}/comments/{commentId}/reactions/{uid} — one Like
+        // or Dislike per user per comment (see ReelCommentReaction's own
+        // doc comment in src/types/reel.ts for why this is exclusive/
+        // single-doc rather than two subcollections, and why it's
+        // deliberately unrelated to postLikes/lifetime Liked credit).
+        match /reactions/{uid} {
+          function reelCommentReactionExists() {
+            return exists(/databases/$(database)/documents/reels/$(reelId)/comments/$(commentId));
+          }
+
+          allow read: if isSignedIn() && reelCommentParentPublished();
+
+          // Both create (first reaction) and update (switching Like <->
+          // Dislike, an overwrite of the same doc) need the identical
+          // shape check — `set()` on an existing doc is evaluated as an
+          // update, not a create, at the Rules level.
+          allow create, update: if isSignedIn()
+            && uid == request.auth.uid
+            && reelCommentParentPublished()
+            && reelCommentReactionExists()
+            && request.resource.data.uid == request.auth.uid
+            && (request.resource.data.type == 'like' || request.resource.data.type == 'dislike')
+            && isServerTimestamp(request.resource.data.createdAt)
+            && request.resource.data.keys().hasOnly(['uid', 'type', 'createdAt']);
+
+          // Removing your own reaction (the "tap the same icon again to
+          // undo" toggle) is always allowed — never trapped by a Block
+          // created afterward, same reasoning as unliking a Reel. The
+          // comment's own author may also remove ANY reaction on it — not
+          // to moderate them individually, but because deleteReelComment
+          // (src/services/reelEngagement.ts) batches this cleanup
+          // together with the comment delete itself, so a reaction never
+          // outlives the comment it was on.
+          allow delete: if isOwner(uid)
+            || (reelCommentReactionExists() && isOwner(get(/databases/$(database)/documents/reels/$(reelId)/comments/$(commentId)).data.authorUid));
+        }
       }
+    }
+
+    // A reply's parentCommentId must reference a real comment on this
+    // SAME Reel that is itself top-level (its own parentCommentId is
+    // null) — caps replies at exactly one level, no reply-to-a-reply
+    // chains (see ReelComment's own doc comment in src/types/reel.ts).
+    function isValidReelCommentParent(reelId, data) {
+      return data.parentCommentId == null
+        || (
+          data.parentCommentId is string
+          && exists(/databases/$(database)/documents/reels/$(reelId)/comments/$(data.parentCommentId))
+          // .get() with a default — see the comments' own delete rule for
+          // why plain dot-notation is unsafe against a legacy comment
+          // that predates this field entirely.
+          && get(/databases/$(database)/documents/reels/$(reelId)/comments/$(data.parentCommentId)).data.get('parentCommentId', null) == null
+        );
     }
 
     function isValidReelCommentCreate(reelId, commentId, data) {
@@ -987,9 +1068,10 @@ service cloud.firestore {
         && data.body is string
         && data.body.size() > 0
         && data.body.size() <= 500
+        && isValidReelCommentParent(reelId, data)
         && isServerTimestamp(data.createdAt)
         && isServerTimestamp(data.updatedAt)
-        && data.keys().hasOnly(['commentId', 'authorUid', 'authorDisplayName', 'authorUsername', 'body', 'createdAt', 'updatedAt']);
+        && data.keys().hasOnly(['commentId', 'authorUid', 'authorDisplayName', 'authorUsername', 'body', 'parentCommentId', 'createdAt', 'updatedAt']);
     }
 
     function reelBaseKeys() {
@@ -1769,7 +1851,7 @@ service cloud.firestore {
     }
 
     function reportBaseKeys() {
-      return ['reportId', 'reporterUid', 'targetType', 'targetUid', 'contentId', 'conversationId', 'messageId', 'reelId', 'reason', 'details', 'createdAt', 'status', 'moderatedAt', 'moderatedByUid'];
+      return ['reportId', 'reporterUid', 'targetType', 'targetUid', 'contentId', 'conversationId', 'messageId', 'reelId', 'commentId', 'reason', 'details', 'createdAt', 'status', 'moderatedAt', 'moderatedByUid'];
     }
 
     // Step 39.1: a report is captured by its reporter but moderated by a
@@ -1797,6 +1879,7 @@ service cloud.firestore {
         && data.conversationId == null
         && data.messageId == null
         && data.reelId == null
+        && data.commentId == null
         && reportId == 'user_' + request.auth.uid + '_' + data.targetUid
         && exists(/databases/$(database)/documents/publicProfiles/$(data.targetUid));
     }
@@ -1808,6 +1891,7 @@ service cloud.firestore {
         && data.conversationId == null
         && data.messageId == null
         && data.reelId == null
+        && data.commentId == null
         && reportId == 'content_' + request.auth.uid + '_' + data.contentId
         && exists(contentPath)
         && get(contentPath).data.status == 'published'
@@ -1823,6 +1907,7 @@ service cloud.firestore {
         && data.messageId is string
         && data.contentId == null
         && data.reelId == null
+        && data.commentId == null
         && exists(convPath)
         && request.auth.uid in get(convPath).data.participantUids
         && exists(msgPath)
@@ -1845,11 +1930,34 @@ service cloud.firestore {
         && data.contentId == null
         && data.conversationId == null
         && data.messageId == null
+        && data.commentId == null
         && exists(reelPath)
         && get(reelPath).data.status == 'published'
         && data.targetUid == get(reelPath).data.authorUid
         && data.targetUid != request.auth.uid
         && reportId == 'reel_' + request.auth.uid + '_' + data.reelId;
+    }
+
+    // Reporting one specific comment on a Reel — distinct from
+    // isValidReelReport above (which reports the Reel/video itself).
+    // Requires the parent Reel to still be published and the exact
+    // comment to still exist, the claimed targetUid to equal that
+    // comment's real author, and the reporter can't target themselves.
+    function isValidReelCommentReport(reportId, data) {
+      let reelPath = /databases/$(database)/documents/reels/$(data.reelId);
+      let commentPath = /databases/$(database)/documents/reels/$(data.reelId)/comments/$(data.commentId);
+      return data.targetType == 'reel_comment'
+        && data.reelId is string
+        && data.commentId is string
+        && data.contentId == null
+        && data.conversationId == null
+        && data.messageId == null
+        && exists(reelPath)
+        && get(reelPath).data.status == 'published'
+        && exists(commentPath)
+        && data.targetUid == get(commentPath).data.authorUid
+        && data.targetUid != request.auth.uid
+        && reportId == 'reel_comment_' + request.auth.uid + '_' + data.commentId;
     }
 
     function isValidReportCreate(reportId, data) {
@@ -1859,6 +1967,7 @@ service cloud.firestore {
           || isValidContentReport(reportId, data)
           || isValidMessageReport(reportId, data)
           || isValidReelReport(reportId, data)
+          || isValidReelCommentReport(reportId, data)
         );
     }
 

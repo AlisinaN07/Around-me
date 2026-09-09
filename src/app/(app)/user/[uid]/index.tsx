@@ -279,6 +279,9 @@ export default function PublicProfileScreen() {
             username={profile.username}
             cityLabel={cityLabel}
             bio={profile.bio}
+            photoURL={profile.photoURL}
+            coverPhotoURL={profile.coverPhotoURL}
+            coverEdgeInset={Spacing.xl}
             postsCount={postsCount}
             followersCount={followerCount}
             followingCount={followingCount}
@@ -491,10 +494,15 @@ const styles = StyleSheet.create({
   contentSection: {
     gap: Spacing.md,
   },
+  // flex-start + an explicit columnGap, not space-between — see the
+  // exact same fix on the own-Profile screen's own postsGrid style for
+  // why (an incomplete row otherwise stretches its few items across the
+  // full width instead of packing them from the left like a real grid).
   postsGrid: {
     flexDirection: 'row',
     flexWrap: 'wrap',
-    justifyContent: 'space-between',
+    justifyContent: 'flex-start',
+    columnGap: Spacing.sm,
     rowGap: Spacing.sm,
   },
   fullRow: {

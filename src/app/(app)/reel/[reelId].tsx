@@ -1,496 +1,119 @@
 import { Ionicons } from '@expo/vector-icons';
-import * as Clipboard from 'expo-clipboard';
-import { router, useIsFocused, useLocalSearchParams } from 'expo-router';
-import { useCallback, useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, Pressable, StyleSheet, Text, View } from 'react-native';
-import { VideoView, useVideoPlayer } from 'expo-video';
+import { router, useFocusEffect, useLocalSearchParams } from 'expo-router';
+import { useCallback, useState } from 'react';
+import { Pressable, StyleSheet, View } from 'react-native';
 
-import { AuthorLink } from '@/components/AuthorLink';
-import { Avatar } from '@/components/Avatar';
-import { Button } from '@/components/Button';
-import { ConfirmDialog } from '@/components/ConfirmDialog';
-import { HeaderScreenLayout } from '@/components/HeaderScreenLayout';
-import { OptionsMenu, type OptionsMenuOption } from '@/components/OptionsMenu';
-import { ReelEngagementSection } from '@/components/ReelEngagementSection';
-import { ReportModal } from '@/components/ReportModal';
-import { INTERESTS } from '@/constants/interests';
-import { Colors, Radius, Spacing } from '@/constants/theme';
-import { useAuth } from '@/hooks/useAuth';
-import { blockUser, isUserBlocked, unblockUser } from '@/services/blocks';
-import { deleteMyReel, fetchReel, resolveReelPlaybackUrl } from '@/services/reels';
-import { isPostReposted, repostPost, undoRepost } from '@/services/reposts';
-import { isPostSaved, savePost, unsavePost } from '@/services/saved';
+import { EmptyState } from '@/components/EmptyState';
+import { ReelFeed } from '@/components/ReelFeed';
+import { Colors } from '@/constants/theme';
+import { fetchProfileReels, fetchReel } from '@/services/reels';
 import type { Reel } from '@/types/reel';
-import { buildReelShareUrl, shareReel } from '@/utils/reelShare';
-import { formatTimeAgo } from '@/utils/timeFormat';
 
 type LoadStatus = 'loading' | 'loaded' | 'error';
-type UrlStatus = 'loading' | 'ready' | 'error';
 
-const CATEGORY_LABEL_BY_ID = new Map(INTERESTS.map((interest) => [interest.id, `${interest.emoji} ${interest.label}`]));
-const PLAYER_HEIGHT = 480;
-
+/**
+ * Single-Post detail route — reached from the Profile grid, share links,
+ * and search. Renders through the exact same ReelFeed/ReelFeedItem the
+ * Home feed uses, so a Post opened from anywhere looks and behaves
+ * identically to Home: full-screen video, the same action rail (Like/
+ * Comment/Save/Share/Options, the "+" follow badge), and the same
+ * ReelCommentsSheet — never the separate compact "shrunk video + comments
+ * listed below" layout this screen used before.
+ *
+ * Not just the one tapped Reel, either — the whole feed here is that
+ * Reel's author's own Post list (fetchProfileReels, the same query the
+ * Profile grid itself is built from), positioned to open exactly on the
+ * one that was tapped, so swiping up/down moves through the rest of that
+ * author's Posts — own profile or someone else's, same behavior either
+ * way. Only the header differs (a plain back button here, vs. Home's
+ * city/mode header), via ReelFeed's own topOverlay slot.
+ */
 export default function ReelDetailScreen() {
   const { reelId } = useLocalSearchParams<{ reelId: string }>();
-  const { user } = useAuth();
-  // This screen is a pushed route on top of whichever tab's stack it was
-  // opened from — Expo Router keeps that stack (and this screen) mounted,
-  // just hidden, if the user switches to a different bottom tab, so
-  // playback would otherwise keep going (audibly, for a Reel with music
-  // merged in) in a tab no longer visible. See the play/pause effect
-  // below.
-  const isScreenFocused = useIsFocused();
-
   const [status, setStatus] = useState<LoadStatus>('loading');
-  const [reel, setReel] = useState<Reel | null>(null);
-  const [playbackUrl, setPlaybackUrl] = useState<string | null>(null);
-  const [urlStatus, setUrlStatus] = useState<UrlStatus>('loading');
-  const [playbackFailed, setPlaybackFailed] = useState(false);
+  const [reels, setReels] = useState<Reel[]>([]);
+  const [initialIndex, setInitialIndex] = useState(0);
 
-  const [isSaved, setIsSaved] = useState(false);
-  const [isReposted, setIsReposted] = useState(false);
-  const [amIBlockingThem, setAmIBlockingThem] = useState(false);
-  const [isBlockSubmitting, setIsBlockSubmitting] = useState(false);
-  const [isOptionsMenuOpen, setIsOptionsMenuOpen] = useState(false);
-  const [isBlockConfirmOpen, setIsBlockConfirmOpen] = useState(false);
-  const [isReportOpen, setIsReportOpen] = useState(false);
-  const [isDeleteConfirmOpen, setIsDeleteConfirmOpen] = useState(false);
-  const [isDeleting, setIsDeleting] = useState(false);
-  const [deleteError, setDeleteError] = useState<string | null>(null);
-  const [toastMessage, setToastMessage] = useState<string | null>(null);
-  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  const isOwnReel = !!user && !!reel && reel.authorUid === user.uid;
-
-  // load() never calls setState before its first await, so nothing runs
-  // synchronously during the effect body below.
   const load = useCallback(async () => {
     setStatus('loading');
+    setReels([]);
     try {
-      const result = await fetchReel(reelId);
-      if (!result || result.status !== 'published') {
+      const target = await fetchReel(reelId);
+      if (!target || target.status !== 'published') {
         setStatus('error');
         return;
       }
-      setReel(result);
-      if (user && result.authorUid !== user.uid) {
-        const [blocked, saved, reposted] = await Promise.all([
-          isUserBlocked(user.uid, result.authorUid),
-          isPostSaved(user.uid, 'reel', result.reelId),
-          isPostReposted(user.uid, 'reel', result.reelId),
-        ]);
-        setAmIBlockingThem(blocked);
-        setIsSaved(saved);
-        setIsReposted(reposted);
+      const profileReels = await fetchProfileReels(target.authorUid);
+      const index = profileReels.findIndex((candidate) => candidate.reelId === reelId);
+      if (index === -1) {
+        // Defensive only — same author, same published status, so this
+        // shouldn't normally happen (the tapped Reel just fell outside
+        // fetchProfileReels' own bounded cap). Still show the Reel that
+        // was actually tapped rather than silently landing somewhere else.
+        setReels([target, ...profileReels]);
+        setInitialIndex(0);
+      } else {
+        setReels(profileReels);
+        setInitialIndex(index);
       }
       setStatus('loaded');
     } catch {
       setStatus('error');
     }
-  }, [reelId, user]);
+  }, [reelId]);
 
-  useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    load();
-  }, [load]);
+  useFocusEffect(
+    useCallback(() => {
+      load();
+    }, [load])
+  );
 
-  const resolveUrl = useCallback(async () => {
-    if (!reel) return;
-    setUrlStatus('loading');
-    setPlaybackFailed(false);
-    const url = await resolveReelPlaybackUrl(reel.storagePath);
-    if (url) {
-      setPlaybackUrl(url);
-      setUrlStatus('ready');
-    } else {
-      setUrlStatus('error');
-    }
-  }, [reel]);
-
-  useEffect(() => {
-    if (reel) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
-      resolveUrl();
-    }
-  }, [reel, resolveUrl]);
-
-  const player = useVideoPlayer(playbackUrl, (p) => {
-    p.loop = true;
-    p.muted = true;
-  });
-
-  useEffect(() => {
-    const subscription = player.addListener('statusChange', ({ status: playerStatus }) => {
-      if (playerStatus === 'error') {
-        setPlaybackFailed(true);
+  // Deleting a Post here removes it from the still-visible list (same
+  // author, so their other Posts stay swipeable) — only when NOTHING is
+  // left does this navigate away (same back-else-Profile fallback the old
+  // single-Reel detail screen used).
+  const handleReelDeleted = (deletedReelId: string) => {
+    const remaining = reels.filter((candidate) => candidate.reelId !== deletedReelId);
+    if (remaining.length === 0) {
+      if (router.canGoBack()) {
+        router.back();
+      } else {
+        router.replace('/profile');
       }
-    });
-    return () => subscription.remove();
-  }, [player]);
-
-  useEffect(() => {
-    if (isScreenFocused && urlStatus === 'ready' && !playbackFailed) {
-      player.play();
-    } else {
-      player.pause();
-    }
-  }, [isScreenFocused, urlStatus, playbackFailed, player]);
-
-  const handleRetryPlayback = async () => {
-    // Forces the player to actually release and recreate (see
-    // ReelFeedItem's preload strategy for why passing null as the
-    // useVideoPlayer source triggers this) rather than reusing a player
-    // instance that already failed to load.
-    setPlaybackUrl(null);
-    await resolveUrl();
-  };
-
-  const handleConfirmBlock = async () => {
-    if (!user || !reel || isBlockSubmitting) return;
-    setIsBlockSubmitting(true);
-    const result = await blockUser(user.uid, reel.authorUid);
-    setIsBlockSubmitting(false);
-    setIsBlockConfirmOpen(false);
-    if (result.ok) {
-      setAmIBlockingThem(true);
-    }
-  };
-
-  const handleUnblock = async () => {
-    if (!user || !reel || isBlockSubmitting) return;
-    setIsBlockSubmitting(true);
-    const result = await unblockUser(user.uid, reel.authorUid);
-    setIsBlockSubmitting(false);
-    if (result.ok) {
-      setAmIBlockingThem(false);
-    }
-  };
-
-  const showToast = useCallback((message: string) => {
-    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
-    setToastMessage(message);
-    toastTimerRef.current = setTimeout(() => setToastMessage(null), 2500);
-  }, []);
-
-  useEffect(() => {
-    return () => {
-      if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
-    };
-  }, []);
-
-  // Share is only ever offered once a real, published Reel is loaded (see
-  // the Step 20 spec — never generate a Share action for a Reel that
-  // isn't loaded/published yet), which is already guaranteed here since
-  // these options only render when status === 'loaded' && reel below.
-  const handleShare = async () => {
-    if (!reel) return;
-    const result = await shareReel(reel.reelId);
-    if (!result.ok && !/cancel/i.test(result.message)) {
-      // Web browsers without the Web Share API reject predictably — fall
-      // back to copying the link instead of leaving the user stuck.
-      await handleCopyLink();
-    }
-  };
-
-  const handleCopyLink = async () => {
-    if (!reel) return;
-    await Clipboard.setStringAsync(buildReelShareUrl(reel.reelId));
-    showToast('Link copied');
-  };
-
-  const handleToggleSave = async () => {
-    if (!reel || !user) return;
-    const wasSaved = isSaved;
-    const result = wasSaved ? await unsavePost(user.uid, 'reel', reel.reelId) : await savePost(user.uid, 'reel', reel.reelId);
-    if (!result.ok) {
-      showToast(result.message);
       return;
     }
-    setIsSaved(!wasSaved);
-    showToast(wasSaved ? 'Removed from saved' : 'Saved');
+    setReels(remaining);
   };
-
-  const handleToggleRepost = async () => {
-    if (!reel || !user) return;
-    const wasReposted = isReposted;
-    const result = wasReposted
-      ? await undoRepost(user.uid, 'reel', reel.reelId)
-      : await repostPost(user.uid, 'reel', reel.reelId, reel.authorUid);
-    if (!result.ok) {
-      showToast(result.message);
-      return;
-    }
-    setIsReposted(!wasReposted);
-    showToast(wasReposted ? 'Undid repost' : 'Reposted');
-  };
-
-  // Permanent — no recycle bin, no restore (locked Step 40.1 policy). The
-  // backend independently re-verifies reel.authorUid == request.auth.uid
-  // server-side, so this is never trusted client-side beyond gating which
-  // menu option even appears.
-  const handleConfirmDelete = async () => {
-    if (!reel || isDeleting) return;
-    setIsDeleting(true);
-    setDeleteError(null);
-    const result = await deleteMyReel(reel.reelId);
-    setIsDeleting(false);
-    if (!result.ok) {
-      setDeleteError(result.message);
-      return;
-    }
-    setIsDeleteConfirmOpen(false);
-    if (router.canGoBack()) {
-      router.back();
-    } else {
-      router.replace('/profile');
-    }
-  };
-
-  const optionsMenuOptions: OptionsMenuOption[] = isOwnReel
-    ? [
-        { label: 'Share post', onPress: handleShare },
-        { label: 'Copy link', onPress: handleCopyLink },
-        { label: 'Delete post', onPress: () => setIsDeleteConfirmOpen(true), destructive: true },
-      ]
-    : amIBlockingThem
-      ? [
-          { label: isSaved ? 'Remove from saved' : 'Save', onPress: handleToggleSave },
-          { label: isReposted ? 'Undo repost' : 'Repost', onPress: handleToggleRepost },
-          { label: 'Share post', onPress: handleShare },
-          { label: 'Copy link', onPress: handleCopyLink },
-          { label: `Unblock ${reel?.authorDisplayName ?? 'this user'}`, onPress: handleUnblock },
-          { label: 'Report post', onPress: () => setIsReportOpen(true) },
-        ]
-      : [
-          { label: isSaved ? 'Remove from saved' : 'Save', onPress: handleToggleSave },
-          { label: isReposted ? 'Undo repost' : 'Repost', onPress: handleToggleRepost },
-          { label: 'Share post', onPress: handleShare },
-          { label: 'Copy link', onPress: handleCopyLink },
-          { label: `Block ${reel?.authorDisplayName ?? 'this user'}`, onPress: () => setIsBlockConfirmOpen(true), destructive: true },
-          { label: 'Report post', onPress: () => setIsReportOpen(true) },
-        ];
-
-  const categoryLabel = reel ? CATEGORY_LABEL_BY_ID.get(reel.categoryId) : undefined;
 
   return (
-    <HeaderScreenLayout
-      title="Post"
-      headerRight={
-        status === 'loaded' && reel ? (
-          <Pressable
-            onPress={() => setIsOptionsMenuOpen(true)}
-            hitSlop={8}
-            accessibilityRole="button"
-            accessibilityLabel="More options"
-            style={styles.overflowButton}
-          >
-            <Ionicons name="ellipsis-horizontal" size={20} color={Colors.textSecondary} />
+    <ReelFeed
+      reels={reels}
+      status={status}
+      errorTitle="Couldn't load this post."
+      onReload={load}
+      onReelDeleted={handleReelDeleted}
+      initialIndex={initialIndex}
+      topOverlay={
+        <View style={styles.backRow}>
+          <Pressable onPress={() => router.back()} hitSlop={8} style={styles.backButton} accessibilityRole="button" accessibilityLabel="Back">
+            <Ionicons name="chevron-back" size={22} color={Colors.text} />
           </Pressable>
-        ) : undefined
+        </View>
       }
-    >
-      {status === 'loading' ? (
-        <View style={styles.centered}>
-          <Text style={styles.loadingText}>Loading…</Text>
-        </View>
-      ) : status === 'error' || !reel ? (
-        <View style={styles.centered}>
-          <Ionicons name="alert-circle-outline" size={32} color={Colors.textSecondary} />
-          <Text style={styles.errorTitle}>Couldn&apos;t load this post.</Text>
-          <Button label="Try again" onPress={load} />
-        </View>
-      ) : (
-        <View style={styles.container}>
-          <View style={styles.playerWrap}>
-            {urlStatus === 'ready' && playbackUrl && !playbackFailed ? (
-              <VideoView style={StyleSheet.absoluteFill} player={player} contentFit="contain" nativeControls allowsPictureInPicture={false} />
-            ) : (
-              <View style={[StyleSheet.absoluteFill, styles.mediaFallback]}>
-                {urlStatus === 'loading' ? (
-                  <ActivityIndicator color={Colors.textSecondary} />
-                ) : (
-                  <View style={styles.playbackErrorState}>
-                    <Ionicons name="alert-circle-outline" size={32} color={Colors.textSecondary} />
-                    <Text style={styles.playbackErrorText}>Couldn&apos;t play this post</Text>
-                    <Pressable onPress={handleRetryPlayback} accessibilityRole="button">
-                      <Text style={styles.retryLink}>Retry</Text>
-                    </Pressable>
-                  </View>
-                )}
-              </View>
-            )}
-          </View>
-
-          <AuthorLink uid={reel.authorUid} style={styles.authorRow}>
-            <Avatar name={reel.authorDisplayName} size={40} />
-            <View>
-              <Text style={styles.authorName}>{reel.authorDisplayName}</Text>
-              <Text style={styles.authorUsername}>@{reel.authorUsername}</Text>
-            </View>
-          </AuthorLink>
-
-          {reel.caption ? <Text style={styles.caption}>{reel.caption}</Text> : null}
-
-          <View style={styles.metaRow}>
-            {categoryLabel ? (
-              <View style={styles.categoryPill}>
-                <Text style={styles.categoryText}>{categoryLabel}</Text>
-              </View>
-            ) : null}
-            {reel.publishedAt ? <Text style={styles.time}>{formatTimeAgo(reel.publishedAt.toDate())}</Text> : null}
-          </View>
-
-          <ReelEngagementSection reelId={reel.reelId} />
-        </View>
-      )}
-
-      {toastMessage ? (
-        <View style={styles.toast} pointerEvents="none">
-          <Text style={styles.toastText}>{toastMessage}</Text>
-        </View>
-      ) : null}
-
-      <OptionsMenu visible={isOptionsMenuOpen} onClose={() => setIsOptionsMenuOpen(false)} options={optionsMenuOptions} />
-
-      <ConfirmDialog
-        visible={isBlockConfirmOpen}
-        title={reel ? `Block ${reel.authorDisplayName}?` : ''}
-        message="They won't be able to follow, like or comment on your content, or message you while blocked."
-        confirmLabel="Block"
-        isSubmitting={isBlockSubmitting}
-        onConfirm={handleConfirmBlock}
-        onCancel={() => setIsBlockConfirmOpen(false)}
-      />
-
-      <ConfirmDialog
-        visible={isDeleteConfirmOpen}
-        title="Delete post?"
-        message={deleteError ?? "This can't be undone."}
-        confirmLabel="Delete"
-        isSubmitting={isDeleting}
-        onConfirm={handleConfirmDelete}
-        onCancel={() => {
-          setIsDeleteConfirmOpen(false);
-          setDeleteError(null);
-        }}
-      />
-
-      {user && reel ? (
-        <ReportModal
-          visible={isReportOpen}
-          onClose={() => setIsReportOpen(false)}
-          reporterUid={user.uid}
-          target={{ type: 'reel', reelId: reel.reelId }}
-        />
-      ) : null}
-    </HeaderScreenLayout>
+      emptyState={<EmptyState bare icon="alert-circle-outline" title="This post is no longer available." />}
+    />
   );
 }
 
 const styles = StyleSheet.create({
-  centered: {
-    alignItems: 'center',
-    gap: Spacing.sm,
-    paddingTop: Spacing.xxl,
-  },
-  loadingText: {
-    color: Colors.textSecondary,
-    fontSize: 14,
-  },
-  errorTitle: {
-    color: Colors.text,
-    fontSize: 15,
-    fontWeight: '700',
-    textAlign: 'center',
-  },
-  overflowButton: {
-    width: 40,
-    height: 40,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  container: {
-    gap: Spacing.sm,
-  },
-  playerWrap: {
-    width: '100%',
-    height: PLAYER_HEIGHT,
-    borderRadius: Radius.lg,
-    overflow: 'hidden',
-    backgroundColor: Colors.surface,
-  },
-  mediaFallback: {
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  playbackErrorState: {
-    alignItems: 'center',
-    gap: Spacing.xs,
-  },
-  playbackErrorText: {
-    color: Colors.textSecondary,
-    fontSize: 13,
-    fontWeight: '600',
-  },
-  retryLink: {
-    color: Colors.accent,
-    fontSize: 13,
-    fontWeight: '700',
-  },
-  authorRow: {
+  backRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: Spacing.sm,
-    marginTop: Spacing.sm,
   },
-  authorName: {
-    color: Colors.text,
-    fontSize: 15,
-    fontWeight: '700',
-  },
-  authorUsername: {
-    color: Colors.textSecondary,
-    fontSize: 13,
-  },
-  caption: {
-    color: Colors.text,
-    fontSize: 15,
-    lineHeight: 21,
-  },
-  metaRow: {
-    flexDirection: 'row',
+  backButton: {
+    width: 32,
+    height: 32,
     alignItems: 'center',
-    gap: Spacing.sm,
-  },
-  categoryPill: {
-    borderRadius: Radius.full,
-    backgroundColor: Colors.surface,
-    borderWidth: 1,
-    borderColor: Colors.border,
-    paddingHorizontal: Spacing.sm,
-    paddingVertical: 4,
-  },
-  categoryText: {
-    color: Colors.accent,
-    fontSize: 12,
-    fontWeight: '600',
-  },
-  time: {
-    color: Colors.textSecondary,
-    fontSize: 12,
-  },
-  toast: {
-    position: 'absolute',
-    bottom: Spacing.xxl,
-    alignSelf: 'center',
-    backgroundColor: 'rgba(11, 11, 15, 0.9)',
-    borderRadius: Radius.full,
-    paddingHorizontal: Spacing.md,
-    paddingVertical: Spacing.sm,
-  },
-  toastText: {
-    color: Colors.text,
-    fontSize: 13,
-    fontWeight: '600',
+    justifyContent: 'center',
   },
 });

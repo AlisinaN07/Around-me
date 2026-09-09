@@ -21,6 +21,10 @@ export type PublicProfile = {
   interests: string[];
   /** Mirrors users/{uid}.bio exactly — see types/user.ts. Always a string, never missing. */
   bio: string;
+  /** Mirrors users/{uid}.photoURL exactly — see types/user.ts. Always a string, never missing. */
+  photoURL: string;
+  /** Mirrors users/{uid}.coverPhotoURL exactly — see types/user.ts. Always a string, never missing. */
+  coverPhotoURL: string;
   accountType: AccountType;
   createdAt: Timestamp;
   updatedAt: Timestamp;

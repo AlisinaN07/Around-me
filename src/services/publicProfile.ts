@@ -30,13 +30,13 @@ const PUBLIC_PROFILES_COLLECTION = 'publicProfiles';
 const USERNAMES_COLLECTION = 'usernames';
 const SEARCH_RESULT_LIMIT = 20;
 
-/** Normalizes a missing `bio` (public profiles created before Step 33) to '' — see fetchUserProfile's identical rule. */
+/** Normalizes a missing `bio`/`photoURL` (public profiles created before those fields existed) to '' — see fetchUserProfile's identical rule. */
 export async function fetchPublicProfile(uid: string): Promise<PublicProfile | null> {
   if (!firestore) return null;
   const snapshot = await getDoc(doc(firestore, PUBLIC_PROFILES_COLLECTION, uid));
   if (!snapshot.exists()) return null;
   const data = snapshot.data() as PublicProfile;
-  return { ...data, bio: data.bio ?? '' };
+  return { ...data, bio: data.bio ?? '', photoURL: data.photoURL ?? '', coverPhotoURL: data.coverPhotoURL ?? '' };
 }
 
 /** Resolves a username to a uid via the existing usernames/{usernameLower} reservation, then reads the public profile — never scans publicProfiles itself. */
@@ -86,9 +86,12 @@ export async function ensureMyPublicProfile(uid: string): Promise<EnsurePublicPr
     countryCode: privateProfile.countryCode,
     cityKey: privateProfile.cityKey,
     interests: privateProfile.interests,
-    // privateProfile.bio is already normalized to '' by fetchUserProfile
-    // above when missing (pre-Step-33 accounts) — never omitted here.
+    // privateProfile.bio/photoURL/coverPhotoURL are already normalized to
+    // '' by fetchUserProfile above when missing (pre-existing accounts) —
+    // never omitted here.
     bio: privateProfile.bio,
+    photoURL: privateProfile.photoURL,
+    coverPhotoURL: privateProfile.coverPhotoURL,
     accountType: privateProfile.accountType,
     createdAt: serverTimestamp(),
     updatedAt: serverTimestamp(),

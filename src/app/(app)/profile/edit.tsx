@@ -1,7 +1,11 @@
+import { Ionicons } from '@expo/vector-icons';
+import * as ImagePicker from 'expo-image-picker';
+import { LinearGradient } from 'expo-linear-gradient';
 import { router } from 'expo-router';
 import { useEffect, useState } from 'react';
-import { StyleSheet, Text, View } from 'react-native';
+import { ActivityIndicator, Image, Pressable, StyleSheet, Text, View } from 'react-native';
 
+import { Avatar } from '@/components/Avatar';
 import { Button } from '@/components/Button';
 import { FormField } from '@/components/FormField';
 import { HeaderScreenLayout } from '@/components/HeaderScreenLayout';
@@ -10,7 +14,14 @@ import { MIN_INTERESTS } from '@/constants/interests';
 import { Colors, Radius, Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
 import { useProfile } from '@/hooks/useProfile';
-import { checkUsernameAvailability, updateMyProfile } from '@/services/userProfile';
+import {
+  checkUsernameAvailability,
+  updateMyProfile,
+  updateMyProfileCoverPhoto,
+  updateMyProfilePhoto,
+  uploadProfileCoverPhoto,
+  uploadProfilePhoto,
+} from '@/services/userProfile';
 import { BIO_MAX_LENGTH, DISPLAY_NAME_MAX_LENGTH, DISPLAY_NAME_MIN_LENGTH } from '@/types/user';
 import { formatCityDisplayName } from '@/utils/cityDisplay';
 import { normalizeUsername } from '@/utils/username';
@@ -41,6 +52,109 @@ export default function EditProfileScreen() {
   const [formError, setFormError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [checkResult, setCheckResult] = useState<CheckResult | null>(null);
+
+  const [isUploadingPhoto, setIsUploadingPhoto] = useState(false);
+  const [photoError, setPhotoError] = useState<string | null>(null);
+
+  // Saved immediately on pick, independent of the "Save changes" button
+  // below — a profile photo change isn't part of the displayName/username/
+  // bio/interests form state or its validation (see updateMyProfilePhoto,
+  // a separate write from updateMyProfile).
+  const handleChangePhoto = async () => {
+    if (!user || isUploadingPhoto) return;
+    setPhotoError(null);
+
+    // Requested only on this explicit tap — never on screen mount (same
+    // minimum-permissions rule the Create Reel cover/video pickers follow).
+    const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
+    if (!permission.granted) {
+      setPhotoError('Around Me needs access to your photo library to choose a picture.');
+      return;
+    }
+
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ['images'],
+      allowsEditing: true,
+      aspect: [1, 1],
+      quality: 0.9,
+    });
+    if (result.canceled || result.assets.length === 0) return;
+
+    const asset = result.assets[0];
+    setIsUploadingPhoto(true);
+
+    await new Promise<void>((resolve) => {
+      uploadProfilePhoto(user.uid, asset.uri, () => {}, async (uploadResult) => {
+        if (!uploadResult.ok) {
+          setPhotoError(uploadResult.message);
+          setIsUploadingPhoto(false);
+          resolve();
+          return;
+        }
+
+        const saveResult = await updateMyProfilePhoto(user.uid, uploadResult.photoURL);
+        setIsUploadingPhoto(false);
+        if (!saveResult.ok) {
+          setPhotoError(saveResult.message);
+          resolve();
+          return;
+        }
+
+        await refreshProfile();
+        resolve();
+      });
+    });
+  };
+
+  const [isUploadingCover, setIsUploadingCover] = useState(false);
+  const [coverError, setCoverError] = useState<string | null>(null);
+
+  // Cover/banner counterpart to handleChangePhoto above — same immediate-
+  // save-on-pick behavior, own error state so a failure in one never hides
+  // the other's message.
+  const handleChangeCoverPhoto = async () => {
+    if (!user || isUploadingCover) return;
+    setCoverError(null);
+
+    const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
+    if (!permission.granted) {
+      setCoverError('Around Me needs access to your photo library to choose a picture.');
+      return;
+    }
+
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ['images'],
+      allowsEditing: true,
+      aspect: [3, 1],
+      quality: 0.9,
+    });
+    if (result.canceled || result.assets.length === 0) return;
+
+    const asset = result.assets[0];
+    setIsUploadingCover(true);
+
+    await new Promise<void>((resolve) => {
+      uploadProfileCoverPhoto(user.uid, asset.uri, () => {}, async (uploadResult) => {
+        if (!uploadResult.ok) {
+          setCoverError(uploadResult.message);
+          setIsUploadingCover(false);
+          resolve();
+          return;
+        }
+
+        const saveResult = await updateMyProfileCoverPhoto(user.uid, uploadResult.coverPhotoURL);
+        setIsUploadingCover(false);
+        if (!saveResult.ok) {
+          setCoverError(saveResult.message);
+          resolve();
+          return;
+        }
+
+        await refreshProfile();
+        resolve();
+      });
+    });
+  };
 
   const originalUsernameLower = profile?.usernameLower ?? '';
   const normalized = normalizeUsername(username);
@@ -150,6 +264,60 @@ export default function EditProfileScreen() {
 
   return (
     <HeaderScreenLayout title="Edit profile">
+      <View style={styles.coverSection}>
+        <Pressable
+          onPress={handleChangeCoverPhoto}
+          disabled={isUploadingCover}
+          style={styles.coverButton}
+          accessibilityRole="button"
+          accessibilityLabel="Change cover photo"
+        >
+          {profile.coverPhotoURL ? (
+            <>
+              <Image source={{ uri: profile.coverPhotoURL }} style={styles.coverImage} />
+              {/* Same bottom fade as ProfileHeader's own cover banner, so
+                  this preview matches exactly. */}
+              <LinearGradient colors={['transparent', Colors.background]} style={styles.coverFade} pointerEvents="none" />
+            </>
+          ) : (
+            <View style={styles.coverPlaceholder}>
+              <Ionicons name="image-outline" size={22} color={Colors.textSecondary} />
+              <Text style={styles.coverPlaceholderText}>Add cover photo</Text>
+            </View>
+          )}
+          <View style={styles.coverBadge}>
+            {isUploadingCover ? (
+              <ActivityIndicator size="small" color={Colors.background} />
+            ) : (
+              <Ionicons name="camera" size={14} color={Colors.background} />
+            )}
+          </View>
+        </Pressable>
+        {coverError ? <Text style={styles.formError}>{coverError}</Text> : null}
+      </View>
+
+      <View style={styles.photoSection}>
+        <Pressable
+          onPress={handleChangePhoto}
+          disabled={isUploadingPhoto}
+          style={styles.photoButton}
+          accessibilityRole="button"
+          accessibilityLabel="Change profile photo"
+        >
+          <View style={styles.avatarRing}>
+            <Avatar name={profile.displayName || '?'} photoURL={profile.photoURL} size={88} />
+          </View>
+          <View style={styles.photoBadge}>
+            {isUploadingPhoto ? (
+              <ActivityIndicator size="small" color={Colors.background} />
+            ) : (
+              <Ionicons name="camera" size={16} color={Colors.background} />
+            )}
+          </View>
+        </Pressable>
+        {photoError ? <Text style={styles.formError}>{photoError}</Text> : null}
+      </View>
+
       <FormField
         label="Name"
         value={displayName}
@@ -229,6 +397,87 @@ export default function EditProfileScreen() {
 }
 
 const styles = StyleSheet.create({
+  coverSection: {
+    gap: Spacing.xs,
+  },
+  coverButton: {
+    width: '100%',
+    height: 120,
+    borderRadius: Radius.lg,
+    overflow: 'hidden',
+  },
+  coverImage: {
+    width: '100%',
+    height: '100%',
+  },
+  coverFade: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    bottom: 0,
+    height: 60,
+  },
+  coverPlaceholder: {
+    width: '100%',
+    height: '100%',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 4,
+    backgroundColor: Colors.surface,
+    borderWidth: 1,
+    borderColor: Colors.border,
+  },
+  coverPlaceholderText: {
+    color: Colors.textSecondary,
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  coverBadge: {
+    position: 'absolute',
+    right: Spacing.sm,
+    bottom: Spacing.sm,
+    width: 26,
+    height: 26,
+    borderRadius: 13,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: Colors.accent,
+    borderWidth: 2,
+    borderColor: Colors.background,
+  },
+  // Overlaps coverButton's own bottom edge — same overlapping-avatar
+  // composition ProfileHeader itself uses once a cover photo is set, so
+  // this screen previews exactly what the redesigned header will look
+  // like.
+  photoSection: {
+    alignItems: 'center',
+    gap: Spacing.xs,
+    paddingBottom: Spacing.sm,
+    marginTop: -48,
+  },
+  // 96 = the 88 Avatar plus avatarRing's own 4px padding on each side.
+  photoButton: {
+    width: 96,
+    height: 96,
+  },
+  avatarRing: {
+    padding: 4,
+    borderRadius: Radius.full,
+    backgroundColor: Colors.background,
+  },
+  photoBadge: {
+    position: 'absolute',
+    right: -2,
+    bottom: -2,
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: Colors.accent,
+    borderWidth: 2,
+    borderColor: Colors.background,
+  },
   bioInput: {
     minHeight: 80,
     textAlignVertical: 'top',

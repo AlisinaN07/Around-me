@@ -1,15 +1,17 @@
 import { Ionicons } from '@expo/vector-icons';
 import * as Clipboard from 'expo-clipboard';
-import { router } from 'expo-router';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Pressable, StyleSheet, Text, View } from 'react-native';
 import { VideoView, useVideoPlayer } from 'expo-video';
 
 import { AuthorLink } from '@/components/AuthorLink';
 import { Avatar } from '@/components/Avatar';
+import { ReelCommentsSheet } from '@/components/ReelCommentsSheet';
 import { Colors, Radius, Spacing } from '@/constants/theme';
 import { INTERESTS } from '@/constants/interests';
 import { useAuth } from '@/hooks/useAuth';
+import { followUser, isFollowing } from '@/services/following';
+import { fetchPublicProfile } from '@/services/publicProfile';
 import { fetchReelCommentCount, fetchReelLikeCount, isReelLiked, likeReel, unlikeReel } from '@/services/reelEngagement';
 import { resolveReelPlaybackUrl } from '@/services/reels';
 import { isPostSaved, savePost, unsavePost } from '@/services/saved';
@@ -52,6 +54,10 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
   const [likeCount, setLikeCount] = useState(0);
   const [commentCount, setCommentCount] = useState(0);
   const [isLikeSubmitting, setIsLikeSubmitting] = useState(false);
+  // Comments open as a half-screen sheet over this still-playing,
+  // still-full-screen item — never a navigation away from it (see
+  // ReelCommentsSheet's own doc comment for why).
+  const [isCommentsOpen, setIsCommentsOpen] = useState(false);
 
   // Save has no meaning on the author's own Reel (same as the retired
   // Save option never appearing in the own-Reel options menu) — see the
@@ -59,6 +65,28 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
   const [isSaved, setIsSaved] = useState(false);
   const [isSaveSubmitting, setIsSaveSubmitting] = useState(false);
   const isOwnReel = !!user && reel.authorUid === user.uid;
+
+  // The small "+" follow badge on the author's avatar — `null` means not
+  // yet checked (renders nothing, same "don't show a wrong guess" rule as
+  // Save/Like), `false` shows the badge, `true` hides it entirely (never
+  // shown again for an already-followed author). `justFollowed` is purely
+  // the brief checkmark shown right after tapping, before the badge
+  // disappears for good — see handleFollow.
+  const [isFollowingAuthor, setIsFollowingAuthor] = useState<boolean | null>(null);
+  const [isFollowSubmitting, setIsFollowSubmitting] = useState(false);
+  const [justFollowed, setJustFollowed] = useState(false);
+  const followHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // The author's avatar photo — deliberately NOT reel.authorDisplayName's
+  // sibling denormalized field. reel.authorDisplayName is frozen at Reel
+  // creation time (never updated if the author later renames), which is
+  // fine for a name but would be wrong here: it would mean a Reel posted
+  // before the author ever set a profile photo could never show one, even
+  // after they add one. So this reads the author's current
+  // publicProfiles/{uid} instead — same live, per-mount fetch (and same
+  // "accepted, low-cost re-read, not a real staleness bug" reasoning) as
+  // the Follow-state effect just below.
+  const [authorPhotoURL, setAuthorPhotoURL] = useState('');
 
   useEffect(() => {
     let cancelled = false;
@@ -123,6 +151,39 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
       cancelled = true;
     };
   }, [reel.reelId, user, isOwnReel]);
+
+  // Reflects the correct current Follow state for THIS item's author
+  // independently (same "reflect current state" reasoning as Save above)
+  // — never shown/fetched for the viewer's own Reel. Deliberately keyed
+  // on reel.authorUid, not reel.reelId: the same author's next Reel in
+  // the feed should never briefly re-show a "+" that was already
+  // dismissed for them this session — but since this is a fresh mount per
+  // feed item (not a shared cache), it still re-checks per item; that's
+  // an accepted, low-cost re-read, not a real staleness bug.
+  useEffect(() => {
+    let cancelled = false;
+    if (isOwnReel || !user) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setIsFollowingAuthor(null);
+      return;
+    }
+    isFollowing(user.uid, reel.authorUid).then((following) => {
+      if (!cancelled) setIsFollowingAuthor(following);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [reel.authorUid, user, isOwnReel]);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchPublicProfile(reel.authorUid).then((authorProfile) => {
+      if (!cancelled) setAuthorPhotoURL(authorProfile?.photoURL ?? '');
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [reel.authorUid]);
 
   const player = useVideoPlayer(playbackUrl, (p) => {
     p.loop = true;
@@ -199,6 +260,34 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
     onToast(wasSaved ? 'Removed from saved' : 'Saved');
   };
 
+  // Tapping the "+" follow badge: real write immediately (never a fake
+  // optimistic follow that could silently fail), then a brief checkmark
+  // before the badge disappears for good — it never comes back for this
+  // author once followed (isFollowingAuthor flips to true permanently
+  // here, same as it would on a fresh mount that found an existing
+  // Follow edge).
+  const handleFollow = async () => {
+    if (!user || isOwnReel || isFollowSubmitting) return;
+    setIsFollowSubmitting(true);
+    const result = await followUser(user.uid, reel.authorUid);
+    setIsFollowSubmitting(false);
+    if (!result.ok) {
+      onToast(result.message);
+      return;
+    }
+    setJustFollowed(true);
+    followHideTimerRef.current = setTimeout(() => {
+      setIsFollowingAuthor(true);
+      setJustFollowed(false);
+    }, 900);
+  };
+
+  useEffect(() => {
+    return () => {
+      if (followHideTimerRef.current) clearTimeout(followHideTimerRef.current);
+    };
+  }, []);
+
   // Same fallback reasoning as the retired options-menu "Share post"
   // entry: the native share sheet can fail for reasons other than the
   // person cancelling it (e.g. no share target configured on web), in
@@ -243,9 +332,23 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
       )}
 
       <View style={styles.actionRail}>
-        <AuthorLink uid={reel.authorUid} style={styles.actionAvatar}>
-          <Avatar name={reel.authorDisplayName} size={40} />
-        </AuthorLink>
+        <View style={styles.actionAvatarWrap}>
+          <AuthorLink uid={reel.authorUid} style={styles.actionAvatar}>
+            <Avatar name={reel.authorDisplayName} photoURL={authorPhotoURL} size={40} />
+          </AuthorLink>
+          {isFollowingAuthor === false && (
+            <Pressable
+              onPress={handleFollow}
+              disabled={isFollowSubmitting}
+              hitSlop={8}
+              style={styles.followBadge}
+              accessibilityRole="button"
+              accessibilityLabel={justFollowed ? 'Followed' : `Follow ${reel.authorDisplayName}`}
+            >
+              <Ionicons name={justFollowed ? 'checkmark' : 'add'} size={14} color={Colors.text} />
+            </Pressable>
+          )}
+        </View>
         <Pressable
           onPress={handleToggleLike}
           disabled={!user || isLikeSubmitting}
@@ -258,7 +361,7 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
           <Text style={styles.actionCount}>{likeCount}</Text>
         </Pressable>
         <Pressable
-          onPress={() => router.push(`/reel/${reel.reelId}`)}
+          onPress={() => setIsCommentsOpen(true)}
           style={styles.actionButton}
           accessibilityRole="button"
           accessibilityLabel="Open comments"
@@ -299,6 +402,13 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
           </View>
         ) : null}
       </View>
+
+      <ReelCommentsSheet
+        visible={isCommentsOpen}
+        reelId={reel.reelId}
+        onClose={() => setIsCommentsOpen(false)}
+        onCommentCountChange={setCommentCount}
+      />
     </View>
   );
 }
@@ -335,8 +445,27 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: Spacing.lg,
   },
+  actionAvatarWrap: {
+    alignItems: 'center',
+  },
   actionAvatar: {
     alignItems: 'center',
+  },
+  // Overlaps the avatar's own bottom edge — same "+" -> checkmark ->
+  // disappears pattern as every other short-video app's follow-from-feed
+  // affordance (see handleFollow's own doc comment for the exact timing).
+  followBadge: {
+    position: 'absolute',
+    bottom: -6,
+    alignSelf: 'center',
+    width: 20,
+    height: 20,
+    borderRadius: 10,
+    backgroundColor: Colors.accent,
+    borderWidth: 2,
+    borderColor: Colors.background,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   actionButton: {
     alignItems: 'center',

@@ -1,10 +1,25 @@
 import { Ionicons } from '@expo/vector-icons';
+import { LinearGradient } from 'expo-linear-gradient';
 import type { ReactNode } from 'react';
-import { StyleSheet, Text, View } from 'react-native';
+import { Image, StyleSheet, Text, View, useWindowDimensions } from 'react-native';
 
 import { Avatar } from '@/components/Avatar';
 import { StatItem } from '@/components/StatItem';
-import { Colors, Spacing, Typography } from '@/constants/theme';
+import { Colors, Layout, Radius, Spacing, Typography } from '@/constants/theme';
+
+const AVATAR_SIZE = 96;
+// How tall the visible cover banner is. Bigger than a plain "card behind
+// the avatar" — it reaches down to just above the display name, so the
+// photo (and its fade) fills the whole space behind the avatar instead of
+// cutting off partway and leaving a plain black gap before the name.
+const COVER_HEIGHT = 200;
+// Where the identity block (avatar + name + everything below) starts,
+// measured from the top of the cover — this is what actually controls the
+// avatar's position, independent of COVER_HEIGHT now that the cover is
+// absolutely positioned behind it (see the render below). Chosen so the
+// avatar sits the same place it always has: half-overlapping a banner,
+// same as before this was decoupled.
+const IDENTITY_TOP_OFFSET = 88;
 
 type ProfileHeaderProps = {
   displayName: string;
@@ -12,6 +27,25 @@ type ProfileHeaderProps = {
   cityLabel: string;
   /** Real, optional free-text bio (Step 33) — rendered only when non-empty, never a placeholder like "Add a bio". */
   bio?: string;
+  /** Real, already-resolved profile photo download URL — see UserProfile.photoURL. Falls back to the initials Avatar when empty/absent. */
+  photoURL?: string;
+  /**
+   * Real, already-resolved cover/banner download URL — see
+   * UserProfile.coverPhotoURL. Renders no banner at all when empty/absent
+   * (never a placeholder), leaving the header exactly as it looked before
+   * this existed.
+   */
+  coverPhotoURL?: string;
+  /**
+   * How much horizontal padding the caller's own screen already applies
+   * before this component (e.g. Spacing.lg on the own Profile tab,
+   * Spacing.xl on the public profile's HeaderScreenLayout) — the cover
+   * banner cancels exactly that much with a negative margin so it reaches
+   * the true screen edges on both sides instead of sitting inset like a
+   * card. Ignored when there's no cover to show. Defaults to 0 (no bleed)
+   * so an unmigrated caller keeps the old contained-card look.
+   */
+  coverEdgeInset?: number;
   /** Real, bounded profile content count — see the caller for its exact source/limit. */
   postsCount: number;
   followersCount: number;
@@ -32,11 +66,12 @@ type ProfileHeaderProps = {
 };
 
 /**
- * Shared identity block — avatar, name, username, city, bio, Posts/
- * Following/Followers/Liked stats (Step 27, bio added Step 33, Liked added
- * Step 41.2H.4). Used by both the own Profile tab and the public profile
- * route so they read as one visual system rather than two (Step 27 Section
- * 19). Carries no verification-badge slot — that doesn't exist in the real
+ * Shared identity block — cover banner, avatar, name, username, city, bio,
+ * Posts/Following/Followers/Liked stats (Step 27, bio added Step 33, Liked
+ * added Step 41.2H.4, cover banner added later). Used by both the own
+ * Profile tab and the public profile route so they read as one visual
+ * system rather than two (Step 27 Section 19). Carries no verification-
+ * badge slot and no online-status indicator — neither exists in the real
  * schema.
  */
 export function ProfileHeader({
@@ -44,6 +79,9 @@ export function ProfileHeader({
   username,
   cityLabel,
   bio,
+  photoURL,
+  coverPhotoURL,
+  coverEdgeInset = 0,
   postsCount,
   followersCount,
   followingCount,
@@ -52,42 +90,94 @@ export function ProfileHeader({
   onPressFollowing,
   headerRight,
 }: ProfileHeaderProps) {
+  const hasCover = !!coverPhotoURL;
+
+  // On a wide web viewport, `page`/`content`'s own maxWidth caps out at
+  // Layout.maxContentWidth and gets centered (see profile.tsx/HeaderScreenLayout)
+  // — that adds an extra gap OUTSIDE the padded content on both sides that
+  // coverEdgeInset alone (which only cancels the padding INSIDE it) can't
+  // reach. This measures that outer gap directly from the real window width
+  // so the cover still bleeds to the true screen edge no matter how wide the
+  // window is. On native and on a narrow/mobile web viewport this is 0 —
+  // the content never gets capped there in the first place.
+  const { width: windowWidth } = useWindowDimensions();
+  const outerCenteringGap = Math.max(0, (windowWidth - Layout.maxContentWidth) / 2);
+  const coverBleed = coverEdgeInset + outerCenteringGap;
+
   return (
     <View style={styles.container}>
-      {headerRight ? <View style={styles.headerRight}>{headerRight}</View> : null}
-
-      <Avatar name={displayName || '?'} size={96} />
-
-      <Text style={styles.displayName} numberOfLines={1}>
-        {displayName}
-      </Text>
-      {username ? <Text style={styles.username}>@{username}</Text> : null}
-      {cityLabel ? (
-        <View style={styles.locationRow}>
-          <Ionicons name="location" size={14} color={Colors.accent} />
-          <Text style={styles.locationText} numberOfLines={1}>
-            {cityLabel}
-          </Text>
+      {hasCover ? (
+        // Absolutely positioned (not in flow) so its own height, driven by
+        // COVER_HEIGHT, is completely independent of where the identity
+        // block below starts — growing the banner never pushes the avatar/
+        // name down with it. left/right (rather than a width + negative
+        // margin) is what lets it bleed past coverEdgeInset here: with no
+        // explicit width, the box's edges ARE the left/right values, so it
+        // sizes itself to exactly fill the gap between them.
+        <View style={[styles.coverWrap, { left: -coverBleed, right: -coverBleed }, coverEdgeInset > 0 && styles.coverWrapEdgeToEdge]}>
+          <Image source={{ uri: coverPhotoURL }} style={styles.cover} />
+          {/* Fades the cover's own bottom edge into the page background
+              instead of a hard cutoff — same scrim technique DetailHero
+              uses for its hero image. */}
+          <LinearGradient
+            colors={['transparent', 'rgba(10, 10, 13, 0.75)', Colors.background]}
+            locations={[0, 0.55, 1]}
+            style={styles.coverFade}
+            pointerEvents="none"
+          />
+          {/* Positioned relative to the (possibly bled-out) cover itself,
+              not the container, so it stays anchored to the banner's own
+              true edge regardless of coverEdgeInset. */}
+          {headerRight ? <View style={styles.headerRightOnCover}>{headerRight}</View> : null}
         </View>
-      ) : null}
-      {bio ? (
-        <Text style={styles.bio} numberOfLines={3}>
-          {bio}
-        </Text>
+      ) : headerRight ? (
+        <View style={styles.headerRight}>{headerRight}</View>
       ) : null}
 
-      <View style={styles.statsRow}>
-        <StatItem value={postsCount} label="Posts" />
-        <View style={styles.statDivider} />
-        <StatItem value={followingCount} label="Following" onPress={onPressFollowing} />
-        <View style={styles.statDivider} />
-        <StatItem value={followersCount} label="Followers" onPress={onPressFollowers} />
-        {likedCount !== undefined ? (
-          <>
-            <View style={styles.statDivider} />
-            <StatItem value={likedCount} label="Liked" />
-          </>
+      {/* position: 'relative' + a higher zIndex than coverWrap's, so this
+          paints on top of the absolutely-positioned cover behind it
+          instead of getting hidden under it — positioned elements stack
+          above plain in-flow ones by default regardless of DOM order. */}
+      <View style={[styles.identity, hasCover && styles.identityWithCover]}>
+        {hasCover ? (
+          <View style={styles.avatarRing}>
+            <Avatar name={displayName || '?'} photoURL={photoURL} size={AVATAR_SIZE} />
+          </View>
+        ) : (
+          <Avatar name={displayName || '?'} photoURL={photoURL} size={AVATAR_SIZE} />
+        )}
+
+        <Text style={styles.displayName} numberOfLines={1}>
+          {displayName}
+        </Text>
+        {username ? <Text style={styles.username}>@{username}</Text> : null}
+        {cityLabel ? (
+          <View style={styles.locationRow}>
+            <Ionicons name="location" size={14} color={Colors.accent} />
+            <Text style={styles.locationText} numberOfLines={1}>
+              {cityLabel}
+            </Text>
+          </View>
         ) : null}
+        {bio ? (
+          <Text style={styles.bio} numberOfLines={3}>
+            {bio}
+          </Text>
+        ) : null}
+
+        <View style={styles.statsRow}>
+          <StatItem value={postsCount} label="Posts" />
+          <View style={styles.statDivider} />
+          <StatItem value={followingCount} label="Following" onPress={onPressFollowing} />
+          <View style={styles.statDivider} />
+          <StatItem value={followersCount} label="Followers" onPress={onPressFollowers} />
+          {likedCount !== undefined ? (
+            <>
+              <View style={styles.statDivider} />
+              <StatItem value={likedCount} label="Liked" />
+            </>
+          ) : null}
+        </View>
       </View>
     </View>
   );
@@ -95,14 +185,81 @@ export function ProfileHeader({
 
 const styles = StyleSheet.create({
   container: {
-    alignItems: 'center',
     gap: 4,
-    paddingTop: Spacing.sm,
+    // The absolutely-positioned coverWrap below anchors to this box, so it
+    // needs to actually be a positioning context — 'relative' is View's
+    // own default, stated explicitly here since it matters.
+    position: 'relative',
+  },
+  // Positioned (not in normal flow) so its height is independent of the
+  // identity block's own position — see COVER_HEIGHT/IDENTITY_TOP_OFFSET's
+  // doc comments above. left/right are set inline per-render (plain 0, or
+  // -coverBleed to reach past coverEdgeInset) — with no explicit width,
+  // the box just fills whatever gap those two edges leave.
+  coverWrap: {
+    position: 'absolute',
+    top: 0,
+    height: COVER_HEIGHT,
+    borderRadius: Radius.lg,
+    overflow: 'hidden',
+    backgroundColor: Colors.surface,
+    zIndex: 0,
+  },
+  coverWrapEdgeToEdge: {
+    borderRadius: 0,
+  },
+  cover: {
+    width: '100%',
+    height: '100%',
+  },
+  // Starts around the avatar's own vertical middle (well above the name)
+  // and darkens the rest of the way down — a bigger, stronger fade than a
+  // thin strip at the very bottom, with a middle color stop (see the
+  // LinearGradient's own `colors`/`locations` above) so the darkening
+  // reads as a real blend rather than a flat linear wash.
+  coverFade: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    bottom: 0,
+    height: 160,
   },
   headerRight: {
     position: 'absolute',
     top: 0,
     right: 0,
+  },
+  // Sits over the banner image instead of the plain background — same
+  // corner, just inset a little so it doesn't touch the true screen edge.
+  headerRightOnCover: {
+    position: 'absolute',
+    top: Spacing.sm,
+    right: Spacing.sm,
+  },
+  identity: {
+    alignItems: 'center',
+    gap: 4,
+    paddingTop: Spacing.sm,
+    // See the render method's own comment: this needs to paint above the
+    // absolutely-positioned coverWrap, which coverEdgeInset > 0 aside would
+    // otherwise sit on top of it by default (positioned elements stack
+    // above static ones regardless of DOM order).
+    position: 'relative',
+    zIndex: 1,
+  },
+  // Starts the avatar at IDENTITY_TOP_OFFSET instead of the plain top
+  // padding above — a fixed position, deliberately NOT derived from
+  // COVER_HEIGHT, so resizing the banner never moves the avatar/name.
+  identityWithCover: {
+    paddingTop: IDENTITY_TOP_OFFSET,
+  },
+  // A plain ring in the page background color, purely to separate the
+  // avatar visually from a busy cover image behind it — not a status
+  // indicator of any kind.
+  avatarRing: {
+    padding: 4,
+    borderRadius: Radius.full,
+    backgroundColor: Colors.background,
   },
   displayName: {
     color: Colors.text,

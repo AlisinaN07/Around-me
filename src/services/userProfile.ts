@@ -4,12 +4,15 @@
  */
 
 import { doc, getDoc, runTransaction, serverTimestamp, type WithFieldValue } from 'firebase/firestore';
+import { getDownloadURL, ref, uploadBytesResumable, type UploadTask } from 'firebase/storage';
 
 import type { PublicProfile } from '@/types/social';
 import {
   BIO_MAX_LENGTH,
   DISPLAY_NAME_MAX_LENGTH,
   DISPLAY_NAME_MIN_LENGTH,
+  PROFILE_COVER_PHOTO_MAX_SIZE_BYTES,
+  PROFILE_PHOTO_MAX_SIZE_BYTES,
   type AccountType,
   type UserProfile,
   type UsernameReservation,
@@ -19,6 +22,7 @@ import { buildCityKey } from '@/utils/cityKey';
 import { normalizeUsername } from '@/utils/username';
 
 import { firestore } from './firestore';
+import { storage } from './storage';
 
 const USERS_COLLECTION = 'users';
 const USERNAMES_COLLECTION = 'usernames';
@@ -70,7 +74,7 @@ export async function fetchUserProfile(uid: string): Promise<UserProfile | null>
   const snapshot = await getDoc(doc(firestore, USERS_COLLECTION, uid));
   if (!snapshot.exists()) return null;
   const data = snapshot.data() as UserProfile;
-  return { ...data, bio: data.bio ?? '' };
+  return { ...data, bio: data.bio ?? '', photoURL: data.photoURL ?? '', coverPhotoURL: data.coverPhotoURL ?? '' };
 }
 
 /** Lightweight existence check — does not reserve the username. */
@@ -154,6 +158,11 @@ export async function createInitialUserProfile(
         // and never null. Onboarding itself doesn't collect a bio yet
         // (Edit Profile is the only place that sets a real one).
         bio: '',
+        // Same canonical empty-string convention as bio — onboarding
+        // doesn't collect a photo either (Edit Profile is the only place
+        // that sets a real one, via updateMyProfilePhoto below).
+        photoURL: '',
+        coverPhotoURL: '',
         accountType: input.accountType,
         onboardingCompleted: true,
         createdAt: serverTimestamp(),
@@ -174,6 +183,8 @@ export async function createInitialUserProfile(
         cityKey,
         interests: input.interests,
         bio: '',
+        photoURL: '',
+        coverPhotoURL: '',
         accountType: input.accountType,
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
@@ -330,4 +341,253 @@ export async function updateMyProfile(input: UpdateProfileInput): Promise<Update
     return { ok: false, error: 'unknown', message: 'Profile was updated but could not be read back.' };
   }
   return { ok: true, profile };
+}
+
+export type UpdateProfilePhotoResult =
+  | { ok: true; profile: UserProfile }
+  | { ok: false; error: 'not-configured' | 'no-profile' | 'unknown'; message: string };
+
+class UpdateProfilePhotoTransactionError extends Error {
+  constructor() {
+    super('no-profile');
+  }
+}
+
+/**
+ * Edit Profile's picture upload, second half — call this only after
+ * uploadProfilePhoto below has finished. Writes the resolved download URL
+ * to both users/{uid}.photoURL and publicProfiles/{uid}.photoURL in one
+ * transaction, exactly like updateMyProfile keeps the two documents in
+ * lockstep for displayName/username/bio/interests. `photoURL` is a real,
+ * already-resolved HTTPS download URL (from getDownloadURL), never a bare
+ * Storage path — see UserProfile.photoURL's own doc comment.
+ */
+export async function updateMyProfilePhoto(uid: string, photoURL: string): Promise<UpdateProfilePhotoResult> {
+  if (!firestore) {
+    return { ok: false, error: 'not-configured', message: 'Firestore is not available.' };
+  }
+  const db = firestore;
+
+  const userRef = doc(db, USERS_COLLECTION, uid);
+  const publicProfileRef = doc(db, PUBLIC_PROFILES_COLLECTION, uid);
+
+  try {
+    await runTransaction(db, async (transaction) => {
+      const userSnapshot = await transaction.get(userRef);
+      if (!userSnapshot.exists()) {
+        throw new UpdateProfilePhotoTransactionError();
+      }
+      const update = { photoURL, updatedAt: serverTimestamp() };
+      transaction.update(userRef, update);
+      transaction.update(publicProfileRef, update);
+    });
+  } catch (error) {
+    if (error instanceof UpdateProfilePhotoTransactionError) {
+      return { ok: false, error: 'no-profile', message: 'Profile not found.' };
+    }
+    return { ok: false, error: 'unknown', message: "Couldn't save your profile photo." };
+  }
+
+  const profile = await fetchUserProfile(uid);
+  if (!profile) {
+    return { ok: false, error: 'unknown', message: 'Photo was saved but could not be read back.' };
+  }
+  return { ok: true, profile };
+}
+
+export type UploadProfilePhotoHandle = { cancel: () => void };
+
+/**
+ * Uploads a locally-picked image to the deterministic Storage object at
+ * profilePhotos/{uid}/photo (see storage.rules — unlike Reel media this
+ * path allows `update`, so re-uploading simply replaces the old photo in
+ * place). Same progress/cancel shape as uploadReelThumbnail in
+ * src/services/reels.ts. Does NOT touch Firestore itself — call
+ * updateMyProfilePhoto with the resolved download URL once onComplete
+ * reports success.
+ */
+export function uploadProfilePhoto(
+  uid: string,
+  localUri: string,
+  onProgress: (percent: number) => void,
+  onComplete: (result: { ok: true; photoURL: string } | { ok: false; message: string }) => void
+): UploadProfilePhotoHandle {
+  let cancelled = false;
+  let task: UploadTask | null = null;
+
+  (async () => {
+    if (!storage) {
+      onComplete({ ok: false, message: 'Storage is not available.' });
+      return;
+    }
+
+    let blob: Blob;
+    try {
+      const response = await fetch(localUri);
+      blob = await response.blob();
+    } catch {
+      onComplete({ ok: false, message: "Couldn't read the selected photo." });
+      return;
+    }
+    if (cancelled) return;
+
+    if (blob.size > PROFILE_PHOTO_MAX_SIZE_BYTES) {
+      onComplete({ ok: false, message: 'That photo is too large. Choose one under 5 MB.' });
+      return;
+    }
+
+    const objectRef = ref(storage, `profilePhotos/${uid}/photo`);
+    task = uploadBytesResumable(objectRef, blob, { contentType: blob.type || 'image/jpeg' });
+
+    task.on(
+      'state_changed',
+      (snapshot) => {
+        const percent = snapshot.totalBytes > 0 ? Math.round((snapshot.bytesTransferred / snapshot.totalBytes) * 100) : 0;
+        onProgress(percent);
+      },
+      (error) => {
+        if (error.code === 'storage/canceled') {
+          onComplete({ ok: false, message: 'Upload cancelled.' });
+          return;
+        }
+        onComplete({ ok: false, message: "Couldn't upload your photo." });
+      },
+      async () => {
+        try {
+          const photoURL = await getDownloadURL(objectRef);
+          onComplete({ ok: true, photoURL });
+        } catch {
+          onComplete({ ok: false, message: "Uploaded, but couldn't finish saving your photo." });
+        }
+      }
+    );
+  })();
+
+  return {
+    cancel: () => {
+      cancelled = true;
+      task?.cancel();
+    },
+  };
+}
+
+export type UpdateProfileCoverPhotoResult =
+  | { ok: true; profile: UserProfile }
+  | { ok: false; error: 'not-configured' | 'no-profile' | 'unknown'; message: string };
+
+class UpdateProfileCoverPhotoTransactionError extends Error {
+  constructor() {
+    super('no-profile');
+  }
+}
+
+/**
+ * Cover/banner counterpart to updateMyProfilePhoto — exact same shape,
+ * just writing coverPhotoURL instead of photoURL. Call this only after
+ * uploadProfileCoverPhoto below has finished.
+ */
+export async function updateMyProfileCoverPhoto(uid: string, coverPhotoURL: string): Promise<UpdateProfileCoverPhotoResult> {
+  if (!firestore) {
+    return { ok: false, error: 'not-configured', message: 'Firestore is not available.' };
+  }
+  const db = firestore;
+
+  const userRef = doc(db, USERS_COLLECTION, uid);
+  const publicProfileRef = doc(db, PUBLIC_PROFILES_COLLECTION, uid);
+
+  try {
+    await runTransaction(db, async (transaction) => {
+      const userSnapshot = await transaction.get(userRef);
+      if (!userSnapshot.exists()) {
+        throw new UpdateProfileCoverPhotoTransactionError();
+      }
+      const update = { coverPhotoURL, updatedAt: serverTimestamp() };
+      transaction.update(userRef, update);
+      transaction.update(publicProfileRef, update);
+    });
+  } catch (error) {
+    if (error instanceof UpdateProfileCoverPhotoTransactionError) {
+      return { ok: false, error: 'no-profile', message: 'Profile not found.' };
+    }
+    return { ok: false, error: 'unknown', message: "Couldn't save your cover photo." };
+  }
+
+  const profile = await fetchUserProfile(uid);
+  if (!profile) {
+    return { ok: false, error: 'unknown', message: 'Cover photo was saved but could not be read back.' };
+  }
+  return { ok: true, profile };
+}
+
+export type UploadProfileCoverPhotoHandle = { cancel: () => void };
+
+/**
+ * Cover/banner counterpart to uploadProfilePhoto — exact same shape,
+ * uploading to profileCovers/{uid}/photo instead (see storage.rules, same
+ * create-or-update-in-place path), just with the larger
+ * PROFILE_COVER_PHOTO_MAX_SIZE_BYTES cap.
+ */
+export function uploadProfileCoverPhoto(
+  uid: string,
+  localUri: string,
+  onProgress: (percent: number) => void,
+  onComplete: (result: { ok: true; coverPhotoURL: string } | { ok: false; message: string }) => void
+): UploadProfileCoverPhotoHandle {
+  let cancelled = false;
+  let task: UploadTask | null = null;
+
+  (async () => {
+    if (!storage) {
+      onComplete({ ok: false, message: 'Storage is not available.' });
+      return;
+    }
+
+    let blob: Blob;
+    try {
+      const response = await fetch(localUri);
+      blob = await response.blob();
+    } catch {
+      onComplete({ ok: false, message: "Couldn't read the selected photo." });
+      return;
+    }
+    if (cancelled) return;
+
+    if (blob.size > PROFILE_COVER_PHOTO_MAX_SIZE_BYTES) {
+      onComplete({ ok: false, message: 'That photo is too large. Choose one under 8 MB.' });
+      return;
+    }
+
+    const objectRef = ref(storage, `profileCovers/${uid}/photo`);
+    task = uploadBytesResumable(objectRef, blob, { contentType: blob.type || 'image/jpeg' });
+
+    task.on(
+      'state_changed',
+      (snapshot) => {
+        const percent = snapshot.totalBytes > 0 ? Math.round((snapshot.bytesTransferred / snapshot.totalBytes) * 100) : 0;
+        onProgress(percent);
+      },
+      (error) => {
+        if (error.code === 'storage/canceled') {
+          onComplete({ ok: false, message: 'Upload cancelled.' });
+          return;
+        }
+        onComplete({ ok: false, message: "Couldn't upload your cover photo." });
+      },
+      async () => {
+        try {
+          const coverPhotoURL = await getDownloadURL(objectRef);
+          onComplete({ ok: true, coverPhotoURL });
+        } catch {
+          onComplete({ ok: false, message: "Uploaded, but couldn't finish saving your cover photo." });
+        }
+      }
+    );
+  })();
+
+  return {
+    cancel: () => {
+      cancelled = true;
+      task?.cancel();
+    },
+  };
 }

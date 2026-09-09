@@ -188,6 +188,9 @@ export default function ProfileScreen() {
                 username={profile?.username ?? ''}
                 cityLabel={cityLabel}
                 bio={profile?.bio}
+                photoURL={profile?.photoURL}
+                coverPhotoURL={profile?.coverPhotoURL}
+                coverEdgeInset={Spacing.lg}
                 postsCount={postsCount}
                 followersCount={followerCount}
                 followingCount={followingCount}
@@ -338,10 +341,16 @@ const styles = StyleSheet.create({
   tabsSection: {
     gap: Spacing.md,
   },
+  // flex-start + an explicit columnGap, not space-between — with
+  // space-between, any row that isn't completely full (the very last row
+  // almost always, and this screen's only 1-2 total Posts case entirely)
+  // stretches its few items across the full row width with a big gap in
+  // the middle instead of packing them from the left like a real grid.
   postsGrid: {
     flexDirection: 'row',
     flexWrap: 'wrap',
-    justifyContent: 'space-between',
+    justifyContent: 'flex-start',
+    columnGap: Spacing.sm,
     rowGap: Spacing.sm,
   },
   fullRow: {

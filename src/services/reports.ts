@@ -10,6 +10,7 @@ import { doc, getDoc, serverTimestamp, setDoc, type WithFieldValue } from 'fireb
 import { fetchContentById } from '@/services/content';
 import { firestore } from '@/services/firestore';
 import { fetchPublicProfile } from '@/services/publicProfile';
+import { fetchReelComment } from '@/services/reelEngagement';
 import { fetchReel } from '@/services/reels';
 import { REPORT_DETAILS_MAX_LENGTH, type Report, type ReportReason } from '@/types/report';
 import type { Message } from '@/types/message';
@@ -31,6 +32,9 @@ function messageReportId(reporterUid: string, messageId: string): string {
 }
 function reelReportId(reporterUid: string, reelId: string): string {
   return `reel_${reporterUid}_${reelId}`;
+}
+function reelCommentReportId(reporterUid: string, commentId: string): string {
+  return `reel_comment_${reporterUid}_${commentId}`;
 }
 
 function normalizeDetails(details: string | undefined): string | null {
@@ -77,6 +81,7 @@ export async function reportUser(reporterUid: string, targetUid: string, reason:
     conversationId: null,
     messageId: null,
     reelId: null,
+    commentId: null,
     reason,
     details: normalizeDetails(details),
     createdAt: serverTimestamp(),
@@ -102,6 +107,7 @@ export async function reportContent(reporterUid: string, contentId: string, reas
     conversationId: null,
     messageId: null,
     reelId: null,
+    commentId: null,
     reason,
     details: normalizeDetails(details),
     createdAt: serverTimestamp(),
@@ -127,6 +133,39 @@ export async function reportReel(reporterUid: string, reelId: string, reason: Re
     conversationId: null,
     messageId: null,
     reelId,
+    commentId: null,
+    reason,
+    details: normalizeDetails(details),
+    createdAt: serverTimestamp(),
+    ...INITIAL_MODERATION_FIELDS,
+  });
+}
+
+export async function reportReelComment(
+  reporterUid: string,
+  reelId: string,
+  commentId: string,
+  reason: ReportReason,
+  details?: string
+): Promise<ReportResult> {
+  const comment = await fetchReelComment(reelId, commentId);
+  if (!comment) {
+    return { ok: false, error: 'not-found', message: "Couldn't find that comment." };
+  }
+  if (comment.authorUid === reporterUid) {
+    return { ok: false, error: 'invalid-input', message: "You can't report your own comment." };
+  }
+  const reportId = reelCommentReportId(reporterUid, commentId);
+  return submitReport(reportId, {
+    reportId,
+    reporterUid,
+    targetType: 'reel_comment',
+    targetUid: comment.authorUid,
+    contentId: null,
+    conversationId: null,
+    messageId: null,
+    reelId,
+    commentId,
     reason,
     details: normalizeDetails(details),
     createdAt: serverTimestamp(),
@@ -160,6 +199,7 @@ export async function reportMessage(
     conversationId,
     messageId,
     reelId: null,
+    commentId: null,
     reason,
     details: normalizeDetails(details),
     createdAt: serverTimestamp(),
