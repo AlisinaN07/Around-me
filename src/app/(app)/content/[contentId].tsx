@@ -14,6 +14,7 @@ import { LoadingState, SkeletonBlock } from '@/components/LoadingState';
 import { OptionsMenu } from '@/components/OptionsMenu';
 import { PostDetail } from '@/components/PostDetail';
 import { ReportModal } from '@/components/ReportModal';
+import { SwipeBackEdge } from '@/components/SwipeBackEdge';
 import { Colors, Layout, Radius, Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
 import { deleteMyContent, fetchContentById } from '@/services/content';
@@ -271,6 +272,8 @@ type MediaDetailScreenProps = {
 function MediaDetailScreen({ content, onOptionsPress }: MediaDetailScreenProps) {
   return (
     <SafeAreaView style={styles.mediaSafeArea} edges={['top']}>
+      {/* Same handler DetailHero's own back button calls. */}
+      <SwipeBackEdge onBack={() => router.back()} />
       <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.mediaScrollContent}>
         <View style={styles.mediaPage}>
           <DetailHero

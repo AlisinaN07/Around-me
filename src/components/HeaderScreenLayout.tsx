@@ -4,6 +4,7 @@ import type { ReactNode } from 'react';
 import { KeyboardAvoidingView, Platform, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
+import { SwipeBackEdge } from '@/components/SwipeBackEdge';
 import { Colors, Layout, Spacing, Typography } from '@/constants/theme';
 
 type HeaderScreenLayoutProps = {
@@ -19,6 +20,8 @@ type HeaderScreenLayoutProps = {
 export function HeaderScreenLayout({ title, subtitle, children, headerRight }: HeaderScreenLayoutProps) {
   return (
     <SafeAreaView style={styles.safeArea} edges={['top', 'bottom']}>
+      {/* Same handler as the back button below. */}
+      <SwipeBackEdge onBack={() => router.back()} />
       <View style={styles.header}>
         <Pressable
           onPress={() => router.back()}

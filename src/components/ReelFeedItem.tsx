@@ -1,12 +1,14 @@
 import { Ionicons } from '@expo/vector-icons';
 import * as Clipboard from 'expo-clipboard';
-import { useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, Pressable, StyleSheet, Text, View } from 'react-native';
+import { router, useIsFocused } from 'expo-router';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { ActivityIndicator, Image, PanResponder, Pressable, StyleSheet, Text, View } from 'react-native';
 import { VideoView, useVideoPlayer } from 'expo-video';
 
 import { AuthorLink } from '@/components/AuthorLink';
 import { Avatar } from '@/components/Avatar';
 import { ReelCommentsSheet } from '@/components/ReelCommentsSheet';
+import { SoundSheet } from '@/components/SoundSheet';
 import { Colors, Radius, Spacing } from '@/constants/theme';
 import { INTERESTS } from '@/constants/interests';
 import { useAuth } from '@/hooks/useAuth';
@@ -15,8 +17,15 @@ import { fetchPublicProfile } from '@/services/publicProfile';
 import { fetchReelCommentCount, fetchReelLikeCount, isReelLiked, likeReel, unlikeReel } from '@/services/reelEngagement';
 import { resolveReelPlaybackUrl } from '@/services/reels';
 import { isPostSaved, savePost, unsavePost } from '@/services/saved';
+import { fetchActiveStoriesForAuthor, hasViewedStory } from '@/services/stories';
 import type { Reel } from '@/types/reel';
+import type { PublicProfile } from '@/types/social';
 import { buildReelShareUrl, shareReel } from '@/utils/reelShare';
+
+// How far (px) a horizontal drag has to travel before it counts as a
+// deliberate "swipe to profile" rather than an accidental wobble during a
+// tap or a vertical page-swipe.
+const SWIPE_TO_PROFILE_THRESHOLD = 60;
 
 type ReelFeedItemProps = {
   reel: Reel;
@@ -46,6 +55,16 @@ const CATEGORY_LABEL_BY_ID = new Map(INTERESTS.map((interest) => [interest.id, `
  */
 export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOptions, onToast }: ReelFeedItemProps) {
   const { user } = useAuth();
+  // Whether the screen THIS item lives on (Home, a single-Post route,
+  // etc.) is the one currently on top — see isSoundSheetOpen's own doc
+  // comment and the SoundSheet render below for why.
+  const isScreenFocused = useIsFocused();
+  // "FOTO" mode (see ReelMediaType's own doc comment in src/types/reel.ts)
+  // — a static image, so it skips the video player entirely below (no
+  // play/pause, no statusChange listener) while reusing the exact same
+  // storagePath-resolving effect, like/comment/save/follow/share state,
+  // and swipe gesture as a video Reel.
+  const isPhoto = reel.mediaType === 'photo';
   const [playbackUrl, setPlaybackUrl] = useState<string | null>(null);
   const [urlStatus, setUrlStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
   const [playbackFailed, setPlaybackFailed] = useState(false);
@@ -58,6 +77,14 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
   // still-full-screen item — never a navigation away from it (see
   // ReelCommentsSheet's own doc comment for why).
   const [isCommentsOpen, setIsCommentsOpen] = useState(false);
+  // The "whose sound is this" bottom sheet (src/components/SoundSheet.tsx)
+  // — same still-playing, no-navigation-away pattern as comments above.
+  // Deliberately NOT reset when this screen loses focus (tapping a post
+  // inside the sheet's own grid pushes the reel detail screen on top) —
+  // see isScreenFocused below, which is what actually hides the Modal
+  // while away, so navigating back here reveals this exact sheet again
+  // rather than a plain feed with no memory it was ever open.
+  const [isSoundSheetOpen, setIsSoundSheetOpen] = useState(false);
 
   // Save has no meaning on the author's own Reel (same as the retired
   // Save option never appearing in the own-Reel options menu) — see the
@@ -185,7 +212,80 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
     };
   }, [reel.authorUid]);
 
-  const player = useVideoPlayer(playbackUrl, (p) => {
+  // Same Story ring as FollowingAvatarRow (src/app/(app)/(tabs)/inbox.tsx)
+  // — accent while any of the author's active Stories is still unwatched,
+  // gray once you've seen all of them, absent entirely if they have none.
+  // fetchActiveStoriesForAuthor already enforces the real followers-only
+  // visibility (src/types/story.ts) — it comes back empty, not an error,
+  // for an author whose Stories you can't see, so this never needs its
+  // own separate "do I follow them" check. Same "accepted, low-cost
+  // per-mount re-read" reasoning as authorPhotoURL/Follow-state above.
+  const [hasActiveStory, setHasActiveStory] = useState(false);
+  const [isStoryUnseen, setIsStoryUnseen] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!user) {
+      // Resets fresh whenever there's no signed-in viewer to check
+      // against — same prop-driven-reset pattern as ReportModal.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setHasActiveStory(false);
+      setIsStoryUnseen(false);
+      return;
+    }
+    fetchActiveStoriesForAuthor(reel.authorUid).then(async (stories) => {
+      if (cancelled) return;
+      if (stories.length === 0) {
+        setHasActiveStory(false);
+        setIsStoryUnseen(false);
+        return;
+      }
+      setHasActiveStory(true);
+      let unseen = false;
+      for (const story of stories) {
+        const seen = await hasViewedStory(story.storyId, user.uid);
+        if (!seen) {
+          unseen = true;
+          break;
+        }
+      }
+      if (!cancelled) setIsStoryUnseen(unseen);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [reel.authorUid, user]);
+
+  // "Whose sound is this" avatar (see this component's own doc comment
+  // above and Reel.musicHash's own doc comment in src/types/reel.ts) —
+  // only ever fetched for a Reel with picked device music AND a real
+  // resolved origin (soundOriginAuthorUid is '' on a Reel with no music,
+  // or a legacy Reel predating this feature — see normalizeReel in
+  // reels.ts). A Reel with NO picked music needs no fetch at all: its own
+  // author (authorPhotoURL, already fetched above) is who gets shown.
+  const [soundOriginProfile, setSoundOriginProfile] = useState<PublicProfile | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (reel.musicSourceType !== 'device' || !reel.soundOriginAuthorUid) {
+      // Resets fresh whenever this Reel has no attributable sound to
+      // look up — same prop-driven-reset pattern as ReportModal.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setSoundOriginProfile(null);
+      return;
+    }
+    fetchPublicProfile(reel.soundOriginAuthorUid).then((profile) => {
+      if (!cancelled) setSoundOriginProfile(profile);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [reel.musicSourceType, reel.soundOriginAuthorUid]);
+
+  // Never given a real source for a photo Reel — there is nothing to
+  // decode or play, and handing a still-image URL to expo-video would just
+  // surface as a spurious playback error.
+  const player = useVideoPlayer(isPhoto ? null : playbackUrl, (p) => {
     p.loop = true;
     // Sound is always on — no mute control, no muted-by-default (owner
     // decision). Note: this can make unattended web autoplay unreliable
@@ -196,21 +296,23 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
   });
 
   useEffect(() => {
+    if (isPhoto) return;
     const subscription = player.addListener('statusChange', ({ status: playerStatus }) => {
       if (playerStatus === 'error') {
         setPlaybackFailed(true);
       }
     });
     return () => subscription.remove();
-  }, [player]);
+  }, [player, isPhoto]);
 
   useEffect(() => {
+    if (isPhoto) return;
     if (isActive && urlStatus === 'ready' && !playbackFailed) {
       player.play();
     } else {
       player.pause();
     }
-  }, [isActive, urlStatus, playbackFailed, player]);
+  }, [isActive, urlStatus, playbackFailed, player, isPhoto]);
 
   const handleRetryPlayback = () => {
     setPlaybackUrl(null);
@@ -303,16 +405,47 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
 
   const categoryLabel = CATEGORY_LABEL_BY_ID.get(reel.categoryId);
 
+  // Swipe left anywhere on the reel to jump to its author's profile — the
+  // same "swipe to the person" gesture short-video apps generally offer,
+  // in addition to the existing tap-the-avatar-or-name (AuthorLink) route.
+  // Works on your own Reel too — /user/[uid] already renders correctly for
+  // your own uid (an "This is you" badge, Edit profile instead of Follow/
+  // Message), so there's no need to special-case it out. Only claims the
+  // gesture once the drag is clearly horizontal, LEFTWARD, and past
+  // SWIPE_TO_PROFILE_THRESHOLD — a rightward drag is deliberately left
+  // unclaimed here (screens with their own back button use SwipeBackEdge
+  // for that direction instead, from a dedicated left-edge hot zone rather
+  // than "anywhere"; see reels.tsx and reel/[reelId].tsx), and a vertical
+  // drag or a plain tap with no real movement falls through untouched to
+  // the feed's own vertical paging and to the action buttons/AuthorLink
+  // Pressables.
+  const swipeResponder = useMemo(
+    () =>
+      PanResponder.create({
+        onMoveShouldSetPanResponder: (_event, gesture) => gesture.dx < -20 && Math.abs(gesture.dx) > Math.abs(gesture.dy) * 1.5,
+        onPanResponderRelease: (_event, gesture) => {
+          if (gesture.dx <= -SWIPE_TO_PROFILE_THRESHOLD) {
+            router.push(`/user/${reel.authorUid}`);
+          }
+        },
+      }),
+    [reel.authorUid]
+  );
+
   return (
-    <View style={[styles.page, { height }]}>
+    <View style={[styles.page, { height }]} {...swipeResponder.panHandlers}>
       {urlStatus === 'ready' && playbackUrl && !playbackFailed ? (
-        <VideoView
-          style={StyleSheet.absoluteFill}
-          player={player}
-          contentFit="cover"
-          nativeControls={false}
-          allowsPictureInPicture={false}
-        />
+        isPhoto ? (
+          <Image source={{ uri: playbackUrl }} style={StyleSheet.absoluteFill} resizeMode="cover" />
+        ) : (
+          <VideoView
+            style={StyleSheet.absoluteFill}
+            player={player}
+            contentFit="cover"
+            nativeControls={false}
+            allowsPictureInPicture={false}
+          />
+        )
       ) : (
         <View style={[StyleSheet.absoluteFill, styles.mediaFallback]}>
           {urlStatus === 'loading' || urlStatus === 'idle' ? (
@@ -333,9 +466,26 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
 
       <View style={styles.actionRail}>
         <View style={styles.actionAvatarWrap}>
-          <AuthorLink uid={reel.authorUid} style={styles.actionAvatar}>
-            <Avatar name={reel.authorDisplayName} photoURL={authorPhotoURL} size={40} />
-          </AuthorLink>
+          {hasActiveStory ? (
+            // An active Story takes over the tap here — same trade as
+            // FollowingAvatarRow's own ringed avatars (Inbox): the
+            // author's Profile is still one tap away from their name
+            // below (AuthorLink there is unaffected by any of this).
+            <Pressable
+              onPress={() => router.push(`/story/${reel.authorUid}`)}
+              style={styles.actionAvatar}
+              accessibilityRole="button"
+              accessibilityLabel={isOwnReel ? 'Your Story' : `${reel.authorDisplayName}'s Story`}
+            >
+              <View style={isStoryUnseen ? styles.avatarRing : styles.avatarRingSeen}>
+                <Avatar name={reel.authorDisplayName} photoURL={authorPhotoURL} size={40} />
+              </View>
+            </Pressable>
+          ) : (
+            <AuthorLink uid={reel.authorUid} style={styles.actionAvatar}>
+              <Avatar name={reel.authorDisplayName} photoURL={authorPhotoURL} size={40} />
+            </AuthorLink>
+          )}
           {isFollowingAuthor === false && (
             <Pressable
               onPress={handleFollow}
@@ -387,7 +537,58 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
         <Pressable onPress={onOpenOptions} style={styles.actionButton} accessibilityRole="button" accessibilityLabel="Post options">
           <Ionicons name="ellipsis-horizontal" size={27} color={Colors.text} />
         </Pressable>
+
+        {/* "Whose sound is this" — a photo has no audio at all, so this
+            never renders for one (isPhoto below). For a video: opens
+            SoundSheet either way (see this component's own doc comment
+            and Reel.musicHash's own doc comment in src/types/reel.ts) —
+            picked music with a resolved origin -> that origin account and
+            every post sharing the sound, with real Save/Use-audio; no
+            picked music -> this Reel's own author, "Original audio" —
+            SoundSheet itself resolves that into the same real
+            Save/Use-audio experience the first time anyone actually opens
+            it (see resolveOwnSoundOrigin's own doc comment in
+            functions/src/index.ts for why that's lazy, not automatic).
+            Picked music with no resolved origin yet (shouldn't normally
+            happen, but never fabricate an avatar) -> nothing rendered. */}
+        {isPhoto ? null : reel.musicSourceType === 'none' ? (
+          <Pressable
+            onPress={() => setIsSoundSheetOpen(true)}
+            style={styles.soundAvatarWrap}
+            accessibilityRole="button"
+            accessibilityLabel="Original audio"
+          >
+            <View style={styles.soundAvatar}>
+              <Avatar name={reel.authorDisplayName} photoURL={authorPhotoURL} size={32} />
+              <View style={styles.soundBadge}>
+                <Ionicons name="musical-notes" size={10} color={Colors.text} />
+              </View>
+            </View>
+          </Pressable>
+        ) : soundOriginProfile ? (
+          <Pressable
+            onPress={() => setIsSoundSheetOpen(true)}
+            style={styles.soundAvatarWrap}
+            accessibilityRole="button"
+            accessibilityLabel={`Sound by ${soundOriginProfile.displayName}`}
+          >
+            <View style={styles.soundAvatar}>
+              <Avatar name={soundOriginProfile.displayName} photoURL={soundOriginProfile.photoURL} size={32} />
+              <View style={styles.soundBadge}>
+                <Ionicons name="musical-notes" size={10} color={Colors.text} />
+              </View>
+            </View>
+          </Pressable>
+        ) : null}
       </View>
+
+      {/* isScreenFocused, not just isSoundSheetOpen alone — see
+          isSoundSheetOpen's own doc comment above: this is what actually
+          hides the Modal while a post tapped inside it is open
+          full-screen, and reveals it again on the way back. */}
+      {isPhoto ? null : (
+        <SoundSheet visible={isSoundSheetOpen && isScreenFocused} reel={reel} onClose={() => setIsSoundSheetOpen(false)} onToast={onToast} />
+      )}
 
       <View style={styles.overlay} pointerEvents="box-none">
         <AuthorLink uid={reel.authorUid} style={styles.authorRow}>
@@ -441,7 +642,7 @@ const styles = StyleSheet.create({
   actionRail: {
     position: 'absolute',
     right: Spacing.lg,
-    bottom: Spacing.xxl * 2,
+    bottom: Spacing.lg,
     alignItems: 'center',
     gap: Spacing.lg,
   },
@@ -450,6 +651,20 @@ const styles = StyleSheet.create({
   },
   actionAvatar: {
     alignItems: 'center',
+  },
+  // Same ring pair as FollowingAvatarRow (src/app/(app)/(tabs)/inbox.tsx),
+  // just sized for this rail's smaller 40px avatar.
+  avatarRing: {
+    borderWidth: 2,
+    borderColor: Colors.accent,
+    borderRadius: 22,
+    padding: 2,
+  },
+  avatarRingSeen: {
+    borderWidth: 2,
+    borderColor: Colors.textMuted,
+    borderRadius: 22,
+    padding: 2,
   },
   // Overlaps the avatar's own bottom edge — same "+" -> checkmark ->
   // disappears pattern as every other short-video app's follow-from-feed
@@ -470,6 +685,26 @@ const styles = StyleSheet.create({
   actionButton: {
     alignItems: 'center',
     gap: 4,
+  },
+  soundAvatarWrap: {
+    alignItems: 'center',
+    marginTop: Spacing.xs,
+  },
+  soundAvatar: {
+    position: 'relative',
+  },
+  soundBadge: {
+    position: 'absolute',
+    bottom: -3,
+    right: -3,
+    width: 16,
+    height: 16,
+    borderRadius: 8,
+    backgroundColor: Colors.surfaceElevated,
+    borderWidth: 1,
+    borderColor: Colors.background,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   actionCount: {
     color: Colors.text,

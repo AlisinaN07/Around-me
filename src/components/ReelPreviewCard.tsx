@@ -23,8 +23,14 @@ import { formatTimeAgo } from '@/utils/timeFormat';
  * full-row layout so a video Post can sit in the same vertical stack as a
  * legacy text Post's ContentCard, without this component needing to know
  * anything about that context.
+ *
+ * `onPress` is optional and overrides the default "open this Reel" tap —
+ * used by a saved-SOUND card (Profile's Saved tab) and SoundSheet's own
+ * grid, where the same square thumbnail needs a different action (open
+ * the Sound sheet, or nothing extra beyond SoundSheet's own wrapping
+ * Pressable) instead of navigating straight to the Reel.
  */
-export function ReelPreviewCard({ reel, style }: { reel: Reel; style?: StyleProp<ViewStyle> }) {
+export function ReelPreviewCard({ reel, style, onPress }: { reel: Reel; style?: StyleProp<ViewStyle>; onPress?: () => void }) {
   const [thumbnailUrl, setThumbnailUrl] = useState<string | null>(null);
 
   useEffect(() => {
@@ -46,7 +52,7 @@ export function ReelPreviewCard({ reel, style }: { reel: Reel; style?: StyleProp
   return (
     <Pressable
       style={[styles.card, style]}
-      onPress={() => router.push(`/reel/${reel.reelId}`)}
+      onPress={onPress ?? (() => router.push(`/reel/${reel.reelId}`))}
       accessibilityRole="button"
       accessibilityLabel="View post"
     >

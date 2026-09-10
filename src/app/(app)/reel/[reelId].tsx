@@ -6,30 +6,40 @@ import { Pressable, StyleSheet, View } from 'react-native';
 import { EmptyState } from '@/components/EmptyState';
 import { ReelFeed } from '@/components/ReelFeed';
 import { Colors } from '@/constants/theme';
-import { fetchProfileReels, fetchReel } from '@/services/reels';
+import { fetchProfileReels, fetchReel, fetchReelsByMusicHash } from '@/services/reels';
 import type { Reel } from '@/types/reel';
 
 type LoadStatus = 'loading' | 'loaded' | 'error';
 
 /**
  * Single-Post detail route — reached from the Profile grid, share links,
- * and search. Renders through the exact same ReelFeed/ReelFeedItem the
- * Home feed uses, so a Post opened from anywhere looks and behaves
- * identically to Home: full-screen video, the same action rail (Like/
- * Comment/Save/Share/Options, the "+" follow badge), and the same
- * ReelCommentsSheet — never the separate compact "shrunk video + comments
- * listed below" layout this screen used before.
+ * search, and SoundSheet's own grid. Renders through the exact same
+ * ReelFeed/ReelFeedItem the Home feed uses, so a Post opened from anywhere
+ * looks and behaves identically to Home: full-screen video, the same
+ * action rail (Like/Comment/Save/Share/Options, the "+" follow badge), and
+ * the same ReelCommentsSheet — never the separate compact "shrunk video +
+ * comments listed below" layout this screen used before.
  *
- * Not just the one tapped Reel, either — the whole feed here is that
- * Reel's author's own Post list (fetchProfileReels, the same query the
- * Profile grid itself is built from), positioned to open exactly on the
- * one that was tapped, so swiping up/down moves through the rest of that
- * author's Posts — own profile or someone else's, same behavior either
- * way. Only the header differs (a plain back button here, vs. Home's
- * city/mode header), via ReelFeed's own topOverlay slot.
+ * Not just the one tapped Reel, either — swiping up/down moves through a
+ * whole list the tapped Reel belongs to, positioned to open exactly on
+ * it. Which list depends on how this screen was reached:
+ *  - Normally (Profile grid, share links, search): that Reel's author's
+ *    own Post list (fetchProfileReels, the same query the Profile grid
+ *    itself is built from) — swiping moves through the rest of that
+ *    author's Posts.
+ *  - From SoundSheet's grid (`musicHash` present in the URL): every
+ *    currently-published Reel sharing that exact sound
+ *    (fetchReelsByMusicHash, the same query SoundSheet's own grid is
+ *    built from) — swiping moves through the OTHER posts using this
+ *    sound, never that author's unrelated posts. With only one post using
+ *    a sound (SoundSheet showed a single tile), that list has exactly one
+ *    entry, so swiping here correctly shows nothing more — not the
+ *    author's other, unrelated Posts.
+ * Only the header differs (a plain back button here, vs. Home's city/mode
+ * header), via ReelFeed's own topOverlay slot.
  */
 export default function ReelDetailScreen() {
-  const { reelId } = useLocalSearchParams<{ reelId: string }>();
+  const { reelId, musicHash } = useLocalSearchParams<{ reelId: string; musicHash?: string }>();
   const [status, setStatus] = useState<LoadStatus>('loading');
   const [reels, setReels] = useState<Reel[]>([]);
   const [initialIndex, setInitialIndex] = useState(0);
@@ -43,24 +53,25 @@ export default function ReelDetailScreen() {
         setStatus('error');
         return;
       }
-      const profileReels = await fetchProfileReels(target.authorUid);
-      const index = profileReels.findIndex((candidate) => candidate.reelId === reelId);
+      const siblingReels = musicHash ? await fetchReelsByMusicHash(musicHash) : await fetchProfileReels(target.authorUid);
+      const index = siblingReels.findIndex((candidate) => candidate.reelId === reelId);
       if (index === -1) {
-        // Defensive only — same author, same published status, so this
-        // shouldn't normally happen (the tapped Reel just fell outside
-        // fetchProfileReels' own bounded cap). Still show the Reel that
-        // was actually tapped rather than silently landing somewhere else.
-        setReels([target, ...profileReels]);
+        // Defensive only — same sound/author, same published status, so
+        // this shouldn't normally happen (the tapped Reel just fell
+        // outside the sibling query's own bounded cap). Still show the
+        // Reel that was actually tapped rather than silently landing
+        // somewhere else.
+        setReels([target, ...siblingReels]);
         setInitialIndex(0);
       } else {
-        setReels(profileReels);
+        setReels(siblingReels);
         setInitialIndex(index);
       }
       setStatus('loaded');
     } catch {
       setStatus('error');
     }
-  }, [reelId]);
+  }, [reelId, musicHash]);
 
   useFocusEffect(
     useCallback(() => {
@@ -93,6 +104,7 @@ export default function ReelDetailScreen() {
       onReload={load}
       onReelDeleted={handleReelDeleted}
       initialIndex={initialIndex}
+      onSwipeBack={() => router.back()}
       topOverlay={
         <View style={styles.backRow}>
           <Pressable onPress={() => router.back()} hitSlop={8} style={styles.backButton} accessibilityRole="button" accessibilityLabel="Back">

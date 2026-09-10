@@ -26,6 +26,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { Button } from '@/components/Button';
 import { FormField } from '@/components/FormField';
+import { SwipeBackEdge } from '@/components/SwipeBackEdge';
 import { Colors, Spacing, Typography } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
 import { useProfile } from '@/hooks/useProfile';
@@ -305,6 +306,8 @@ function Bullet({ text }: { text: string }) {
 function Screen({ canGoBack, children }: { canGoBack: boolean; children: ReactNode }) {
   return (
     <SafeAreaView style={styles.safeArea} edges={['top', 'bottom']}>
+      {/* Same handler Header's own back button calls, only when it's actually shown. */}
+      {canGoBack ? <SwipeBackEdge onBack={() => router.back()} /> : null}
       <Header canGoBack={canGoBack} />
       <KeyboardAvoidingView style={styles.flex} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
         <ScrollView contentContainerStyle={styles.scrollContent} keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>

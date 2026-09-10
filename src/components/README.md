@@ -13,3 +13,4 @@ Reusable UI components shared across screens.
 - `ContentCard.tsx` — Post/Activity/Event card for the Around/Following/profile/place feeds.
 - `EventCard.tsx` — compact Activity/Event discovery card (Happening Now/Today/Upcoming rails, `/events`) with a NOW/Today/Tonight badge and tappable Place link.
 - `ReelPreviewCard.tsx` — Reel grid thumbnail (profile Reels tab).
+- `SwipeBackEdge.tsx` — invisible left-edge strip that turns a rightward swipe there into the same action as tapping the screen's own back chevron.

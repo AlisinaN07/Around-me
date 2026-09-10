@@ -57,6 +57,7 @@ export default function ReelsScreen() {
       status={status}
       errorTitle={`Couldn't load posts in ${cityLabel}`}
       onReload={load}
+      onSwipeBack={() => router.back()}
       topOverlay={
         <View style={styles.backRow}>
           <Pressable onPress={() => router.back()} hitSlop={8} style={styles.backButton} accessibilityRole="button" accessibilityLabel="Back">

@@ -8,10 +8,10 @@
  * Firestore directly for Saved relationships.
  */
 
-import { collection, deleteDoc, doc, getDoc, getDocs, limit, orderBy, query, serverTimestamp, setDoc, type WithFieldValue } from 'firebase/firestore';
+import { collection, deleteDoc, doc, getDoc, getDocs, limit, orderBy, query, serverTimestamp, setDoc, where, type WithFieldValue } from 'firebase/firestore';
 
 import { fetchContentById } from '@/services/content';
-import { fetchReel } from '@/services/reels';
+import { fetchReel, fetchReelsByMusicHash } from '@/services/reels';
 import type { PostContent } from '@/types/content';
 import type { Reel } from '@/types/reel';
 import type { SavedPost, SavedTargetType } from '@/types/saved';
@@ -73,7 +73,18 @@ export async function isPostSaved(uid: string, targetType: SavedTargetType, targ
  */
 export type SavedPostItem =
   | { kind: 'reel'; savedId: string; reel: Reel }
-  | { kind: 'text'; savedId: string; content: PostContent };
+  | { kind: 'text'; savedId: string; content: PostContent }
+  /**
+   * A saved SOUND (see SavedTargetType's own doc comment in
+   * src/types/saved.ts) — `originReel` is the real, currently-published
+   * origin Reel for that exact sound, always resolved fresh here (never
+   * the stale reel that happened to be playing when it was saved), used
+   * purely as a display surrogate (its author's avatar/name, its own
+   * thumbnail) since there is no separate "sound" document to show.
+   * `postCount` is how many currently-published Reels share this exact
+   * sound right now.
+   */
+  | { kind: 'sound'; savedId: string; musicHash: string; originReel: Reel; postCount: number };
 
 /**
  * A bounded page of the caller's own Saved Posts, newest-saved-first, with
@@ -100,6 +111,14 @@ export async function fetchSavedPosts(uid: string, limitCount = DEFAULT_SAVED_LI
         if (!reel || reel.status !== 'published') return null;
         return { kind: 'reel' as const, savedId: id, reel };
       }
+      if (data.targetType === 'sound') {
+        // targetId is a musicHash here, not a reelId — see
+        // SavedTargetType's own doc comment in src/types/saved.ts.
+        const soundReels = await fetchReelsByMusicHash(data.targetId);
+        const originReel = soundReels[0];
+        if (!originReel) return null;
+        return { kind: 'sound' as const, savedId: id, musicHash: data.targetId, originReel, postCount: soundReels.length };
+      }
       const content = await fetchContentById(data.targetId);
       if (!content || content.type !== 'post' || content.status !== 'published') return null;
       return { kind: 'text' as const, savedId: id, content };
@@ -107,4 +126,37 @@ export async function fetchSavedPosts(uid: string, limitCount = DEFAULT_SAVED_LI
   );
 
   return resolved.filter((item): item is SavedPostItem => item !== null);
+}
+
+/**
+ * One saved SOUND, scoped to exactly that (no unrelated saved Reels/Posts
+ * ever fetched) — the "Favorites" tab of the music picker
+ * (src/app/(app)/create/reel/music.tsx), which only ever needs sounds,
+ * never a full mixed Saved list. Same resolution/skip-if-gone reasoning
+ * as fetchSavedPosts' own 'sound' branch.
+ */
+export type SavedSound = { savedId: string; musicHash: string; originReel: Reel };
+
+export async function fetchSavedSounds(uid: string, limitCount = DEFAULT_SAVED_LIMIT): Promise<SavedSound[]> {
+  if (!firestore) return [];
+
+  const savedQuery = query(
+    collection(firestore, 'users', uid, SAVED_SUBCOLLECTION),
+    where('targetType', '==', 'sound'),
+    orderBy('savedAt', 'desc'),
+    limit(limitCount)
+  );
+  const snapshot = await getDocs(savedQuery);
+  const savedDocs = snapshot.docs.map((docSnapshot) => ({ id: docSnapshot.id, data: docSnapshot.data() as SavedPost }));
+
+  const resolved = await Promise.all(
+    savedDocs.map(async ({ id, data }) => {
+      const soundReels = await fetchReelsByMusicHash(data.targetId);
+      const originReel = soundReels[0];
+      if (!originReel) return null;
+      return { savedId: id, musicHash: data.targetId, originReel };
+    })
+  );
+
+  return resolved.filter((item): item is SavedSound => item !== null);
 }

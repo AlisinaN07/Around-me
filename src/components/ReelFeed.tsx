@@ -10,6 +10,7 @@ import { ErrorState } from '@/components/ErrorState';
 import { OptionsMenu, type OptionsMenuOption } from '@/components/OptionsMenu';
 import { ReelFeedItem } from '@/components/ReelFeedItem';
 import { ReportModal } from '@/components/ReportModal';
+import { SwipeBackEdge } from '@/components/SwipeBackEdge';
 import { Colors, Radius, Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
 import { blockUser } from '@/services/blocks';
@@ -52,6 +53,14 @@ type ReelFeedProps = {
    * as when this prop isn't provided at all.
    */
   initialIndex?: number;
+  /**
+   * Same handler `topOverlay`'s own back button calls (usually
+   * `() => router.back()`) — when provided, a rightward swipe from the left
+   * edge does the same thing (see SwipeBackEdge). Home doesn't pass this
+   * (it has no back button — it's a root tab), so the gesture simply
+   * doesn't exist there; `/reels` and the single-Reel detail view both do.
+   */
+  onSwipeBack?: () => void;
 };
 
 /**
@@ -62,7 +71,7 @@ type ReelFeedProps = {
  * scope) and pass the resulting `reels`/`status`; everything about
  * rendering and interacting with them lives here.
  */
-export function ReelFeed({ reels, status, errorTitle, emptyState, onReload, topOverlay, onReelDeleted, initialIndex }: ReelFeedProps) {
+export function ReelFeed({ reels, status, errorTitle, emptyState, onReload, topOverlay, onReelDeleted, initialIndex, onSwipeBack }: ReelFeedProps) {
   const { user } = useAuth();
   const [containerHeight, setContainerHeight] = useState(0);
   const [activeIndex, setActiveIndex] = useState(initialIndex ?? 0);
@@ -225,6 +234,10 @@ export function ReelFeed({ reels, status, errorTitle, emptyState, onReload, topO
 
   return (
     <SafeAreaView style={styles.safeArea} edges={['top']}>
+      {/* Same handler topOverlay's own back button calls, when provided
+          (Home doesn't pass onSwipeBack, so this simply isn't rendered
+          there). */}
+      {onSwipeBack ? <SwipeBackEdge onBack={onSwipeBack} /> : null}
       <View
         style={styles.content}
         onLayout={(event) => {

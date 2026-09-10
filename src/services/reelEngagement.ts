@@ -34,7 +34,7 @@ import { resolveTrustedFields, type EngagementError, type EngagementResult } fro
 import { firestore } from './firestore';
 import { buildNotificationId, notificationRef } from './notifications';
 import { postLikeRef } from './postLikes';
-import { reelRef } from './reels';
+import { normalizeReel, reelRef } from './reels';
 
 const REELS_COLLECTION = 'reels';
 const DEFAULT_REEL_COMMENT_LIMIT = 30;
@@ -75,7 +75,7 @@ async function assertPublishedReel(reelId: string): Promise<AssertPublishedReelR
   if (!snapshot.exists() || snapshot.data().status !== 'published') {
     return { ok: false, error: 'not-found', message: "Couldn't find that post." };
   }
-  return { ok: true, reel: snapshot.data() as Reel };
+  return { ok: true, reel: normalizeReel(snapshot.data() as Reel) };
 }
 
 // ---------------------------------------------------------------------------

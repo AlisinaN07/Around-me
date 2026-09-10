@@ -1,7 +1,7 @@
 import { Ionicons } from '@expo/vector-icons';
-import { router, useFocusEffect } from 'expo-router';
-import { useCallback, useMemo, useState } from 'react';
-import { Pressable, ScrollView, StyleSheet, View } from 'react-native';
+import { router, useFocusEffect, useIsFocused } from 'expo-router';
+import { useCallback, useMemo, useRef, useState } from 'react';
+import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { Button } from '@/components/Button';
@@ -14,7 +14,8 @@ import { LoadingState } from '@/components/LoadingState';
 import { ProfileHeader } from '@/components/ProfileHeader';
 import { ProfileTabBar } from '@/components/ProfileTabBar';
 import { ReelPreviewCard } from '@/components/ReelPreviewCard';
-import { Colors, Layout, Spacing } from '@/constants/theme';
+import { SoundSheet } from '@/components/SoundSheet';
+import { Colors, Layout, Radius, Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
 import { useProfile } from '@/hooks/useProfile';
 import type { Content, EventContent, PostContent } from '@/types/content';
@@ -85,6 +86,9 @@ const EMPTY_TEXT: Record<ProfileTab, string> = {
  */
 export default function ProfileScreen() {
   const { user } = useAuth();
+  // Whether THIS screen is the one currently on top — see
+  // soundSheetReel's own doc comment and the SoundSheet render below.
+  const isScreenFocused = useIsFocused();
   const { profile } = useProfile();
 
   const [status, setStatus] = useState<LoadStatus>('loading');
@@ -99,6 +103,21 @@ export default function ProfileScreen() {
   const [repostedPosts, setRepostedPosts] = useState<RepostedPostItem[]>([]);
   const [activities, setActivities] = useState<ProfileActivity[]>([]);
   const [savedPosts, setSavedPosts] = useState<SavedPostItem[]>([]);
+  // The sound sheet, opened from a saved 'sound' card below — SoundSheet
+  // takes a real Reel (see its own doc comment); a saved sound's
+  // originReel already carries a real musicHash/soundOriginAuthorUid.
+  // Deliberately NOT reset when this screen loses focus (tapping a post
+  // inside the sheet's own grid pushes the reel detail screen on top) —
+  // isScreenFocused above is what actually hides the Modal while away,
+  // so navigating back here reveals this exact sheet again.
+  const [soundSheetReel, setSoundSheetReel] = useState<Reel | null>(null);
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showToast = useCallback((message: string) => {
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    setToastMessage(message);
+    toastTimerRef.current = setTimeout(() => setToastMessage(null), 2500);
+  }, []);
   const [activeTab, setActiveTab] = useState<ProfileTab>('post');
 
   const load = useCallback(async () => {
@@ -164,6 +183,7 @@ export default function ProfileScreen() {
       // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [user?.uid])
   );
+
 
   const cityLabel = profile?.cityName ? formatCityDisplayName(profile.cityName) : '';
   const tabs = isBusinessAccount(profile) ? PROFILE_TABS_BUSINESS : PROFILE_TABS_PERSONAL;
@@ -290,6 +310,18 @@ export default function ProfileScreen() {
                     {savedPosts.map((item) =>
                       item.kind === 'reel' ? (
                         <ReelPreviewCard key={`saved-reel-${item.savedId}`} reel={item.reel} />
+                      ) : item.kind === 'sound' ? (
+                        <View key={`saved-sound-${item.savedId}`} style={styles.soundCard}>
+                          <ReelPreviewCard
+                            reel={item.originReel}
+                            onPress={() => setSoundSheetReel(item.originReel)}
+                            style={styles.soundCardThumbnail}
+                          />
+                          <View style={styles.soundCardBadge} pointerEvents="none">
+                            <Ionicons name="musical-notes" size={12} color={Colors.text} />
+                            <Text style={styles.soundCardBadgeText}>{item.postCount}</Text>
+                          </View>
+                        </View>
                       ) : (
                         <View key={`saved-text-${item.savedId}`} style={styles.fullRow}>
                           <ContentCard item={item.content} currentUid={user?.uid ?? null} />
@@ -303,6 +335,20 @@ export default function ProfileScreen() {
           )}
         </View>
       </ScrollView>
+
+      {soundSheetReel ? (
+        // isScreenFocused, not just soundSheetReel alone — see its own
+        // doc comment: this is what hides the Modal while a post tapped
+        // inside it is open full-screen, and reveals it again on the way
+        // back rather than requiring soundSheetReel to be re-set.
+        <SoundSheet visible={isScreenFocused} reel={soundSheetReel} onClose={() => setSoundSheetReel(null)} onToast={showToast} />
+      ) : null}
+
+      {toastMessage ? (
+        <View style={styles.toast} pointerEvents="none">
+          <Text style={styles.toastText}>{toastMessage}</Text>
+        </View>
+      ) : null}
     </SafeAreaView>
   );
 }
@@ -355,6 +401,48 @@ const styles = StyleSheet.create({
   },
   fullRow: {
     width: '100%',
+  },
+  soundCard: {
+    width: '31%',
+    aspectRatio: 9 / 16,
+    position: 'relative',
+  },
+  // Overrides ReelPreviewCard's own default 31%-of-parent width — here its
+  // parent is soundCard above, which already carries the real 31% (of the
+  // grid), so the card itself just fills that wrapper completely.
+  soundCardThumbnail: {
+    width: '100%',
+  },
+  soundCardBadge: {
+    position: 'absolute',
+    bottom: Spacing.xs,
+    right: Spacing.xs,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 3,
+    backgroundColor: 'rgba(11, 11, 15, 0.7)',
+    borderRadius: Radius.full,
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+  },
+  soundCardBadgeText: {
+    color: Colors.text,
+    fontSize: 10,
+    fontWeight: '700',
+  },
+  toast: {
+    position: 'absolute',
+    bottom: Spacing.xxl,
+    alignSelf: 'center',
+    backgroundColor: 'rgba(11, 11, 15, 0.9)',
+    borderRadius: Radius.full,
+    paddingHorizontal: Spacing.md,
+    paddingVertical: Spacing.sm,
+  },
+  toastText: {
+    color: Colors.text,
+    fontSize: 13,
+    fontWeight: '600',
   },
   contentList: {
     gap: Spacing.md,
