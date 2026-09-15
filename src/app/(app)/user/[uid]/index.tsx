@@ -20,7 +20,7 @@ import { ReportModal } from '@/components/ReportModal';
 import { Colors, Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
 import { blockUser, isUserBlocked, unblockUser } from '@/services/blocks';
-import { fetchProfilePostCount, fetchPublicUserContent } from '@/services/content';
+import { fetchProfileEventCount, fetchProfilePostCount, fetchPublicUserContent } from '@/services/content';
 import { fetchFollowerCount, fetchFollowingCount, followUser, isFollowing, unfollowUser } from '@/services/following';
 import { fetchConversation, getConversationId } from '@/services/messages';
 import { fetchMyNewMessagesFrom } from '@/services/privacySettings';
@@ -34,6 +34,7 @@ import type { Reel } from '@/types/reel';
 import type { PublicProfile } from '@/types/social';
 import { isBusinessAccount } from '@/utils/accountCapabilities';
 import { formatCityDisplayName } from '@/utils/cityDisplay';
+import { isHappeningNow } from '@/utils/dateWindows';
 import { mergeProfilePosts } from '@/utils/profilePosts';
 
 type LoadStatus = 'loading' | 'loaded' | 'error';
@@ -42,9 +43,11 @@ type LoadStatus = 'loading' | 'loaded' | 'error';
 // per-technical-type selector, just Posts vs. 'repost' (Step 41.2F, PUBLIC)
 // vs. 'activity' (Step 41.2G, PUBLIC — Events this profile owner marked
 // Interested/Going, NOT the retired legacy content.type=='activity') vs.
-// (Business-only) Events. Saved (Step 41.2E) is PRIVATE and never appears
-// on this public profile route. Tab order is locked: Posts, Reposts,
-// (Events), Activities.
+// Events. Saved (Step 41.2E) is PRIVATE and never appears on this public
+// profile route. Tab order for a Personal account is locked: Posts,
+// Reposts, Activities. A Business account shows no tab bar at all — see
+// effectiveTab below — its Profile is Events-only, same as viewing your
+// own Business Profile (src/app/(app)/(tabs)/profile.tsx).
 type ProfileTab = 'post' | 'repost' | 'event' | 'activity';
 
 const PROFILE_TABS_PERSONAL: { id: ProfileTab; label: string }[] = [
@@ -52,12 +55,20 @@ const PROFILE_TABS_PERSONAL: { id: ProfileTab; label: string }[] = [
   { id: 'repost', label: 'Reposts' },
   { id: 'activity', label: 'Activities' },
 ];
-const PROFILE_TABS_BUSINESS: { id: ProfileTab; label: string }[] = [
-  { id: 'post', label: 'Posts' },
-  { id: 'repost', label: 'Reposts' },
-  { id: 'event', label: 'Events' },
-  { id: 'activity', label: 'Activities' },
+
+// Same Live/Upcoming/Past split as own-Profile
+// (src/app/(app)/(tabs)/profile.tsx) — see that file's own doc comment.
+type EventStatusTab = 'live' | 'upcoming' | 'past';
+const EVENT_STATUS_TABS: { id: EventStatusTab; label: string }[] = [
+  { id: 'live', label: 'Live Events' },
+  { id: 'upcoming', label: 'Upcoming Events' },
+  { id: 'past', label: 'Past Events' },
 ];
+const EVENT_STATUS_EMPTY_TEXT: Record<EventStatusTab, string> = {
+  live: 'No events happening right now',
+  upcoming: 'No upcoming events yet',
+  past: 'No past events yet',
+};
 
 // See src/app/(app)/(tabs)/profile.tsx's own PROFILE_CONTENT_LIMIT doc
 // comment — identical reasoning, kept as a separate local constant since
@@ -67,6 +78,8 @@ const PROFILE_CONTENT_LIMIT = 40;
 const EMPTY_TEXT: Record<ProfileTab, string> = {
   post: 'No posts yet',
   repost: 'No reposts yet',
+  // Superseded by EVENT_STATUS_EMPTY_TEXT above — see own-Profile's
+  // identical comment on its own EMPTY_TEXT.event.
   event: 'No events yet',
   activity: 'No activities yet',
 };
@@ -89,6 +102,7 @@ export default function PublicProfileScreen() {
   const [followerCount, setFollowerCount] = useState(0);
   const [followingCount, setFollowingCount] = useState(0);
   const [postsCount, setPostsCount] = useState(0);
+  const [eventsCount, setEventsCount] = useState(0);
   // Step 41.2H.4 — undefined means "not (yet) ready/available", never a
   // fake 0; see ProfileHeader's likedCount doc comment.
   const [likedCount, setLikedCount] = useState<number | undefined>(undefined);
@@ -100,6 +114,7 @@ export default function PublicProfileScreen() {
   const [repostedPosts, setRepostedPosts] = useState<RepostedPostItem[]>([]);
   const [activities, setActivities] = useState<ProfileActivity[]>([]);
   const [contentTab, setContentTab] = useState<ProfileTab>('post');
+  const [eventStatusTab, setEventStatusTab] = useState<EventStatusTab>('live');
 
   // Safety state — see src/services/blocks.ts / privacySettings.ts.
   // canMessage is only ever used to proactively enable/disable the
@@ -122,6 +137,7 @@ export default function PublicProfileScreen() {
         following,
         textPostCount,
         reelCount,
+        eventCount,
         likedResult,
         followingState,
         userContent,
@@ -133,14 +149,17 @@ export default function PublicProfileScreen() {
         fetchPublicProfile(uid),
         fetchFollowerCount(uid),
         fetchFollowingCount(uid),
-        // Two exact server-side aggregations, summed — see
-        // fetchProfilePostCount's and fetchProfileReelCount's own doc
+        // Three exact server-side aggregations — see fetchProfilePostCount's,
+        // fetchProfileReelCount's, and fetchProfileEventCount's own doc
         // comments. A failure here falls into the same catch as every
         // other profile fetch below, so a failed count is never shown as
         // a confident (wrong) 0 — the whole screen shows its error state
-        // instead, same as an own-profile load failure.
+        // instead, same as an own-profile load failure. eventCount is
+        // fetched unconditionally (a Personal profile just never displays
+        // it), same as every other stat here.
         fetchProfilePostCount(uid),
         fetchProfileReelCount(uid),
+        fetchProfileEventCount(uid),
         // Step 41.2H.4 — the ONE stat allowed to be simply absent for a
         // given load; fetchLifetimeLikedCount never throws (see its own
         // doc comment), same reasoning as the own-Profile screen.
@@ -173,6 +192,7 @@ export default function PublicProfileScreen() {
       setFollowerCount(followers);
       setFollowingCount(following);
       setPostsCount(textPostCount + reelCount);
+      setEventsCount(eventCount);
       setLikedCount(likedResult.ready ? likedResult.likedCount : undefined);
       setAmFollowing(followingState);
       setContent(userContent);
@@ -251,9 +271,22 @@ export default function PublicProfileScreen() {
   };
 
   const cityLabel = profile?.cityName ? formatCityDisplayName(profile.cityName) : '';
-  const tabs = isBusinessAccount(profile) ? PROFILE_TABS_BUSINESS : PROFILE_TABS_PERSONAL;
+  // Same rule as own-Profile (src/app/(app)/(tabs)/profile.tsx) — a
+  // Business account's Profile is Events-only, no tab bar to switch away
+  // from it with.
+  const isBusiness = isBusinessAccount(profile);
+  const effectiveTab: ProfileTab = isBusiness ? 'event' : contentTab;
   const textPosts = useMemo(() => content.filter((item): item is PostContent => item.type === 'post'), [content]);
   const businessEvents = useMemo(() => content.filter((item): item is EventContent => item.type === 'event'), [content]);
+  const displayedEvents = useMemo(() => {
+    const now = new Date();
+    return businessEvents.filter((item) => {
+      const live = isHappeningNow(item, now);
+      if (eventStatusTab === 'live') return live;
+      if (eventStatusTab === 'upcoming') return !live && item.startsAt.toMillis() > now.getTime();
+      return !live && item.endsAt.toMillis() < now.getTime();
+    });
+  }, [businessEvents, eventStatusTab]);
   const mergedPosts = useMemo(() => mergeProfilePosts(reels, textPosts), [reels, textPosts]);
 
   const optionsMenuOptions: OptionsMenuOption[] = amIBlockingThem
@@ -282,7 +315,8 @@ export default function PublicProfileScreen() {
             photoURL={profile.photoURL}
             coverPhotoURL={profile.coverPhotoURL}
             coverEdgeInset={Spacing.xl}
-            postsCount={postsCount}
+            postsCount={isBusiness ? eventsCount : postsCount}
+            postsLabel={isBusiness ? 'Events' : 'Posts'}
             followersCount={followerCount}
             followingCount={followingCount}
             likedCount={likedCount}
@@ -340,9 +374,13 @@ export default function PublicProfileScreen() {
           <InterestPills interestIds={profile.interests} />
 
           <View style={styles.contentSection}>
-            <ProfileTabBar tabs={tabs} value={contentTab} onChange={setContentTab} />
+            {isBusiness ? (
+              <ProfileTabBar tabs={EVENT_STATUS_TABS} value={eventStatusTab} onChange={setEventStatusTab} />
+            ) : (
+              <ProfileTabBar tabs={PROFILE_TABS_PERSONAL} value={contentTab} onChange={setContentTab} />
+            )}
 
-            {contentTab === 'post' ? (
+            {effectiveTab === 'post' ? (
               mergedPosts.length === 0 ? (
                 <EmptyState
                   bare
@@ -359,13 +397,13 @@ export default function PublicProfileScreen() {
                       <ReelPreviewCard key={`reel-${item.reel.reelId}`} reel={item.reel} />
                     ) : (
                       <View key={`text-${item.content.contentId}`} style={styles.fullRow}>
-                        <ContentCard item={item.content} currentUid={user?.uid ?? null} />
+                        <ContentCard item={item.content} currentUid={user?.uid ?? null} showAuthor={false} />
                       </View>
                     )
                   )}
                 </View>
               )
-            ) : contentTab === 'repost' ? (
+            ) : effectiveTab === 'repost' ? (
               repostedPosts.length === 0 ? (
                 <EmptyState bare icon="repeat-outline" title={EMPTY_TEXT.repost} />
               ) : (
@@ -381,13 +419,13 @@ export default function PublicProfileScreen() {
                   )}
                 </View>
               )
-            ) : contentTab === 'event' ? (
-              businessEvents.length === 0 ? (
-                <EmptyState bare icon="calendar-outline" title={EMPTY_TEXT.event} />
+            ) : effectiveTab === 'event' ? (
+              displayedEvents.length === 0 ? (
+                <EmptyState bare icon="calendar-outline" title={EVENT_STATUS_EMPTY_TEXT[eventStatusTab]} />
               ) : (
                 <View style={styles.contentList}>
-                  {businessEvents.map((item) => (
-                    <ContentCard key={item.contentId} item={item} currentUid={user?.uid ?? null} />
+                  {displayedEvents.map((item) => (
+                    <ContentCard key={item.contentId} item={item} currentUid={user?.uid ?? null} showAuthor={false} showTypeBadge={false} />
                   ))}
                 </View>
               )

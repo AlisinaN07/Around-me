@@ -53,6 +53,11 @@ export function findCityByKey(cityKey: string): City | null {
   return CITIES.find((city) => city.cityKey === cityKey) ?? null;
 }
 
+/** Every catalog city in one country — the drill-down list shown after tapping a Country in the City Explorer (src/app/(app)/cities/[countryCode].tsx). Empty for a country with no catalog cities yet (most of them, today) — that screen still offers "Explore all of {country}" either way. */
+export function citiesForCountry(countryCode: string): City[] {
+  return CITIES.filter((city) => city.countryCode === countryCode);
+}
+
 // Same construction as src/utils/cityKey.ts — built from numeric code
 // points rather than an inline escape, to avoid ambiguity.
 const COMBINING_MARKS_RANGE_START = 0x0300;

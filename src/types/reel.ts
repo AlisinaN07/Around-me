@@ -34,6 +34,22 @@ export const REEL_MUSIC_MAX_DURATION_MS = 600_000;
 /** Hard Storage-enforced cap on the uploaded cover-thumbnail image — a single still frame, always far smaller than the video/music caps above. */
 export const REEL_THUMBNAIL_MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024;
 
+/** Hard Storage-enforced cap on a "FOTO" mode Reel's own image (mediaType == 'photo', or a 'video' Reel with needsPhotoVideoRender == true before it's rendered — see that field's own doc comment) — bigger than the derived thumbnail cap above since this is the actual full-resolution Post, not a small cover crop. */
+export const REEL_PHOTO_MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024;
+
+/**
+ * Fixed display length for a "FOTO" mode photo posted WITH music — rendered
+ * server-side (see renderPhotoToVideo in functions/src/index.ts) into a
+ * real 15-second MP4 (the still image held for the whole clip, the chosen
+ * track as its audio track) and published as an ordinary `mediaType:
+ * 'video'` Reel. Deliberately NOT one of REEL_MAX_DURATION_MS's two
+ * user-selectable video lengths — a photo-with-music post always renders
+ * to exactly this length, never 60s, never user-adjustable. A photo posted
+ * WITHOUT music is unaffected by this constant at all — it stays
+ * `mediaType: 'photo'` with `durationMs: 0`, exactly as before.
+ */
+export const REEL_PHOTO_DURATION_MS = 15_000;
+
 /**
  * reels/{reelId}. authorDisplayName/authorUsername/cityName/countryCode/
  * cityKey are a PUBLIC-SAFE SNAPSHOT of the author's private users/{uid}
@@ -80,6 +96,29 @@ export const REEL_THUMBNAIL_MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024;
  */
 export type ReelMusicSourceType = 'none' | 'device';
 
+/**
+ * 'video' is every Reel published before this field existed and the
+ * overwhelming majority since (see normalizeReel in src/services/reels.ts
+ * for how a legacy document missing this key entirely is read back as
+ * 'video', never a missing key call sites have to special-case). 'photo'
+ * is a single still image captured via the camera screen's "FOTO" mode
+ * WITHOUT music — it reuses `storagePath`/`storageContentType`/
+ * `fileSizeBytes`/`width`/`height` for the photo itself (there's no
+ * separate video to describe), `durationMs` is the sentinel `0` (a photo
+ * has no duration), and `thumbnailStoragePath` etc. are set to the EXACT
+ * SAME values as the main `storagePath` fields — the photo IS its own
+ * cover image, so there is no separate thumbnail object to upload (see
+ * createReelDraft). Every other field (caption, category, likes, comments,
+ * follow, report, save, repost...) is identical either way; ReelFeedItem/
+ * ReelPreviewCard are the only two places that need to know which kind of
+ * media they're showing.
+ *
+ * A "FOTO" mode photo taken WITH music is deliberately NOT this 'photo'
+ * type at all — see `needsPhotoVideoRender`'s own doc comment below for
+ * why it's a real 'video' Reel from the moment its draft is created.
+ */
+export type ReelMediaType = 'video' | 'photo';
+
 export type Reel = {
   reelId: string;
   authorUid: string;
@@ -90,6 +129,29 @@ export type Reel = {
   cityKey: string;
   categoryId: string;
   caption: string;
+  mediaType: ReelMediaType;
+  /**
+   * True ONLY during the brief window between a "FOTO"-mode-with-music
+   * draft's creation and the renderPhotoToVideo Cloud Function
+   * (functions/src/index.ts) finishing — false for every other Reel,
+   * including this one once rendering completes. While true, `mediaType`
+   * is already `'video'` (so this Reel publishes and plays back through
+   * the exact same code as any other video, once rendering is done), but
+   * the Storage object at `storagePath` STILL actually holds the
+   * originally-captured PHOTO (image/*, up to REEL_PHOTO_MAX_FILE_SIZE_BYTES)
+   * rather than a real video — renderPhotoToVideo downloads that photo
+   * plus the music at `musicStorageAudioPath`, renders a real
+   * REEL_PHOTO_DURATION_MS-long MP4 (the image held static, the music as
+   * its audio track) via ffmpeg, and overwrites `storagePath` with the
+   * result in place — the same "overwrite in place, update
+   * storageContentType/fileSizeBytes" pattern muxReelMusic already uses
+   * for a video+music merge — before flipping this back to `false`.
+   * Firestore Rules (isValidReelPublish) refuse to publish a Reel while
+   * this is still `true`, specifically to prevent an un-rendered photo
+   * from ever being published as if it were a real video. Always `false`
+   * on a legacy document missing this key — see normalizeReel.
+   */
+  needsPhotoVideoRender: boolean;
   storagePath: string;
   storageContentType: string;
   fileSizeBytes: number;
@@ -100,6 +162,10 @@ export type Reel = {
    * duration. True duration enforcement would require trusted
    * server-side media inspection (e.g. Cloud Functions + a media
    * probing library), which is explicitly out of scope for Step 18.
+   * Always `0` when mediaType is 'photo'. Always exactly
+   * REEL_PHOTO_DURATION_MS for a "FOTO"-with-music Reel (mediaType
+   * 'video' with needsPhotoVideoRender true, or already rendered) — see
+   * that field's own doc comment.
    */
   durationMs: number;
   width: number;
@@ -117,6 +183,38 @@ export type Reel = {
   /** Declared duration in milliseconds from the picked audio file — same client-declared caveat as `durationMs` above. 0 when musicSourceType is 'none'. */
   musicDurationMs: number;
   /**
+   * Sound attribution — who this exact device-picked audio file traces
+   * back to on Around Me, so the feed can show a "whose sound is this"
+   * avatar (see ReelFeedItem.tsx's own doc comment) instead of only the
+   * Reel's own author. ALWAYS `''` when musicSourceType is 'none' — a
+   * Reel with no picked music has no sound to attribute at all (its own
+   * captured audio belongs to its own author, trivially, with no lookup
+   * needed).
+   *
+   * These three fields are NEVER set by the client — createReelDraft
+   * always writes them as `''`, and only a trusted Cloud Function
+   * (muxReelMusic or renderPhotoToVideo in functions/src/index.ts, both
+   * already downloading the picked music file locally before this step)
+   * computes musicHash (a SHA-256 of the audio file's actual bytes — the
+   * only way to recognize "the same sound" across two unrelated
+   * uploads, since a device-picked file carries no catalog/track ID of
+   * its own) and looks it up against soundOrigins/{musicHash} — a
+   * server-only collection (no client Firestore rule at all; it falls
+   * under the default-deny catch-all) recording, per unique sound, the
+   * FIRST Reel/author on Around Me ever traced to it, first-write-wins
+   * via a Firestore transaction. isValidReelPublish (firestore.rules)
+   * requires these three stay byte-identical from whatever the trusted
+   * function already stamped — a client can never fabricate its own
+   * attribution.
+   *
+   * Always `''` on a legacy Reel missing these keys — see normalizeReel.
+   */
+  musicHash: string;
+  /** The uid this Reel's picked sound is attributed to (itself, if this Reel is the first on Around Me traced to that exact audio) — see musicDurationMs's neighboring doc comment above for the full model. `''` whenever musicSourceType is 'none', or on any legacy Reel predating this feature. */
+  soundOriginAuthorUid: string;
+  /** The reelId of the very first Reel traced to this exact sound (may be this Reel's own reelId) — paired with soundOriginAuthorUid above, same doc comment. */
+  soundOriginReelId: string;
+  /**
    * A real still frame from THIS Reel's own video, chosen by the author
    * at capture time (see camera.tsx's cover-frame picker) — never a
    * generic placeholder or an unrelated image. `reels/{authorUid}/
@@ -128,6 +226,13 @@ export type Reel = {
    * thumbnail available" and fall back gracefully (see
    * ReelPreviewCard.tsx), never assume the field is truly guaranteed at
    * runtime just because the type says so.
+   *
+   * When mediaType is 'photo', this (and the four fields below it) are set
+   * to the EXACT SAME values as `storagePath`/`storageContentType`/
+   * `fileSizeBytes`/`width`/`height` — the photo already IS its own cover
+   * image, so there's no separate object uploaded for it (see
+   * createReelDraft) — but the field is still always genuinely present,
+   * same as for a video Reel.
    */
   thumbnailStoragePath: string;
   thumbnailStorageContentType: string;
@@ -226,6 +331,24 @@ export type SelectedReelVideo = {
   source: 'camera' | 'library';
   fileSizeBytes: number | null;
   durationMs: number | null;
+  width: number | null;
+  height: number | null;
+  mimeType: string | null;
+};
+
+/**
+ * UI/runtime-only state for a "FOTO" mode photo the user has captured but
+ * not yet published — the mediaType == 'photo' counterpart to
+ * SelectedReelVideo above, with no `durationMs` (a photo has none) and no
+ * `source` (always the camera — there is no library-photo picker for
+ * Posts). `expo-camera`'s `takePictureAsync()` returns width/height/uri
+ * directly (unlike `recordAsync()`, nothing here needs a post-capture
+ * probe), so every field besides `mimeType` — which the camera doesn't
+ * report at all — is non-null from the moment a photo is taken.
+ */
+export type SelectedReelPhoto = {
+  uri: string;
+  fileSizeBytes: number | null;
   width: number | null;
   height: number | null;
   mimeType: string | null;

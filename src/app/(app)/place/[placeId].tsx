@@ -251,6 +251,9 @@ const styles = StyleSheet.create({
     // built-in marginHorizontal is the only inset — matching how cards look
     // everywhere else they're used (Home, Following, public profile).
     marginHorizontal: -Spacing.xl,
+    // ContentCard itself carries no vertical margin (see its own styles) —
+    // this list, like every other one that renders it, owns the spacing.
+    gap: Spacing.md,
   },
   cardRail: {
     flexDirection: 'row',

@@ -24,6 +24,43 @@ import type { Notification } from '@/types/notification';
 
 import { firestore } from './firestore';
 import { buildNotificationId, notificationRef } from './notifications';
+import { trackContentInteraction } from './recommendations/interactions';
+
+/**
+ * Fire-and-forget — a recommendation-signal write never blocks or fails
+ * the real follow/unfollow action. No categoryId here (a follow is a
+ * creator-affinity signal, not tied to one category) — applyInteractionToProfile
+ * already skips updating a score for an empty key.
+ *
+ * Recommendation Engine — Step 3 — `targetCityKey`/`targetCountryCode`
+ * (the FOLLOWED account's own home city, not the follower's) are new as
+ * of this pass: `follow`/`unfollow` previously always passed an empty
+ * cityKey, meaning the single most decisive real-world location signal
+ * this app has — deliberately choosing to follow a specific place's
+ * account — never touched `cityScores` AT ALL, despite `follow` already
+ * having a defined (and, since this pass, a boosted — see
+ * CITY_WEIGHT_OVERRIDES) city weight. See followUser/unfollowUser below
+ * for where these are actually resolved from the target's own public
+ * profile.
+ */
+function trackFollowSignal(
+  uid: string,
+  targetUid: string,
+  action: 'follow' | 'unfollow',
+  targetCityKey: string,
+  targetCountryCode: string
+): void {
+  trackContentInteraction({
+    userId: uid,
+    contentId: targetUid,
+    contentType: 'content',
+    action,
+    categoryId: '',
+    creatorId: targetUid,
+    cityKey: targetCityKey,
+    countryCode: targetCountryCode,
+  }).catch(() => {});
+}
 
 const FOLLOWS_COLLECTION = 'follows';
 const DEFAULT_LIST_LIMIT = 30;
@@ -54,7 +91,12 @@ export async function followUser(followerUid: string, targetUid: string): Promis
   // The notification's actor snapshot comes from the follower's own PUBLIC
   // profile — exactly the public-safe info a notification should show,
   // and consistent with how the follow edge itself is validated.
-  const actorProfile = await fetchPublicProfile(followerUid);
+  // targetProfile is fetched alongside it purely for the recommendation
+  // signal below (see trackFollowSignal's own doc comment) — a missing
+  // target profile still lets the real follow action proceed; the city
+  // signal simply falls back to an empty string, same as before this
+  // pass, rather than blocking the follow itself over it.
+  const [actorProfile, targetProfile] = await Promise.all([fetchPublicProfile(followerUid), fetchPublicProfile(targetUid)]);
   if (!actorProfile) {
     return { ok: false, error: 'unknown', message: "Couldn't follow this user." };
   }
@@ -90,11 +132,16 @@ export async function followUser(followerUid: string, targetUid: string): Promis
   } catch {
     return { ok: false, error: 'unknown', message: "Couldn't follow this user." };
   }
+  trackFollowSignal(followerUid, targetUid, 'follow', targetProfile?.cityKey ?? '', targetProfile?.countryCode ?? '');
   return { ok: true };
 }
 
 export async function unfollowUser(followerUid: string, targetUid: string): Promise<FollowActionResult> {
   if (!firestore) return { ok: false, error: 'not-configured', message: 'Firestore is not available.' };
+  // Fetched purely for the recommendation signal below (same reasoning as
+  // followUser's own targetProfile fetch) — a lookup failure still lets
+  // the real unfollow proceed via the empty-string fallback.
+  const targetProfile = await fetchPublicProfile(targetUid);
   try {
     // Removing the follow edge and its notification land in the same
     // batch, so a follow notification can never outlive the follow it was
@@ -106,6 +153,7 @@ export async function unfollowUser(followerUid: string, targetUid: string): Prom
   } catch {
     return { ok: false, error: 'unknown', message: "Couldn't unfollow this user." };
   }
+  trackFollowSignal(followerUid, targetUid, 'unfollow', targetProfile?.cityKey ?? '', targetProfile?.countryCode ?? '');
   return { ok: true };
 }
 

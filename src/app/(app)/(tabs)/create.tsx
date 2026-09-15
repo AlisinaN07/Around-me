@@ -31,7 +31,7 @@ import { isBusinessAccount } from '@/utils/accountCapabilities';
  * here too, not only at the tab-press layer.
  */
 export default function CreateScreen() {
-  const { homeCity, activeCity, isExploringAnotherCity } = useCity();
+  const { homeCity, activeScopeLabel, isExploringElsewhere } = useCity();
   const { profile, isProfileLoading } = useProfile();
   const isBusiness = isBusinessAccount(profile);
 
@@ -59,11 +59,11 @@ export default function CreateScreen() {
       <View style={styles.content}>
         <Text style={styles.title}>Create</Text>
 
-        {isExploringAnotherCity && homeCity && activeCity ? (
+        {isExploringElsewhere && homeCity ? (
           <View style={styles.exploringBanner}>
             <Ionicons name="information-circle-outline" size={18} color={Colors.textSecondary} />
             <Text style={styles.exploringBannerText}>
-              You&apos;re exploring {activeCity.cityName}. New content publishes to your home city, {homeCity.cityName}.
+              You&apos;re exploring {activeScopeLabel}. New content publishes to your home city, {homeCity.cityName}.
             </Text>
           </View>
         ) : null}

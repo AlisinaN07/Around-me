@@ -16,6 +16,7 @@
     "expo-document-picker": "~57.0.1",
     "expo-file-system": "~57.0.6",
     "expo-font": "~57.0.1",
+    "expo-image-manipulator": "~57.0.16",
     "expo-image-picker": "~57.0.15",
     "expo-linear-gradient": "~57.0.1",
     "expo-linking": "~57.0.6",
@@ -52,6 +53,7 @@
     "lint": "expo lint",
     "test:rules": "npx firebase-tools emulators:exec --only firestore \"node tests/firestore.rules.test.mjs\"",
     "test:cities": "tsx tests/cities.test.ts",
+    "test:recommendations": "tsx tests/recommendations.test.ts",
     "cleanup:test-data": "node scripts/delete-test-documents.cjs"
   },
   "private": true

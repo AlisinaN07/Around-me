@@ -4,6 +4,7 @@ import { useCallback, useMemo, useState } from 'react';
 import { Platform, Pressable, RefreshControl, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
+import { Avatar } from '@/components/Avatar';
 import { ConversationRow } from '@/components/ConversationRow';
 import { EmptyState } from '@/components/EmptyState';
 import { ErrorState } from '@/components/ErrorState';
@@ -11,12 +12,15 @@ import { NotificationRow } from '@/components/NotificationRow';
 import { SkeletonBlock } from '@/components/LoadingState';
 import { Colors, Layout, Radius, Spacing, Typography } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
+import { fetchFollowingUids } from '@/services/following';
 import { fetchConversations, otherParticipantUid } from '@/services/messages';
 import { fetchNotifications, markAllNotificationsRead, markNotificationRead } from '@/services/notifications';
 import { fetchPublicProfile } from '@/services/publicProfile';
+import { fetchActiveStoriesForFollowing, hasViewedStory } from '@/services/stories';
 import type { Conversation } from '@/types/message';
 import type { Notification } from '@/types/notification';
 import type { PublicProfile } from '@/types/social';
+import type { StoryGroup } from '@/types/story';
 
 type InboxMode = 'activity' | 'messages';
 type LoadStatus = 'loading' | 'loaded' | 'error';
@@ -25,15 +29,22 @@ type LoadStatus = 'loading' | 'loaded' | 'error';
  * Inbox — Step 28 visual reconstruction. Real product model preserved
  * exactly: Activity (notifications) and Messages (1-to-1 conversations)
  * are the only two modes — never renamed to "Primary"/"Groups" from the
- * reference, since Groups doesn't exist. No Requests row, no active-
- * people/story strip, no online presence — none of that has real backend
- * support (see README "Inbox — Step 28").
+ * reference, since Groups doesn't exist. No Requests row, no online
+ * presence — neither has real backend support (see README "Inbox — Step
+ * 28"). Shown under the header, above the mode tabs, regardless of mode:
+ * FollowingAvatarRow — your own profile, then everyone you follow, left
+ * to right. This is now ALSO where Stories live (there is no separate
+ * tray on Home any more — see src/app/(app)/story/[uid].tsx) — anyone in
+ * the row with a currently-active Story (src/types/story.ts) gets a
+ * colored ring and opens the full-screen viewer on tap; everyone else
+ * just opens a chat with them (or, for your own avatar, your Profile
+ * tab), same as before Stories existed.
  */
 export default function InboxScreen() {
   const { user } = useAuth();
   const uid = user?.uid ?? null;
 
-  const [mode, setMode] = useState<InboxMode>('activity');
+  const [mode, setMode] = useState<InboxMode>('messages');
 
   const [status, setStatus] = useState<LoadStatus>('loading');
   const [notifications, setNotifications] = useState<Notification[]>([]);
@@ -44,6 +55,54 @@ export default function InboxScreen() {
   const [otherProfiles, setOtherProfiles] = useState<Record<string, PublicProfile | null>>({});
   const [isMessagesRefreshing, setIsMessagesRefreshing] = useState(false);
   const [messageQuery, setMessageQuery] = useState('');
+
+  const [myProfile, setMyProfile] = useState<PublicProfile | null>(null);
+  const [followingProfiles, setFollowingProfiles] = useState<PublicProfile[]>([]);
+  // One entry per uid (self included) that currently has an active Story —
+  // see src/types/story.ts. Absent from this map at all means "no active
+  // Story," the ordinary case for most people in the row.
+  const [storyGroupByUid, setStoryGroupByUid] = useState<Map<string, StoryGroup>>(new Map());
+  // Every uid (self included) whose CURRENT Story group still has at
+  // least one Story you (the viewer) haven't watched yet — the colored
+  // vs. gray ring distinction in FollowingAvatarRow. A uid only leaves
+  // this set once every Story in its group has a real view doc for you
+  // (see hasViewedStory in src/services/stories.ts) — watching some but
+  // not all of a group's Stories still shows it as unseen, same as every
+  // real Stories feature.
+  const [unseenAuthorUids, setUnseenAuthorUids] = useState<Set<string>>(new Set());
+
+  const loadFollowingRow = useCallback(async () => {
+    if (!uid) return;
+    const [me, followedUids, activeStoryGroups] = await Promise.all([
+      fetchPublicProfile(uid),
+      fetchFollowingUids(uid),
+      fetchActiveStoriesForFollowing(uid),
+    ]);
+    setMyProfile(me);
+    // Bounded by fetchFollowingUids' own default limit — same bounded
+    // Promise.all reasoning as loadMessages' own otherProfiles fetch below.
+    const profiles = await Promise.all(followedUids.map((followedUid) => fetchPublicProfile(followedUid)));
+    setFollowingProfiles(profiles.filter((profile): profile is PublicProfile => profile !== null));
+    setStoryGroupByUid(new Map(activeStoryGroups.map((group) => [group.authorUid, group])));
+
+    // One hasViewedStory call per active Story across every group shown in
+    // this row — small and bounded, same read-cost shape as everything
+    // else here. A group counts as "unseen" the moment ANY of its
+    // Stories comes back unwatched.
+    const unseen = new Set<string>();
+    await Promise.all(
+      activeStoryGroups.map(async (group) => {
+        for (const story of group.stories) {
+          const seen = await hasViewedStory(story.storyId, uid);
+          if (!seen) {
+            unseen.add(group.authorUid);
+            return;
+          }
+        }
+      })
+    );
+    setUnseenAuthorUids(unseen);
+  }, [uid]);
 
   const load = useCallback(
     async (isRefresh = false) => {
@@ -108,6 +167,7 @@ export default function InboxScreen() {
     useCallback(() => {
       load();
       loadMessages();
+      loadFollowingRow();
       // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [uid])
   );
@@ -173,17 +233,34 @@ export default function InboxScreen() {
       <View style={styles.page}>
         <View style={styles.header}>
           <Text style={styles.title}>Inbox</Text>
-          {mode === 'activity' && unreadIds.length > 0 ? (
+          <View style={styles.headerRightGroup}>
+            {mode === 'activity' && unreadIds.length > 0 ? (
+              <Pressable
+                onPress={handleMarkAllRead}
+                hitSlop={8}
+                accessibilityRole="button"
+                accessibilityLabel="Mark all as read"
+              >
+                <Text style={styles.markAllText}>Mark all as read</Text>
+              </Pressable>
+            ) : null}
             <Pressable
-              onPress={handleMarkAllRead}
+              onPress={() => router.push('/inbox/search')}
               hitSlop={8}
               accessibilityRole="button"
-              accessibilityLabel="Mark all as read"
+              accessibilityLabel="Search people you follow"
             >
-              <Text style={styles.markAllText}>Mark all as read</Text>
+              <Ionicons name="search-outline" size={20} color={Colors.text} />
             </Pressable>
-          ) : null}
+          </View>
         </View>
+
+        <FollowingAvatarRow
+          myProfile={myProfile}
+          followingProfiles={followingProfiles}
+          storyGroupByUid={storyGroupByUid}
+          unseenAuthorUids={unseenAuthorUids}
+        />
 
         <View style={styles.modeWrap}>
           <InboxModeTabs value={mode} onChange={setMode} unreadMessages={totalUnreadMessages} />
@@ -235,6 +312,73 @@ export default function InboxScreen() {
   );
 }
 
+type FollowingAvatarRowProps = {
+  myProfile: PublicProfile | null;
+  followingProfiles: PublicProfile[];
+  storyGroupByUid: Map<string, StoryGroup>;
+  unseenAuthorUids: Set<string>;
+};
+
+/**
+ * "Your profile, then everyone you follow, left to right" — this is also
+ * where Stories live now (see this screen's own doc comment). Anyone in
+ * the row with a currently-active Story gets a ring — accent-colored
+ * while any of their Stories is still unwatched, gray once you've seen
+ * all of them (see unseenAuthorUids' own doc comment above) — and opens
+ * the full-screen viewer (src/app/(app)/story/[uid].tsx) on tap EITHER
+ * way (a gray ring still opens the Story, it just isn't announcing new
+ * content any more), carrying a `queue` of every OTHER story-having uid
+ * in this same row so finishing one person's Stories advances straight
+ * into the next's. Everyone without an active Story just opens a chat
+ * with them (or, for your own avatar, your Profile tab) — the original,
+ * pre-Stories behavior. Renders nothing until your own profile has
+ * loaded (never a bare "You" bubble flashing in before it's ready).
+ */
+function FollowingAvatarRow({ myProfile, followingProfiles, storyGroupByUid, unseenAuthorUids }: FollowingAvatarRowProps) {
+  if (!myProfile) return null;
+
+  const items = [
+    { uid: myProfile.uid, profile: myProfile, isSelf: true },
+    ...followingProfiles.map((profile) => ({ uid: profile.uid, profile, isSelf: false })),
+  ];
+  const storyQueue = items.filter((item) => storyGroupByUid.has(item.uid)).map((item) => item.uid);
+
+  return (
+    <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.followingScroll} contentContainerStyle={styles.followingRow}>
+      {items.map(({ uid, profile, isSelf }) => {
+        const hasStory = storyGroupByUid.has(uid);
+        const isUnseen = unseenAuthorUids.has(uid);
+        return (
+          <Pressable
+            key={uid}
+            onPress={() => {
+              if (hasStory) {
+                router.push(`/story/${uid}?queue=${encodeURIComponent(storyQueue.join(','))}`);
+              } else if (isSelf) {
+                router.push('/profile');
+              } else {
+                router.push(`/chat/${uid}`);
+              }
+            }}
+            style={styles.followingItem}
+            accessibilityRole="button"
+            accessibilityLabel={
+              isSelf ? (hasStory ? 'Your Story' : 'Your profile') : hasStory ? `${profile.displayName}'s Story` : `Message ${profile.displayName}`
+            }
+          >
+            <View style={hasStory ? (isUnseen ? styles.avatarRing : styles.avatarRingSeen) : undefined}>
+              <Avatar name={profile.displayName} photoURL={profile.photoURL} size={52} />
+            </View>
+            <Text style={styles.followingLabel} numberOfLines={1}>
+              {isSelf ? (hasStory ? 'Your Story' : 'You') : profile.displayName}
+            </Text>
+          </Pressable>
+        );
+      })}
+    </ScrollView>
+  );
+}
+
 type InboxModeTabsProps = {
   value: InboxMode;
   onChange: (mode: InboxMode) => void;
@@ -251,13 +395,13 @@ type InboxModeTabsProps = {
 function InboxModeTabs({ value, onChange, unreadMessages }: InboxModeTabsProps) {
   return (
     <View style={styles.modeTrack}>
-      <ModePill label="Activity" active={value === 'activity'} onPress={() => onChange('activity')} />
       <ModePill
         label="Messages"
         active={value === 'messages'}
         onPress={() => onChange('messages')}
         badge={unreadMessages > 0 ? unreadMessages : undefined}
       />
+      <ModePill label="Activity" active={value === 'activity'} onPress={() => onChange('activity')} />
     </View>
   );
 }
@@ -432,6 +576,11 @@ const styles = StyleSheet.create({
     color: Colors.text,
     ...Typography.screenTitle,
   },
+  headerRightGroup: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Spacing.md,
+  },
   markAllText: {
     color: Colors.accent,
     fontSize: 13,
@@ -440,6 +589,43 @@ const styles = StyleSheet.create({
   modeWrap: {
     paddingHorizontal: Spacing.lg,
     paddingBottom: Spacing.sm,
+  },
+  followingScroll: {
+    flexGrow: 0,
+    flexShrink: 0,
+  },
+  followingRow: {
+    flexGrow: 0,
+    alignItems: 'flex-start',
+    gap: Spacing.md,
+    paddingHorizontal: Spacing.lg,
+    paddingBottom: Spacing.md,
+  },
+  followingItem: {
+    alignItems: 'center',
+    width: 60,
+    gap: 4,
+  },
+  // Only applied to an avatar with a currently-active Story — see
+  // FollowingAvatarRow's own doc comment.
+  avatarRing: {
+    borderWidth: 2,
+    borderColor: Colors.accent,
+    borderRadius: 32,
+    padding: 2,
+  },
+  // Same shape as avatarRing, just gray — an active Story you've already
+  // watched in full (see FollowingAvatarRow's own doc comment).
+  avatarRingSeen: {
+    borderWidth: 2,
+    borderColor: Colors.textMuted,
+    borderRadius: 32,
+    padding: 2,
+  },
+  followingLabel: {
+    color: Colors.textSecondary,
+    fontSize: 11,
+    fontWeight: '600',
   },
   modeTrack: {
     flexDirection: 'row',

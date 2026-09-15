@@ -12,7 +12,15 @@ import type { Timestamp } from 'firebase/firestore';
  * current original document at read time (see fetchSavedPosts), so it can
  * never go stale or leak a deleted/edited Post's old content.
  */
-export type SavedTargetType = 'reel' | 'post';
+/**
+ * 'sound' (see Reel.musicHash's own doc comment in src/types/reel.ts) is
+ * a saved SOUND, not a saved Post — its `targetId` is a musicHash, not a
+ * reelId/contentId. Resolved for display in fetchSavedPosts (src/services/saved.ts)
+ * via whichever Reel is currently the oldest published one sharing that
+ * hash, since there is no separate client-readable "sound" document to
+ * show details from (soundOrigins/{musicHash} is server-only).
+ */
+export type SavedTargetType = 'reel' | 'post' | 'sound';
 
 export type SavedPost = {
   targetType: SavedTargetType;

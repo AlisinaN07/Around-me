@@ -80,17 +80,37 @@ service firebase.storage {
       //    upload can never happen before its Firestore draft exists,
       //    into someone else's author path, or against an already
       //    (or never) "uploading" Reel.
+      // Step: "FOTO" mode — a single still image is also a valid Reel
+      // media object at this same path (see src/types/reel.ts's
+      // ReelMediaType doc comment), with its own smaller size cap; the
+      // Firestore document's own mediaType decides which content-type/size
+      // rule actually applies, exactly like isValidReelCreate does
+      // server-side on the Firestore document itself.
+      //
+      // Step — renderPhotoToVideo: a "FOTO" photo taken WITH music is a
+      // 'video' mediaType Reel from the moment its draft exists (see
+      // Reel.needsPhotoVideoRender's own doc comment), but the upload
+      // landing HERE, before renderPhotoToVideo has run, is still the
+      // original photo — so it needs the same image bounds as a plain
+      // 'photo' Reel, not the video bounds a 'video' mediaType would
+      // otherwise require. renderPhotoToVideo itself writes the eventual
+      // real video to this exact path via the Admin SDK, which bypasses
+      // these Rules entirely, so no separate allowance is needed for that
+      // write.
       allow create: if isSignedIn()
         && request.auth.uid == authorUid
         && resource == null
         && request.resource.size > 0
-        && request.resource.size <= 50 * 1024 * 1024
-        && request.resource.contentType.matches('video/.*')
         && reelExists(reelId)
         && reelDoc(reelId).authorUid == authorUid
         && reelDoc(reelId).reelId == reelId
         && reelDoc(reelId).status == 'uploading'
-        && reelDoc(reelId).storagePath == 'reels/' + authorUid + '/' + reelId + '/source';
+        && reelDoc(reelId).storagePath == 'reels/' + authorUid + '/' + reelId + '/source'
+        && (
+          (reelDoc(reelId).mediaType == 'photo' && request.resource.size <= 10 * 1024 * 1024 && request.resource.contentType.matches('image/.*'))
+          || (reelDoc(reelId).mediaType == 'video' && reelDoc(reelId).needsPhotoVideoRender == true && request.resource.size <= 10 * 1024 * 1024 && request.resource.contentType.matches('image/.*'))
+          || (reelDoc(reelId).mediaType == 'video' && reelDoc(reelId).needsPhotoVideoRender != true && request.resource.size <= 50 * 1024 * 1024 && request.resource.contentType.matches('video/.*'))
+        );
 
       // No metadata-only changes to an existing object either.
       allow update: if false;
@@ -174,6 +194,86 @@ service firebase.storage {
         && reelDoc(reelId).status == 'uploading';
     }
 
+    // soundOrigins/{musicHash}/audio — the ONE permanent copy of a given
+    // sound's actual audio bytes, kept the first time its hash is ever
+    // seen (see Reel.musicHash's own doc comment in src/types/reel.ts and
+    // soundOriginAudioStoragePath in functions/src/index.ts). Only ever
+    // written by trusted Cloud Functions via the Admin SDK, which bypasses
+    // these Rules entirely — `allow write: if false` here is about
+    // ordinary clients, not about blocking the functions themselves.
+    // Readable by any signed-in user: reusing a sound for a new post
+    // ("Use audio" in src/components/SoundSheet.tsx) needs no more
+    // privacy than seeing the Reels that already used it publicly.
+    match /soundOrigins/{musicHash}/audio {
+      allow read: if isSignedIn();
+      allow write: if false;
+    }
+
+    function storyPath(storyId) {
+      return /databases/(default)/documents/stories/$(storyId);
+    }
+
+    function storyExists(storyId) {
+      return firestore.exists(storyPath(storyId));
+    }
+
+    function storyDoc(storyId) {
+      return firestore.get(storyPath(storyId)).data;
+    }
+
+    function followEdgeExists(followerUid, followingUid) {
+      return firestore.exists(/databases/(default)/documents/follows/$(followerUid + '_' + followingUid));
+    }
+
+    // stories/{authorUid}/{storyId}/source — the one Story media object per
+    // Story (see src/services/stories.ts's storyStoragePath). Mirrors the
+    // Reels /source block above, with one key difference: Stories are
+    // followers-only, not public-within-app, so a read ALSO requires a
+    // real follow edge from the requester to the author — not just
+    // "published." This file's own header comment documents a hard cap of
+    // 2 UNIQUE cross-service documents per rule evaluation — storyDoc(...)
+    // and the follow-edge check below are exactly those 2, leaving no
+    // budget for a separate, third block-graph lookup here. That's not a
+    // gap: blocking always deletes BOTH follow edges atomically (see
+    // src/services/blocks.ts) — a blocked relationship can never have a
+    // real follow edge to satisfy the check below in the first place, so
+    // the same block outcome is enforced transitively, at no extra cost.
+    match /stories/{authorUid}/{storyId}/source {
+      allow read: if isSignedIn()
+        && storyExists(storyId)
+        && storyDoc(storyId).authorUid == authorUid
+        && (
+          request.auth.uid == authorUid
+          || (storyDoc(storyId).status == 'published' && followEdgeExists(request.auth.uid, authorUid))
+        );
+
+      allow create: if isSignedIn()
+        && request.auth.uid == authorUid
+        && resource == null
+        && request.resource.size > 0
+        && storyExists(storyId)
+        && storyDoc(storyId).authorUid == authorUid
+        && storyDoc(storyId).storyId == storyId
+        && storyDoc(storyId).status == 'uploading'
+        && storyDoc(storyId).storagePath == 'stories/' + authorUid + '/' + storyId + '/source'
+        && (
+          (storyDoc(storyId).mediaType == 'photo' && request.resource.size <= 10 * 1024 * 1024 && request.resource.contentType.matches('image/.*'))
+          || (storyDoc(storyId).mediaType != 'photo' && request.resource.size <= 50 * 1024 * 1024 && request.resource.contentType.matches('video/.*'))
+        );
+
+      allow update: if false;
+
+      // Deletable while "uploading" (failed/cancelled-upload cleanup) OR
+      // at any time once published — the author's own "delete my Story"
+      // (deleteMyStory in src/services/stories.ts). Unlike a Reel, which
+      // can never be client-deleted once published, a Story has no
+      // cascade (no likes/comments/thumbnail/music) to worry about.
+      allow delete: if isSignedIn()
+        && request.auth.uid == authorUid
+        && storyExists(storyId)
+        && storyDoc(storyId).authorUid == authorUid;
+    }
+
     // profilePhotos/{uid}/photo — Edit Profile's picture upload. A single
     // deterministic object per user (never per-upload), unlike the Reel
     // paths above: a profile photo is meant to be replaced in place, not
@@ -219,6 +319,36 @@ service firebase.storage {
         && request.resource.contentType.matches('image/.*');
 
       allow delete: if isSignedIn() && request.auth.uid == uid;
+    }
+
+    // eventCovers/{authorUid}/{draftId}/photo — Create Event's OPTIONAL
+    // cover/background photo (Step 36), uploaded BEFORE the
+    // content/{contentId} document itself exists: unlike Reels/Stories,
+    // content documents are created in one atomic setDoc (see
+    // src/services/content.ts's createEvent), never a multi-stage draft —
+    // so there is no Firestore draft doc here to cross-check the way
+    // reelDoc()/storyDoc() do above. `draftId` (see generateEventDraftId
+    // in src/services/content.ts) is a fresh, random, purely client-side
+    // identifier with no Firestore meaning at all — its only job is to
+    // keep each Create Event attempt's photo at its own distinct path, so
+    // a LATER event by the same author can never overwrite (and thereby
+    // silently change the displayed cover of) an EARLIER already-
+    // published one, the way reusing one shared per-user slot (like
+    // profileCovers/{uid}/photo) would. Mutable in place for that SAME
+    // draftId only, since the organizer may pick, then re-pick, a
+    // different image before ever publishing.
+    match /eventCovers/{authorUid}/{draftId}/photo {
+      // Public-safe by product design, same as a published Event itself —
+      // same isSignedIn() gate as every other read above, not stricter.
+      allow read: if isSignedIn();
+
+      allow create, update: if isSignedIn()
+        && request.auth.uid == authorUid
+        && request.resource.size > 0
+        && request.resource.size <= 8 * 1024 * 1024
+        && request.resource.contentType.matches('image/.*');
+
+      allow delete: if isSignedIn() && request.auth.uid == authorUid;
     }
 
     // Everything else — including the bucket root and any other path —

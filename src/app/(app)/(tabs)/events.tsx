@@ -17,12 +17,14 @@ import { useAuth } from '@/hooks/useAuth';
 import { useProfile } from '@/hooks/useProfile';
 import { useCity } from '@/providers/CityProvider';
 import { fetchDiscoverySections, fetchFollowingDiscoverySections, type DiscoverySections } from '@/services/content';
+import { rankEventSections } from '@/services/recommendations/recommendationEngine';
+import { browseScopeKey } from '@/types/browseScope';
 import type { ActivityContent, EventContent } from '@/types/content';
 import { canCreateEvent } from '@/utils/accountCapabilities';
 import { getWeekendWindow } from '@/utils/dateWindows';
 
 type LoadStatus = 'loading' | 'loaded' | 'error';
-type EventsMode = 'forYou' | 'following';
+export type EventsMode = 'forYou' | 'following';
 
 // Bounded per section (happening/today/upcoming), matching the "30
 // initial, no infinite scroll" recommendation for this screen — see
@@ -31,6 +33,14 @@ type EventsMode = 'forYou' | 'following';
 // this same bounded result set is laid out and split (This Weekend vs.
 // Coming Up is a client-side split of `upcoming`, not a new query).
 const SECTION_LIMIT = 15;
+
+// Happening Now / Today-or-Tonight / Coming Up each show only this many
+// cards in their own horizontal rail here, with a "Show more" action in
+// their SectionHeader (only rendered at all once there's something more
+// to reveal) navigating to /events/section for the full list — see that
+// screen for why this is a real navigation rather than an in-place
+// expand.
+const SECTION_COLLAPSED_LIMIT = 5;
 
 /**
  * Events — Business Event discovery (Step 26 visual reconstruction; Step
@@ -50,9 +60,14 @@ const SECTION_LIMIT = 15;
  */
 export default function EventsScreen() {
   const { user } = useAuth();
-  const { activeCity, homeCity, isExploringAnotherCity, isReady: isCityReady } = useCity();
+  const { activeScope, activeScopeLabel, homeCity, isExploringElsewhere, isReady: isCityReady } = useCity();
   const { profile } = useProfile();
   const canCreateEventHere = canCreateEvent(profile);
+
+  // See index.tsx's own doc comment on this same pattern (Step 5, second
+  // pass) — one value per app-open/screen session, reused for every
+  // rankEventSections call this mount makes.
+  const [feedSessionId] = useState(() => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`);
 
   const [mode, setMode] = useState<EventsMode>('forYou');
   const [categoryFilter, setCategoryFilter] = useState<string | null>(null);
@@ -65,37 +80,56 @@ export default function EventsScreen() {
   const [followsAnyone, setFollowsAnyone] = useState(true);
   const [followingStatus, setFollowingStatus] = useState<LoadStatus>('loading');
 
-  const cityLabel = activeCity?.cityName ?? 'your city';
+  const cityLabel = activeScopeLabel;
 
   const loadForYou = useCallback(async () => {
-    if (!activeCity) return;
     setForYouStatus('loading');
-    // Clears the previous city's sections immediately so a city switch
-    // never leaves a stale city's cards on screen during the fetch (same
-    // rule every other discovery surface in this app follows).
+    // Clears the previous scope's sections immediately so a scope switch
+    // never leaves stale cards on screen during the fetch (same rule
+    // every other discovery surface in this app follows).
     setForYouSections(null);
     try {
-      const result = await fetchDiscoverySections(activeCity.cityKey, SECTION_LIMIT);
-      setForYouSections(result);
+      const result = await fetchDiscoverySections(activeScope, SECTION_LIMIT);
+      // Reorders each existing time-based section by relevance (interest/
+      // location/event-time/creator-affinity/freshness) — see
+      // rankEventSections' own doc comment for why this keeps Events'
+      // existing sectioned UX rather than replacing it with one flat feed.
+      // Falls back to the plain chronological sections if ranking itself
+      // fails for any reason (never a harder error over an otherwise
+      // successful fetch) — only meaningful when signed in.
+      const ranked = user
+        ? await rankEventSections(
+            user.uid,
+            result,
+            activeScope,
+            homeCity?.cityKey ?? '',
+            homeCity?.countryCode ?? '',
+            profile?.interests,
+            feedSessionId
+          ).catch(() => result)
+        : result;
+      setForYouSections(ranked);
       setForYouStatus('loaded');
     } catch {
       setForYouStatus('error');
     }
-  }, [activeCity]);
+  }, [activeScope, user, homeCity, profile, feedSessionId]);
 
   const loadFollowing = useCallback(async () => {
-    if (!activeCity || !user) return;
+    if (!user) return;
     setFollowingStatus('loading');
     setFollowingSections(null);
     try {
-      const result = await fetchFollowingDiscoverySections(user.uid, activeCity.cityKey, SECTION_LIMIT);
+      const result = await fetchFollowingDiscoverySections(user.uid, activeScope, SECTION_LIMIT);
       setFollowingSections(result.sections);
       setFollowsAnyone(result.followsAnyone);
       setFollowingStatus('loaded');
     } catch {
       setFollowingStatus('error');
     }
-  }, [activeCity, user]);
+  }, [activeScope, user]);
+
+  const activeScopeKey = useMemo(() => browseScopeKey(activeScope), [activeScope]);
 
   useFocusEffect(
     useCallback(() => {
@@ -106,7 +140,7 @@ export default function EventsScreen() {
         loadFollowing();
       }
       // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [activeCity?.cityKey, isCityReady, mode])
+    }, [activeScopeKey, isCityReady, mode])
   );
 
   const status = mode === 'forYou' ? forYouStatus : followingStatus;
@@ -149,8 +183,14 @@ export default function EventsScreen() {
 
   const totalRealItems = sections ? sections.happeningNow.length + sections.today.length + sections.upcoming.length : 0;
   const totalFilteredItems = happeningNow.length + today.length + upcomingAll.length;
-  const canCreateHere = !!homeCity && !isExploringAnotherCity;
+  const canCreateHere = !!homeCity && !isExploringElsewhere;
   const isFilterActive = categoryFilter !== null;
+
+  // Shared by all three rails' "Show more" — see /events/section for what
+  // `which` selects and why mode/category are passed through.
+  const openSection = (which: 'happeningNow' | 'today' | 'comingUp') => {
+    router.push(`/events/section?which=${which}&mode=${mode}${categoryFilter ? `&category=${categoryFilter}` : ''}`);
+  };
 
   return (
     <SafeAreaView style={styles.safeArea} edges={['top']}>
@@ -196,7 +236,7 @@ export default function EventsScreen() {
                 ) : (
                   <EmptyState icon="calendar-outline" title="No upcoming events from businesses you follow." />
                 )
-              ) : isExploringAnotherCity ? (
+              ) : isExploringElsewhere ? (
                 <EmptyState
                   icon="calendar-outline"
                   title={`No upcoming events in ${cityLabel} yet.`}
@@ -227,9 +267,14 @@ export default function EventsScreen() {
             <>
               {happeningNow.length > 0 ? (
                 <View style={styles.section}>
-                  <SectionHeader title="Happening Now" badge={<Pill label="LIVE" tone="live" />} />
+                  <SectionHeader
+                    title="Happening Now"
+                    badge={<Pill label="LIVE" tone="live" />}
+                    actionLabel={happeningNow.length > SECTION_COLLAPSED_LIMIT ? 'Show more' : undefined}
+                    onActionPress={() => openSection('happeningNow')}
+                  />
                   <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.heroRail} style={styles.heroRailScroll}>
-                    {happeningNow.map((item) => (
+                    {happeningNow.slice(0, SECTION_COLLAPSED_LIMIT).map((item) => (
                       <EventCard key={item.contentId} item={item} variant="hero" />
                     ))}
                   </ScrollView>
@@ -238,12 +283,20 @@ export default function EventsScreen() {
 
               {today.length > 0 ? (
                 <View style={styles.section}>
-                  <SectionHeader title={sections?.todayLabel ?? 'Today'} />
-                  <View style={styles.rowList}>
-                    {today.map((item) => (
-                      <EventCard key={item.contentId} item={item} variant="row" />
+                  <SectionHeader
+                    title={sections?.todayLabel ?? 'Today'}
+                    actionLabel={today.length > SECTION_COLLAPSED_LIMIT ? 'Show more' : undefined}
+                    onActionPress={() => openSection('today')}
+                  />
+                  {/* Same horizontal hero rail as Happening Now above — every
+                      one of these three rails teases SECTION_COLLAPSED_LIMIT
+                      cards, then "Show more" opens /events/section for the
+                      rest, same variant, full-size. */}
+                  <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.heroRail} style={styles.heroRailScroll}>
+                    {today.slice(0, SECTION_COLLAPSED_LIMIT).map((item) => (
+                      <EventCard key={item.contentId} item={item} variant="hero" />
                     ))}
-                  </View>
+                  </ScrollView>
                 </View>
               ) : null}
 
@@ -260,12 +313,17 @@ export default function EventsScreen() {
 
               {comingUp.length > 0 ? (
                 <View style={styles.section}>
-                  <SectionHeader title="Coming Up" />
-                  <View style={styles.grid}>
-                    {comingUp.map((item) => (
-                      <EventCard key={item.contentId} item={item} variant="upcoming" />
+                  <SectionHeader
+                    title="Coming Up"
+                    actionLabel={comingUp.length > SECTION_COLLAPSED_LIMIT ? 'Show more' : undefined}
+                    onActionPress={() => openSection('comingUp')}
+                  />
+                  {/* Same horizontal hero rail as Happening Now/Tonight above. */}
+                  <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.heroRail} style={styles.heroRailScroll}>
+                    {comingUp.slice(0, SECTION_COLLAPSED_LIMIT).map((item) => (
+                      <EventCard key={item.contentId} item={item} variant="hero" />
                     ))}
-                  </View>
+                  </ScrollView>
                 </View>
               ) : null}
             </>
@@ -394,9 +452,6 @@ const styles = StyleSheet.create({
   },
   heroRail: {
     gap: Spacing.md,
-    paddingHorizontal: Spacing.lg,
-  },
-  rowList: {
     paddingHorizontal: Spacing.lg,
   },
   grid: {

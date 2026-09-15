@@ -42,10 +42,12 @@ service cloud.firestore {
         && request.resource.data.coverPhotoURL.size() <= 2048
         // Step 30: Around Me supports exactly two account types, chosen
         // once during onboarding — no arbitrary string (e.g. 'admin',
-        // 'organizer', 'verified_business') is ever accepted. accountType
-        // is also asserted unchanged in `allow update` below, so it is
-        // immutable after create either way — a client can never later
-        // rewrite personal -> business or back through a profile edit.
+        // 'organizer', 'verified_business') is ever accepted. The Edit
+        // Profile `allow update` below still asserts accountType unchanged
+        // (Section 14), and a dedicated second `allow update` (Step 35)
+        // permits exactly one further transition — personal -> business,
+        // never the reverse — so accountType only ever moves in one
+        // direction after create, and only through that one narrow path.
         && (request.resource.data.accountType == 'personal' || request.resource.data.accountType == 'business')
         && request.resource.data.onboardingCompleted is bool
         && isServerTimestamp(request.resource.data.createdAt)
@@ -94,6 +96,42 @@ service cloud.firestore {
           'accountType', 'onboardingCompleted', 'createdAt', 'updatedAt'
         ]);
 
+      // Step 35 — Settings -> Switch to Business account
+      // (src/app/(app)/settings/business-account.tsx,
+      // upgradeToBusinessAccount in src/services/userProfile.ts). A
+      // SEPARATE, narrow `allow update` from the Edit Profile one above —
+      // Firestore evaluates multiple `allow update` blocks for the same
+      // match as OR, so this adds exactly one more permitted write without
+      // touching the Edit Profile rule at all: accountType moving from
+      // 'personal' to 'business', and ONLY that direction — there is no
+      // rule anywhere that permits 'business' -> 'personal', so once this
+      // write lands it can never be undone by the client. Every other
+      // field must be byte-identical to its prior value, same
+      // immutability guarantee Edit Profile provides for its own fields.
+      allow update: if isOwner(uid)
+        && resource.data.accountType == 'personal'
+        && request.resource.data.accountType == 'business'
+        && request.resource.data.uid == resource.data.uid
+        && request.resource.data.email == resource.data.email
+        && request.resource.data.displayName == resource.data.displayName
+        && request.resource.data.username == resource.data.username
+        && request.resource.data.usernameLower == resource.data.usernameLower
+        && request.resource.data.cityName == resource.data.cityName
+        && request.resource.data.countryCode == resource.data.countryCode
+        && request.resource.data.cityKey == resource.data.cityKey
+        && request.resource.data.interests == resource.data.interests
+        && request.resource.data.bio == resource.data.bio
+        && request.resource.data.photoURL == resource.data.photoURL
+        && request.resource.data.coverPhotoURL == resource.data.coverPhotoURL
+        && request.resource.data.onboardingCompleted == resource.data.onboardingCompleted
+        && request.resource.data.createdAt == resource.data.createdAt
+        && isServerTimestamp(request.resource.data.updatedAt)
+        && request.resource.data.keys().hasOnly([
+          'uid', 'email', 'displayName', 'username', 'usernameLower',
+          'cityName', 'countryCode', 'cityKey', 'interests', 'bio', 'photoURL', 'coverPhotoURL',
+          'accountType', 'onboardingCompleted', 'createdAt', 'updatedAt'
+        ]);
+
       // users/{uid}/saved/{savedId} — Step 41.2E. A private bookmark list:
       // ONLY the owner may ever read, create, or delete their own Saved
       // relationships — security does not depend on the Saved tab being
@@ -112,6 +150,162 @@ service cloud.firestore {
 
         allow delete: if isOwner(uid);
       }
+
+      // users/{uid}/recommendationEvents/{eventId} — the "For You"
+      // recommendation engine's own append-only interaction log (see
+      // src/types/recommendation.ts). ONLY the owner may ever read or
+      // create their own events, exactly like Saved above; never
+      // updatable or deletable — a logged interaction is permanent, same
+      // reasoning as a Like/Follow edge being create-or-delete-only
+      // elsewhere in this file, except an interaction event isn't even
+      // deletable (there is no "undo an impression").
+      match /recommendationEvents/{eventId} {
+        allow read: if isOwner(uid);
+
+        allow create: if isOwner(uid) && isValidRecommendationEventCreate(uid, request.resource.data);
+
+        allow update: if false;
+
+        allow delete: if false;
+      }
+
+      // users/{uid}/recommendationProfile/{docId} — the same engine's
+      // single derived aggregate document (always docId == 'main' — see
+      // RecommendationProfile's own doc comment). A pure cache of
+      // recommendationEvents: safe to fully overwrite (never a partial
+      // field-by-field diff to validate), so create/update share one
+      // validation function. Bounded map/list sizes here mirror the
+      // client's own trimming logic (interestProfile.ts) — this is a
+      // defense-in-depth cap, not the only place size is kept small.
+      //
+      // Recommendation Engine — Step 5 — this SAME match block also
+      // governs `recommendationProfile/collaborative` (the trusted
+      // collaborative-filtering output — see functions/src/collaborative.ts
+      // and src/types/collaborative.ts), and DELIBERATELY needed no
+      // changes to support it: `allow read: if isOwner(uid)` already
+      // covers any docId (owner-only, matching Step 30's "users may read
+      // their own collaborative result"), while `create`/`update` are
+      // already restricted to `docId == 'main'` — so a client attempting
+      // to write `.../recommendationProfile/collaborative` is already
+      // denied by the existing `docId == 'main'` check, with no special-
+      // casing needed. Only the Admin SDK (functions/src/collaborative.ts,
+      // which bypasses Rules entirely via IAM) can ever write it.
+      match /recommendationProfile/{docId} {
+        allow read: if isOwner(uid);
+
+        allow create: if isOwner(uid) && docId == 'main' && isValidRecommendationProfileWrite(request.resource.data);
+
+        allow update: if isOwner(uid) && docId == 'main' && isValidRecommendationProfileWrite(request.resource.data);
+
+        allow delete: if false;
+      }
+
+      // Recommendation Engine — Step 6 — users/{uid}/feedSessions/{sessionId}:
+      // the trusted, backend-only-maintained per-session evaluation
+      // summary (see functions/src/metrics.ts — built incrementally from
+      // the SAME trusted recommendationEvents stream, never written
+      // directly by any client). Owner-read only, matching every other
+      // derived-analytics doc in this file; NO client write path exists
+      // at all (unlike recommendationProfile/main, which the client DOES
+      // write via a transaction) — this is pure backend aggregation, so
+      // create/update/delete are all unconditionally denied.
+      match /feedSessions/{sessionId} {
+        allow read: if isOwner(uid);
+
+        allow create: if false;
+
+        allow update: if false;
+
+        allow delete: if false;
+      }
+    }
+
+    // Recommendation Engine — Step 6 — recommendationMetrics/{docId}
+    // (functions/src/metrics.ts's daily reels_*/events_* aggregates) is
+    // DELIBERATELY given no match block here at all — same precedent as
+    // `recommendationStatsEvents` (Step 4) and `systemMigrations`: a
+    // collection with no matching rule is denied to every client by
+    // Firestore's own default-deny, and only the Admin SDK (which
+    // bypasses Rules via IAM) ever touches it. There is no per-user
+    // breakdown in this collection to protect (Step 16) — it is
+    // aggregate-only by construction, and the admin evaluation script
+    // (scripts/evaluate-recommendations.cjs) reads it via the same
+    // privileged CLI-OAuth mechanism this project's other admin scripts
+    // already use, never through a client-facing read path.
+
+    // Step "For You" recommendation engine — see src/types/recommendation.ts
+    // and src/services/recommendations/. Every numeric/category/creator/
+    // city field here is a derived, recomputable signal (never a public-
+    // safe profile snapshot the way content/{contentId}'s author fields
+    // are), so validation only needs to bound shape/size, not cross-check
+    // it against another document.
+    function isValidRecommendationAction(action) {
+      return action in [
+        'impression', 'video_started', 'quick_skip', 'open', 'watch_25', 'watch_50', 'watch_75', 'complete', 'rewatch',
+        'like', 'unlike', 'save', 'unsave', 'share', 'comment', 'profile_open', 'follow', 'unfollow',
+        'event_open', 'event_save', 'event_unsave', 'event_interested', 'event_going', 'not_interested'
+      ];
+    }
+
+    function isValidRecommendationEventCreate(uid, data) {
+      return data.userId == uid
+        && data.contentId is string
+        && (data.contentType == 'reel' || data.contentType == 'content')
+        && isValidRecommendationAction(data.action)
+        && data.categoryId is string
+        && data.creatorId is string
+        && data.cityKey is string
+        && data.countryCode is string
+        && data.weight is number
+        && data.watchDurationMs is number
+        && data.watchDurationMs >= 0
+        && data.watchPercentage is number
+        && data.watchPercentage >= 0
+        && data.watchPercentage <= 1
+        // Recommendation Engine — Step 6, Steps 18/19 — bounded, optional-
+        // in-spirit (client sends 0/''-defaults when no ranked-item
+        // context exists — see TrackInteractionInput's own doc comment)
+        // DEVELOPMENT/analytics metadata. Never trusted for anything
+        // beyond aggregate metrics — functions/src/metrics.ts is the only
+        // reader, and it treats every field here as self-reported (same
+        // MEDIUM trust level this collection already had before this
+        // pass — see src/types/engagementStats.ts's own trust-level
+        // documentation for the established precedent).
+        && data.rankPosition is int && data.rankPosition >= 0 && data.rankPosition <= 1000
+        && data.sourceTags is string && data.sourceTags.size() <= 200
+        && data.bucket is string && data.bucket.size() <= 30
+        && data.rankingVersion is string && data.rankingVersion.size() <= 30
+        && data.experimentVariant is string && data.experimentVariant.size() <= 60
+        && data.feedSessionId is string && data.feedSessionId.size() <= 100
+        && isServerTimestamp(data.createdAt)
+        && data.keys().hasOnly([
+          'eventId', 'userId', 'contentId', 'contentType', 'action', 'categoryId', 'creatorId',
+          'cityKey', 'countryCode', 'weight', 'watchDurationMs', 'watchPercentage',
+          'rankPosition', 'sourceTags', 'bucket', 'rankingVersion', 'experimentVariant', 'feedSessionId',
+          'createdAt'
+        ]);
+    }
+
+    function isValidRecommendationProfileWrite(data) {
+      return data.categoryScores is map && data.categoryScores.size() <= 200
+        && data.creatorScores is map && data.creatorScores.size() <= 100
+        && data.cityScores is map && data.cityScores.size() <= 50
+        && data.excludedContentIds is list && data.excludedContentIds.size() <= 300
+        // Second pass, Step 4 — bounded the same way as excludedContentIds
+        // above (owner-only write; a user can only ever corrupt their OWN
+        // recommendation data this way, same risk level as the score maps
+        // above, so this deliberately doesn't deep-validate every
+        // recentImpressions entry's own {count, lastSeenAt} shape).
+        && data.recentImpressions is map && data.recentImpressions.size() <= 200
+        && data.stronglyEngagedContentIds is list && data.stronglyEngagedContentIds.size() <= 200
+        && data.respondedEventIds is list && data.respondedEventIds.size() <= 200
+        && data.interactionCount is number
+        && data.lastDecayAt is number
+        && isServerTimestamp(data.updatedAt)
+        && data.keys().hasOnly([
+          'categoryScores', 'creatorScores', 'cityScores', 'excludedContentIds', 'recentImpressions',
+          'stronglyEngagedContentIds', 'respondedEventIds', 'interactionCount', 'lastDecayAt', 'updatedAt'
+        ]);
     }
 
     // Step 41.2E — target validation for a new Saved relationship. Rejects:
@@ -149,6 +343,15 @@ service cloud.firestore {
             && savedContentTarget(data.targetId).type == 'post'
             && savedContentTarget(data.targetId).status == 'published'
             && savedContentTarget(data.targetId).authorUid != uid)
+          // A saved SOUND (see Reel.musicHash's own doc comment in
+          // src/types/reel.ts) — targetId is the musicHash itself, not a
+          // reelId/contentId. soundOrigins/{musicHash} is otherwise a
+          // fully server-only collection (no client read/write rule at
+          // all) — this exists() check is the one place a client's write
+          // is allowed to depend on it, just to confirm the hash is a
+          // real known sound, never an arbitrary string.
+          || (data.targetType == 'sound'
+            && exists(/databases/$(database)/documents/soundOrigins/$(data.targetId)))
         );
     }
 
@@ -238,17 +441,27 @@ service cloud.firestore {
     // Step 33 — mirrors isValidPublicProfileCreate's shape/consistency
     // checks for the update path: the editable fields must match the
     // post-commit users/{uid} document exactly, and every immutable field
-    // (cityName/countryCode/cityKey/accountType/createdAt) must be
-    // unchanged from what publicProfiles/{uid} already had — a client can
-    // never use this update to drift the public mirror away from the
-    // private profile, or to change something Edit Profile doesn't cover.
+    // (cityName/countryCode/cityKey/createdAt) must be unchanged from what
+    // publicProfiles/{uid} already had — a client can never use this
+    // update to drift the public mirror away from the private profile, or
+    // to change something Edit Profile doesn't cover.
+    //
+    // accountType is the one exception (Step 35): rather than pinning it
+    // to its OLD value here too, it's asserted equal to the post-commit
+    // users/{uid} value instead — exactly the same rule
+    // isValidPublicProfileCreate already uses. This has no effect on Edit
+    // Profile's own update (which never touches accountType on either
+    // document, so the post-commit users/{uid} value is simply whatever it
+    // already was), but it's what lets the SAME transaction that performs
+    // the personal -> business upgrade on users/{uid} also update this
+    // mirror to match, without a second, duplicate allow-block here.
     function isValidPublicProfileUpdate(uid, data, oldData) {
       let profile = getAfter(/databases/$(database)/documents/users/$(uid)).data;
       return data.uid == oldData.uid
         && data.cityName == oldData.cityName
         && data.countryCode == oldData.countryCode
         && data.cityKey == oldData.cityKey
-        && data.accountType == oldData.accountType
+        && data.accountType == profile.accountType
         && data.createdAt == oldData.createdAt
         && data.displayName == profile.displayName
         && data.username == profile.username
@@ -529,7 +742,11 @@ service cloud.firestore {
           && data.endsAt is timestamp
           && data.startsAt < data.endsAt
           && data.keys().hasAll(baseContentKeys().concat(['title', 'description', 'startsAt', 'endsAt', 'placeName']))
-          && data.keys().hasOnly(baseContentKeys().concat(['title', 'description', 'startsAt', 'endsAt', 'placeName']));
+          // Step 36 — coverPhotoURL is OPTIONAL (an organizer may skip it),
+          // same "absent key, not a blank value" pattern isValidPostShape
+          // already uses for placeName above.
+          && data.keys().hasOnly(baseContentKeys().concat(['title', 'description', 'startsAt', 'endsAt', 'placeName', 'coverPhotoURL']))
+          && (!('coverPhotoURL' in data) || (data.coverPhotoURL is string && data.coverPhotoURL.size() > 0 && data.coverPhotoURL.size() <= 2048));
       }
 
       // If placeId is set, the linked place must exist, be active, be in
@@ -731,6 +948,27 @@ service cloud.firestore {
           );
 
         allow delete: if false;
+      }
+
+      // Recommendation Engine — Step 4 — content/{contentId}/stats/engagement:
+      // the trusted, server-aggregated engagement stats doc (see
+      // src/types/engagementStats.ts and functions/src/engagementStats.ts).
+      // Readable by any signed-in user viewing the content (same visibility
+      // as the content itself) — but NEVER client-writable, in either
+      // direction: only the Cloud Functions trigger (Admin SDK, which
+      // bypasses these Rules entirely via IAM) may create/update/delete it.
+      // This is the one thing that makes the stats trustworthy at all — see
+      // this feature's own final report for why a client-writable aggregate
+      // (even a "validated" one, like stats/activity above) can never be
+      // more than self-reported.
+      match /stats/engagement {
+        function engagementStatsParent() {
+          return get(/databases/$(database)/documents/content/$(contentId)).data;
+        }
+
+        allow read: if isSignedIn() && engagementStatsParent().status == 'published';
+
+        allow create, update, delete: if false;
       }
 
       // content/{contentId}/responses/{uid} — one document per user's
@@ -1036,6 +1274,20 @@ service cloud.firestore {
             || (reelCommentReactionExists() && isOwner(get(/databases/$(database)/documents/reels/$(reelId)/comments/$(commentId)).data.authorUid));
         }
       }
+
+      // Recommendation Engine — Step 4 — reels/{reelId}/stats/engagement:
+      // same trusted, server-aggregated, never-client-writable stats doc as
+      // content/{contentId}/stats/engagement above — see that block's own
+      // doc comment for the full reasoning.
+      match /stats/engagement {
+        function reelEngagementStatsParent() {
+          return get(/databases/$(database)/documents/reels/$(reelId)).data;
+        }
+
+        allow read: if isSignedIn() && reelEngagementStatsParent().status == 'published';
+
+        allow create, update, delete: if false;
+      }
     }
 
     // A reply's parentCommentId must reference a real comment on this
@@ -1078,10 +1330,11 @@ service cloud.firestore {
       return [
         'reelId', 'authorUid', 'authorDisplayName', 'authorUsername',
         'cityName', 'countryCode', 'cityKey', 'categoryId', 'caption',
-        'storagePath', 'storageContentType', 'fileSizeBytes', 'durationMs',
+        'mediaType', 'needsPhotoVideoRender', 'storagePath', 'storageContentType', 'fileSizeBytes', 'durationMs',
         'width', 'height', 'status', 'visibility',
         'musicSourceType', 'musicTitle', 'musicStorageAudioPath',
         'musicStorageContentType', 'musicFileSizeBytes', 'musicDurationMs',
+        'musicHash', 'soundOriginAuthorUid', 'soundOriginReelId',
         'thumbnailStoragePath', 'thumbnailStorageContentType',
         'thumbnailFileSizeBytes', 'thumbnailWidth', 'thumbnailHeight',
         'createdAt', 'updatedAt', 'publishedAt'
@@ -1090,9 +1343,23 @@ service cloud.firestore {
 
     // A real still frame from the Reel's own video, chosen by the author
     // at capture time (see src/types/reel.ts's Reel.thumbnailStoragePath
-    // doc comment) — REQUIRED on every Reel, unlike optional music.
+    // doc comment) — REQUIRED on every Reel, unlike optional music. For a
+    // "FOTO" mode Reel (mediaType == 'photo'), the photo already IS its
+    // own cover — this instead requires thumbnailStoragePath to point at
+    // the EXACT SAME object as storagePath, with identical metadata, since
+    // there's no separate thumbnail object uploaded for one (see
+    // isValidReelCreate below).
     function isValidReelThumbnail(reelId, authorUid, data) {
-      return data.thumbnailStoragePath == 'reels/' + authorUid + '/' + reelId + '/thumbnail'
+      return (
+        data.mediaType == 'photo'
+        && data.thumbnailStoragePath == data.storagePath
+        && data.thumbnailStorageContentType == data.storageContentType
+        && data.thumbnailFileSizeBytes == data.fileSizeBytes
+        && data.thumbnailWidth == data.width
+        && data.thumbnailHeight == data.height
+      ) || (
+        data.mediaType == 'video'
+        && data.thumbnailStoragePath == 'reels/' + authorUid + '/' + reelId + '/thumbnail'
         && data.thumbnailStorageContentType is string
         && data.thumbnailStorageContentType.matches('image/.*')
         && data.thumbnailFileSizeBytes is int
@@ -1101,7 +1368,8 @@ service cloud.firestore {
         && data.thumbnailWidth is number
         && data.thumbnailWidth > 0
         && data.thumbnailHeight is number
-        && data.thumbnailHeight > 0;
+        && data.thumbnailHeight > 0
+      );
     }
 
     // Device-picked background music (see src/types/reel.ts's
@@ -1150,15 +1418,61 @@ service cloud.firestore {
         && data.categoryId.size() > 0
         && data.caption is string
         && data.caption.size() <= 500
+        && data.mediaType in ['video', 'photo']
+        && data.needsPhotoVideoRender is bool
+        // Only a 'video' draft can ever be pending photo-to-video
+        // rendering — see Reel.needsPhotoVideoRender's own doc comment in
+        // src/types/reel.ts. A plain 'photo' (no music) is never in this
+        // transient state.
+        && (data.mediaType == 'video' || data.needsPhotoVideoRender == false)
         && data.storagePath == 'reels/' + request.auth.uid + '/' + reelId + '/source'
-        && data.storageContentType is string
-        && data.storageContentType.matches('video/.*')
-        && data.fileSizeBytes is int
-        && data.fileSizeBytes > 0
-        && data.fileSizeBytes <= 52428800
-        && data.durationMs is int
-        && data.durationMs > 0
-        && data.durationMs <= 60000
+        && (
+          (
+            data.mediaType == 'video'
+            && data.needsPhotoVideoRender == false
+            && data.storageContentType is string
+            && data.storageContentType.matches('video/.*')
+            && data.fileSizeBytes is int
+            && data.fileSizeBytes > 0
+            && data.fileSizeBytes <= 52428800
+            && data.durationMs is int
+            && data.durationMs > 0
+            && data.durationMs <= 60000
+          ) || (
+            // "FOTO" mode WITH music (Step — renderPhotoToVideo): mediaType
+            // is already 'video', but the upload landing at storagePath
+            // right now is still the photo itself, pending server-side
+            // rendering — same image bounds as a plain photo below, except
+            // durationMs is fixed at exactly 15000 (REEL_PHOTO_DURATION_MS
+            // in src/types/reel.ts — this literal must stay in sync with
+            // that constant) rather than the sentinel 0, since this Reel
+            // WILL have a real 15-second duration once rendered.
+            data.mediaType == 'video'
+            && data.needsPhotoVideoRender == true
+            // renderPhotoToVideo (functions/src/index.ts) refuses to run at
+            // all without device-picked music — a "FOTO" capture with no
+            // music never sets needsPhotoVideoRender in the first place
+            // (it's a plain mediaType == 'photo' draft instead), so this
+            // combination should never legitimately be missing music.
+            && data.musicSourceType == 'device'
+            && data.storageContentType is string
+            && data.storageContentType.matches('image/.*')
+            && data.fileSizeBytes is int
+            && data.fileSizeBytes > 0
+            && data.fileSizeBytes <= 10485760
+            && data.durationMs == 15000
+          ) || (
+            data.mediaType == 'photo'
+            && data.storageContentType is string
+            && data.storageContentType.matches('image/.*')
+            && data.fileSizeBytes is int
+            && data.fileSizeBytes > 0
+            && data.fileSizeBytes <= 10485760
+            // A photo has no duration — always the sentinel 0, same
+            // convention as every other unused-for-this-variant field.
+            && data.durationMs == 0
+          )
+        )
         && data.width is number
         && data.width > 0
         && data.height is number
@@ -1166,6 +1480,15 @@ service cloud.firestore {
         && data.status == 'uploading'
         && data.visibility == 'city'
         && data.publishedAt == null
+        // Sound attribution (musicHash/soundOriginAuthorUid/
+        // soundOriginReelId — see Reel.musicHash's own doc comment in
+        // src/types/reel.ts) is NEVER known at create time — only a
+        // trusted Cloud Function computes it, later, via an Admin SDK
+        // update that bypasses these Rules entirely. A client can only
+        // ever create a draft with these still empty.
+        && data.musicHash == ''
+        && data.soundOriginAuthorUid == ''
+        && data.soundOriginReelId == ''
         && isValidReelMusic(reelId, request.auth.uid, data)
         && isValidReelThumbnail(reelId, request.auth.uid, data)
         && isServerTimestamp(data.createdAt)
@@ -1194,6 +1517,17 @@ service cloud.firestore {
         && newData.cityKey == oldData.cityKey
         && newData.categoryId == oldData.categoryId
         && newData.caption == oldData.caption
+        && newData.mediaType == oldData.mediaType
+        // A Reel still awaiting photo-to-video rendering (see
+        // Reel.needsPhotoVideoRender's own doc comment) can never publish —
+        // renderPhotoToVideo (an Admin SDK write, bypassing these Rules
+        // entirely) must flip this to false FIRST, which is also the point
+        // at which storagePath actually starts holding a real video instead
+        // of the original photo. Without this check, a client could skip
+        // straight to publishReel and publish the raw, un-rendered photo
+        // as if it were a real video.
+        && oldData.needsPhotoVideoRender == false
+        && newData.needsPhotoVideoRender == false
         && newData.storagePath == oldData.storagePath
         && newData.storageContentType == oldData.storageContentType
         && newData.fileSizeBytes == oldData.fileSizeBytes
@@ -1207,6 +1541,9 @@ service cloud.firestore {
         && newData.musicStorageContentType == oldData.musicStorageContentType
         && newData.musicFileSizeBytes == oldData.musicFileSizeBytes
         && newData.musicDurationMs == oldData.musicDurationMs
+        && newData.musicHash == oldData.musicHash
+        && newData.soundOriginAuthorUid == oldData.soundOriginAuthorUid
+        && newData.soundOriginReelId == oldData.soundOriginReelId
         && newData.thumbnailStoragePath == oldData.thumbnailStoragePath
         && newData.thumbnailStorageContentType == oldData.thumbnailStorageContentType
         && newData.thumbnailFileSizeBytes == oldData.thumbnailFileSizeBytes
@@ -1214,6 +1551,159 @@ service cloud.firestore {
         && newData.thumbnailHeight == oldData.thumbnailHeight
         && newData.createdAt == oldData.createdAt
         && newData.keys().hasOnly(reelBaseKeys());
+    }
+
+    // stories/{storyId} — a separate root collection from reels/{reelId}
+    // (see src/types/story.ts for why Stories don't share the Reel model).
+    // Same two-phase lifecycle as Reels: "uploading" -> "published" (see
+    // src/services/stories.ts). UNLIKE Reels, visibility is
+    // followers-only, not city-wide — see isCanViewStory below — and there
+    // is no cascade to clean up on delete (no likes/comments/thumbnail/
+    // music, unlike a Reel).
+    match /stories/{storyId} {
+      // The author can always read their own Story (including a still-
+      // "uploading" draft, needed for the upload workflow — same
+      // reasoning as reels/{reelId}'s own read rule). Anyone else may read
+      // it ONLY once published AND only if they follow the author AND
+      // neither has blocked the other — see isCanViewStory.
+      allow read: if isSignedIn() && isCanViewStory(resource.data);
+
+      allow create: if isSignedIn() && isValidStoryCreate(storyId, request.resource.data);
+
+      // The ONLY allowed transition: uploading -> published, stamping
+      // publishedAt/expiresAt. Every other field is immutable. expiresAt
+      // is bounded to a narrow window around request.time + 24h (see
+      // STORY_EXPIRY_MS in src/types/story.ts) — a client-computed value,
+      // not server-authoritative, so this caps how far it can be pushed
+      // out rather than trusting it outright.
+      allow update: if isSignedIn()
+        && resource.data.authorUid == request.auth.uid
+        && isValidStoryPublish(request.resource.data, resource.data);
+
+      // The author may delete their own Story at any time (Instagram-style
+      // "delete my Story" — see deleteMyStory in src/services/stories.ts),
+      // uploading or published — unlike a published Reel, which can never
+      // be client-deleted (a Story has no cascade to worry about).
+      allow delete: if isSignedIn() && resource.data.authorUid == request.auth.uid;
+
+      // stories/{storyId}/views/{viewerUid} — one doc per person who has
+      // viewed this Story, keyed by their own uid (write-once-per-viewer;
+      // a repeat view is an update, just refreshing viewedAt). Only the
+      // Story's own author can ever READ this subcollection — a viewer
+      // must never learn who else viewed it, matching real Stories
+      // features' privacy model. A viewer may only write their OWN entry,
+      // and only if they're actually allowed to view the parent Story in
+      // the first place (isCanViewStory again, evaluated against the
+      // PARENT story document, not this views doc).
+      match /views/{viewerUid} {
+        allow read: if isSignedIn()
+          && (
+            request.auth.uid == viewerUid
+            || get(/databases/$(database)/documents/stories/$(storyId)).data.authorUid == request.auth.uid
+          );
+
+        allow create, update: if isSignedIn()
+          && request.auth.uid == viewerUid
+          && isCanViewStory(get(/databases/$(database)/documents/stories/$(storyId)).data)
+          && request.resource.data.viewerUid == viewerUid
+          && isServerTimestamp(request.resource.data.viewedAt)
+          && request.resource.data.keys().hasOnly(['viewerUid', 'viewedAt']);
+
+        allow delete: if false;
+      }
+    }
+
+    function isCanViewStory(story) {
+      return story.authorUid == request.auth.uid
+        || (
+          story.status == 'published'
+          && exists(/databases/$(database)/documents/follows/$(request.auth.uid + '_' + story.authorUid))
+          && isNotBlockedEitherWay(request.auth.uid, story.authorUid)
+        );
+    }
+
+    function storyBaseKeys() {
+      return [
+        'storyId', 'authorUid', 'authorDisplayName', 'authorUsername',
+        'mediaType', 'storagePath', 'storageContentType', 'fileSizeBytes',
+        'durationMs', 'width', 'height', 'status',
+        'createdAt', 'updatedAt', 'publishedAt', 'expiresAt'
+      ];
+    }
+
+    function isValidStoryCreate(storyId, data) {
+      let profile = get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+      return exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && profile.onboardingCompleted == true
+        && data.storyId == storyId
+        && data.authorUid == request.auth.uid
+        && data.authorDisplayName == profile.displayName
+        && data.authorUsername == profile.username
+        && data.mediaType in ['video', 'photo']
+        && data.storagePath == 'stories/' + request.auth.uid + '/' + storyId + '/source'
+        && (
+          (
+            data.mediaType == 'video'
+            && data.storageContentType is string
+            && data.storageContentType.matches('video/.*')
+            && data.fileSizeBytes is int
+            && data.fileSizeBytes > 0
+            && data.fileSizeBytes <= 52428800
+            && data.durationMs is int
+            && data.durationMs > 0
+            && data.durationMs <= 60000
+          ) || (
+            data.mediaType == 'photo'
+            && data.storageContentType is string
+            && data.storageContentType.matches('image/.*')
+            && data.fileSizeBytes is int
+            && data.fileSizeBytes > 0
+            && data.fileSizeBytes <= 10485760
+            && data.durationMs == 0
+          )
+        )
+        && data.width is number
+        && data.width > 0
+        && data.height is number
+        && data.height > 0
+        && data.status == 'uploading'
+        && data.publishedAt == null
+        && data.expiresAt == null
+        && isServerTimestamp(data.createdAt)
+        && isServerTimestamp(data.updatedAt)
+        && data.keys().hasOnly(storyBaseKeys());
+    }
+
+    // Every field except status/publishedAt/expiresAt/updatedAt must stay
+    // byte-identical to what create validated — same "nothing else can
+    // change on publish" reasoning as isValidReelPublish above.
+    function isValidStoryPublish(newData, oldData) {
+      return oldData.status == 'uploading'
+        && newData.status == 'published'
+        && oldData.publishedAt == null
+        && isServerTimestamp(newData.publishedAt)
+        && isServerTimestamp(newData.updatedAt)
+        // expiresAt is client-computed (see Story.expiresAt's own doc
+        // comment in src/types/story.ts) — bounded to within 10 minutes of
+        // exactly request.time + 24h, wide enough to absorb ordinary clock
+        // skew/upload latency, narrow enough that a client can't fabricate
+        // a meaningfully longer-lived Story.
+        && newData.expiresAt is timestamp
+        && newData.expiresAt > request.time + duration.value(23, 'h') + duration.value(50, 'm')
+        && newData.expiresAt < request.time + duration.value(24, 'h') + duration.value(10, 'm')
+        && newData.storyId == oldData.storyId
+        && newData.authorUid == oldData.authorUid
+        && newData.authorDisplayName == oldData.authorDisplayName
+        && newData.authorUsername == oldData.authorUsername
+        && newData.mediaType == oldData.mediaType
+        && newData.storagePath == oldData.storagePath
+        && newData.storageContentType == oldData.storageContentType
+        && newData.fileSizeBytes == oldData.fileSizeBytes
+        && newData.durationMs == oldData.durationMs
+        && newData.width == oldData.width
+        && newData.height == oldData.height
+        && newData.createdAt == oldData.createdAt
+        && newData.keys().hasOnly(storyBaseKeys());
     }
 
     // notifications/{notificationId} — one social notification per Like,

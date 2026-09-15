@@ -9,9 +9,11 @@ import { SettingsRow } from '@/components/SettingsRow';
 import { SettingsSection } from '@/components/SettingsSection';
 import { Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
+import { useProfile } from '@/hooks/useProfile';
 import { fetchMyBlockedUserIds } from '@/services/blocks';
 import { fetchMyNewMessagesFrom } from '@/services/privacySettings';
 import { NEW_MESSAGES_FROM_OPTIONS } from '@/types/privacy';
+import { isBusinessAccount } from '@/utils/accountCapabilities';
 
 type LoadStatus = 'loading' | 'loaded' | 'error';
 
@@ -26,6 +28,7 @@ type LoadStatus = 'loading' | 'loaded' | 'error';
  */
 export default function SettingsScreen() {
   const { user, signOut } = useAuth();
+  const { profile } = useProfile();
   const [status, setStatus] = useState<LoadStatus>('loading');
   const [messagePrivacyLabel, setMessagePrivacyLabel] = useState('');
   const [blockedCount, setBlockedCount] = useState(0);
@@ -69,6 +72,17 @@ export default function SettingsScreen() {
         <View style={styles.container}>
           <SettingsSection title="Account">
             <SettingsRow icon="person-outline" label="Edit profile" onPress={() => router.push('/profile/edit')} />
+            {/* Step 35 — only shown for a Personal account: the switch is
+                one-way, so once an account is already Business there is
+                nothing further to offer here (see settings/index.tsx's own
+                "real rows only" note at the top of this file). */}
+            {!isBusinessAccount(profile) ? (
+              <SettingsRow
+                icon="briefcase-outline"
+                label="Switch to Business account"
+                onPress={() => router.push('/settings/business-account')}
+              />
+            ) : null}
             <SettingsRow
               icon="trash-outline"
               label="Delete account"

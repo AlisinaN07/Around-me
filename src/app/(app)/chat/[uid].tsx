@@ -9,6 +9,7 @@ import { Button } from '@/components/Button';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
 import { OptionsMenu, type OptionsMenuOption } from '@/components/OptionsMenu';
 import { ReportModal } from '@/components/ReportModal';
+import { SwipeBackEdge } from '@/components/SwipeBackEdge';
 import { Colors, Radius, Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
 import { blockUser, isUserBlocked, unblockUser } from '@/services/blocks';
@@ -145,6 +146,8 @@ export default function ChatScreen() {
 
   return (
     <SafeAreaView style={styles.safeArea} edges={['top', 'bottom']}>
+      {/* Same handler the back button below calls. */}
+      <SwipeBackEdge onBack={() => router.back()} />
       <View style={styles.header}>
         <Pressable onPress={() => router.back()} hitSlop={8} accessibilityRole="button" accessibilityLabel="Back" style={styles.backButton}>
           <Ionicons name="chevron-back" size={24} color={Colors.text} />

@@ -8,12 +8,12 @@ type ProfileTabBarProps<T extends string> = {
   onChange: (id: T) => void;
 };
 
-// Step 41.2G — Business Own Profile now reaches 5 tabs. Above this many,
-// equal-flex tabs get too narrow for a label like "Activities" on a narrow
-// phone, so the row switches to horizontal scroll with a fixed per-tab
-// min-width instead of squeezing every label. At 4 tabs or fewer (every
-// other profile/account combination), the original equal-flex row is
-// unchanged — this threshold only ever fires for the one 5-tab case.
+// Step 41.2G added a 5th tab for Business profiles; a later step (Business
+// Profile is now Events-only, no tab bar at all — see the profile screens'
+// own effectiveTab) removed that case, but this threshold is left in place
+// as a general safeguard: above 4 tabs, equal-flex labels get too narrow
+// on a phone, so the row switches to horizontal scroll with a fixed
+// per-tab min-width instead of squeezing every label.
 const SCROLL_THRESHOLD = 4;
 
 /**

@@ -29,20 +29,25 @@ import {
   setDoc,
   updateDoc,
   where,
+  type QueryConstraint,
   type WithFieldValue,
 } from 'firebase/firestore';
 import { deleteObject, getDownloadURL, ref, uploadBytesResumable, type UploadTask } from 'firebase/storage';
 import { httpsCallable } from 'firebase/functions';
 
 import { INTERESTS } from '@/constants/interests';
+import type { BrowseScope } from '@/types/browseScope';
 import {
   REEL_CAPTION_MAX_LENGTH,
   REEL_MAX_DURATION_MS,
   REEL_MAX_FILE_SIZE_BYTES,
   REEL_MUSIC_MAX_DURATION_MS,
   REEL_MUSIC_MAX_FILE_SIZE_BYTES,
+  REEL_PHOTO_DURATION_MS,
+  REEL_PHOTO_MAX_FILE_SIZE_BYTES,
   REEL_THUMBNAIL_MAX_FILE_SIZE_BYTES,
   type Reel,
+  type ReelMediaType,
 } from '@/types/reel';
 
 import { fetchFollowingUids } from './following';
@@ -87,10 +92,28 @@ function isValidCategoryId(categoryId: string): boolean {
   return VALID_CATEGORY_IDS.has(categoryId);
 }
 
+/**
+ * Normalizes a missing `mediaType` (every Reel published before this field
+ * existed) to 'video' — the only kind of Reel there was until "FOTO" mode
+ * — so every read site returns a real `ReelMediaType`, never a missing key
+ * call sites have to special-case. Same convention as `bio ?? ''` on
+ * UserProfile.
+ */
+export function normalizeReel(data: Reel): Reel {
+  return {
+    ...data,
+    mediaType: data.mediaType ?? 'video',
+    needsPhotoVideoRender: data.needsPhotoVideoRender ?? false,
+    musicHash: data.musicHash ?? '',
+    soundOriginAuthorUid: data.soundOriginAuthorUid ?? '',
+    soundOriginReelId: data.soundOriginReelId ?? '',
+  };
+}
+
 export async function fetchReel(reelId: string): Promise<Reel | null> {
   if (!firestore) return null;
   const snapshot = await getDoc(reelRef(reelId));
-  return snapshot.exists() ? (snapshot.data() as Reel) : null;
+  return snapshot.exists() ? normalizeReel(snapshot.data() as Reel) : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -101,12 +124,32 @@ export type CreateReelDraftInput = {
   uid: string;
   categoryId: string;
   caption: string;
+  /** 'video' (the original, still overwhelmingly common case, and also a "FOTO"-mode photo taken WITH music — see `photoRenderPending` below) or 'photo' ("FOTO" mode WITHOUT music — see ReelMediaType's own doc comment in src/types/reel.ts). */
+  mediaType: ReelMediaType;
+  /**
+   * True ONLY for a "FOTO"-mode photo taken WITH music: `mediaType` is
+   * 'video' (this draft WILL publish as a real video), but
+   * `storageContentType`/`fileSizeBytes`/`width`/`height` below still
+   * describe the PHOTO itself — createReelDraft validates them as an
+   * image (same bounds as mediaType 'photo'), stores `durationMs` as the
+   * fixed REEL_PHOTO_DURATION_MS, and sets `needsPhotoVideoRender: true`
+   * on the created Reel. The caller must then upload that photo to
+   * `reel.storagePath` (via uploadReelVideo — it just uploads bytes,
+   * despite its name), a real chosen `thumbnail` (required, same as any
+   * other video — see below), and music, then call renderPhotoToVideo
+   * BEFORE publishReel. Omit/false for every other case, including a
+   * plain photo with no music (`mediaType: 'photo'`) and an ordinary
+   * video.
+   */
+  photoRenderPending?: boolean;
   storageContentType: string;
   fileSizeBytes: number;
   /**
    * Declared duration in milliseconds from the picked asset's own metadata
    * — see src/types/reel.ts's Reel.durationMs doc comment for why this is
-   * a client-declared value, not a verified one.
+   * a client-declared value, not a verified one. Ignored (always stored as
+   * 0) when mediaType is 'photo', or as REEL_PHOTO_DURATION_MS when
+   * `photoRenderPending` is true.
    */
   durationMs: number;
   width: number;
@@ -114,9 +157,12 @@ export type CreateReelDraftInput = {
   /**
    * The device-audio file picked alongside the camera recording (see
    * camera.tsx's "Music" control) — `undefined`/omitted for the ordinary
-   * case (no music, or a library-picked video, which never has this).
-   * See ReelMusicSourceType's doc comment in src/types/reel.ts for the
-   * full model this maps onto.
+   * case (no music, a library-picked video, or a plain photo with no
+   * music). REQUIRED in practice whenever `photoRenderPending` is true —
+   * that's the only reason a "FOTO"-mode capture ever reaches this input
+   * at all (no music means the plain `mediaType: 'photo'` path instead,
+   * which never sets `photoRenderPending`). See ReelMusicSourceType's doc
+   * comment in src/types/reel.ts for the full model this maps onto.
    */
   music?: {
     title: string;
@@ -125,12 +171,18 @@ export type CreateReelDraftInput = {
     durationMs: number;
   };
   /**
-   * The real still frame from this video the author picked as its cover
-   * (see camera.tsx's cover-frame picker and Reel.thumbnailStoragePath's
-   * own doc comment in src/types/reel.ts) — REQUIRED, unlike `music`:
-   * every Reel needs a real thumbnail.
+   * The real cover image for this Reel — REQUIRED whenever this draft will
+   * actually publish as a video, i.e. whenever `mediaType` is 'video',
+   * which includes `photoRenderPending: true` (see camera.tsx's cover-
+   * frame picker for an ordinary video, and its resized-photo-as-thumbnail
+   * step for the photoRenderPending case) and Reel.thumbnailStoragePath's
+   * own doc comment in src/types/reel.ts. Ignored when `mediaType` is
+   * 'photo': that photo already IS its own cover image, automatically
+   * derived from storageContentType/fileSizeBytes/width/height above
+   * instead — see Reel.thumbnailStoragePath's own doc comment for why
+   * there's no separate object to upload for it in that case.
    */
-  thumbnail: {
+  thumbnail?: {
     storageContentType: string;
     fileSizeBytes: number;
     width: number;
@@ -151,6 +203,19 @@ export async function createReelDraft(input: CreateReelDraftInput): Promise<Crea
     return { ok: false, error: 'no-profile', message: 'Complete your profile before creating a post.' };
   }
 
+  const isPhoto = input.mediaType === 'photo';
+  // "FOTO" mode with music — a real video from the moment this draft
+  // exists (mediaType is already 'video'), but the bytes about to be
+  // uploaded to storagePath are still the photo itself until
+  // renderPhotoToVideo runs — see CreateReelDraftInput.photoRenderPending's
+  // own doc comment.
+  const isPhotoPendingRender = !isPhoto && input.photoRenderPending === true;
+  // Everywhere below that needs "this upload is actually an image, not a
+  // real video" (content-type/size bounds, dimension requirement) cares
+  // about isPhoto OR isPhotoPendingRender equally — only durationMs and
+  // the thumbnail requirement (further down) tell the two apart.
+  const isImageUpload = isPhoto || isPhotoPendingRender;
+
   const caption = input.caption.trim();
   if (caption.length > REEL_CAPTION_MAX_LENGTH) {
     return { ok: false, error: 'invalid-input', message: `Caption must be ${REEL_CAPTION_MAX_LENGTH} characters or fewer.` };
@@ -158,17 +223,27 @@ export async function createReelDraft(input: CreateReelDraftInput): Promise<Crea
   if (!isValidCategoryId(input.categoryId)) {
     return { ok: false, error: 'invalid-input', message: 'Choose a valid category.' };
   }
-  if (!input.storageContentType.startsWith('video/')) {
-    return { ok: false, error: 'invalid-input', message: 'Only video files can be shared as a post.' };
-  }
-  if (!Number.isFinite(input.fileSizeBytes) || input.fileSizeBytes <= 0 || input.fileSizeBytes > REEL_MAX_FILE_SIZE_BYTES) {
-    return { ok: false, error: 'invalid-input', message: 'Video must be under 50 MB.' };
-  }
-  if (!Number.isFinite(input.durationMs) || input.durationMs <= 0 || input.durationMs > REEL_MAX_DURATION_MS) {
-    return { ok: false, error: 'invalid-input', message: 'Video must be 60 seconds or shorter.' };
+
+  if (isImageUpload) {
+    if (!input.storageContentType.startsWith('image/')) {
+      return { ok: false, error: 'invalid-input', message: 'Only image files can be shared as a photo post.' };
+    }
+    if (!Number.isFinite(input.fileSizeBytes) || input.fileSizeBytes <= 0 || input.fileSizeBytes > REEL_PHOTO_MAX_FILE_SIZE_BYTES) {
+      return { ok: false, error: 'invalid-input', message: 'Photo must be under 10 MB.' };
+    }
+  } else {
+    if (!input.storageContentType.startsWith('video/')) {
+      return { ok: false, error: 'invalid-input', message: 'Only video files can be shared as a post.' };
+    }
+    if (!Number.isFinite(input.fileSizeBytes) || input.fileSizeBytes <= 0 || input.fileSizeBytes > REEL_MAX_FILE_SIZE_BYTES) {
+      return { ok: false, error: 'invalid-input', message: 'Video must be under 50 MB.' };
+    }
+    if (!Number.isFinite(input.durationMs) || input.durationMs <= 0 || input.durationMs > REEL_MAX_DURATION_MS) {
+      return { ok: false, error: 'invalid-input', message: 'Video must be 60 seconds or shorter.' };
+    }
   }
   if (!Number.isFinite(input.width) || input.width <= 0 || !Number.isFinite(input.height) || input.height <= 0) {
-    return { ok: false, error: 'invalid-input', message: "Couldn't read this video's dimensions." };
+    return { ok: false, error: 'invalid-input', message: isImageUpload ? "Couldn't read this photo's dimensions." : "Couldn't read this video's dimensions." };
   }
   if (input.music) {
     if (!input.music.storageContentType.startsWith('audio/')) {
@@ -181,21 +256,46 @@ export async function createReelDraft(input: CreateReelDraftInput): Promise<Crea
       return { ok: false, error: 'invalid-input', message: 'Music file must be 10 minutes or shorter.' };
     }
   }
-  if (!input.thumbnail.storageContentType.startsWith('image/')) {
-    return { ok: false, error: 'invalid-input', message: 'Cover image must be a real image file.' };
-  }
-  if (
-    !Number.isFinite(input.thumbnail.fileSizeBytes) ||
-    input.thumbnail.fileSizeBytes <= 0 ||
-    input.thumbnail.fileSizeBytes > REEL_THUMBNAIL_MAX_FILE_SIZE_BYTES
-  ) {
-    return { ok: false, error: 'invalid-input', message: 'Cover image must be under 5 MB.' };
-  }
-  if (!Number.isFinite(input.thumbnail.width) || input.thumbnail.width <= 0 || !Number.isFinite(input.thumbnail.height) || input.thumbnail.height <= 0) {
-    return { ok: false, error: 'invalid-input', message: "Couldn't read the cover image's dimensions." };
+  // Every 'video'-mediaType draft needs a real chosen cover image —
+  // including isPhotoPendingRender, which publishes as a real video too.
+  // Only a plain 'photo' (no music) skips this, since it's its own cover.
+  if (!isPhoto) {
+    if (!input.thumbnail) {
+      return { ok: false, error: 'invalid-input', message: "Couldn't prepare this post's cover image — try again." };
+    }
+    if (!input.thumbnail.storageContentType.startsWith('image/')) {
+      return { ok: false, error: 'invalid-input', message: 'Cover image must be a real image file.' };
+    }
+    if (
+      !Number.isFinite(input.thumbnail.fileSizeBytes) ||
+      input.thumbnail.fileSizeBytes <= 0 ||
+      input.thumbnail.fileSizeBytes > REEL_THUMBNAIL_MAX_FILE_SIZE_BYTES
+    ) {
+      return { ok: false, error: 'invalid-input', message: 'Cover image must be under 5 MB.' };
+    }
+    if (!Number.isFinite(input.thumbnail.width) || input.thumbnail.width <= 0 || !Number.isFinite(input.thumbnail.height) || input.thumbnail.height <= 0) {
+      return { ok: false, error: 'invalid-input', message: "Couldn't read the cover image's dimensions." };
+    }
   }
 
   const draftRef = doc(collection(firestore, REELS_COLLECTION));
+  // A plain photo (no music) IS its own cover — see
+  // Reel.thumbnailStoragePath's own doc comment — so thumbnailStoragePath
+  // just points at the exact same object as storagePath instead of a
+  // separate uploaded one. isPhotoPendingRender does NOT qualify for this
+  // shortcut even though its upload is also an image right now: storagePath
+  // is about to be OVERWRITTEN by renderPhotoToVideo with the rendered
+  // video, so its thumbnail must be a real, separately-uploaded, permanent
+  // copy — same as any other video Reel.
+  const thumbnail = isPhoto
+    ? { storagePath: reelStoragePath(profile.uid, draftRef.id), storageContentType: input.storageContentType, fileSizeBytes: input.fileSizeBytes, width: input.width, height: input.height }
+    : {
+        storagePath: reelThumbnailStoragePath(profile.uid, draftRef.id),
+        storageContentType: input.thumbnail!.storageContentType,
+        fileSizeBytes: input.thumbnail!.fileSizeBytes,
+        width: input.thumbnail!.width,
+        height: input.thumbnail!.height,
+      };
   const data = {
     reelId: draftRef.id,
     authorUid: profile.uid,
@@ -206,10 +306,12 @@ export async function createReelDraft(input: CreateReelDraftInput): Promise<Crea
     cityKey: profile.cityKey,
     categoryId: input.categoryId,
     caption,
+    mediaType: input.mediaType,
+    needsPhotoVideoRender: isPhotoPendingRender,
     storagePath: reelStoragePath(profile.uid, draftRef.id),
     storageContentType: input.storageContentType,
     fileSizeBytes: input.fileSizeBytes,
-    durationMs: input.durationMs,
+    durationMs: isPhoto ? 0 : isPhotoPendingRender ? REEL_PHOTO_DURATION_MS : input.durationMs,
     width: input.width,
     height: input.height,
     status: 'uploading',
@@ -223,11 +325,19 @@ export async function createReelDraft(input: CreateReelDraftInput): Promise<Crea
     musicStorageContentType: input.music?.storageContentType ?? '',
     musicFileSizeBytes: input.music?.fileSizeBytes ?? 0,
     musicDurationMs: input.music?.durationMs ?? 0,
-    thumbnailStoragePath: reelThumbnailStoragePath(profile.uid, draftRef.id),
-    thumbnailStorageContentType: input.thumbnail.storageContentType,
-    thumbnailFileSizeBytes: input.thumbnail.fileSizeBytes,
-    thumbnailWidth: input.thumbnail.width,
-    thumbnailHeight: input.thumbnail.height,
+    // Always empty at creation — only a trusted Cloud Function
+    // (muxReelMusic/renderPhotoToVideo, via the Admin SDK) ever stamps a
+    // real value, later, once the picked music file's actual bytes have
+    // been hashed. See Reel.musicHash's own doc comment in
+    // src/types/reel.ts.
+    musicHash: '',
+    soundOriginAuthorUid: '',
+    soundOriginReelId: '',
+    thumbnailStoragePath: thumbnail.storagePath,
+    thumbnailStorageContentType: thumbnail.storageContentType,
+    thumbnailFileSizeBytes: thumbnail.fileSizeBytes,
+    thumbnailWidth: thumbnail.width,
+    thumbnailHeight: thumbnail.height,
     createdAt: serverTimestamp(),
     updatedAt: serverTimestamp(),
     publishedAt: null,
@@ -468,6 +578,67 @@ export async function muxReelMusic(reelId: string): Promise<MuxReelMusicResult> 
 }
 
 // ---------------------------------------------------------------------------
+// Phase 2.5 (photo variant) — render a "FOTO" mode photo taken WITH music
+// into a real video. Same trusted-backend-only reasoning as muxReelMusic
+// above (real ffmpeg processing, no client SDK can do this), but this is a
+// DIFFERENT operation: muxReelMusic merges an audio track into an EXISTING
+// video; this one generates the video itself from a still image plus music
+// (see Reel.needsPhotoVideoRender's own doc comment and
+// functions/src/index.ts's renderPhotoToVideo). Only ever called — instead
+// of muxReelMusic, never alongside it — between the photo/thumbnail/music
+// uploads finishing and publishReel, for a draft created with
+// CreateReelDraftInput's `photoRenderPending: true`.
+// ---------------------------------------------------------------------------
+
+export type RenderPhotoToVideoResult = { ok: true } | { ok: false; message: string };
+
+export async function renderPhotoToVideo(reelId: string): Promise<RenderPhotoToVideoResult> {
+  if (!functions) {
+    return { ok: false, message: 'This feature is not available right now.' };
+  }
+  try {
+    await httpsCallable(functions, 'renderPhotoToVideo')({ reelId });
+  } catch {
+    return { ok: false, message: "Couldn't finish processing this post." };
+  }
+  return { ok: true };
+}
+
+// ---------------------------------------------------------------------------
+// Own captured audio (a plain video with no picked music, musicSourceType
+// 'none') made saveable/reusable ON DEMAND — see
+// SoundSheet.tsx's own doc comment for why this is deliberately lazy
+// rather than run on every ordinary video publish: extracting and hashing
+// an audio track costs real server compute, and the overwhelming majority
+// of videos never have anyone open their sound sheet at all, let alone
+// try to save/reuse it. Idempotent — safe to call again for a Reel this
+// has already resolved (returns the existing values without redoing any
+// work), and safe for two different viewers to call around the same time
+// (functions/src/index.ts's resolveSoundOrigin handles that race with a
+// transaction, exactly like a real device-picked sound would).
+// ---------------------------------------------------------------------------
+
+export type ResolveOwnSoundOriginResult =
+  | { ok: true; musicHash: string; originAuthorUid: string; originReelId: string }
+  | { ok: false; message: string };
+
+export async function resolveOwnSoundOrigin(reelId: string): Promise<ResolveOwnSoundOriginResult> {
+  if (!functions) {
+    return { ok: false, message: 'This feature is not available right now.' };
+  }
+  try {
+    const result = await httpsCallable(functions, 'resolveOwnSoundOrigin')({ reelId });
+    const data = result.data as { musicHash: string; originAuthorUid: string; originReelId: string };
+    return { ok: true, musicHash: data.musicHash, originAuthorUid: data.originAuthorUid, originReelId: data.originReelId };
+  } catch (error) {
+    if (__DEV__) {
+      console.warn('[reels] resolveOwnSoundOrigin failed:', error);
+    }
+    return { ok: false, message: "Couldn't process this post's sound." };
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Phase 3 — publish (the only allowed update on a Reel)
 // ---------------------------------------------------------------------------
 
@@ -574,18 +745,54 @@ export async function discardReelDraft(
 // Read — one-shot reads only, no realtime listener (see Step 18 spec).
 // ---------------------------------------------------------------------------
 
-/** Newest published Reels for one city. Never fetches all Reels then filters client-side. */
-export async function fetchCityReels(cityKey: string, limitCount = DEFAULT_FEED_LIMIT): Promise<Reel[]> {
+/**
+ * The equality/`in` clause a scoped query filters on — `cityKey`
+ * (`==` for one City, `in` for several Cities), `countryCode` for Country
+ * scope, or none at all for World (every published Reel, everywhere).
+ * See src/types/browseScope.ts's own doc comment for why this never
+ * affects what a new Reel is created with, only what a query reads back.
+ *
+ * NEVER use this for a query that already has its own `in`/
+ * `array-contains-any` clause (fetchFollowingReels below already filters
+ * `authorUid in [...]`) — Firestore allows only ONE such clause per
+ * query. Use scopeVariants for that instead.
+ */
+function scopeWhereClause(scope: BrowseScope): QueryConstraint[] {
+  if (scope.kind === 'city') return [where('cityKey', '==', scope.cityKey)];
+  if (scope.kind === 'cities') return [where('cityKey', 'in', scope.cityKeys)];
+  if (scope.kind === 'country') return [where('countryCode', '==', scope.countryCode)];
+  return [];
+}
+
+/**
+ * Every scope kind EXCEPT 'cities' already reads as a single query variant
+ * (one equality clause, or none). 'cities' scope expands into one variant
+ * per city (`cityKey == that city`) instead of the `in` clause
+ * scopeWhereClause would build for it, because fetchFollowingReels
+ * already has its OWN `in` clause (`authorUid in [...]`) — Firestore
+ * permits only one per query — so it runs one query per (authorUid
+ * chunk × variant) pair and merges everything. Every other scope kind
+ * still reuses the exact same composite index it always has (see
+ * firestore.indexes.json) since each variant here is structurally
+ * identical to scopeWhereClause's own single-variant output.
+ */
+function scopeVariants(scope: BrowseScope): QueryConstraint[][] {
+  if (scope.kind === 'cities') return scope.cityKeys.map((cityKey) => [where('cityKey', '==', cityKey)]);
+  return [scopeWhereClause(scope)];
+}
+
+/** Newest published Reels in one scope (city/country/world). Never fetches all Reels then filters client-side. */
+export async function fetchCityReels(scope: BrowseScope, limitCount = DEFAULT_FEED_LIMIT): Promise<Reel[]> {
   if (!firestore) return [];
   const feedQuery = query(
     collection(firestore, REELS_COLLECTION),
-    where('cityKey', '==', cityKey),
+    ...scopeWhereClause(scope),
     where('status', '==', 'published'),
     orderBy('publishedAt', 'desc'),
     limit(limitCount)
   );
   const snapshot = await getDocs(feedQuery);
-  return snapshot.docs.map((docSnapshot) => docSnapshot.data() as Reel);
+  return snapshot.docs.map((docSnapshot) => normalizeReel(docSnapshot.data() as Reel));
 }
 
 function chunkArray<T>(items: T[], size: number): T[][] {
@@ -598,8 +805,8 @@ function chunkArray<T>(items: T[], size: number): T[][] {
 
 export type FetchFollowingReelsInput = {
   currentUid: string;
-  /** The city to scope the feed to — Active City, passed explicitly (same pattern as fetchFollowingFeed in content.ts). */
-  cityKey: string;
+  /** The scope to filter the feed to — Active Scope, passed explicitly (same pattern as fetchFollowingFeed in content.ts). */
+  scope: BrowseScope;
   limit?: number;
 };
 
@@ -608,28 +815,29 @@ export type FollowingReelsResult = {
   /**
    * Whether the caller follows anyone at all — lets the UI distinguish
    * "you don't follow anyone yet" from "you follow people, but none of
-   * them have Reels in this city" without a second, duplicate
+   * them have Reels in this scope" without a second, duplicate
    * fetchFollowingUids call (this function already makes exactly one).
    */
   followsAnyone: boolean;
 };
 
 /**
- * Published Reels, in one city, from people `currentUid` follows —
- * chronological (newest publishedAt first). Mirrors fetchFollowingFeed in
- * src/services/content.ts exactly: resolves followed uids first, then
- * queries Reels directly by those uids in chunks of
+ * Published Reels, in one scope (city/country/world), from people
+ * `currentUid` follows — chronological (newest publishedAt first). Mirrors
+ * fetchFollowingFeed in src/services/content.ts exactly: resolves followed
+ * uids first, then queries Reels directly by those uids in chunks of
  * FOLLOWING_UID_CHUNK_SIZE (10, well under the JS SDK's 30-value `in`
- * cap), each chunk further scoped by cityKey + status so this never
- * fetches a followed author's Reels from OTHER cities only to discard them
- * client-side. Results are merged, deduplicated by reelId, globally
- * re-sorted by publishedAt, and capped to the requested limit. Uses the
- * dedicated (cityKey, status, authorUid, publishedAt DESC) composite index
- * — the only new index this step adds.
+ * cap), each chunk further scoped by the same clause + status so this
+ * never fetches a followed author's Reels outside the current scope only
+ * to discard them client-side. Results are merged, deduplicated by
+ * reelId, globally re-sorted by publishedAt, and capped to the requested
+ * limit. Uses one dedicated (scope clause, status, authorUid,
+ * publishedAt DESC) composite index per BrowseScope kind — see
+ * firestore.indexes.json.
  */
 export async function fetchFollowingReels({
   currentUid,
-  cityKey,
+  scope,
   limit: limitCount = DEFAULT_FOLLOWING_FEED_LIMIT,
 }: FetchFollowingReelsInput): Promise<FollowingReelsResult> {
   if (!firestore) return { reels: [], followsAnyone: false };
@@ -641,16 +849,23 @@ export async function fetchFollowingReels({
   }
 
   const chunks = chunkArray(followedUids, FOLLOWING_UID_CHUNK_SIZE);
+  // Cross-product of author chunks × scope variants — see scopeVariants'
+  // own doc comment for why a multi-city scope can't just fold into a
+  // single `in` clause here (authorUid already owns this query's one
+  // allowed `in`).
+  const variants = scopeVariants(scope);
   const chunkResults = await Promise.all(
-    chunks.map((chunk) =>
-      getDocs(
-        query(
-          collection(db, REELS_COLLECTION),
-          where('authorUid', 'in', chunk),
-          where('cityKey', '==', cityKey),
-          where('status', '==', 'published'),
-          orderBy('publishedAt', 'desc'),
-          limit(limitCount)
+    chunks.flatMap((chunk) =>
+      variants.map((variant) =>
+        getDocs(
+          query(
+            collection(db, REELS_COLLECTION),
+            where('authorUid', 'in', chunk),
+            ...variant,
+            where('status', '==', 'published'),
+            orderBy('publishedAt', 'desc'),
+            limit(limitCount)
+          )
         )
       )
     )
@@ -660,7 +875,7 @@ export async function fetchFollowingReels({
   const merged: Reel[] = [];
   for (const snapshot of chunkResults) {
     for (const docSnapshot of snapshot.docs) {
-      const reel = docSnapshot.data() as Reel;
+      const reel = normalizeReel(docSnapshot.data() as Reel);
       if (seenReelIds.has(reel.reelId)) continue;
       seenReelIds.add(reel.reelId);
       merged.push(reel);
@@ -686,7 +901,33 @@ export async function fetchProfileReels(uid: string, limitCount = DEFAULT_PROFIL
     limit(limitCount)
   );
   const snapshot = await getDocs(profileReelsQuery);
-  return snapshot.docs.map((docSnapshot) => docSnapshot.data() as Reel);
+  return snapshot.docs.map((docSnapshot) => normalizeReel(docSnapshot.data() as Reel));
+}
+
+const DEFAULT_SOUND_REEL_LIMIT = 30;
+
+/**
+ * Every currently-published Reel sharing one exact sound (see
+ * Reel.musicHash's own doc comment in src/types/reel.ts), OLDEST first —
+ * the first entry is always the real origin (soundOriginAuthorUid/
+ * soundOriginReelId on every result in this list point back to that same
+ * first entry's authorUid/reelId). Powers SoundSheet's post grid and
+ * fetchSavedPosts' 'sound' resolution (src/services/saved.ts) — there is
+ * no separate client-readable "sound" document to show details from
+ * (soundOrigins/{musicHash} is server-only), so the origin Reel itself is
+ * always what's actually displayed.
+ */
+export async function fetchReelsByMusicHash(musicHash: string, limitCount = DEFAULT_SOUND_REEL_LIMIT): Promise<Reel[]> {
+  if (!firestore || !musicHash) return [];
+  const soundReelsQuery = query(
+    collection(firestore, REELS_COLLECTION),
+    where('musicHash', '==', musicHash),
+    where('status', '==', 'published'),
+    orderBy('publishedAt', 'asc'),
+    limit(limitCount)
+  );
+  const snapshot = await getDocs(soundReelsQuery);
+  return snapshot.docs.map((docSnapshot) => normalizeReel(docSnapshot.data() as Reel));
 }
 
 /**

@@ -24,25 +24,25 @@ type LoadStatus = 'loading' | 'loaded' | 'error';
  */
 export default function ReelsScreen() {
   const { user } = useAuth();
-  const { activeCity, homeCity, isExploringAnotherCity, isReady: isCityReady } = useCity();
+  const { activeScope, activeScopeLabel, homeCity, isExploringElsewhere, isReady: isCityReady } = useCity();
   const [status, setStatus] = useState<LoadStatus>('loading');
   const [reels, setReels] = useState<Reel[]>([]);
 
-  const cityLabel = activeCity?.cityName ?? 'your city';
+  const cityLabel = activeScopeLabel;
 
   const load = useCallback(async () => {
-    if (!activeCity || !user) return;
+    if (!user) return;
     setStatus('loading');
     setReels([]);
     try {
-      const [cityReels, blockedUids] = await Promise.all([fetchCityReels(activeCity.cityKey), fetchMyBlockedUserIds(user.uid)]);
+      const [cityReels, blockedUids] = await Promise.all([fetchCityReels(activeScope), fetchMyBlockedUserIds(user.uid)]);
       const blockedSet = new Set(blockedUids);
       setReels(blockedSet.size > 0 ? cityReels.filter((reel) => !blockedSet.has(reel.authorUid)) : cityReels);
       setStatus('loaded');
     } catch {
       setStatus('error');
     }
-  }, [activeCity, user]);
+  }, [activeScope, user]);
 
   useFocusEffect(
     useCallback(() => {
@@ -57,6 +57,7 @@ export default function ReelsScreen() {
       status={status}
       errorTitle={`Couldn't load posts in ${cityLabel}`}
       onReload={load}
+      onSwipeBack={() => router.back()}
       topOverlay={
         <View style={styles.backRow}>
           <Pressable onPress={() => router.back()} hitSlop={8} style={styles.backButton} accessibilityRole="button" accessibilityLabel="Back">
@@ -77,7 +78,7 @@ export default function ReelsScreen() {
           action={
             <>
               <Button label="Create post" onPress={() => router.push('/create/reel/camera')} />
-              {isExploringAnotherCity && homeCity ? (
+              {isExploringElsewhere && homeCity ? (
                 <Text style={styles.exploringHint}>Posts you create publish to your home city, {homeCity.cityName}.</Text>
               ) : null}
             </>

@@ -34,7 +34,22 @@ import { resolveTrustedFields, type EngagementError, type EngagementResult } fro
 import { firestore } from './firestore';
 import { buildNotificationId, notificationRef } from './notifications';
 import { postLikeRef } from './postLikes';
-import { reelRef } from './reels';
+import { trackContentInteraction } from './recommendations/interactions';
+import { normalizeReel, reelRef } from './reels';
+
+/** Fire-and-forget — a recommendation-signal write never blocks or fails the real like/comment action it's attached to (see trackContentInteraction's own doc comment). */
+function trackReelSignal(uid: string, reel: Reel, action: 'like' | 'unlike' | 'comment'): void {
+  trackContentInteraction({
+    userId: uid,
+    contentId: reel.reelId,
+    contentType: 'reel',
+    action,
+    categoryId: reel.categoryId,
+    creatorId: reel.authorUid,
+    cityKey: reel.cityKey,
+    countryCode: reel.countryCode,
+  }).catch(() => {});
+}
 
 const REELS_COLLECTION = 'reels';
 const DEFAULT_REEL_COMMENT_LIMIT = 30;
@@ -75,7 +90,7 @@ async function assertPublishedReel(reelId: string): Promise<AssertPublishedReelR
   if (!snapshot.exists() || snapshot.data().status !== 'published') {
     return { ok: false, error: 'not-found', message: "Couldn't find that post." };
   }
-  return { ok: true, reel: snapshot.data() as Reel };
+  return { ok: true, reel: normalizeReel(snapshot.data() as Reel) };
 }
 
 // ---------------------------------------------------------------------------
@@ -145,6 +160,7 @@ export async function likeReel(reelId: string, uid: string): Promise<LikeReelRes
     return { ok: false, error: 'unknown', message: "Couldn't like this post." };
   }
 
+  trackReelSignal(uid, parent.reel, 'like');
   return { ok: true, alreadyLiked: false };
 }
 
@@ -168,6 +184,9 @@ export async function unlikeReel(reelId: string, uid: string): Promise<{ ok: tru
       batch.delete(notificationRef(buildNotificationId('reel_like', { reelId, actorUid: uid })));
     }
     await batch.commit();
+    if (reelSnapshot.exists()) {
+      trackReelSignal(uid, normalizeReel(reelSnapshot.data() as Reel), 'unlike');
+    }
   } catch {
     return { ok: false, error: 'unknown', message: "Couldn't remove your like." };
   }
@@ -262,6 +281,7 @@ export async function addReelComment(
   if (!created.exists()) {
     return { ok: false, error: 'unknown', message: 'Comment was posted but could not be read back.' };
   }
+  trackReelSignal(uid, parent.reel, 'comment');
   return { ok: true, comment: created.data() as ReelComment };
 }
 

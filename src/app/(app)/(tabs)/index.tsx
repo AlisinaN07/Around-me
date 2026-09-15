@@ -1,6 +1,6 @@
 import { Ionicons } from '@expo/vector-icons';
 import { router, useFocusEffect } from 'expo-router';
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 
 import { Button } from '@/components/Button';
@@ -9,13 +9,27 @@ import { ReelCategoryFilterSheet } from '@/components/ReelCategoryFilterSheet';
 import { ReelFeed } from '@/components/ReelFeed';
 import { Colors, Typography } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
+import { useProfile } from '@/hooks/useProfile';
 import { useCity } from '@/providers/CityProvider';
 import { fetchMyBlockedUserIds } from '@/services/blocks';
-import { fetchCityReels, fetchFollowingReels } from '@/services/reels';
+import { assignExperimentVariant, COLLABORATIVE_WEIGHT_V1_EXPERIMENT } from '@/services/recommendations/experiments';
+import { getForYouReels } from '@/services/recommendations/recommendationEngine';
+import { fetchFollowingReels } from '@/services/reels';
+import { browseScopeKey } from '@/types/browseScope';
 import type { Reel } from '@/types/reel';
+import type { RankedItem, RankingAttribution } from '@/types/recommendation';
 
 type LoadStatus = 'loading' | 'loaded' | 'error';
 type HomeMode = 'forYou' | 'following';
+
+/** Recommendation Engine — Step 6 — builds a reelId-keyed attribution map from one getForYouReels page, stamping in the UI-layer-computed experimentVariant (the ranking engine itself doesn't know about experiments — Step 29). */
+function attributionMapFor(rankedReels: RankedItem<Reel>[], experimentVariant: string | undefined): Record<string, RankingAttribution> {
+  const map: Record<string, RankingAttribution> = {};
+  for (const ranked of rankedReels) {
+    map[ranked.item.reelId] = experimentVariant ? { ...ranked.attribution, experimentVariant } : ranked.attribution;
+  }
+  return map;
+}
 
 /**
  * Home — the local user-generated social/Reel feed (Step 25). Deliberately
@@ -30,7 +44,38 @@ type HomeMode = 'forYou' | 'following';
  */
 export default function HomeScreen() {
   const { user } = useAuth();
-  const { activeCity, homeCity, isExploringAnotherCity, isReady: isCityReady } = useCity();
+  const { profile } = useProfile();
+  const { activeScope, activeScopeLabel, homeCity, isExploringElsewhere, isReady: isCityReady } = useCity();
+
+  // Step 5, second pass — one value per app-open/feed session, generated
+  // ONCE at mount and reused for every page fetched during it (initial +
+  // every loadMoreForYou call). Never persisted, never sent anywhere but
+  // this session's own getForYouReels calls — see
+  // recommendationEngine.ts's applySessionJitter for what it's actually
+  // used for (a small, deterministic per-item jitter so scrolling forward
+  // never reshuffles already-shown content, while a fresh app open — a
+  // fresh value here — naturally varies discovery ordering session to
+  // session).
+  const [feedSessionId] = useState(() => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`);
+
+  // Recommendation Engine — Step 6, Steps 11/18/19 — computed once per
+  // signed-in uid (deterministic — see experiments.ts), attached to every
+  // tracked interaction's attribution below purely for FUTURE analysis.
+  // COLLABORATIVE_WEIGHT_V1_EXPERIMENT is disabled (Step 13/29), so this
+  // is always 'control' today, using the exact same collaborativeWeight
+  // already in production — computing and recording an assignment has no
+  // effect on what's actually shown.
+  const experimentVariant = useMemo(
+    () => (user ? assignExperimentVariant(user.uid, COLLABORATIVE_WEIGHT_V1_EXPERIMENT).variantId : undefined),
+    [user]
+  );
+  // Recommendation Engine — Step 6, Step 18/19 — the ranked attribution
+  // for every reelId currently in forYouReels, keyed by reelId (a plain
+  // Reel[] array alone, as rendered by ReelFeed, has nowhere to carry
+  // this). Populated in loadForYou/loadMoreForYou below, alongside (never
+  // instead of) the plain reel list — attribution is DEVELOPMENT/
+  // analytics metadata only (Step 29), never consulted by ranking itself.
+  const [forYouAttribution, setForYouAttribution] = useState<Record<string, RankingAttribution>>({});
 
   // In-session only, resets to "For You" (the default) on fresh mount —
   // same non-persisted pattern the old Around/Following toggle used.
@@ -40,42 +85,97 @@ export default function HomeScreen() {
 
   const [forYouReels, setForYouReels] = useState<Reel[]>([]);
   const [forYouStatus, setForYouStatus] = useState<LoadStatus>('loading');
+  const [isForYouLoadingMore, setIsForYouLoadingMore] = useState(false);
+  // Every reelId already shown THIS session — the recommendation engine's
+  // own pagination mechanism (Step 19): each page excludes these, so
+  // "load more" never just re-ranks/repeats the same pool. Reset whenever
+  // loadForYou (re)starts a fresh session (scope/mode change, pull-to-
+  // refresh via onReload). A ref, not state — read at call time by
+  // loadMoreForYou, never itself needs to trigger a re-render.
+  const seenForYouReelIdsRef = useRef<Set<string>>(new Set());
 
   const [followingReels, setFollowingReels] = useState<Reel[]>([]);
   const [followsAnyone, setFollowsAnyone] = useState(true);
   const [followingStatus, setFollowingStatus] = useState<LoadStatus>('loading');
 
-  const cityLabel = activeCity?.cityName ?? 'your city';
+  const cityLabel = activeScopeLabel;
 
   const loadForYou = useCallback(async () => {
-    if (!activeCity) return;
+    if (!user || !homeCity) return;
     setForYouStatus('loading');
-    // Clears the previous city's Reels immediately — otherwise the empty
+    // Clears the previous scope's Reels immediately — otherwise the empty
     // state (which only shows when the list is already empty) would be
-    // skipped and a stale city's video would render under the new city's
-    // header for the duration of the fetch (same city-switch rule as
-    // every other discovery surface in this app).
+    // skipped and a stale scope's video would render under the new
+    // scope's header for the duration of the fetch (same scope-switch
+    // rule as every other discovery surface in this app).
     setForYouReels([]);
+    setForYouAttribution({});
+    seenForYouReelIdsRef.current = new Set();
     try {
-      const [cityReels, blockedUids] = await Promise.all([
-        fetchCityReels(activeCity.cityKey),
-        user ? fetchMyBlockedUserIds(user.uid) : Promise.resolve<string[]>([]),
-      ]);
-      const blockedSet = new Set(blockedUids);
-      setForYouReels(blockedSet.size > 0 ? cityReels.filter((reel) => !blockedSet.has(reel.authorUid)) : cityReels);
+      const page = await getForYouReels({
+        uid: user.uid,
+        scope: activeScope,
+        homeCityKey: homeCity.cityKey,
+        homeCountryCode: homeCity.countryCode,
+        excludeReelIds: seenForYouReelIdsRef.current,
+        onboardingInterestIds: profile?.interests,
+        sessionSeed: feedSessionId,
+      });
+      const reels = page.reels.map((ranked) => ranked.item);
+      for (const reel of reels) seenForYouReelIdsRef.current.add(reel.reelId);
+      setForYouReels(reels);
+      setForYouAttribution(attributionMapFor(page.reels, experimentVariant));
       setForYouStatus('loaded');
+      // Recommendation Engine — Step 6, Step 21 — dev-only visibility into
+      // "does intelligence make the feed slow" — never persisted, never
+      // shown in production UI, and reading it can never throw (Step 19's
+      // own "latency measurement does not break recommendation flow").
+      if (__DEV__) {
+        // eslint-disable-next-line no-console
+        console.log('[recommendations] getForYouReels latency (ms):', page.latencyMs);
+      }
     } catch {
       setForYouStatus('error');
     }
-  }, [activeCity, user]);
+  }, [activeScope, user, homeCity, profile, feedSessionId, experimentVariant]);
+
+  // Step 19 pagination — wired to ReelFeed's onEndReached below. Blocked
+  // users are already excluded inside getForYouReels' own candidate
+  // generation, so nothing extra to filter here.
+  const loadMoreForYou = useCallback(async () => {
+    if (!user || !homeCity || isForYouLoadingMore || forYouStatus !== 'loaded') return;
+    setIsForYouLoadingMore(true);
+    try {
+      const page = await getForYouReels({
+        uid: user.uid,
+        scope: activeScope,
+        homeCityKey: homeCity.cityKey,
+        homeCountryCode: homeCity.countryCode,
+        excludeReelIds: seenForYouReelIdsRef.current,
+        onboardingInterestIds: profile?.interests,
+        sessionSeed: feedSessionId,
+      });
+      const newReels = page.reels.map((ranked) => ranked.item);
+      if (newReels.length > 0) {
+        for (const reel of newReels) seenForYouReelIdsRef.current.add(reel.reelId);
+        setForYouReels((current) => [...current, ...newReels]);
+        setForYouAttribution((current) => ({ ...current, ...attributionMapFor(page.reels, experimentVariant) }));
+      }
+    } catch {
+      // A failed "load more" just means the feed doesn't grow this time —
+      // never surfaces as a full-screen error over an already-loaded feed.
+    } finally {
+      setIsForYouLoadingMore(false);
+    }
+  }, [activeScope, user, homeCity, isForYouLoadingMore, forYouStatus, profile, feedSessionId, experimentVariant]);
 
   const loadFollowing = useCallback(async () => {
-    if (!activeCity || !user) return;
+    if (!user) return;
     setFollowingStatus('loading');
     setFollowingReels([]);
     try {
       const [result, blockedUids] = await Promise.all([
-        fetchFollowingReels({ currentUid: user.uid, cityKey: activeCity.cityKey }),
+        fetchFollowingReels({ currentUid: user.uid, scope: activeScope }),
         fetchMyBlockedUserIds(user.uid),
       ]);
       const blockedSet = new Set(blockedUids);
@@ -85,9 +185,11 @@ export default function HomeScreen() {
     } catch {
       setFollowingStatus('error');
     }
-  }, [activeCity, user]);
+  }, [activeScope, user]);
 
-  // Reloads whenever Home regains focus, Active City changes, or the
+  const activeScopeKey = useMemo(() => browseScopeKey(activeScope), [activeScope]);
+
+  // Reloads whenever Home regains focus, Active Scope changes, or the
   // visible mode changes — same one-shot-per-visit pattern the rest of
   // this app's discovery surfaces use, no realtime listener.
   useFocusEffect(
@@ -99,7 +201,7 @@ export default function HomeScreen() {
         loadFollowing();
       }
       // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [activeCity?.cityKey, isCityReady, mode])
+    }, [activeScopeKey, isCityReady, mode])
   );
 
   const visibleForYouReels = useMemo(
@@ -172,9 +274,12 @@ export default function HomeScreen() {
     <>
       <ReelFeed
         reels={visibleForYouReels}
+        attributionByReelId={forYouAttribution}
+        feedSessionId={feedSessionId}
         status={forYouStatus}
         errorTitle={`Couldn't load posts in ${cityLabel}`}
         onReload={loadForYou}
+        onEndReached={loadMoreForYou}
         topOverlay={topOverlay}
         emptyState={
           <EmptyState
@@ -185,7 +290,7 @@ export default function HomeScreen() {
             action={
               <>
                 <Button label="Create post" onPress={() => router.push('/create/reel/camera')} />
-                {isExploringAnotherCity && homeCity ? (
+                {isExploringElsewhere && homeCity ? (
                   <Text style={styles.exploringHint}>Posts you create publish to your home city, {homeCity.cityName}.</Text>
                 ) : null}
               </>

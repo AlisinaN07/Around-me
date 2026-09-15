@@ -17,15 +17,19 @@ import {
   serverTimestamp,
   setDoc,
   where,
+  type QueryConstraint,
   type WithFieldValue,
 } from 'firebase/firestore';
 import { httpsCallable } from 'firebase/functions';
+import { getDownloadURL, ref, uploadBytesResumable, type UploadTask } from 'firebase/storage';
 
 import { INTERESTS } from '@/constants/interests';
 import type { ActivityContent, Content, EventContent, PostContent } from '@/types/content';
+import type { BrowseScope } from '@/types/browseScope';
 import {
   BODY_MAX_LENGTH,
   DESCRIPTION_MAX_LENGTH,
+  EVENT_COVER_PHOTO_MAX_SIZE_BYTES,
   MAX_PARTICIPANTS_LIMIT,
   PLACE_NAME_MAX_LENGTH,
   TITLE_MAX_LENGTH,
@@ -35,6 +39,7 @@ import { getTodayOrTonightWindow, getUpcomingWindow } from '@/utils/dateWindows'
 import { fetchFollowingUids } from './following';
 import { firestore } from './firestore';
 import { functions } from './functions';
+import { storage } from './storage';
 import { fetchUserProfile } from './userProfile';
 
 const CONTENT_COLLECTION = 'content';
@@ -321,7 +326,118 @@ export type CreateEventInput = {
   placeName: string;
   /** A known places/{placeId}, or omitted/null for a manually-typed place name. */
   placeId?: string | null;
+  /**
+   * Step 36 — an already-uploaded cover photo's resolved download URL
+   * (see uploadEventCoverPhoto below), or omitted/undefined for no cover
+   * at all. Never a local file URI — the Create Event screen must finish
+   * uploading before calling createEvent, since content documents are
+   * immutable after creation and there is no later "attach a photo" edit.
+   */
+  coverPhotoURL?: string;
 };
+
+/**
+ * Step 36 — a fresh, random, purely-local identifier reserved by the
+ * Create Event screen BEFORE any Storage upload happens, and held for
+ * that screen's lifetime (see its own `useState(() => generateEventDraftId())`
+ * lazy initializer). It has no meaning in Firestore at all — content
+ * documents are created in one atomic setDoc (see createEvent below), not
+ * a multi-stage draft the way Reels/Stories are — its ONLY job is to keep
+ * each Create Event attempt's cover photo at its own distinct Storage
+ * path (eventCovers/{authorUid}/{draftId}/photo), so a LATER event by the
+ * same author can never overwrite, and thereby silently change the
+ * displayed cover of, an EARLIER already-published one. Reuses Firestore's
+ * own random-ID generator purely for convenience (same trick
+ * createReelDraft/createStoryDraft use) — no document is ever created at
+ * this path.
+ */
+export function generateEventDraftId(): string {
+  if (!firestore) {
+    return `local-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  }
+  return doc(collection(firestore, CONTENT_COLLECTION)).id;
+}
+
+export type UploadEventCoverPhotoHandle = { cancel: () => void };
+
+/**
+ * Uploads a locally-picked cover image for an in-progress Event draft to
+ * eventCovers/{uid}/{draftId}/photo (see generateEventDraftId's own doc
+ * comment for why the path is keyed by a throwaway draftId rather than a
+ * real contentId). Mutable in place for the SAME draftId — the organizer
+ * may pick, then re-pick, a different image before ever publishing — but
+ * a fresh draftId is generated per Create Event screen visit, so this
+ * never touches any other draft's or any published Event's own image.
+ * Does NOT touch Firestore itself — call createEvent with the resolved
+ * coverPhotoURL once onComplete reports success, same division of
+ * responsibility as uploadProfileCoverPhoto/updateMyProfileCoverPhoto in
+ * src/services/userProfile.ts.
+ */
+export function uploadEventCoverPhoto(
+  uid: string,
+  draftId: string,
+  localUri: string,
+  onProgress: (percent: number) => void,
+  onComplete: (result: { ok: true; coverPhotoURL: string } | { ok: false; message: string }) => void
+): UploadEventCoverPhotoHandle {
+  let cancelled = false;
+  let task: UploadTask | null = null;
+
+  (async () => {
+    if (!storage) {
+      onComplete({ ok: false, message: 'Storage is not available.' });
+      return;
+    }
+
+    let blob: Blob;
+    try {
+      const response = await fetch(localUri);
+      blob = await response.blob();
+    } catch {
+      onComplete({ ok: false, message: "Couldn't read the selected photo." });
+      return;
+    }
+    if (cancelled) return;
+
+    if (blob.size > EVENT_COVER_PHOTO_MAX_SIZE_BYTES) {
+      onComplete({ ok: false, message: 'That photo is too large. Choose one under 8 MB.' });
+      return;
+    }
+
+    const objectRef = ref(storage, `eventCovers/${uid}/${draftId}/photo`);
+    task = uploadBytesResumable(objectRef, blob, { contentType: blob.type || 'image/jpeg' });
+
+    task.on(
+      'state_changed',
+      (snapshot) => {
+        const percent = snapshot.totalBytes > 0 ? Math.round((snapshot.bytesTransferred / snapshot.totalBytes) * 100) : 0;
+        onProgress(percent);
+      },
+      (error) => {
+        if (error.code === 'storage/canceled') {
+          onComplete({ ok: false, message: 'Upload cancelled.' });
+          return;
+        }
+        onComplete({ ok: false, message: "Couldn't upload your cover photo." });
+      },
+      async () => {
+        try {
+          const coverPhotoURL = await getDownloadURL(objectRef);
+          onComplete({ ok: true, coverPhotoURL });
+        } catch {
+          onComplete({ ok: false, message: "Uploaded, but couldn't finish saving your cover photo." });
+        }
+      }
+    );
+  })();
+
+  return {
+    cancel: () => {
+      cancelled = true;
+      task?.cancel();
+    },
+  };
+}
 
 export async function createEvent(input: CreateEventInput): Promise<CreateContentResult<EventContent>> {
   if (!firestore) {
@@ -356,6 +472,11 @@ export async function createEvent(input: CreateEventInput): Promise<CreateConten
     placeId: placeLink.placeId,
     startsAt: Timestamp.fromDate(input.startsAt),
     endsAt: Timestamp.fromDate(input.endsAt),
+    // Step 36 — omitted entirely when absent, same "absent key, not a
+    // blank value" convention placeName already uses on Post above; never
+    // trusts a raw string the caller could hand-type (this must already
+    // be a resolved download URL from uploadEventCoverPhoto).
+    ...(input.coverPhotoURL ? { coverPhotoURL: input.coverPhotoURL } : {}),
     createdAt: serverTimestamp(),
     updatedAt: serverTimestamp(),
   } satisfies WithFieldValue<EventContent>;
@@ -445,6 +566,27 @@ export async function fetchProfilePostCount(uid: string): Promise<number> {
 }
 
 /**
+ * Same exact-count pattern as fetchProfilePostCount above, `type == 'event'`
+ * instead — a Business account's Profile header shows this real total in
+ * place of the Posts count (see ProfileHeader's own postsLabel prop),
+ * never businessEvents.length from the bounded fetchPublicUserContent
+ * page, which would silently undercount past PROFILE_CONTENT_LIMIT.
+ */
+export async function fetchProfileEventCount(uid: string): Promise<number> {
+  if (!firestore) {
+    return 0;
+  }
+  const countQuery = query(
+    collection(firestore, CONTENT_COLLECTION),
+    where('authorUid', '==', uid),
+    where('type', '==', 'event'),
+    where('status', '==', 'published')
+  );
+  const snapshot = await getCountFromServer(countQuery);
+  return snapshot.data().count;
+}
+
+/**
  * Published content linked to one known Place (posts, activities, events
  * mixed), newest first — powers a Place page's "What's happening here".
  * Only ever filters by placeId + status; manually-typed places (placeId
@@ -463,6 +605,43 @@ export async function fetchPlaceContent(placeId: string, limitCount = DEFAULT_FE
   );
   const snapshot = await getDocs(contentQuery);
   return snapshot.docs.map((docSnapshot) => docSnapshot.data() as Content);
+}
+
+/**
+ * The equality/`in` clause a scoped query filters on — `cityKey`
+ * (`==` for one City, `in` for several Cities), `countryCode` for Country
+ * scope, or none at all for World (every published document,
+ * everywhere). See src/types/browseScope.ts's own doc comment for why
+ * this never affects what a new document is created with, only what a
+ * query reads back.
+ *
+ * NEVER use this for a query that already has its own `in`/
+ * `array-contains-any` clause (e.g. the Following-scoped queries below,
+ * which already filter `authorUid in [...]`) — Firestore allows only ONE
+ * such clause per query. Use scopeVariants for those instead.
+ */
+function scopeWhereClause(scope: BrowseScope): QueryConstraint[] {
+  if (scope.kind === 'city') return [where('cityKey', '==', scope.cityKey)];
+  if (scope.kind === 'cities') return [where('cityKey', 'in', scope.cityKeys)];
+  if (scope.kind === 'country') return [where('countryCode', '==', scope.countryCode)];
+  return [];
+}
+
+/**
+ * Every scope kind EXCEPT 'cities' already reads as a single query variant
+ * (one equality clause, or none). 'cities' scope can't reuse the `in`
+ * clause scopeWhereClause would build for it here, because these callers
+ * already have their OWN `in` clause (`authorUid in [...]`) — Firestore
+ * permits only one per query — so a multi-city scope instead expands into
+ * one variant per city (`cityKey == that city`), and the caller runs one
+ * query per (authorUid chunk × variant) pair and merges everything. Every
+ * other scope kind still reuses the exact same composite index it always
+ * has (see firestore.indexes.json) since each variant here is structurally
+ * identical to scopeWhereClause's own single-variant output.
+ */
+function scopeVariants(scope: BrowseScope): QueryConstraint[][] {
+  if (scope.kind === 'cities') return scope.cityKeys.map((cityKey) => [where('cityKey', '==', cityKey)]);
+  return [scopeWhereClause(scope)];
 }
 
 async function fetchUpcomingByType<T extends ActivityContent | EventContent>(
@@ -496,14 +675,16 @@ export function fetchUpcomingActivities(cityKey: string, limitCount = DEFAULT_FE
 
 /**
  * Activities/Events whose startsAt falls in [window.start, window.end) —
- * reuses the same composite index as fetchUpcomingByType/
- * fetchHappeningNowByType (cityKey, status, type, startsAt ASC): a second
- * range clause on the SAME field (startsAt) is allowed by Firestore in a
- * single query, so no new index is needed for Today/Tonight or Upcoming.
+ * reuses the same composite index as fetchHappeningNowByType (scope
+ * clause, status, type, startsAt ASC): a second range clause on the SAME
+ * field (startsAt) is allowed by Firestore in a single query, so no new
+ * index is needed for Today/Tonight vs. Upcoming — only for a different
+ * `scope` kind (see firestore.indexes.json's countryCode/world-scoped
+ * content indexes).
  */
 async function fetchByStartsAtWindowByType<T extends ActivityContent | EventContent>(
   type: 'activity' | 'event',
-  cityKey: string,
+  scope: BrowseScope,
   window: { start: Date; end: Date },
   limitCount: number
 ): Promise<T[]> {
@@ -513,7 +694,7 @@ async function fetchByStartsAtWindowByType<T extends ActivityContent | EventCont
   const windowQuery = query(
     collection(firestore, CONTENT_COLLECTION),
     where('type', '==', type),
-    where('cityKey', '==', cityKey),
+    ...scopeWhereClause(scope),
     where('status', '==', 'published'),
     where('startsAt', '>=', Timestamp.fromDate(window.start)),
     where('startsAt', '<', Timestamp.fromDate(window.end)),
@@ -525,13 +706,13 @@ async function fetchByStartsAtWindowByType<T extends ActivityContent | EventCont
 }
 
 async function fetchByStartsAtWindow(
-  cityKey: string,
+  scope: BrowseScope,
   window: { start: Date; end: Date },
   limitCount: number
 ): Promise<(ActivityContent | EventContent)[]> {
   const [events, activities] = await Promise.all([
-    fetchByStartsAtWindowByType<EventContent>('event', cityKey, window, limitCount),
-    fetchByStartsAtWindowByType<ActivityContent>('activity', cityKey, window, limitCount),
+    fetchByStartsAtWindowByType<EventContent>('event', scope, window, limitCount),
+    fetchByStartsAtWindowByType<ActivityContent>('activity', scope, window, limitCount),
   ]);
   return [...events, ...activities].sort((a, b) => a.startsAt.toMillis() - b.startsAt.toMillis());
 }
@@ -560,15 +741,15 @@ export type DiscoverySections = {
  * Happening Now (an item that started earlier today and hasn't ended yet
  * matches both queries).
  */
-export async function fetchDiscoverySections(cityKey: string, limitCount = DEFAULT_DISCOVERY_SECTION_LIMIT): Promise<DiscoverySections> {
+export async function fetchDiscoverySections(scope: BrowseScope, limitCount = DEFAULT_DISCOVERY_SECTION_LIMIT): Promise<DiscoverySections> {
   const now = new Date();
   const todayWindow = getTodayOrTonightWindow(now);
   const upcomingWindow = getUpcomingWindow(todayWindow.end);
 
   const [happeningNowAll, todayCandidatesAll, upcomingAll] = await Promise.all([
-    fetchHappeningNow(cityKey, limitCount),
-    fetchByStartsAtWindow(cityKey, todayWindow, limitCount),
-    fetchByStartsAtWindow(cityKey, upcomingWindow, limitCount),
+    fetchHappeningNow(scope, limitCount),
+    fetchByStartsAtWindow(scope, todayWindow, limitCount),
+    fetchByStartsAtWindow(scope, upcomingWindow, limitCount),
   ]);
 
   // Step 41.2B: legacy Activity is retired from active discovery — Events
@@ -604,63 +785,92 @@ export async function fetchDiscoverySections(cityKey: string, limitCount = DEFAU
 
 /**
  * Chunked, authorUid-scoped variant of fetchHappeningNowByType, Events
- * only. Reuses the same (type, cityKey, status, startsAt) index shape as
- * fetchDiscoverySections, with authorUid folded into the equality group
- * ahead of startsAt — see the dedicated
- * (type, cityKey, status, authorUid, startsAt) index in
- * firestore.indexes.json, the one new index this feature adds.
+ * only. Reuses the same (type, scope clause, status, startsAt) index
+ * shape as fetchDiscoverySections, with authorUid folded into the
+ * equality group ahead of startsAt — see the dedicated
+ * (type, cityKey/countryCode, status, authorUid, startsAt) indexes in
+ * firestore.indexes.json (one per BrowseScope kind).
  */
-async function fetchFollowingHappeningNowEvents(authorUidChunks: string[][], cityKey: string, limitCount: number): Promise<EventContent[]> {
+async function fetchFollowingHappeningNowEvents(authorUidChunks: string[][], scope: BrowseScope, limitCount: number): Promise<EventContent[]> {
   if (!firestore || authorUidChunks.length === 0) return [];
   const db = firestore;
   const now = Timestamp.now();
+  // Cross-product of author chunks × scope variants — see scopeVariants'
+  // own doc comment for why a multi-city scope can't just fold into a
+  // single `in` clause here (authorUid already owns this query's one
+  // allowed `in`).
+  const variants = scopeVariants(scope);
   const chunkResults = await Promise.all(
-    authorUidChunks.map((chunk) =>
-      getDocs(
-        query(
-          collection(db, CONTENT_COLLECTION),
-          where('type', '==', 'event'),
-          where('cityKey', '==', cityKey),
-          where('status', '==', 'published'),
-          where('authorUid', 'in', chunk),
-          where('startsAt', '<=', now),
-          orderBy('startsAt', 'asc'),
-          limit(limitCount)
+    authorUidChunks.flatMap((chunk) =>
+      variants.map((variant) =>
+        getDocs(
+          query(
+            collection(db, CONTENT_COLLECTION),
+            where('type', '==', 'event'),
+            ...variant,
+            where('status', '==', 'published'),
+            where('authorUid', 'in', chunk),
+            where('startsAt', '<=', now),
+            orderBy('startsAt', 'asc'),
+            limit(limitCount)
+          )
         )
       )
     )
   );
-  const items = chunkResults.flatMap((snapshot) => snapshot.docs.map((docSnapshot) => docSnapshot.data() as EventContent));
+  const seenIds = new Set<string>();
+  const items: EventContent[] = [];
+  for (const snapshot of chunkResults) {
+    for (const docSnapshot of snapshot.docs) {
+      const item = docSnapshot.data() as EventContent;
+      if (seenIds.has(item.contentId)) continue;
+      seenIds.add(item.contentId);
+      items.push(item);
+    }
+  }
   return items.filter((item) => item.endsAt.toMillis() >= now.toMillis());
 }
 
 /** Chunked, authorUid-scoped variant of fetchByStartsAtWindowByType, Events only — same index note as fetchFollowingHappeningNowEvents above. */
 async function fetchFollowingEventsByStartsAtWindow(
   authorUidChunks: string[][],
-  cityKey: string,
+  scope: BrowseScope,
   window: { start: Date; end: Date },
   limitCount: number
 ): Promise<EventContent[]> {
   if (!firestore || authorUidChunks.length === 0) return [];
   const db = firestore;
+  const variants = scopeVariants(scope);
   const chunkResults = await Promise.all(
-    authorUidChunks.map((chunk) =>
-      getDocs(
-        query(
-          collection(db, CONTENT_COLLECTION),
-          where('type', '==', 'event'),
-          where('cityKey', '==', cityKey),
-          where('status', '==', 'published'),
-          where('authorUid', 'in', chunk),
-          where('startsAt', '>=', Timestamp.fromDate(window.start)),
-          where('startsAt', '<', Timestamp.fromDate(window.end)),
-          orderBy('startsAt', 'asc'),
-          limit(limitCount)
+    authorUidChunks.flatMap((chunk) =>
+      variants.map((variant) =>
+        getDocs(
+          query(
+            collection(db, CONTENT_COLLECTION),
+            where('type', '==', 'event'),
+            ...variant,
+            where('status', '==', 'published'),
+            where('authorUid', 'in', chunk),
+            where('startsAt', '>=', Timestamp.fromDate(window.start)),
+            where('startsAt', '<', Timestamp.fromDate(window.end)),
+            orderBy('startsAt', 'asc'),
+            limit(limitCount)
+          )
         )
       )
     )
   );
-  return chunkResults.flatMap((snapshot) => snapshot.docs.map((docSnapshot) => docSnapshot.data() as EventContent));
+  const seenIds = new Set<string>();
+  const items: EventContent[] = [];
+  for (const snapshot of chunkResults) {
+    for (const docSnapshot of snapshot.docs) {
+      const item = docSnapshot.data() as EventContent;
+      if (seenIds.has(item.contentId)) continue;
+      seenIds.add(item.contentId);
+      items.push(item);
+    }
+  }
+  return items;
 }
 
 export type FollowingDiscoverySections = {
@@ -682,7 +892,7 @@ export type FollowingDiscoverySections = {
  */
 export async function fetchFollowingDiscoverySections(
   currentUid: string,
-  cityKey: string,
+  scope: BrowseScope,
   limitCount = DEFAULT_DISCOVERY_SECTION_LIMIT
 ): Promise<FollowingDiscoverySections> {
   const emptySections: DiscoverySections = { happeningNow: [], todayLabel: 'Today', today: [], upcoming: [] };
@@ -699,9 +909,9 @@ export async function fetchFollowingDiscoverySections(
   const upcomingWindow = getUpcomingWindow(todayWindow.end);
 
   const [happeningNow, todayCandidates, upcoming] = await Promise.all([
-    fetchFollowingHappeningNowEvents(chunks, cityKey, limitCount),
-    fetchFollowingEventsByStartsAtWindow(chunks, cityKey, todayWindow, limitCount),
-    fetchFollowingEventsByStartsAtWindow(chunks, cityKey, upcomingWindow, limitCount),
+    fetchFollowingHappeningNowEvents(chunks, scope, limitCount),
+    fetchFollowingEventsByStartsAtWindow(chunks, scope, todayWindow, limitCount),
+    fetchFollowingEventsByStartsAtWindow(chunks, scope, upcomingWindow, limitCount),
   ]);
 
   const happeningIds = new Set(happeningNow.map((item) => item.contentId));
@@ -729,7 +939,7 @@ export async function fetchFollowingDiscoverySections(
  */
 async function fetchHappeningNowByType<T extends ActivityContent | EventContent>(
   type: 'activity' | 'event',
-  cityKey: string,
+  scope: BrowseScope,
   limitCount: number
 ): Promise<T[]> {
   if (!firestore) {
@@ -739,7 +949,7 @@ async function fetchHappeningNowByType<T extends ActivityContent | EventContent>
   const startedQuery = query(
     collection(firestore, CONTENT_COLLECTION),
     where('type', '==', type),
-    where('cityKey', '==', cityKey),
+    ...scopeWhereClause(scope),
     where('status', '==', 'published'),
     where('startsAt', '<=', now),
     orderBy('startsAt', 'asc'),
@@ -752,12 +962,12 @@ async function fetchHappeningNowByType<T extends ActivityContent | EventContent>
 }
 
 export async function fetchHappeningNow(
-  cityKey: string,
+  scope: BrowseScope,
   limitCount = DEFAULT_FEED_LIMIT
 ): Promise<(ActivityContent | EventContent)[]> {
   const [events, activities] = await Promise.all([
-    fetchHappeningNowByType<EventContent>('event', cityKey, limitCount),
-    fetchHappeningNowByType<ActivityContent>('activity', cityKey, limitCount),
+    fetchHappeningNowByType<EventContent>('event', scope, limitCount),
+    fetchHappeningNowByType<ActivityContent>('activity', scope, limitCount),
   ]);
   return [...events, ...activities].sort((a, b) => a.startsAt.toMillis() - b.startsAt.toMillis());
 }
