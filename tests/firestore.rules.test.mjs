@@ -548,12 +548,15 @@ async function main() {
       await assertFails(setDoc(doc(dave, 'users', 'dave'), invalid));
     });
 
-    // --- DENY: accountType mutation after onboarding (Step 30). The
-    // users/{uid} match block has no `allow update` at all, so this is
-    // denied before any field-level check even runs — but the test asserts
-    // the outcome that actually matters: a Personal account can never
-    // rewrite itself to Business (or vice versa) after signup. ---
-    await check('DENY: user attempts to mutate their own accountType', async () => {
+    // --- DENY: accountType mutation via the Edit Profile path (Step 30,
+    // reconfirmed after Step 35). Step 35 added a SEPARATE, narrow
+    // `allow update` that permits exactly personal -> business elsewhere
+    // in this file (see "Business account upgrade (Step 35)" below) — but
+    // it requires a fresh `updatedAt: serverTimestamp()`. This particular
+    // write omits it entirely, so it still falls through to deny, same as
+    // before Step 35 (a missing updatedAt fails every users/{uid} update
+    // rule that exists today, not just this one). ---
+    await check('DENY: user attempts to mutate their own accountType (missing updatedAt)', async () => {
       const alice = testEnv.authenticatedContext('alice').firestore();
       await assertFails(updateDoc(doc(alice, 'users', 'alice'), { accountType: 'business' }));
     });
@@ -671,6 +674,57 @@ async function main() {
     await check('ALLOW: Business account creates a valid Event', async () => {
       await assertSucceeds(
         setDoc(doc(alice, 'content', 'event-alice-1'), validEvent('alice', 'Test User', 'alice_handle', 'event-alice-1'))
+      );
+    });
+
+    // -------------------------------------------------------------------
+    // Step 36 — Event cover photo, OPTIONAL (organizers may skip it).
+    // Uses distinct contentIds throughout — event-alice-1 above is reused
+    // by many later tests in this file and must never be touched again.
+    // -------------------------------------------------------------------
+    await check('ALLOW: Business account creates an Event WITH a coverPhotoURL', async () => {
+      await assertSucceeds(
+        setDoc(
+          doc(alice, 'content', 'event-cover-1'),
+          validEvent('alice', 'Test User', 'alice_handle', 'event-cover-1', {
+            coverPhotoURL: 'https://firebasestorage.googleapis.com/v0/b/around-me-6a437.appspot.com/o/eventCovers%2Falice%2Fd1%2Fphoto?alt=media&token=abc',
+          })
+        )
+      );
+    });
+
+    await check('ALLOW: Business account creates an Event WITHOUT a coverPhotoURL (still optional)', async () => {
+      await assertSucceeds(
+        setDoc(doc(alice, 'content', 'event-no-cover-1'), validEvent('alice', 'Test User', 'alice_handle', 'event-no-cover-1'))
+      );
+    });
+
+    await check('DENY: Event coverPhotoURL is not a string', async () => {
+      await assertFails(
+        setDoc(
+          doc(alice, 'content', 'event-cover-bad-type-1'),
+          validEvent('alice', 'Test User', 'alice_handle', 'event-cover-bad-type-1', { coverPhotoURL: 12345 })
+        )
+      );
+    });
+
+    await check('DENY: Event coverPhotoURL is an empty string (omit the key instead)', async () => {
+      await assertFails(
+        setDoc(
+          doc(alice, 'content', 'event-cover-empty-1'),
+          validEvent('alice', 'Test User', 'alice_handle', 'event-cover-empty-1', { coverPhotoURL: '' })
+        )
+      );
+    });
+
+    await check('DENY: Event coverPhotoURL exceeds 2048 characters', async () => {
+      await assertFails(
+        setDoc(
+          doc(alice, 'content', 'event-cover-toolong-1'),
+          validEvent('alice', 'Test User', 'alice_handle', 'event-cover-toolong-1', {
+            coverPhotoURL: 'https://example.com/' + 'x'.repeat(2048),
+          })
+        )
       );
     });
 
@@ -1466,8 +1520,62 @@ async function main() {
       await assertFails(updateDoc(doc(bob, 'users', 'alice'), { displayName: 'Hijacked' }));
     });
 
-    await check('DENY: owner changes accountType via update', async () => {
-      await assertFails(updateDoc(doc(bob, 'users', 'bob'), { accountType: 'business', updatedAt: serverTimestamp() }));
+    // Step 35 changed what's true here: a BARE `{ accountType: 'business',
+    // updatedAt }` update from a Personal account (bob) is now genuinely
+    // ALLOWED — see "Business account upgrade (Step 35)" below for that
+    // positive case, tested on an isolated fixture so bob himself stays
+    // Personal for every later test in this file that depends on it. What
+    // the Edit Profile update rule (this block) still denies is changing
+    // accountType TOGETHER WITH any other field in the same write — the
+    // Step 35 rule requires every other field to be byte-identical.
+    await check('DENY: owner changes accountType together with another field via update', async () => {
+      await assertFails(
+        updateDoc(doc(bob, 'users', 'bob'), { accountType: 'business', displayName: 'Sneaky', updatedAt: serverTimestamp() })
+      );
+    });
+
+    await check('DENY: owner reverts a Business account back to Personal via update', async () => {
+      // alice was promoted to Business earlier in this file (see the
+      // Event-creation fixture setup above) — the one-way guarantee means
+      // business -> personal must still be denied for her specifically.
+      await assertFails(updateDoc(doc(alice, 'users', 'alice'), { accountType: 'personal', updatedAt: serverTimestamp() }));
+    });
+
+    // =========================================================================
+    // Business account upgrade (Step 35) — src/services/userProfile.ts'
+    // upgradeToBusinessAccount, src/app/(app)/settings/business-account.tsx.
+    // 'frank' is a fresh, one-off fixture used ONLY in this block, kept
+    // Personal until the ALLOW test below deliberately flips him — unlike
+    // bob/alice/carol, no later test in this file depends on his account
+    // type, so this is the one uid in the whole suite it's actually safe
+    // to permanently upgrade to Business mid-run.
+    // =========================================================================
+    await seedProfile(testEnv, 'frank', 'frank_handle', { displayName: 'Frank Franksson' });
+    const frank = testEnv.authenticatedContext('frank').firestore();
+    await assertSucceeds(setDoc(doc(frank, 'publicProfiles', 'frank'), validPublicProfile('frank', 'Frank Franksson', 'frank_handle')));
+
+    await check('ALLOW: a Personal account switches itself to Business (users/{uid} alone)', async () => {
+      await assertSucceeds(updateDoc(doc(frank, 'users', 'frank'), { accountType: 'business', updatedAt: serverTimestamp() }));
+    });
+
+    await check('ALLOW: the matching publicProfiles/{uid} mirror update, in the same transaction shape upgradeToBusinessAccount uses', async () => {
+      // The ALLOW test above already flipped users/frank to Business — this
+      // mirrors upgradeToBusinessAccount's OWN transaction (both documents
+      // updated together) starting from that already-upgraded state, since
+      // isValidPublicProfileUpdate asserts publicProfiles.accountType
+      // matches the POST-COMMIT users/{uid} value, not its own prior value.
+      await assertSucceeds(
+        runTransaction(frank, async (tx) => {
+          tx.update(doc(frank, 'users', 'frank'), { accountType: 'business', updatedAt: serverTimestamp() });
+          tx.update(doc(frank, 'publicProfiles', 'frank'), { accountType: 'business', updatedAt: serverTimestamp() });
+        })
+      );
+      const publicProfile = await getDoc(doc(bob, 'publicProfiles', 'frank'));
+      assert.equal(publicProfile.data().accountType, 'business');
+    });
+
+    await check('DENY: frank cannot then revert his own just-upgraded account back to Personal', async () => {
+      await assertFails(updateDoc(doc(frank, 'users', 'frank'), { accountType: 'personal', updatedAt: serverTimestamp() }));
     });
 
     await check('DENY: owner changes cityName/cityKey via update', async () => {
@@ -4466,6 +4574,175 @@ async function main() {
 
     await check('cleanup: s41hb unlikes the Reel', async () => {
       await assertSucceeds(unlikeSocialPost(s41hb, 's41hb', 'reel', 'reel-41h-1'));
+    });
+
+    // -------------------------------------------------------------------
+    // Recommendation Engine — Step 4, Step 17/25 — reels/{reelId}/stats/
+    // engagement: any signed-in user may READ it (same visibility as the
+    // Reel itself), but NO client — not even the Reel's own author — may
+    // ever create/update/delete it. Reused reel-41h-1 (already published,
+    // still exists at this point in the suite) rather than seeding a new
+    // one just for this check.
+    // -------------------------------------------------------------------
+    await check('ALLOW: any signed-in user reads reels/{reelId}/stats/engagement (even nonexistent)', async () => {
+      await assertSucceeds(getDoc(doc(s41hb, 'reels', 'reel-41h-1', 'stats', 'engagement')));
+    });
+
+    await check('DENY: a client (even the Reel author) creates reels/{reelId}/stats/engagement', async () => {
+      const s41ha = testEnv.authenticatedContext('s41ha').firestore();
+      await assertFails(setDoc(doc(s41ha, 'reels', 'reel-41h-1', 'stats', 'engagement'), { likes: 999, updatedAtMs: Date.now(), schemaVersion: 1 }));
+    });
+
+    await check('DENY: a client updates an existing reels/{reelId}/stats/engagement doc', async () => {
+      await testEnv.withSecurityRulesDisabled(async (adminContext) => {
+        await setDoc(doc(adminContext.firestore(), 'reels', 'reel-41h-1', 'stats', 'engagement'), {
+          likes: 3,
+          comments: 0,
+          saves: 0,
+          shares: 0,
+          impressions: 10,
+          videoStarts: 5,
+          meaningfulViews: 4,
+          completions: 1,
+          rewatches: 0,
+          totalWatchMs: 4000,
+          totalWatchPercent: 3.2,
+          watchSampleCount: 4,
+          notInterestedCount: 0,
+          eventOpens: 0,
+          eventInterested: 0,
+          eventGoing: 0,
+          updatedAtMs: Date.now(),
+          schemaVersion: 1,
+        });
+      });
+      await assertFails(updateDoc(doc(s41hb, 'reels', 'reel-41h-1', 'stats', 'engagement'), { likes: 999999 }));
+    });
+
+    await check('DENY: a client deletes reels/{reelId}/stats/engagement', async () => {
+      await assertFails(deleteDoc(doc(s41hb, 'reels', 'reel-41h-1', 'stats', 'engagement')));
+    });
+
+    // -------------------------------------------------------------------
+    // Recommendation Engine — Step 5, Step 30/31 (#16) —
+    // users/{uid}/recommendationProfile/collaborative: the SAME
+    // {docId}-wildcard match block that already governs .../main governs
+    // this too (see firestore.rules' own doc comment on that block) — no
+    // rules change was needed to add this doc, and this section proves
+    // it: even the doc's OWN OWNER cannot create/update/delete it (only
+    // 'main' is ever client-writable), while read-own still works.
+    // -------------------------------------------------------------------
+    await check('ALLOW: a user reads their own recommendationProfile/collaborative (even nonexistent)', async () => {
+      await assertSucceeds(getDoc(doc(s41hb, 'users', 's41hb', 'recommendationProfile', 'collaborative')));
+    });
+
+    await check('DENY: a user creates their OWN recommendationProfile/collaborative', async () => {
+      await assertFails(
+        setDoc(doc(s41hb, 'users', 's41hb', 'recommendationProfile', 'collaborative'), {
+          categoryScores: { padel: 0.9 },
+          neighborCount: 999,
+          averageSimilarity: 1,
+          confidence: 1,
+          sourceInteractionCount: 0,
+          generatedAt: Date.now(),
+          schemaVersion: 1,
+        })
+      );
+    });
+
+    await check('DENY: a user updates an existing recommendationProfile/collaborative (backend-seeded)', async () => {
+      await testEnv.withSecurityRulesDisabled(async (adminContext) => {
+        await setDoc(doc(adminContext.firestore(), 'users', 's41hb', 'recommendationProfile', 'collaborative'), {
+          categoryScores: {},
+          neighborCount: 0,
+          averageSimilarity: 0,
+          confidence: 0,
+          sourceInteractionCount: 0,
+          generatedAt: Date.now(),
+          schemaVersion: 1,
+        });
+      });
+      await assertFails(updateDoc(doc(s41hb, 'users', 's41hb', 'recommendationProfile', 'collaborative'), { confidence: 1 }));
+    });
+
+    await check("DENY: a user reads ANOTHER user's recommendationProfile/collaborative", async () => {
+      await assertFails(getDoc(doc(s41hb, 'users', 's41ha', 'recommendationProfile', 'collaborative')));
+    });
+
+    // -------------------------------------------------------------------
+    // Recommendation Engine — Step 6, Step 31 (#17) — a client can only
+    // ever write recommendationEvents under their OWN uid, even once the
+    // Step 6 analytics fields exist on the document; and cannot write
+    // another user's feedSessions summary at all (backend-only, like
+    // recommendationProfile/collaborative above).
+    // -------------------------------------------------------------------
+    function validRecommendationEventWithAnalytics(overrides = {}) {
+      return {
+        eventId: 'evt-step6-1',
+        userId: 's41hb',
+        contentId: 'reel-41h-1',
+        contentType: 'reel',
+        action: 'impression',
+        categoryId: 'music',
+        creatorId: 's41ha',
+        cityKey: 'se:karlstad',
+        countryCode: 'SE',
+        weight: 0,
+        watchDurationMs: 0,
+        watchPercentage: 0,
+        rankPosition: 3,
+        sourceTags: 'known_interest,same_city',
+        bucket: 'known',
+        rankingVersion: 'v1.0',
+        experimentVariant: '',
+        feedSessionId: 'session-abc',
+        createdAt: serverTimestamp(),
+        ...overrides,
+      };
+    }
+
+    await check('ALLOW: a user creates their OWN recommendationEvents doc with the new Step 6 analytics fields', async () => {
+      await assertSucceeds(setDoc(doc(s41hb, 'users', 's41hb', 'recommendationEvents', 'evt-step6-1'), validRecommendationEventWithAnalytics()));
+    });
+
+    await check("DENY: a user creates a recommendationEvents doc under ANOTHER user's uid", async () => {
+      await assertFails(
+        setDoc(doc(s41hb, 'users', 's41ha', 'recommendationEvents', 'evt-step6-2'), validRecommendationEventWithAnalytics({ userId: 's41ha' }))
+      );
+    });
+
+    await check("DENY: a user creates a recommendationEvents doc claiming to be ANOTHER user (userId mismatch) under their OWN path", async () => {
+      await assertFails(
+        setDoc(doc(s41hb, 'users', 's41hb', 'recommendationEvents', 'evt-step6-3'), validRecommendationEventWithAnalytics({ userId: 's41ha' }))
+      );
+    });
+
+    await check('ALLOW: a user reads their own feedSessions summary (even nonexistent)', async () => {
+      await assertSucceeds(getDoc(doc(s41hb, 'users', 's41hb', 'feedSessions', 'session-abc')));
+    });
+
+    await check('DENY: a user creates their OWN feedSessions summary (backend-only, like recommendationProfile/collaborative)', async () => {
+      await assertFails(
+        setDoc(doc(s41hb, 'users', 's41hb', 'feedSessions', 'session-abc'), {
+          userId: 's41hb',
+          startedAt: Date.now(),
+          lastEventAt: Date.now(),
+          itemsShown: 999,
+          schemaVersion: 1,
+        })
+      );
+    });
+
+    await check("DENY: a user reads ANOTHER user's feedSessions summary", async () => {
+      await assertFails(getDoc(doc(s41hb, 'users', 's41ha', 'feedSessions', 'session-abc')));
+    });
+
+    await check('DENY: a client writes to recommendationMetrics at all (no match block — default deny)', async () => {
+      await assertFails(setDoc(doc(s41hb, 'recommendationMetrics', 'reels_2026-09-15'), { impressions: 999999 }));
+    });
+
+    await check('DENY: a client reads recommendationMetrics at all (no match block — default deny)', async () => {
+      await assertFails(getDoc(doc(s41hb, 'recommendationMetrics', 'reels_2026-09-15')));
     });
 
     await testEnv.clearFirestore();

@@ -19,26 +19,29 @@ type DetailHeroProps = {
   endsAt: Timestamp;
   /** Omit entirely to hide the More button (matches content/[contentId].tsx's existing "no options menu on your own content" rule). */
   onOptionsPress?: () => void;
+  /** Step 36 — an Event's own optional cover photo. Omit for Activity (no such field exists) or an Event that never had one; MediaCard falls back to the gradient/emoji exactly as it always has. */
+  coverPhotoURL?: string;
 };
 
 /**
  * Full-bleed media-first hero shared by Event and Activity detail (Step
- * 29) — real category emoji over the Step 26 gradient/glow MediaCard
- * fallback (Event/Activity have no real media field yet, so no image is
- * ever fabricated here), a top scrim for the real Back/More controls
- * (the only hero actions — no fake Save/Share/Calendar/Ticket), and a
- * bottom scrim carrying the real category + title. LIVE/Ended uses the
- * exact same `isHappeningNow` check EventCard already uses — never an
- * invented status.
+ * 29). Uses the real category emoji over the Step 26 gradient/glow
+ * MediaCard fallback when there's no real cover photo — Activity still
+ * has no image field of its own, and an Event without one falls back the
+ * same way; Step 36 wires in a real Event coverPhotoURL when present. A
+ * top scrim for the real Back/More controls (the only hero actions — no
+ * fake Save/Share/Calendar/Ticket), and a bottom scrim carrying the real
+ * category + title. LIVE/Ended uses the exact same `isHappeningNow` check
+ * EventCard already uses — never an invented status.
  */
-export function DetailHero({ title, categoryId, startsAt, endsAt, onOptionsPress }: DetailHeroProps) {
+export function DetailHero({ title, categoryId, startsAt, endsAt, onOptionsPress, coverPhotoURL }: DetailHeroProps) {
   const category = INTERESTS.find((interest) => interest.id === categoryId);
   const now = new Date();
   const live = isHappeningNow({ startsAt, endsAt }, now);
   const ended = endsAt.toMillis() <= now.getTime();
 
   return (
-    <MediaCard emoji={category?.emoji} height={HERO_HEIGHT} radius={0}>
+    <MediaCard source={coverPhotoURL} emoji={category?.emoji} height={HERO_HEIGHT} radius={0}>
       <LinearGradient colors={['rgba(10, 10, 13, 0.75)', 'transparent']} style={styles.topScrim} pointerEvents="none" />
       <View style={styles.topRow} pointerEvents="box-none">
         <Pressable onPress={() => router.back()} style={styles.iconButton} hitSlop={8} accessibilityRole="button" accessibilityLabel="Back">

@@ -17,6 +17,7 @@ import type { Reel } from '@/types/reel';
 import type { SavedPost, SavedTargetType } from '@/types/saved';
 
 import { firestore } from './firestore';
+import { trackContentInteraction } from './recommendations/interactions';
 
 const SAVED_SUBCOLLECTION = 'saved';
 const DEFAULT_SAVED_LIMIT = 40;
@@ -27,6 +28,50 @@ function savedId(targetType: SavedTargetType, targetId: string): string {
 
 function savedRef(uid: string, targetType: SavedTargetType, targetId: string) {
   return doc(firestore!, 'users', uid, SAVED_SUBCOLLECTION, savedId(targetType, targetId));
+}
+
+/**
+ * Fire-and-forget — a recommendation-signal write never blocks or fails
+ * the real save/unsave action. A saved 'sound' isn't a Post the
+ * recommendation engine ranks (see SavedTargetType's own doc comment in
+ * src/types/saved.ts), so this only tracks 'reel'/'post' targets — and
+ * resolves the target document ITSELF here (savePost/unsavePost otherwise
+ * never read it) purely for the categoryId/creatorId/cityKey a save
+ * signal needs to be meaningful.
+ */
+async function trackSaveSignal(uid: string, targetType: SavedTargetType, targetId: string, action: 'save' | 'unsave'): Promise<void> {
+  if (targetType === 'sound') return;
+  try {
+    if (targetType === 'reel') {
+      const reel = await fetchReel(targetId);
+      if (!reel) return;
+      await trackContentInteraction({
+        userId: uid,
+        contentId: reel.reelId,
+        contentType: 'reel',
+        action,
+        categoryId: reel.categoryId,
+        creatorId: reel.authorUid,
+        cityKey: reel.cityKey,
+        countryCode: reel.countryCode,
+      });
+    } else {
+      const content = await fetchContentById(targetId);
+      if (!content) return;
+      await trackContentInteraction({
+        userId: uid,
+        contentId: content.contentId,
+        contentType: 'content',
+        action,
+        categoryId: content.categoryId,
+        creatorId: content.authorUid,
+        cityKey: content.cityKey,
+        countryCode: content.countryCode,
+      });
+    }
+  } catch {
+    // Best-effort only — see this function's own doc comment.
+  }
 }
 
 export type SaveActionError = 'not-configured' | 'unknown';
@@ -44,6 +89,7 @@ export async function savePost(uid: string, targetType: SavedTargetType, targetI
   } catch {
     return { ok: false, error: 'unknown', message: "Couldn't save this post." };
   }
+  trackSaveSignal(uid, targetType, targetId, 'save').catch(() => {});
   return { ok: true };
 }
 
@@ -55,6 +101,7 @@ export async function unsavePost(uid: string, targetType: SavedTargetType, targe
   } catch {
     return { ok: false, error: 'unknown', message: "Couldn't remove this from your saved posts." };
   }
+  trackSaveSignal(uid, targetType, targetId, 'unsave').catch(() => {});
   return { ok: true };
 }
 

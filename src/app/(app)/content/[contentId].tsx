@@ -18,6 +18,7 @@ import { SwipeBackEdge } from '@/components/SwipeBackEdge';
 import { Colors, Layout, Radius, Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
 import { deleteMyContent, fetchContentById } from '@/services/content';
+import { trackContentInteraction } from '@/services/recommendations/interactions';
 import { isPostReposted, repostPost, undoRepost } from '@/services/reposts';
 import { isPostSaved, savePost, unsavePost } from '@/services/saved';
 import type { ActivityContent, Content, EventContent } from '@/types/content';
@@ -75,6 +76,29 @@ export default function ContentDetailScreen() {
     // eslint-disable-next-line react-hooks/set-state-in-effect
     load();
   }, [load]);
+
+  // Step 2, second pass — `event_open` fires once per loaded Event
+  // detail, regardless of entry point (Events discovery, a Place page's
+  // "Happening now" rail, a share link, ...) — see EventCard's own
+  // default onPress, which already routes here for every variant. Posts/
+  // Activities have no equivalent tracked signal (not asked for). Guarded
+  // by contentId in the dependency array so refocusing this same screen
+  // (useFocusEffect-free here, but a re-render from an unrelated state
+  // change is still possible) never double-fires for the same content.
+  useEffect(() => {
+    if (!user || !content || content.type !== 'event') return;
+    trackContentInteraction({
+      userId: user.uid,
+      contentId: content.contentId,
+      contentType: 'content',
+      action: 'event_open',
+      categoryId: content.categoryId,
+      creatorId: content.authorUid,
+      cityKey: content.cityKey,
+      countryCode: content.countryCode,
+    }).catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [content?.contentId, content?.type, user]);
 
   const showToast = useCallback((message: string) => {
     if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
@@ -282,6 +306,7 @@ function MediaDetailScreen({ content, onOptionsPress }: MediaDetailScreenProps) 
             startsAt={content.startsAt}
             endsAt={content.endsAt}
             onOptionsPress={onOptionsPress}
+            coverPhotoURL={content.type === 'event' ? content.coverPhotoURL : undefined}
           />
           <View style={styles.mediaBody}>
             {content.type === 'activity' ? <ActivityDetail content={content} /> : <EventDetail content={content} />}

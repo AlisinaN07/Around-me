@@ -21,7 +21,7 @@ import { useProfile } from '@/hooks/useProfile';
 import type { Content, EventContent, PostContent } from '@/types/content';
 import type { Reel } from '@/types/reel';
 import { fetchFollowerCount, fetchFollowingCount } from '@/services/following';
-import { fetchProfilePostCount, fetchPublicUserContent } from '@/services/content';
+import { fetchProfileEventCount, fetchProfilePostCount, fetchPublicUserContent } from '@/services/content';
 import { fetchLifetimeLikedCount } from '@/services/profileLiked';
 import { fetchProfileActivities, type ProfileActivity } from '@/services/profileActivities';
 import { fetchProfileReelCount, fetchProfileReels } from '@/services/reels';
@@ -29,17 +29,20 @@ import { fetchProfileReposts, type RepostedPostItem } from '@/services/reposts';
 import { fetchSavedPosts, type SavedPostItem } from '@/services/saved';
 import { isBusinessAccount } from '@/utils/accountCapabilities';
 import { formatCityDisplayName } from '@/utils/cityDisplay';
+import { isHappeningNow } from '@/utils/dateWindows';
 import { mergeProfilePosts } from '@/utils/profilePosts';
 
 type LoadStatus = 'loading' | 'loaded' | 'error';
 // Step 41.2C — unified Posts tab: 'reel' (video Post) and legacy text
 // 'post' now merge into a single 'post' tab, so this is no longer a
-// per-technical-type selector, just Posts vs. (Business-only) Events vs.
-// 'repost' (Step 41.2F, PUBLIC) vs. 'activity' (Step 41.2G, PUBLIC — Events
-// this profile owner marked Interested/Going, NOT the retired legacy
+// per-technical-type selector, just Posts vs. Events vs. 'repost' (Step
+// 41.2F, PUBLIC) vs. 'activity' (Step 41.2G, PUBLIC — Events this profile
+// owner marked Interested/Going, NOT the retired legacy
 // content.type=='activity') vs. 'saved' (Step 41.2E, PRIVATE — own Profile
-// only, never shown on the public profile route). Tab order is locked:
-// Posts, Reposts, (Events), Activities, Saved.
+// only, never shown on the public profile route). Tab order for a
+// Personal account is locked: Posts, Reposts, Activities, Saved. A
+// Business account shows no tab bar at all — see effectiveTab below —
+// its Profile is Events-only.
 type ProfileTab = 'post' | 'repost' | 'event' | 'activity' | 'saved';
 
 const PROFILE_TABS_PERSONAL: { id: ProfileTab; label: string }[] = [
@@ -48,13 +51,23 @@ const PROFILE_TABS_PERSONAL: { id: ProfileTab; label: string }[] = [
   { id: 'activity', label: 'Activities' },
   { id: 'saved', label: 'Saved' },
 ];
-const PROFILE_TABS_BUSINESS: { id: ProfileTab; label: string }[] = [
-  { id: 'post', label: 'Posts' },
-  { id: 'repost', label: 'Reposts' },
-  { id: 'event', label: 'Events' },
-  { id: 'activity', label: 'Activities' },
-  { id: 'saved', label: 'Saved' },
+
+// A Business account's single Events tab is itself split by real time
+// status — Live (happening right now, via the same isHappeningNow every
+// other Event surface already uses) / Upcoming (hasn't started) / Past
+// (already ended) — a mutually exclusive, exhaustive three-way partition
+// of businessEvents, never a separate query.
+type EventStatusTab = 'live' | 'upcoming' | 'past';
+const EVENT_STATUS_TABS: { id: EventStatusTab; label: string }[] = [
+  { id: 'live', label: 'Live Events' },
+  { id: 'upcoming', label: 'Upcoming Events' },
+  { id: 'past', label: 'Past Events' },
 ];
+const EVENT_STATUS_EMPTY_TEXT: Record<EventStatusTab, string> = {
+  live: 'No events happening right now',
+  upcoming: 'No upcoming events yet',
+  past: 'No past events yet',
+};
 
 // Bumped above fetchPublicUserContent's own DEFAULT_FEED_LIMIT (20) for
 // profile use specifically — this one mixed fetch now backs both the
@@ -68,6 +81,10 @@ const PROFILE_CONTENT_LIMIT = 40;
 const EMPTY_TEXT: Record<ProfileTab, string> = {
   post: 'No posts yet',
   repost: 'No reposts yet',
+  // Superseded by EVENT_STATUS_EMPTY_TEXT below — the Events tab now has
+  // its own Live/Upcoming/Past empty copy. Kept here anyway so this stays
+  // a total Record<ProfileTab, string> (every ProfileTab needs a value)
+  // without an unused optional field.
   event: 'No events yet',
   activity: 'No activities yet',
   saved: 'No saved posts yet',
@@ -95,6 +112,7 @@ export default function ProfileScreen() {
   const [followerCount, setFollowerCount] = useState(0);
   const [followingCount, setFollowingCount] = useState(0);
   const [postsCount, setPostsCount] = useState(0);
+  const [eventsCount, setEventsCount] = useState(0);
   // Step 41.2H.4 — undefined means "not (yet) ready/available", never a
   // fake 0; see ProfileHeader's likedCount doc comment.
   const [likedCount, setLikedCount] = useState<number | undefined>(undefined);
@@ -119,24 +137,29 @@ export default function ProfileScreen() {
     toastTimerRef.current = setTimeout(() => setToastMessage(null), 2500);
   }, []);
   const [activeTab, setActiveTab] = useState<ProfileTab>('post');
+  const [eventStatusTab, setEventStatusTab] = useState<EventStatusTab>('live');
 
   const load = useCallback(async () => {
     if (!user) return;
     setStatus('loading');
     try {
-      const [followers, following, textPostCount, reelCount, likedResult, userContent, userReels, userReposts, userActivities, userSavedPosts] =
+      const [followers, following, textPostCount, reelCount, eventCount, likedResult, userContent, userReels, userReposts, userActivities, userSavedPosts] =
         await Promise.all([
           fetchFollowerCount(user.uid),
           fetchFollowingCount(user.uid),
-          // Two exact server-side aggregations, summed — see
-          // fetchProfilePostCount's and fetchProfileReelCount's own doc
-          // comments for why neither is ever derived from the bounded
+          // Three exact server-side aggregations — see fetchProfilePostCount's,
+          // fetchProfileReelCount's, and fetchProfileEventCount's own doc
+          // comments for why none is ever derived from the bounded
           // mixed/Reel queries below. A failure here falls into the same
           // catch as every other profile fetch, so a failed count is never
           // shown as a confident (wrong) 0 — the whole screen shows its
-          // error state instead.
+          // error state instead. eventCount is fetched unconditionally
+          // (Personal accounts just never display it) — same "fetch
+          // everything a profile might need" rule the rest of this Promise.all
+          // already follows.
           fetchProfilePostCount(user.uid),
           fetchProfileReelCount(user.uid),
+          fetchProfileEventCount(user.uid),
           // Step 41.2H.4 — the ONE stat allowed to be simply absent for a
           // given load: fetchLifetimeLikedCount never throws (see its own
           // doc comment), so its presence here doesn't put Liked on the
@@ -165,6 +188,7 @@ export default function ProfileScreen() {
       setFollowerCount(followers);
       setFollowingCount(following);
       setPostsCount(textPostCount + reelCount);
+      setEventsCount(eventCount);
       setLikedCount(likedResult.ready ? likedResult.likedCount : undefined);
       setContent(userContent);
       setReels(userReels);
@@ -186,9 +210,26 @@ export default function ProfileScreen() {
 
 
   const cityLabel = profile?.cityName ? formatCityDisplayName(profile.cityName) : '';
-  const tabs = isBusinessAccount(profile) ? PROFILE_TABS_BUSINESS : PROFILE_TABS_PERSONAL;
+  // A Business account's Profile shows ONLY Events — no tab bar at all,
+  // rather than a single-item tab nobody can switch away from (this
+  // codebase's own "never render a control with nothing to do" rule).
+  // Posts/Reposts/Activities/Saved are unreachable from Profile for a
+  // Business account by design; effectiveTab (not activeTab) drives every
+  // branch below so this holds even if activeTab is still whatever it was
+  // from before the account switched to Business.
+  const isBusiness = isBusinessAccount(profile);
+  const effectiveTab: ProfileTab = isBusiness ? 'event' : activeTab;
   const textPosts = useMemo(() => content.filter((item): item is PostContent => item.type === 'post'), [content]);
   const businessEvents = useMemo(() => content.filter((item): item is EventContent => item.type === 'event'), [content]);
+  const displayedEvents = useMemo(() => {
+    const now = new Date();
+    return businessEvents.filter((item) => {
+      const live = isHappeningNow(item, now);
+      if (eventStatusTab === 'live') return live;
+      if (eventStatusTab === 'upcoming') return !live && item.startsAt.toMillis() > now.getTime();
+      return !live && item.endsAt.toMillis() < now.getTime();
+    });
+  }, [businessEvents, eventStatusTab]);
   const mergedPosts = useMemo(() => mergeProfilePosts(reels, textPosts), [reels, textPosts]);
 
   return (
@@ -211,7 +252,8 @@ export default function ProfileScreen() {
                 photoURL={profile?.photoURL}
                 coverPhotoURL={profile?.coverPhotoURL}
                 coverEdgeInset={Spacing.lg}
-                postsCount={postsCount}
+                postsCount={isBusiness ? eventsCount : postsCount}
+                postsLabel={isBusiness ? 'Events' : 'Posts'}
                 followersCount={followerCount}
                 followingCount={followingCount}
                 likedCount={likedCount}
@@ -239,9 +281,13 @@ export default function ProfileScreen() {
               </View>
 
               <View style={styles.tabsSection}>
-                <ProfileTabBar tabs={tabs} value={activeTab} onChange={setActiveTab} />
+                {isBusiness ? (
+                  <ProfileTabBar tabs={EVENT_STATUS_TABS} value={eventStatusTab} onChange={setEventStatusTab} />
+                ) : (
+                  <ProfileTabBar tabs={PROFILE_TABS_PERSONAL} value={activeTab} onChange={setActiveTab} />
+                )}
 
-                {activeTab === 'post' ? (
+                {effectiveTab === 'post' ? (
                   mergedPosts.length === 0 ? (
                     <EmptyState
                       bare
@@ -256,13 +302,13 @@ export default function ProfileScreen() {
                           <ReelPreviewCard key={`reel-${item.reel.reelId}`} reel={item.reel} />
                         ) : (
                           <View key={`text-${item.content.contentId}`} style={styles.fullRow}>
-                            <ContentCard item={item.content} currentUid={user?.uid ?? null} />
+                            <ContentCard item={item.content} currentUid={user?.uid ?? null} showAuthor={false} />
                           </View>
                         )
                       )}
                     </View>
                   )
-                ) : activeTab === 'repost' ? (
+                ) : effectiveTab === 'repost' ? (
                   repostedPosts.length === 0 ? (
                     <EmptyState bare icon="repeat-outline" title={EMPTY_TEXT.repost} body="Posts you repost will appear here." />
                   ) : (
@@ -278,17 +324,17 @@ export default function ProfileScreen() {
                       )}
                     </View>
                   )
-                ) : activeTab === 'event' ? (
-                  businessEvents.length === 0 ? (
-                    <EmptyState bare icon="calendar-outline" title={EMPTY_TEXT.event} />
+                ) : effectiveTab === 'event' ? (
+                  displayedEvents.length === 0 ? (
+                    <EmptyState bare icon="calendar-outline" title={EVENT_STATUS_EMPTY_TEXT[eventStatusTab]} />
                   ) : (
                     <View style={styles.contentList}>
-                      {businessEvents.map((item) => (
-                        <ContentCard key={item.contentId} item={item} currentUid={user?.uid ?? null} />
+                      {displayedEvents.map((item) => (
+                        <ContentCard key={item.contentId} item={item} currentUid={user?.uid ?? null} showAuthor={false} showTypeBadge={false} />
                       ))}
                     </View>
                   )
-                ) : activeTab === 'activity' ? (
+                ) : effectiveTab === 'activity' ? (
                   activities.length === 0 ? (
                     <EmptyState
                       bare

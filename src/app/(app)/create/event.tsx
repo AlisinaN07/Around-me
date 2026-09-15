@@ -1,7 +1,9 @@
 import { Ionicons } from '@expo/vector-icons';
+import * as ImagePicker from 'expo-image-picker';
+import { LinearGradient } from 'expo-linear-gradient';
 import { router } from 'expo-router';
 import { useState } from 'react';
-import { StyleSheet, Text, View } from 'react-native';
+import { ActivityIndicator, Image, Pressable, StyleSheet, Text, View } from 'react-native';
 
 import { Button } from '@/components/Button';
 import { CategorySelector } from '@/components/CategorySelector';
@@ -9,10 +11,10 @@ import { HeaderScreenLayout } from '@/components/HeaderScreenLayout';
 import { DateTimeField } from '@/components/DateTimeField';
 import { FormField } from '@/components/FormField';
 import { PlaceSelector, type PlaceSelectorValue } from '@/components/PlaceSelector';
-import { Colors, Spacing } from '@/constants/theme';
+import { Colors, Radius, Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
 import { useProfile } from '@/hooks/useProfile';
-import { createEvent } from '@/services/content';
+import { createEvent, generateEventDraftId, uploadEventCoverPhoto } from '@/services/content';
 import { DESCRIPTION_MAX_LENGTH, PLACE_NAME_MAX_LENGTH, TITLE_MAX_LENGTH } from '@/types/content';
 import { canCreateEvent } from '@/utils/accountCapabilities';
 import { formatCityDisplayName } from '@/utils/cityDisplay';
@@ -39,8 +41,55 @@ export default function CreateEventScreen() {
   const [formError, setFormError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
+  // Step 36 — a fresh draft id reserved once for this screen's whole
+  // lifetime (lazy initializer — see generateEventDraftId's own doc
+  // comment for why this exists and why it's never regenerated mid-draft).
+  const [draftId] = useState(() => generateEventDraftId());
+  const [coverPhotoURL, setCoverPhotoURL] = useState('');
+  const [isUploadingCover, setIsUploadingCover] = useState(false);
+  const [coverError, setCoverError] = useState<string | null>(null);
+
+  // Uploaded immediately on pick, independent of Publish — an Event's
+  // cover is genuinely optional, so there's nothing to validate here the
+  // way title/description/etc. are; Publish just includes whatever
+  // coverPhotoURL (possibly still '') is already resolved by then.
+  const handleChangeCoverPhoto = async () => {
+    if (!user || isUploadingCover) return;
+    setCoverError(null);
+
+    const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
+    if (!permission.granted) {
+      setCoverError('Around Me needs access to your photo library to choose a picture.');
+      return;
+    }
+
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ['images'],
+      allowsEditing: true,
+      aspect: [3, 1],
+      quality: 0.9,
+    });
+    if (result.canceled || result.assets.length === 0) return;
+
+    const asset = result.assets[0];
+    setIsUploadingCover(true);
+
+    await new Promise<void>((resolve) => {
+      uploadEventCoverPhoto(user.uid, draftId, asset.uri, () => {}, (uploadResult) => {
+        setIsUploadingCover(false);
+        if (!uploadResult.ok) {
+          setCoverError(uploadResult.message);
+          resolve();
+          return;
+        }
+        setCoverPhotoURL(uploadResult.coverPhotoURL);
+        resolve();
+      });
+    });
+  };
+
   const handlePublish = async () => {
-    if (isSubmitting) return;
+    if (isSubmitting || isUploadingCover) return;
 
     const trimmedTitle = title.trim();
     const trimmedDescription = description.trim();
@@ -97,6 +146,7 @@ export default function CreateEventScreen() {
       placeId: place.placeId,
       startsAt,
       endsAt,
+      ...(coverPhotoURL ? { coverPhotoURL } : {}),
     });
 
     setIsSubmitting(false);
@@ -135,6 +185,37 @@ export default function CreateEventScreen() {
       title="Create event"
       subtitle="Share something happening in the city. People can mark themselves Interested or Going."
     >
+      <View style={styles.coverSection}>
+        <Text style={styles.coverLabel}>Cover photo (optional)</Text>
+        <Pressable
+          onPress={handleChangeCoverPhoto}
+          disabled={isUploadingCover}
+          style={styles.coverButton}
+          accessibilityRole="button"
+          accessibilityLabel={coverPhotoURL ? 'Change cover photo' : 'Add cover photo'}
+        >
+          {coverPhotoURL ? (
+            <>
+              <Image source={{ uri: coverPhotoURL }} style={styles.coverImage} />
+              <LinearGradient colors={['transparent', Colors.background]} style={styles.coverFade} pointerEvents="none" />
+            </>
+          ) : (
+            <View style={styles.coverPlaceholder}>
+              <Ionicons name="image-outline" size={22} color={Colors.textSecondary} />
+              <Text style={styles.coverPlaceholderText}>Add a background photo for this event</Text>
+            </View>
+          )}
+          <View style={styles.coverBadge}>
+            {isUploadingCover ? (
+              <ActivityIndicator size="small" color={Colors.background} />
+            ) : (
+              <Ionicons name="camera" size={14} color={Colors.background} />
+            )}
+          </View>
+        </Pressable>
+        {coverError ? <Text style={styles.formError}>{coverError}</Text> : null}
+      </View>
+
       <FormField
         label="Title"
         placeholder="Live music tonight"
@@ -206,7 +287,7 @@ export default function CreateEventScreen() {
 
       {formError ? <Text style={styles.formError}>{formError}</Text> : null}
 
-      <Button label="Publish event" onPress={handlePublish} loading={isSubmitting} />
+      <Button label="Publish event" onPress={handlePublish} loading={isSubmitting} disabled={isUploadingCover} />
     </HeaderScreenLayout>
   );
 }
@@ -238,5 +319,60 @@ const styles = StyleSheet.create({
     color: Colors.error,
     fontSize: 13,
     textAlign: 'center',
+  },
+  coverSection: {
+    gap: Spacing.xs,
+  },
+  coverLabel: {
+    color: Colors.text,
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  coverButton: {
+    width: '100%',
+    height: 140,
+    borderRadius: Radius.lg,
+    overflow: 'hidden',
+  },
+  coverImage: {
+    width: '100%',
+    height: '100%',
+  },
+  coverFade: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    bottom: 0,
+    height: 60,
+  },
+  coverPlaceholder: {
+    width: '100%',
+    height: '100%',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 4,
+    paddingHorizontal: Spacing.lg,
+    backgroundColor: Colors.surface,
+    borderWidth: 1,
+    borderColor: Colors.border,
+  },
+  coverPlaceholderText: {
+    color: Colors.textSecondary,
+    fontSize: 13,
+    fontWeight: '600',
+    textAlign: 'center',
+  },
+  coverBadge: {
+    position: 'absolute',
+    right: Spacing.sm,
+    bottom: Spacing.sm,
+    width: 26,
+    height: 26,
+    borderRadius: 13,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: Colors.accent,
+    borderWidth: 2,
+    borderColor: Colors.background,
   },
 });

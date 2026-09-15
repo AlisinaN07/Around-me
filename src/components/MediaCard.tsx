@@ -25,11 +25,15 @@ type MediaCardProps = {
 /**
  * Cover-image container with a graceful no-media fallback (Step 24, glow
  * fallback added Step 26) — the shared base for any media-first card.
- * Content types with no image field today (Post/Activity/Event) render a
- * dark gradient + soft accent glow + category emoji/icon instead of a
- * placeholder stock photo or an invented URL, per the "no hardcoded demo
- * data" rule. `source` stays fully optional and unused today — real media
- * can be wired in later without changing this component's shape.
+ * Content types with no image field render a dark gradient + soft accent
+ * glow + category emoji/icon instead of a placeholder stock photo or an
+ * invented URL, per the "no hardcoded demo data" rule. `source` was left
+ * optional and unused when this component was first built so real media
+ * could be wired in later without changing its shape — Step 36 is the
+ * first to actually do that, passing an Event's own optional
+ * coverPhotoURL (see EventCard.tsx's eventCoverSource helper). Activity
+ * and Post still have no image field of their own, so they still always
+ * fall through to the gradient/emoji fallback.
  */
 export function MediaCard({ source, emoji, fallbackIcon = 'image-outline', height, radius = Radius.lg, children }: MediaCardProps) {
   const resolvedSource = typeof source === 'string' ? { uri: source } : source;

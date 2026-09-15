@@ -40,6 +40,11 @@ type EventCardProps = {
   responseStatus?: EventResponseStatus;
 };
 
+/** Step 36 — an Event's own optional cover photo, or undefined for an Activity (no such field exists on ActivityContent) or an Event that never had one. MediaCard's own `source` prop has been ready for real media since Step 26; this is the first content type to actually supply one. */
+function eventCoverSource(item: ActivityContent | EventContent): string | undefined {
+  return item.type === 'event' ? item.coverPhotoURL : undefined;
+}
+
 type Badge = { label: string; tone: 'now' | 'soon' };
 
 function getBadge(item: ActivityContent | EventContent, now: Date, liveLabel: string): Badge | null {
@@ -80,7 +85,7 @@ function HeroCard({ item, now, onPress }: VariantCardProps) {
       accessibilityRole="button"
       accessibilityLabel={`${isActivity ? 'Activity' : 'Event'}: ${item.title}`}
     >
-      <MediaCard emoji={category?.emoji} height={128} radius={Radius.lg}>
+      <MediaCard source={eventCoverSource(item)} emoji={category?.emoji} height={128} radius={Radius.lg}>
         {badge ? (
           <View style={styles.heroBadgeOverlay}>
             <Pill label={badge.label} tone={badge.tone === 'now' ? 'live' : 'neutral'} />
@@ -140,7 +145,7 @@ function RowCard({ item, now, onPress, responseStatus }: VariantCardProps & { re
       accessibilityRole="button"
       accessibilityLabel={`${isActivity ? 'Activity' : 'Event'}: ${item.title}`}
     >
-      <MediaCard emoji={category?.emoji} height={64} radius={Radius.md} />
+      <MediaCard source={eventCoverSource(item)} emoji={category?.emoji} height={64} radius={Radius.md} />
 
       <View style={styles.rowBody}>
         <Text style={styles.rowTime} numberOfLines={1}>
@@ -185,7 +190,7 @@ function UpcomingCard({ item, now, onPress }: VariantCardProps) {
       accessibilityRole="button"
       accessibilityLabel={`${isActivity ? 'Activity' : 'Event'}: ${item.title}`}
     >
-      <MediaCard emoji={category?.emoji} height={90} radius={Radius.lg}>
+      <MediaCard source={eventCoverSource(item)} emoji={category?.emoji} height={90} radius={Radius.lg}>
         <View style={styles.upcomingDateOverlay}>
           <DateBadge date={item.startsAt.toDate()} />
         </View>

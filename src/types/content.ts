@@ -68,6 +68,18 @@ export type EventContent = ContentBase & {
   startsAt: Timestamp;
   endsAt: Timestamp;
   placeName: string;
+  /**
+   * Step 36 — an OPTIONAL background/cover photo, omitted entirely (never
+   * an empty string) when the organizer doesn't add one — same "absent
+   * key, not a blank value" convention placeName already uses on
+   * PostContent above. A real, already-resolved HTTPS download URL (see
+   * uploadEventCoverPhoto/createEvent in src/services/content.ts), never a
+   * bare Storage path. Content documents are immutable after publish (no
+   * edit UI exists — see the content/{contentId} `allow update: if false`
+   * in firestore.rules), so unlike a profile photo this is set once, at
+   * creation, and never changed afterward.
+   */
+  coverPhotoURL?: string;
 };
 
 /** content/{contentId} — the unified root collection for all city content. */
@@ -78,6 +90,8 @@ export const TITLE_MAX_LENGTH = 120;
 export const DESCRIPTION_MAX_LENGTH = 1000;
 export const PLACE_NAME_MAX_LENGTH = 200;
 export const MAX_PARTICIPANTS_LIMIT = 500;
+/** Step 36 — same cap as PROFILE_COVER_PHOTO_MAX_SIZE_BYTES (src/types/user.ts): a banner-shaped image, not a single still like a profile photo. */
+export const EVENT_COVER_PHOTO_MAX_SIZE_BYTES = 8 * 1024 * 1024;
 
 /**
  * content/{activityId}/participants/{uid} — one document per joined user.

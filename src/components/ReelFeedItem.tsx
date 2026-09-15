@@ -15,10 +15,12 @@ import { useAuth } from '@/hooks/useAuth';
 import { followUser, isFollowing } from '@/services/following';
 import { fetchPublicProfile } from '@/services/publicProfile';
 import { fetchReelCommentCount, fetchReelLikeCount, isReelLiked, likeReel, unlikeReel } from '@/services/reelEngagement';
+import { trackContentInteraction, trackReelWatchSummary, trackVideoStarted } from '@/services/recommendations/interactions';
 import { resolveReelPlaybackUrl } from '@/services/reels';
 import { isPostSaved, savePost, unsavePost } from '@/services/saved';
 import { fetchActiveStoriesForAuthor, hasViewedStory } from '@/services/stories';
 import type { Reel } from '@/types/reel';
+import type { RankingAttribution } from '@/types/recommendation';
 import type { PublicProfile } from '@/types/social';
 import { buildReelShareUrl, shareReel } from '@/utils/reelShare';
 
@@ -43,6 +45,10 @@ type ReelFeedItemProps = {
   onOpenOptions: () => void;
   /** Brief transient confirmation (e.g. "Saved") — rendered once by the shared parent feed, not per-item. */
   onToast: (message: string) => void;
+  /** Recommendation Engine — Step 6 — DEVELOPMENT/analytics-only ranking metadata for THIS reel (Step 18/19) — undefined for a Reel that didn't come from a ranked feed (Following mode, /reels, a single-Reel detail view). Attached to every tracking call this component fires below; never read for anything else. */
+  attribution?: RankingAttribution;
+  /** Paired with `attribution` — see ReelFeed.tsx's own doc comment. */
+  feedSessionId?: string;
 };
 
 const CATEGORY_LABEL_BY_ID = new Map(INTERESTS.map((interest) => [interest.id, `${interest.emoji} ${interest.label}`]));
@@ -53,7 +59,7 @@ const CATEGORY_LABEL_BY_ID = new Map(INTERESTS.map((interest) => [interest.id, `
  * `shouldPrepare`) — see ReelsScreen for how activity/prepare windows are
  * tracked and how only one item is ever active at a time.
  */
-export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOptions, onToast }: ReelFeedItemProps) {
+export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOptions, onToast, attribution, feedSessionId }: ReelFeedItemProps) {
   const { user } = useAuth();
   // Whether the screen THIS item lives on (Home, a single-Post route,
   // etc.) is the one currently on top — see isSoundSheetOpen's own doc
@@ -314,6 +320,135 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
     }
   }, [isActive, urlStatus, playbackFailed, player, isPhoto]);
 
+  // Recommendation signals (Step 1, second pass) — REAL player-position-
+  // based watch tracking for video Reels, replacing the earlier dwell-
+  // time proxy (see ReelFeed.tsx's git history for that earlier version).
+  // `maxWatchedMsRef` accumulates the furthest real playback position
+  // reached THIS viewing session (never wall-clock time); `playToEndRef`
+  // counts how many times expo-video's own `playToEnd` event has fired
+  // this session (it fires every loop, even with `player.loop = true`),
+  // so a second full pass counts as a rewatch. Nothing here writes to
+  // Firestore on every tick — these are local accumulators only; exactly
+  // one summarized event is sent when this item stops being active (see
+  // the isActive-keyed effect below, which reads these refs at cleanup
+  // time). `hasStartedRef` guards trackVideoStarted so it fires at most
+  // once per viewing session, never once per timeUpdate tick.
+  const maxWatchedMsRef = useRef(0);
+  const playToEndRef = useRef(0);
+  const hasStartedRef = useRef(false);
+
+  useEffect(() => {
+    if (isPhoto) return;
+    const timeSub = player.addListener('timeUpdate', ({ currentTime }) => {
+      const currentMs = currentTime * 1000;
+      if (currentMs > maxWatchedMsRef.current) maxWatchedMsRef.current = currentMs;
+      if (!hasStartedRef.current && currentMs > 0) {
+        hasStartedRef.current = true;
+        if (user) {
+          trackVideoStarted({
+            userId: user.uid,
+            contentId: reel.reelId,
+            categoryId: reel.categoryId,
+            creatorId: reel.authorUid,
+            cityKey: reel.cityKey,
+            countryCode: reel.countryCode,
+          }).catch(() => {});
+        }
+      }
+    });
+    const endSub = player.addListener('playToEnd', () => {
+      playToEndRef.current += 1;
+    });
+    return () => {
+      timeSub.remove();
+      endSub.remove();
+    };
+    // Deliberately keyed only on [player, isPhoto] — reel/user identifying
+    // fields don't change for an already-mounted item, and re-subscribing
+    // on every render would both leak listeners (a new one added before
+    // the old is ever removed, since this effect wouldn't re-run to clean
+    // up the previous one) and risk firing trackVideoStarted more than
+    // once by resetting nothing here on purpose (that reset lives in the
+    // isActive-keyed effect below, which owns the session boundary).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [player, isPhoto]);
+
+  useEffect(() => {
+    if (!isActive || !user) return;
+    // Entering — reset THIS viewing session's accumulators. For a photo
+    // Reel there is no player, so watch behavior falls back to dwell time
+    // (the only signal available for a static image) captured via
+    // `enteredAt` below.
+    maxWatchedMsRef.current = 0;
+    playToEndRef.current = 0;
+    hasStartedRef.current = false;
+    const enteredAt = Date.now();
+
+    trackContentInteraction({
+      userId: user.uid,
+      contentId: reel.reelId,
+      contentType: 'reel',
+      action: 'impression',
+      categoryId: reel.categoryId,
+      creatorId: reel.authorUid,
+      cityKey: reel.cityKey,
+      countryCode: reel.countryCode,
+      attribution,
+      feedSessionId,
+    }).catch(() => {});
+
+    return () => {
+      // Leaving — isActive flipped false, or this item unmounted while
+      // still active (e.g. the feed itself was torn down). Reads the
+      // refs' LATEST values, kept fresh by the listener effect above
+      // regardless of this effect's own lifecycle.
+      if (isPhoto) {
+        const dwellMs = Date.now() - enteredAt;
+        const durationMs = reel.durationMs > 0 ? reel.durationMs : Math.max(dwellMs, 1);
+        trackReelWatchSummary({
+          userId: user.uid,
+          contentId: reel.reelId,
+          categoryId: reel.categoryId,
+          creatorId: reel.authorUid,
+          cityKey: reel.cityKey,
+          countryCode: reel.countryCode,
+          watchDurationMs: dwellMs,
+          videoDurationMs: durationMs,
+          attribution,
+          feedSessionId,
+        }).catch(() => {});
+        return;
+      }
+      // Prefer the player's own reported duration; fall back to the
+      // Reel's declared durationMs only if playback never actually
+      // loaded far enough to report one (e.g. a network failure).
+      const videoDurationMs = player.duration > 0 ? player.duration * 1000 : reel.durationMs;
+      trackReelWatchSummary({
+        userId: user.uid,
+        contentId: reel.reelId,
+        categoryId: reel.categoryId,
+        creatorId: reel.authorUid,
+        cityKey: reel.cityKey,
+        countryCode: reel.countryCode,
+        watchDurationMs: maxWatchedMsRef.current,
+        videoDurationMs,
+        isRewatch: playToEndRef.current >= 2,
+        attribution,
+        feedSessionId,
+      }).catch(() => {});
+    };
+    // Deliberately excludes `attribution`/`feedSessionId` — this effect's
+    // own boundary IS the viewing session (isActive true -> false), so it
+    // must record the attribution snapshot captured at ENTRY for both the
+    // impression and the eventual exit's watch summary. A parent re-render
+    // that rebuilds the attribution map (e.g. loadMoreForYou appending a
+    // page) gives every already-shown reel a structurally-equal but
+    // referentially-new `attribution` object; reacting to that would tear
+    // down and re-fire this effect mid-view, double-counting the
+    // impression and truncating the watch summary already in progress.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isActive, isPhoto, user, player, reel.reelId, reel.categoryId, reel.authorUid, reel.cityKey, reel.countryCode, reel.durationMs]);
+
   const handleRetryPlayback = () => {
     setPlaybackUrl(null);
     setPlaybackFailed(false);
@@ -397,6 +532,20 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
   // nothing happening at all. A genuine cancel stays quiet.
   const handleShare = async () => {
     const result = await shareReel(reel.reelId);
+    if (result.ok && user) {
+      trackContentInteraction({
+        userId: user.uid,
+        contentId: reel.reelId,
+        contentType: 'reel',
+        action: 'share',
+        categoryId: reel.categoryId,
+        creatorId: reel.authorUid,
+        cityKey: reel.cityKey,
+        countryCode: reel.countryCode,
+        attribution,
+        feedSessionId,
+      }).catch(() => {});
+    }
     if (!result.ok && !/cancel/i.test(result.message)) {
       await Clipboard.setStringAsync(buildReelShareUrl(reel.reelId));
       onToast('Link copied');

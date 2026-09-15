@@ -48,6 +48,8 @@ type ProfileHeaderProps = {
   coverEdgeInset?: number;
   /** Real, bounded profile content count — see the caller for its exact source/limit. */
   postsCount: number;
+  /** Label for the postsCount stat — 'Posts' by default. A Business account's Profile passes 'Events' along with an events count instead, since its Profile is Events-only (see (tabs)/profile.tsx and user/[uid]/index.tsx). */
+  postsLabel?: string;
   followersCount: number;
   followingCount: number;
   /**
@@ -83,6 +85,7 @@ export function ProfileHeader({
   coverPhotoURL,
   coverEdgeInset = 0,
   postsCount,
+  postsLabel = 'Posts',
   followersCount,
   followingCount,
   likedCount,
@@ -166,7 +169,7 @@ export function ProfileHeader({
         ) : null}
 
         <View style={styles.statsRow}>
-          <StatItem value={postsCount} label="Posts" />
+          <StatItem value={postsCount} label={postsLabel} />
           <View style={styles.statDivider} />
           <StatItem value={followingCount} label="Following" onPress={onPressFollowing} />
           <View style={styles.statDivider} />
@@ -291,6 +294,14 @@ const styles = StyleSheet.create({
   statsRow: {
     flexDirection: 'row',
     alignItems: 'center',
+    justifyContent: 'space-between',
+    // `identity`'s own alignItems: 'center' shrink-wraps every other child
+    // in this block (avatar, name, bio, ...) — this row needs to ignore
+    // that so justifyContent above has room to spread the stats out,
+    // rather than bunching them in the middle. Full-width (100%) read as
+    // too wide once built; 80% keeps the spread-out look while pulling
+    // both edges in — still centered, via identity's own alignItems.
+    width: '80%',
     marginTop: Spacing.lg,
   },
   statDivider: {

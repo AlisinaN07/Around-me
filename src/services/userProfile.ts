@@ -395,6 +395,65 @@ export async function updateMyProfilePhoto(uid: string, photoURL: string): Promi
   return { ok: true, profile };
 }
 
+export type UpgradeToBusinessAccountResult =
+  | { ok: true; profile: UserProfile }
+  | { ok: false; error: 'not-configured' | 'no-profile' | 'already-business' | 'unknown'; message: string };
+
+class UpgradeToBusinessAccountTransactionError extends Error {
+  constructor(public code: 'no-profile' | 'already-business') {
+    super(code);
+  }
+}
+
+/**
+ * Settings -> Switch to Business account. A DELIBERATELY ONE-WAY
+ * transition — firestore.rules only ever permits accountType to move
+ * personal -> business, never the reverse (see the dedicated second
+ * `allow update` on users/{uid}, Step 35); the `already-business` guard
+ * here just gives a friendlier error than letting a redundant call hit
+ * that rule and fail as 'unknown'. Updates users/{uid} and
+ * publicProfiles/{uid} together in one transaction, touching ONLY
+ * accountType/updatedAt on each — same dual-document-in-lockstep pattern
+ * as updateMyProfile above, just narrower.
+ */
+export async function upgradeToBusinessAccount(uid: string): Promise<UpgradeToBusinessAccountResult> {
+  if (!firestore) {
+    return { ok: false, error: 'not-configured', message: 'Firestore is not available.' };
+  }
+  const db = firestore;
+
+  const userRef = doc(db, USERS_COLLECTION, uid);
+  const publicProfileRef = doc(db, PUBLIC_PROFILES_COLLECTION, uid);
+
+  try {
+    await runTransaction(db, async (transaction) => {
+      const userSnapshot = await transaction.get(userRef);
+      if (!userSnapshot.exists()) {
+        throw new UpgradeToBusinessAccountTransactionError('no-profile');
+      }
+      const current = userSnapshot.data() as UserProfile;
+      if (current.accountType === 'business') {
+        throw new UpgradeToBusinessAccountTransactionError('already-business');
+      }
+      const update = { accountType: 'business' as const, updatedAt: serverTimestamp() };
+      transaction.update(userRef, update);
+      transaction.update(publicProfileRef, update);
+    });
+  } catch (error) {
+    if (error instanceof UpgradeToBusinessAccountTransactionError) {
+      const message = error.code === 'no-profile' ? 'Profile not found.' : 'Your account is already a Business account.';
+      return { ok: false, error: error.code, message };
+    }
+    return { ok: false, error: 'unknown', message: "Couldn't switch your account type." };
+  }
+
+  const profile = await fetchUserProfile(uid);
+  if (!profile) {
+    return { ok: false, error: 'unknown', message: 'Account type was updated but could not be read back.' };
+  }
+  return { ok: true, profile };
+}
+
 export type UploadProfilePhotoHandle = { cancel: () => void };
 
 /**

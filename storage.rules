@@ -321,6 +321,36 @@ service firebase.storage {
       allow delete: if isSignedIn() && request.auth.uid == uid;
     }
 
+    // eventCovers/{authorUid}/{draftId}/photo — Create Event's OPTIONAL
+    // cover/background photo (Step 36), uploaded BEFORE the
+    // content/{contentId} document itself exists: unlike Reels/Stories,
+    // content documents are created in one atomic setDoc (see
+    // src/services/content.ts's createEvent), never a multi-stage draft —
+    // so there is no Firestore draft doc here to cross-check the way
+    // reelDoc()/storyDoc() do above. `draftId` (see generateEventDraftId
+    // in src/services/content.ts) is a fresh, random, purely client-side
+    // identifier with no Firestore meaning at all — its only job is to
+    // keep each Create Event attempt's photo at its own distinct path, so
+    // a LATER event by the same author can never overwrite (and thereby
+    // silently change the displayed cover of) an EARLIER already-
+    // published one, the way reusing one shared per-user slot (like
+    // profileCovers/{uid}/photo) would. Mutable in place for that SAME
+    // draftId only, since the organizer may pick, then re-pick, a
+    // different image before ever publishing.
+    match /eventCovers/{authorUid}/{draftId}/photo {
+      // Public-safe by product design, same as a published Event itself —
+      // same isSignedIn() gate as every other read above, not stricter.
+      allow read: if isSignedIn();
+
+      allow create, update: if isSignedIn()
+        && request.auth.uid == authorUid
+        && request.resource.size > 0
+        && request.resource.size <= 8 * 1024 * 1024
+        && request.resource.contentType.matches('image/.*');
+
+      allow delete: if isSignedIn() && request.auth.uid == authorUid;
+    }
+
     // Everything else — including the bucket root and any other path —
     // is denied by default. No public/open bucket access of any kind.
     match /{allPaths=**} {

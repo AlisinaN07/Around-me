@@ -24,7 +24,22 @@ import type { Notification } from '@/types/notification';
 
 import { firestore } from './firestore';
 import { buildNotificationId, notificationRef } from './notifications';
+import { trackContentInteraction } from './recommendations/interactions';
 import { fetchUserProfile } from './userProfile';
+
+/** Fire-and-forget — a recommendation-signal write never blocks or fails the real event-response action. */
+function trackEventResponseSignal(uid: string, event: EventContent, status: EventResponseStatus): void {
+  trackContentInteraction({
+    userId: uid,
+    contentId: event.contentId,
+    contentType: 'content',
+    action: status === 'going' ? 'event_going' : 'event_interested',
+    categoryId: event.categoryId,
+    creatorId: event.authorUid,
+    cityKey: event.cityKey,
+    countryCode: event.countryCode,
+  }).catch(() => {});
+}
 
 const CONTENT_COLLECTION = 'content';
 const DEFAULT_PARTICIPANT_LIMIT = 10;
@@ -269,6 +284,10 @@ export async function setEventResponse(eventId: string, uid: string, status: Eve
   const trusted = await resolveTrustedFields(uid);
   if (!trusted.ok) return trusted;
 
+  // Captured inside the transaction below, used for tracking only after
+  // it commits successfully.
+  let trackedEvent: EventContent | null = null;
+
   try {
     await runTransaction(db, async (tx) => {
       const eventSnap = await tx.get(contentDocRef(eventId));
@@ -279,6 +298,7 @@ export async function setEventResponse(eventId: string, uid: string, status: Eve
       if (event.endsAt.toMillis() <= Date.now()) {
         throw new TransactionAbort('ended', 'Event has ended.');
       }
+      trackedEvent = event;
 
       const existingSnap = await tx.get(responseRef(eventId, uid));
       const currentStatus = existingSnap.exists() ? (existingSnap.data() as EventResponse).status : null;
@@ -349,6 +369,9 @@ export async function setEventResponse(eventId: string, uid: string, status: Eve
     return { ok: false, error: 'unknown', message: "Couldn't update your response." };
   }
 
+  if (trackedEvent) {
+    trackEventResponseSignal(uid, trackedEvent, status);
+  }
   return { ok: true, status };
 }
 

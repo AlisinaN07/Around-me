@@ -1860,3 +1860,23 @@ export const resolveOwnSoundOrigin = onCall({ region: REGION, timeoutSeconds: 18
     await rm(workDir, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// Recommendation Engine — Step 4 — trusted engagement-stats aggregation
+// triggers. Split into their own file (engagementStats.ts) rather than
+// added directly here — this file was already large before this pass;
+// see that file's own top doc comment for the full design.
+// ---------------------------------------------------------------------------
+export * from './engagementStats';
+
+// ---------------------------------------------------------------------------
+// Recommendation Engine — Step 5 — collaborative filtering (user
+// similarity). Own file for the same reason as engagementStats.ts.
+// ---------------------------------------------------------------------------
+export * from './collaborative';
+
+// ---------------------------------------------------------------------------
+// Recommendation Engine — Step 6 — evaluation & feed-health metrics. Own
+// file for the same reason as engagementStats.ts.
+// ---------------------------------------------------------------------------
+export * from './metrics';

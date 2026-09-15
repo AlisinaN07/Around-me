@@ -29,12 +29,14 @@ import {
   setDoc,
   updateDoc,
   where,
+  type QueryConstraint,
   type WithFieldValue,
 } from 'firebase/firestore';
 import { deleteObject, getDownloadURL, ref, uploadBytesResumable, type UploadTask } from 'firebase/storage';
 import { httpsCallable } from 'firebase/functions';
 
 import { INTERESTS } from '@/constants/interests';
+import type { BrowseScope } from '@/types/browseScope';
 import {
   REEL_CAPTION_MAX_LENGTH,
   REEL_MAX_DURATION_MS,
@@ -743,12 +745,48 @@ export async function discardReelDraft(
 // Read — one-shot reads only, no realtime listener (see Step 18 spec).
 // ---------------------------------------------------------------------------
 
-/** Newest published Reels for one city. Never fetches all Reels then filters client-side. */
-export async function fetchCityReels(cityKey: string, limitCount = DEFAULT_FEED_LIMIT): Promise<Reel[]> {
+/**
+ * The equality/`in` clause a scoped query filters on — `cityKey`
+ * (`==` for one City, `in` for several Cities), `countryCode` for Country
+ * scope, or none at all for World (every published Reel, everywhere).
+ * See src/types/browseScope.ts's own doc comment for why this never
+ * affects what a new Reel is created with, only what a query reads back.
+ *
+ * NEVER use this for a query that already has its own `in`/
+ * `array-contains-any` clause (fetchFollowingReels below already filters
+ * `authorUid in [...]`) — Firestore allows only ONE such clause per
+ * query. Use scopeVariants for that instead.
+ */
+function scopeWhereClause(scope: BrowseScope): QueryConstraint[] {
+  if (scope.kind === 'city') return [where('cityKey', '==', scope.cityKey)];
+  if (scope.kind === 'cities') return [where('cityKey', 'in', scope.cityKeys)];
+  if (scope.kind === 'country') return [where('countryCode', '==', scope.countryCode)];
+  return [];
+}
+
+/**
+ * Every scope kind EXCEPT 'cities' already reads as a single query variant
+ * (one equality clause, or none). 'cities' scope expands into one variant
+ * per city (`cityKey == that city`) instead of the `in` clause
+ * scopeWhereClause would build for it, because fetchFollowingReels
+ * already has its OWN `in` clause (`authorUid in [...]`) — Firestore
+ * permits only one per query — so it runs one query per (authorUid
+ * chunk × variant) pair and merges everything. Every other scope kind
+ * still reuses the exact same composite index it always has (see
+ * firestore.indexes.json) since each variant here is structurally
+ * identical to scopeWhereClause's own single-variant output.
+ */
+function scopeVariants(scope: BrowseScope): QueryConstraint[][] {
+  if (scope.kind === 'cities') return scope.cityKeys.map((cityKey) => [where('cityKey', '==', cityKey)]);
+  return [scopeWhereClause(scope)];
+}
+
+/** Newest published Reels in one scope (city/country/world). Never fetches all Reels then filters client-side. */
+export async function fetchCityReels(scope: BrowseScope, limitCount = DEFAULT_FEED_LIMIT): Promise<Reel[]> {
   if (!firestore) return [];
   const feedQuery = query(
     collection(firestore, REELS_COLLECTION),
-    where('cityKey', '==', cityKey),
+    ...scopeWhereClause(scope),
     where('status', '==', 'published'),
     orderBy('publishedAt', 'desc'),
     limit(limitCount)
@@ -767,8 +805,8 @@ function chunkArray<T>(items: T[], size: number): T[][] {
 
 export type FetchFollowingReelsInput = {
   currentUid: string;
-  /** The city to scope the feed to — Active City, passed explicitly (same pattern as fetchFollowingFeed in content.ts). */
-  cityKey: string;
+  /** The scope to filter the feed to — Active Scope, passed explicitly (same pattern as fetchFollowingFeed in content.ts). */
+  scope: BrowseScope;
   limit?: number;
 };
 
@@ -777,28 +815,29 @@ export type FollowingReelsResult = {
   /**
    * Whether the caller follows anyone at all — lets the UI distinguish
    * "you don't follow anyone yet" from "you follow people, but none of
-   * them have Reels in this city" without a second, duplicate
+   * them have Reels in this scope" without a second, duplicate
    * fetchFollowingUids call (this function already makes exactly one).
    */
   followsAnyone: boolean;
 };
 
 /**
- * Published Reels, in one city, from people `currentUid` follows —
- * chronological (newest publishedAt first). Mirrors fetchFollowingFeed in
- * src/services/content.ts exactly: resolves followed uids first, then
- * queries Reels directly by those uids in chunks of
+ * Published Reels, in one scope (city/country/world), from people
+ * `currentUid` follows — chronological (newest publishedAt first). Mirrors
+ * fetchFollowingFeed in src/services/content.ts exactly: resolves followed
+ * uids first, then queries Reels directly by those uids in chunks of
  * FOLLOWING_UID_CHUNK_SIZE (10, well under the JS SDK's 30-value `in`
- * cap), each chunk further scoped by cityKey + status so this never
- * fetches a followed author's Reels from OTHER cities only to discard them
- * client-side. Results are merged, deduplicated by reelId, globally
- * re-sorted by publishedAt, and capped to the requested limit. Uses the
- * dedicated (cityKey, status, authorUid, publishedAt DESC) composite index
- * — the only new index this step adds.
+ * cap), each chunk further scoped by the same clause + status so this
+ * never fetches a followed author's Reels outside the current scope only
+ * to discard them client-side. Results are merged, deduplicated by
+ * reelId, globally re-sorted by publishedAt, and capped to the requested
+ * limit. Uses one dedicated (scope clause, status, authorUid,
+ * publishedAt DESC) composite index per BrowseScope kind — see
+ * firestore.indexes.json.
  */
 export async function fetchFollowingReels({
   currentUid,
-  cityKey,
+  scope,
   limit: limitCount = DEFAULT_FOLLOWING_FEED_LIMIT,
 }: FetchFollowingReelsInput): Promise<FollowingReelsResult> {
   if (!firestore) return { reels: [], followsAnyone: false };
@@ -810,16 +849,23 @@ export async function fetchFollowingReels({
   }
 
   const chunks = chunkArray(followedUids, FOLLOWING_UID_CHUNK_SIZE);
+  // Cross-product of author chunks × scope variants — see scopeVariants'
+  // own doc comment for why a multi-city scope can't just fold into a
+  // single `in` clause here (authorUid already owns this query's one
+  // allowed `in`).
+  const variants = scopeVariants(scope);
   const chunkResults = await Promise.all(
-    chunks.map((chunk) =>
-      getDocs(
-        query(
-          collection(db, REELS_COLLECTION),
-          where('authorUid', 'in', chunk),
-          where('cityKey', '==', cityKey),
-          where('status', '==', 'published'),
-          orderBy('publishedAt', 'desc'),
-          limit(limitCount)
+    chunks.flatMap((chunk) =>
+      variants.map((variant) =>
+        getDocs(
+          query(
+            collection(db, REELS_COLLECTION),
+            where('authorUid', 'in', chunk),
+            ...variant,
+            where('status', '==', 'published'),
+            orderBy('publishedAt', 'desc'),
+            limit(limitCount)
+          )
         )
       )
     )

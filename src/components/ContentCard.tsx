@@ -1,6 +1,6 @@
 import { Ionicons } from '@expo/vector-icons';
 import { router } from 'expo-router';
-import { Pressable, StyleSheet, Text, View } from 'react-native';
+import { Image, Pressable, StyleSheet, Text, View } from 'react-native';
 
 import { AuthorLink } from '@/components/AuthorLink';
 import { INTERESTS } from '@/constants/interests';
@@ -12,6 +12,27 @@ type ContentCardProps = {
   item: Content;
   /** Signed-in user's own uid, to show the "You" indicator — never used for anything else. */
   currentUid: string | null;
+  /**
+   * Hides the author name/username/You-badge row. Defaults to true (every
+   * existing call site keeps its current look). Profile screens (own and
+   * other users') pass false for tabs that only ever show that SAME
+   * profile's own authored content (Posts, Events) — the profile header
+   * above already establishes whose content this is, so repeating their
+   * name on every single card is redundant there. Reposts/Saved keep the
+   * default: those items can be authored by someone else entirely, so the
+   * author identity is still real information, not decoration.
+   */
+  showAuthor?: boolean;
+  /**
+   * Hides the "EVENT"/"POST"/"ACTIVITY" type pill, keeping the category
+   * pill (if any). Defaults to true. The Business Profile Events tabs
+   * (Live/Upcoming/Past — see (tabs)/profile.tsx and user/[uid]/index.tsx)
+   * pass false: every card there is already known to be an Event, so
+   * repeating that on each one is redundant, same reasoning as
+   * showAuthor. Every mixed-type list (Reposts, Saved, Place feed) keeps
+   * the default, where the type genuinely varies card to card.
+   */
+  showTypeBadge?: boolean;
 };
 
 const TYPE_LABEL: Record<Content['type'], string> = {
@@ -20,11 +41,56 @@ const TYPE_LABEL: Record<Content['type'], string> = {
   event: 'Event',
 };
 
+/**
+ * The type ("EVENT") + category ("🎵 Music") pill pair — shared by both
+ * places it can render: its own row under the header (showAuthor), or
+ * inline within the header itself, left-aligned against the time
+ * (!showAuthor — see ContentCard's own render for why: no author row left
+ * to anchor a separate line under).
+ */
+function TypeAndCategoryBadges({
+  item,
+  category,
+  inline = false,
+  showType = true,
+}: {
+  item: Content;
+  category: (typeof INTERESTS)[number] | undefined;
+  inline?: boolean;
+  showType?: boolean;
+}) {
+  if (!showType && !category) return null;
+  return (
+    <View style={[styles.metaRow, inline && styles.metaRowInline]}>
+      {showType && (
+        <View style={styles.typeBadge}>
+          <Text style={styles.typeBadgeText}>{TYPE_LABEL[item.type]}</Text>
+        </View>
+      )}
+      {category && (
+        <View style={styles.categoryPill}>
+          <Text style={styles.categoryText}>
+            {category.emoji} {category.label}
+          </Text>
+        </View>
+      )}
+    </View>
+  );
+}
+
 /** Renders a real content/{contentId} document — no invented engagement numbers, ever. */
-export function ContentCard({ item, currentUid }: ContentCardProps) {
+export function ContentCard({ item, currentUid, showAuthor = true, showTypeBadge = true }: ContentCardProps) {
   const isOwn = currentUid !== null && item.authorUid === currentUid;
   const category = INTERESTS.find((interest) => interest.id === item.categoryId);
   const timeLabel = item.type === 'post' ? formatTimeAgo(item.createdAt.toDate()) : formatEventTime(item.startsAt.toDate());
+  // Step 36's optional Event cover photo (no such field on Post/Activity).
+  // Shown as this card's own background, everywhere an Event renders as a
+  // ContentCard, with a dark overlay underneath every text element so it
+  // stays readable over a busy photo — same idea as EventCard's MediaCard-
+  // based cards and DetailHero's scrims, just a flat tint here rather than
+  // a top/bottom gradient, since this card's text isn't confined to one
+  // edge (header, title/description, and place all need contrast).
+  const coverPhotoURL = item.type === 'event' ? item.coverPhotoURL : undefined;
 
   return (
     <Pressable
@@ -33,37 +99,40 @@ export function ContentCard({ item, currentUid }: ContentCardProps) {
       accessibilityRole="button"
       accessibilityLabel={`View ${item.type}`}
     >
+      {coverPhotoURL ? (
+        <>
+          <Image source={{ uri: coverPhotoURL }} style={StyleSheet.absoluteFill} resizeMode="cover" />
+          <View style={[StyleSheet.absoluteFill, styles.coverOverlay]} pointerEvents="none" />
+        </>
+      ) : null}
+
       <View style={styles.header}>
-        <View style={styles.authorRow}>
-          <AuthorLink uid={item.authorUid} style={styles.authorLink}>
-            <Text style={styles.authorName} numberOfLines={1}>
-              {item.authorDisplayName}
-            </Text>
-            <Text style={styles.username} numberOfLines={1}>
-              @{item.authorUsername}
-            </Text>
-          </AuthorLink>
-          {isOwn && (
-            <View style={styles.youBadge}>
-              <Text style={styles.youText}>You</Text>
-            </View>
-          )}
-        </View>
+        {showAuthor ? (
+          <View style={styles.authorRow}>
+            <AuthorLink uid={item.authorUid} style={styles.authorLink}>
+              <Text style={styles.authorName} numberOfLines={1}>
+                {item.authorDisplayName}
+              </Text>
+              <Text style={styles.username} numberOfLines={1}>
+                @{item.authorUsername}
+              </Text>
+            </AuthorLink>
+            {isOwn && (
+              <View style={styles.youBadge}>
+                <Text style={styles.youText}>You</Text>
+              </View>
+            )}
+          </View>
+        ) : (
+          // No author row to anchor the type/category badges under their
+          // own separate line — they move up onto the same row as the
+          // time instead, left-aligned against it.
+          <TypeAndCategoryBadges item={item} category={category} showType={showTypeBadge} inline />
+        )}
         <Text style={styles.time}>{timeLabel}</Text>
       </View>
 
-      <View style={styles.metaRow}>
-        <View style={styles.typeBadge}>
-          <Text style={styles.typeBadgeText}>{TYPE_LABEL[item.type]}</Text>
-        </View>
-        {category && (
-          <View style={styles.categoryPill}>
-            <Text style={styles.categoryText}>
-              {category.emoji} {category.label}
-            </Text>
-          </View>
-        )}
-      </View>
+      {showAuthor && <TypeAndCategoryBadges item={item} category={category} showType={showTypeBadge} />}
 
       {item.type === 'post' ? (
         <Text style={styles.body}>{item.body}</Text>
@@ -86,17 +155,16 @@ export function ContentCard({ item, currentUid }: ContentCardProps) {
       {item.type === 'activity' && item.maxParticipants ? (
         <Text style={styles.meta}>Up to {item.maxParticipants} people</Text>
       ) : null}
-
-      {item.type !== 'post' && (
-        <View style={styles.actionButton}>
-          <Text style={styles.actionText}>{item.type === 'activity' ? 'View activity' : 'View event'}</Text>
-        </View>
-      )}
     </Pressable>
   );
 }
 
 const styles = StyleSheet.create({
+  // Deliberately no marginBottom here — vertical spacing between cards is
+  // the LIST's job (every real caller already wraps these in a container
+  // with its own gap/rowGap: profile.tsx and user/[uid]/index.tsx's
+  // contentList, place/[placeId].tsx's contentList, postsGrid's rowGap).
+  // Adding a margin here too used to double that spacing.
   card: {
     borderRadius: Radius.lg,
     backgroundColor: Colors.surface,
@@ -104,8 +172,18 @@ const styles = StyleSheet.create({
     borderColor: Colors.border,
     padding: Spacing.md,
     marginHorizontal: Spacing.lg,
-    marginBottom: Spacing.md,
     gap: Spacing.xs,
+    // Keeps the absolutely-positioned cover photo below (when present)
+    // clipped to the card's own rounded corners instead of poking out as
+    // a sharp rectangle.
+    overflow: 'hidden',
+  },
+  // Flat tint, not a gradient — this card's text isn't confined to one
+  // edge the way DetailHero's is, so the whole photo needs even, uniform
+  // darkening for every line of text to stay readable. Same base color as
+  // this app's other dark scrims (Colors.background, #0A0A0D).
+  coverOverlay: {
+    backgroundColor: 'rgba(10, 10, 13, 0.72)',
   },
   header: {
     flexDirection: 'row',
@@ -160,6 +238,13 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: Spacing.xs,
     marginTop: 2,
+  },
+  // Sits inside the header row itself (next to `time`, same baseline) —
+  // metaRow's own marginTop is meant for spacing below the header, which
+  // would misalign it here instead.
+  metaRowInline: {
+    marginTop: 0,
+    flexShrink: 1,
   },
   typeBadge: {
     borderRadius: Radius.full,
@@ -217,19 +302,5 @@ const styles = StyleSheet.create({
   meta: {
     color: Colors.textSecondary,
     fontSize: 12,
-  },
-  actionButton: {
-    alignSelf: 'flex-start',
-    borderRadius: Radius.full,
-    borderWidth: 1,
-    borderColor: Colors.accent,
-    paddingHorizontal: Spacing.md,
-    paddingVertical: 6,
-    marginTop: Spacing.xs,
-  },
-  actionText: {
-    color: Colors.accent,
-    fontSize: 12,
-    fontWeight: '700',
   },
 });

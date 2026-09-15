@@ -28,6 +28,21 @@ import { contentDocRef, resolveTrustedFields, type EngagementError, type Engagem
 import { firestore } from './firestore';
 import { buildNotificationId, notificationRef } from './notifications';
 import { postLikeRef } from './postLikes';
+import { trackContentInteraction } from './recommendations/interactions';
+
+/** Fire-and-forget — a recommendation-signal write never blocks or fails the real like/comment action it's attached to (see trackContentInteraction's own doc comment). */
+function trackContentSignal(uid: string, content: Content, action: 'like' | 'unlike' | 'comment'): void {
+  trackContentInteraction({
+    userId: uid,
+    contentId: content.contentId,
+    contentType: 'content',
+    action,
+    categoryId: content.categoryId,
+    creatorId: content.authorUid,
+    cityKey: content.cityKey,
+    countryCode: content.countryCode,
+  }).catch(() => {});
+}
 
 const CONTENT_COLLECTION = 'content';
 const DEFAULT_COMMENT_LIMIT = 30;
@@ -125,6 +140,7 @@ export async function likeContent(contentId: string, uid: string): Promise<LikeC
     return { ok: false, error: 'unknown', message: "Couldn't like this." };
   }
 
+  trackContentSignal(uid, parent.content, 'like');
   return { ok: true, alreadyLiked: false };
 }
 
@@ -148,6 +164,9 @@ export async function unlikeContent(contentId: string, uid: string): Promise<{ o
       batch.delete(notificationRef(buildNotificationId('like', { contentId, actorUid: uid })));
     }
     await batch.commit();
+    if (contentSnapshot.exists()) {
+      trackContentSignal(uid, contentSnapshot.data() as Content, 'unlike');
+    }
   } catch {
     return { ok: false, error: 'unknown', message: "Couldn't remove your like." };
   }
@@ -235,6 +254,7 @@ export async function createComment(contentId: string, uid: string, body: string
   if (!created.exists()) {
     return { ok: false, error: 'unknown', message: 'Comment was posted but could not be read back.' };
   }
+  trackContentSignal(uid, parent.content, 'comment');
   return { ok: true, comment: created.data() as ContentComment };
 }
 

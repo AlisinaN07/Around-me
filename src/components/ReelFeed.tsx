@@ -14,10 +14,12 @@ import { SwipeBackEdge } from '@/components/SwipeBackEdge';
 import { Colors, Radius, Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
 import { blockUser } from '@/services/blocks';
+import { trackContentInteraction } from '@/services/recommendations/interactions';
 import { deleteMyReel } from '@/services/reels';
 import { isPostReposted, repostPost, undoRepost } from '@/services/reposts';
 import { buildReelShareUrl } from '@/utils/reelShare';
 import type { Reel } from '@/types/reel';
+import type { RankingAttribution } from '@/types/recommendation';
 
 type LoadStatus = 'loading' | 'loaded' | 'error';
 
@@ -25,6 +27,10 @@ const VIEWABILITY_CONFIG = { itemVisiblePercentThreshold: 90 };
 
 type ReelFeedProps = {
   reels: Reel[];
+  /** Recommendation Engine — Step 6 — DEVELOPMENT/analytics-only per-reelId ranking metadata (Step 18/19), keyed by reelId. Omitted entirely by callers whose reels aren't ranked by this engine at all (Following mode, the standalone /reels route, a single-Reel detail view) — ReelFeedItem's own tracking calls simply omit attribution in that case, same as before this feature existed. */
+  attributionByReelId?: Record<string, RankingAttribution>;
+  /** Paired with attributionByReelId — omitted by the same non-ranked callers. */
+  feedSessionId?: string;
   status: LoadStatus;
   errorTitle: string;
   emptyState: ReactNode;
@@ -61,6 +67,15 @@ type ReelFeedProps = {
    * doesn't exist there; `/reels` and the single-Reel detail view both do.
    */
   onSwipeBack?: () => void;
+  /**
+   * Called when the viewer scrolls near the end of the loaded list — the
+   * caller's own cue to fetch and append the next page (Step 19's
+   * pagination). Optional: Home's "For You" mode is the only caller that
+   * passes this today; every other caller (Following, `/reels`, the
+   * single-Reel detail view) still fetches one bounded page and never
+   * appends more, same as before this existed.
+   */
+  onEndReached?: () => void;
 };
 
 /**
@@ -71,7 +86,20 @@ type ReelFeedProps = {
  * scope) and pass the resulting `reels`/`status`; everything about
  * rendering and interacting with them lives here.
  */
-export function ReelFeed({ reels, status, errorTitle, emptyState, onReload, topOverlay, onReelDeleted, initialIndex, onSwipeBack }: ReelFeedProps) {
+export function ReelFeed({
+  reels,
+  attributionByReelId,
+  feedSessionId,
+  status,
+  errorTitle,
+  emptyState,
+  onReload,
+  topOverlay,
+  onReelDeleted,
+  initialIndex,
+  onSwipeBack,
+  onEndReached,
+}: ReelFeedProps) {
   const { user } = useAuth();
   const [containerHeight, setContainerHeight] = useState(0);
   const [activeIndex, setActiveIndex] = useState(initialIndex ?? 0);
@@ -121,6 +149,15 @@ export function ReelFeed({ reels, status, errorTitle, emptyState, onReload, topO
       setActiveIndex(firstVisible.index);
     }
   }, []);
+
+  // Impression/watch-behavior tracking used to live here as a dwell-time
+  // approximation across the whole list (keyed on activeIndex) — replaced
+  // by REAL per-item, player-position-based tracking owned by
+  // ReelFeedItem itself (Step 1, second pass: it has direct access to the
+  // video player's own reported position/duration, which this list-level
+  // component never did). 'not_interested' (below) is the one
+  // recommendation signal that still belongs here, since it's driven by
+  // this component's own options menu.
 
   const showToast = useCallback((message: string) => {
     if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
@@ -181,6 +218,31 @@ export function ReelFeed({ reels, status, errorTitle, emptyState, onReload, topO
     [showToast]
   );
 
+  // The recommendation engine's one negative, explicit signal (Step 2/13
+  // — "deprioritize content the user already marked not interested").
+  // Fire-and-forget, same as every other tracking call in this file — see
+  // trackContentInteraction's own doc comment. Never shown on the
+  // viewer's own Reel (own-content branch below has no use for it).
+  const handleNotInterested = useCallback(
+    (reel: Reel) => {
+      if (!user) return;
+      trackContentInteraction({
+        userId: user.uid,
+        contentId: reel.reelId,
+        contentType: 'reel',
+        action: 'not_interested',
+        categoryId: reel.categoryId,
+        creatorId: reel.authorUid,
+        cityKey: reel.cityKey,
+        countryCode: reel.countryCode,
+        attribution: attributionByReelId?.[reel.reelId],
+        feedSessionId,
+      }).catch(() => {});
+      showToast("We'll show you less like this");
+    },
+    [user, showToast, attributionByReelId, feedSessionId]
+  );
+
   // Share moved out of this menu into its own always-visible action-rail
   // icon per item (ReelFeedItem owns the share/copy-link-fallback flow
   // now) — "Copy link" stays here as a separate, explicit menu action.
@@ -191,6 +253,7 @@ export function ReelFeed({ reels, status, errorTitle, emptyState, onReload, topO
           { label: 'Delete post', onPress: () => setDeleteTarget(optionsReel), destructive: true },
         ]
       : [
+          { label: 'Not interested', onPress: () => handleNotInterested(optionsReel) },
           { label: isOptionsReelReposted ? 'Undo repost' : 'Repost', onPress: () => handleToggleRepost(optionsReel) },
           { label: 'Copy link', onPress: () => handleCopyLink(optionsReel) },
           { label: 'Report post', onPress: () => setReportReel(optionsReel) },
@@ -276,6 +339,8 @@ export function ReelFeed({ reels, status, errorTitle, emptyState, onReload, topO
                 shouldPrepare={Math.abs(index - activeIndex) <= 1}
                 onOpenOptions={() => setOptionsReel(item)}
                 onToast={showToast}
+                attribution={attributionByReelId?.[item.reelId]}
+                feedSessionId={feedSessionId}
               />
             )}
             pagingEnabled
@@ -286,6 +351,8 @@ export function ReelFeed({ reels, status, errorTitle, emptyState, onReload, topO
             getItemLayout={(_, index) => ({ length: containerHeight, offset: containerHeight * index, index })}
             viewabilityConfig={VIEWABILITY_CONFIG}
             onViewableItemsChanged={onViewableItemsChanged}
+            onEndReached={onEndReached}
+            onEndReachedThreshold={1.5}
             // Conservative preload strategy (see ReelFeedItem's
             // shouldPrepare prop): only the active item plus one neighbor
             // on each side ever resolve a playback URL or hold a real
