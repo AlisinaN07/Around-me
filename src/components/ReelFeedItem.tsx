@@ -2,7 +2,7 @@ import { Ionicons } from '@expo/vector-icons';
 import * as Clipboard from 'expo-clipboard';
 import { router, useIsFocused } from 'expo-router';
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { ActivityIndicator, Image, PanResponder, Pressable, StyleSheet, Text, View } from 'react-native';
+import { ActivityIndicator, Image, PanResponder, Platform, Pressable, StyleSheet, Text, View } from 'react-native';
 import { VideoView, useVideoPlayer } from 'expo-video';
 
 import { AuthorLink } from '@/components/AuthorLink';
@@ -292,7 +292,26 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
   // decode or play, and handing a still-image URL to expo-video would just
   // surface as a spurious playback error.
   const player = useVideoPlayer(isPhoto ? null : playbackUrl, (p) => {
-    p.loop = true;
+    // Deliberately NOT p.loop = true on native — on iOS/Android, expo-
+    // video's own native loop visibly flashes black for a frame or two at
+    // the loop point (it appears to fully reset the player item rather
+    // than just seeking back within the same one). Looping manually
+    // instead — see the `playToEnd` listener below, which calls
+    // player.replay() (a lightweight seek-to-0 on the SAME already-
+    // buffered player, not a re-init) followed by player.play() — is the
+    // documented, lower-overhead way to loop and reads as seamless on
+    // real devices.
+    //
+    // On web this is the OPPOSITE: expo-video's web build backs this with
+    // a plain HTML5 <video>, and manually replaying via replay()+play()
+    // on 'playToEnd' measured a very visible ~0.4-0.9s freeze at both the
+    // end and the restart of every loop (confirmed live: currentTime sits
+    // pinned at duration, then pinned at 0, before resuming) — far worse
+    // than the native black-flash this was written to avoid. The
+    // browser's own native <video loop> attribute already loops
+    // perfectly seamlessly with zero JS involvement, so web keeps using
+    // it exactly as before this fix existed.
+    p.loop = Platform.OS === 'web';
     // Sound is always on — no mute control, no muted-by-default (owner
     // decision). Note: this can make unattended web autoplay unreliable
     // under a strict browser autoplay policy (some browsers block
@@ -308,7 +327,18 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
         setPlaybackFailed(true);
       }
     });
-    return () => subscription.remove();
+    return () => {
+      // Same native-player-already-released race as the watch-summary
+      // effect's duration read further down this file — on unmount,
+      // useVideoPlayer's own release effect can clean up before this
+      // one, making `.remove()` throw. try/catch keeps that harmless: a
+      // released player has no listeners left to worry about anyway.
+      try {
+        subscription.remove();
+      } catch {
+        // Player already released — nothing left to unsubscribe from.
+      }
+    };
   }, [player, isPhoto]);
 
   useEffect(() => {
@@ -325,9 +355,13 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
   // time proxy (see ReelFeed.tsx's git history for that earlier version).
   // `maxWatchedMsRef` accumulates the furthest real playback position
   // reached THIS viewing session (never wall-clock time); `playToEndRef`
-  // counts how many times expo-video's own `playToEnd` event has fired
-  // this session (it fires every loop, even with `player.loop = true`),
-  // so a second full pass counts as a rewatch. Nothing here writes to
+  // counts how many times `playToEnd` has fired this session — once per
+  // loop. On native, the player has no native loop (see useVideoPlayer's
+  // own setup above) and this listener is what actually triggers every
+  // subsequent loop; on web, `playToEnd` still fires once per loop
+  // alongside the browser's own native <video loop> (expo-video's own
+  // event, independent of the loop attribute) — either way a second full
+  // pass still counts as a rewatch exactly as before. Nothing here writes to
   // Firestore on every tick — these are local accumulators only; exactly
   // one summarized event is sent when this item stops being active (see
   // the isActive-keyed effect below, which reads these refs at cleanup
@@ -358,10 +392,34 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
     });
     const endSub = player.addListener('playToEnd', () => {
       playToEndRef.current += 1;
+      // Manual loop — NATIVE ONLY. See useVideoPlayer's own setup above
+      // for why native keeps p.loop=false and loops via replay()+play()
+      // instead. On web, `playToEnd` still fires once per loop even
+      // though p.loop=true already handles the actual looping on its own
+      // (confirmed live) — calling replay()/play() again here on top of
+      // that measured a very visible ~0.5-0.9s freeze at both the end and
+      // restart of every loop (this call fighting the browser's own
+      // already-in-progress native loop), so web must skip this entirely
+      // and let the native <video loop> attribute do the whole job.
+      if (Platform.OS !== 'web') {
+        player.replay();
+        player.play();
+      }
     });
     return () => {
-      timeSub.remove();
-      endSub.remove();
+      // Same native-player-already-released race as the statusChange
+      // listener's cleanup above — try/catch per subscription so one
+      // already-gone listener never stops the other from unsubscribing.
+      try {
+        timeSub.remove();
+      } catch {
+        // Player already released — nothing left to unsubscribe from.
+      }
+      try {
+        endSub.remove();
+      } catch {
+        // Player already released — nothing left to unsubscribe from.
+      }
     };
     // Deliberately keyed only on [player, isPhoto] — reel/user identifying
     // fields don't change for an already-mounted item, and re-subscribing
@@ -420,9 +478,27 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
         return;
       }
       // Prefer the player's own reported duration; fall back to the
-      // Reel's declared durationMs only if playback never actually
-      // loaded far enough to report one (e.g. a network failure).
-      const videoDurationMs = player.duration > 0 ? player.duration * 1000 : reel.durationMs;
+      // Reel's declared durationMs if playback never actually loaded far
+      // enough to report one (e.g. a network failure) OR if the native
+      // player is already gone by the time this runs: on unmount,
+      // useVideoPlayer's own internal release effect (registered earlier
+      // in this component's hook order — see expo-video's
+      // useReleasingSharedObjectWithLifecycle) cleans up BEFORE this
+      // effect's cleanup, since React fires effect cleanups in
+      // declaration order. Reading a property off an already-released
+      // player then throws a native "NotFoundException: Unable to find
+      // the native shared object" that crashes the whole screen (repro:
+      // navigate away from Home and back while a Reel is still mounted)
+      // — try/catch is the only way to read it safely here.
+      let videoDurationMs = reel.durationMs;
+      try {
+        if (player.duration > 0) {
+          videoDurationMs = player.duration * 1000;
+        }
+      } catch {
+        // Player already released — reel.durationMs above is the only
+        // duration left to report.
+      }
       trackReelWatchSummary({
         userId: user.uid,
         contentId: reel.reelId,
