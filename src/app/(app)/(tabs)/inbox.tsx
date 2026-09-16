@@ -1,6 +1,6 @@
 import { Ionicons } from '@expo/vector-icons';
 import { router, useFocusEffect } from 'expo-router';
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import { Platform, Pressable, RefreshControl, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
@@ -71,47 +71,100 @@ export default function InboxScreen() {
   // real Stories feature.
   const [unseenAuthorUids, setUnseenAuthorUids] = useState<Set<string>>(new Set());
 
-  const loadFollowingRow = useCallback(async () => {
-    if (!uid) return;
-    const [me, followedUids, activeStoryGroups] = await Promise.all([
-      fetchPublicProfile(uid),
-      fetchFollowingUids(uid),
-      fetchActiveStoriesForFollowing(uid),
-    ]);
-    setMyProfile(me);
-    // Bounded by fetchFollowingUids' own default limit — same bounded
-    // Promise.all reasoning as loadMessages' own otherProfiles fetch below.
-    const profiles = await Promise.all(followedUids.map((followedUid) => fetchPublicProfile(followedUid)));
-    setFollowingProfiles(profiles.filter((profile): profile is PublicProfile => profile !== null));
-    setStoryGroupByUid(new Map(activeStoryGroups.map((group) => [group.authorUid, group])));
+  // Whether this row's own fetch is currently in flight — a silent
+  // revalidate skips entirely rather than overlap one already running
+  // (see the useFocusEffect below for the full stale-while-revalidate
+  // pattern, same one already proven on Home/Events/Profile). This row
+  // has no dedicated loading/error UI of its own (it just quietly
+  // populates whenever data arrives), so the only thing `silent` changes
+  // here is this overlap guard — there's no status to avoid touching.
+  const isFollowingRowInFlightRef = useRef(false);
+  const loadFollowingRow = useCallback(
+    async (options?: { silent?: boolean }) => {
+      if (!uid) return;
+      const silent = options?.silent ?? false;
+      if (silent && isFollowingRowInFlightRef.current) return;
+      isFollowingRowInFlightRef.current = true;
+      try {
+        const [me, followedUids, activeStoryGroups] = await Promise.all([
+          fetchPublicProfile(uid),
+          fetchFollowingUids(uid),
+          fetchActiveStoriesForFollowing(uid),
+        ]);
+        setMyProfile(me);
+        // Bounded by fetchFollowingUids' own default limit — same bounded
+        // Promise.all reasoning as loadMessages' own otherProfiles fetch below.
+        const profiles = await Promise.all(followedUids.map((followedUid) => fetchPublicProfile(followedUid)));
+        setFollowingProfiles(profiles.filter((profile): profile is PublicProfile => profile !== null));
+        setStoryGroupByUid(new Map(activeStoryGroups.map((group) => [group.authorUid, group])));
 
-    // One hasViewedStory call per active Story across every group shown in
-    // this row — small and bounded, same read-cost shape as everything
-    // else here. A group counts as "unseen" the moment ANY of its
-    // Stories comes back unwatched.
-    const unseen = new Set<string>();
-    await Promise.all(
-      activeStoryGroups.map(async (group) => {
-        for (const story of group.stories) {
-          const seen = await hasViewedStory(story.storyId, uid);
-          if (!seen) {
-            unseen.add(group.authorUid);
-            return;
-          }
-        }
-      })
-    );
-    setUnseenAuthorUids(unseen);
-  }, [uid]);
+        // One hasViewedStory call per active Story across every group shown
+        // in this row — small and bounded, same read-cost shape as
+        // everything else here. A group counts as "unseen" the moment ANY
+        // of its Stories comes back unwatched.
+        const unseen = new Set<string>();
+        await Promise.all(
+          activeStoryGroups.map(async (group) => {
+            for (const story of group.stories) {
+              const seen = await hasViewedStory(story.storyId, uid);
+              if (!seen) {
+                unseen.add(group.authorUid);
+                return;
+              }
+            }
+          })
+        );
+        setUnseenAuthorUids(unseen);
+      } catch {
+        // This row never had a dedicated error state before this pattern
+        // existed — a failed refresh (silent or not) just leaves it
+        // showing whatever it last successfully loaded, same as it
+        // already implicitly did.
+      } finally {
+        isFollowingRowInFlightRef.current = false;
+      }
+    },
+    [uid]
+  );
 
+  // Whether notifications/messages are currently in flight — same overlap
+  // guard as loadFollowingRow's own isFollowingRowInFlightRef above, and
+  // the same pattern already proven on Home/Events/Profile: a silent call
+  // skips entirely rather than overlap one already running (covers both
+  // "two silent revalidates overlap" from rapidly leaving/returning, and
+  // "a silent revalidate fires before the very first real load has even
+  // resolved"). Neither a pull-to-refresh nor an explicit retry ever
+  // checks this — an explicit user action is never silently dropped.
+  const isNotificationsInFlightRef = useRef(false);
+  const isMessagesInFlightRef = useRef(false);
+
+  /**
+   * `isRefresh`/`silent` are mutually exclusive and cover Inbox's whole
+   * stale-while-revalidate behavior, same shape as Home/Events/Profile's
+   * own `{silent?: boolean}` (isRefresh is Inbox-specific: it already
+   * existed here, wired to the real pull-to-refresh spinner). Plain call
+   * (neither flag): a REAL load — sets `status` to 'loading', used for the
+   * first-ever load and ErrorState's Try again. `isRefresh: true`: pull-
+   * to-refresh — sets `isRefreshing` (the RefreshControl spinner) instead
+   * of `status`, still a real refetch. `silent: true`: a background
+   * revalidate — touches neither `status` nor `isRefreshing`, so nothing
+   * currently on screen changes while this refetches behind it; on
+   * success it updates `notifications` in place, and on failure it leaves
+   * whatever's already shown untouched rather than surfacing the error
+   * state over content that was working a moment ago.
+   */
   const load = useCallback(
-    async (isRefresh = false) => {
+    async (options?: { isRefresh?: boolean; silent?: boolean }) => {
       if (!uid) {
         return;
       }
+      const isRefresh = options?.isRefresh ?? false;
+      const silent = options?.silent ?? false;
+      if (silent && isNotificationsInFlightRef.current) return;
+      isNotificationsInFlightRef.current = true;
       if (isRefresh) {
         setIsRefreshing(true);
-      } else {
+      } else if (!silent) {
         setStatus('loading');
       }
       try {
@@ -119,22 +172,27 @@ export default function InboxScreen() {
         setNotifications(items);
         setStatus('loaded');
       } catch {
-        setStatus('error');
+        if (!silent) setStatus('error');
       } finally {
         setIsRefreshing(false);
+        isNotificationsInFlightRef.current = false;
       }
     },
     [uid]
   );
 
   const loadMessages = useCallback(
-    async (isRefresh = false) => {
+    async (options?: { isRefresh?: boolean; silent?: boolean }) => {
       if (!uid) {
         return;
       }
+      const isRefresh = options?.isRefresh ?? false;
+      const silent = options?.silent ?? false;
+      if (silent && isMessagesInFlightRef.current) return;
+      isMessagesInFlightRef.current = true;
       if (isRefresh) {
         setIsMessagesRefreshing(true);
-      } else {
+      } else if (!silent) {
         setMessagesStatus('loading');
       }
       try {
@@ -151,23 +209,40 @@ export default function InboxScreen() {
         setOtherProfiles(profilesByUid);
         setMessagesStatus('loaded');
       } catch {
-        setMessagesStatus('error');
+        if (!silent) setMessagesStatus('error');
       } finally {
         setIsMessagesRefreshing(false);
+        isMessagesInFlightRef.current = false;
       }
     },
     [uid]
   );
 
-  // Fires on mount and again every time Inbox regains focus — e.g. after
-  // tapping a notification/conversation and coming back. No realtime
-  // listener for either list — Chat itself owns the one realtime listener
-  // in this app while it's open (see src/app/(app)/chat/[uid].tsx).
+  // Stale-while-revalidate — same key-comparison pattern already proven on
+  // Home/Events/Profile (see their own doc comments). Inbox has no
+  // scope/city dimension the way those do — just the account itself — so
+  // the key is `uid` alone. First focus for a uid (fresh sign-in, or the
+  // very first mount): a real load for all three, the skeleton is
+  // expected then. Every later refocus with the SAME uid (the ordinary
+  // "tapped a notification/conversation, came back" case): a silent
+  // background revalidate instead — notifications/messages/the following
+  // row all stay showing exactly as they were while this refetches
+  // quietly behind them. A genuine account switch (uid actually changes)
+  // still gets a real load for all three, same as before.
+  const loadedUidRef = useRef<string | null>(null);
   useFocusEffect(
     useCallback(() => {
-      load();
-      loadMessages();
-      loadFollowingRow();
+      if (!uid) return;
+      if (loadedUidRef.current !== uid) {
+        loadedUidRef.current = uid;
+        load();
+        loadMessages();
+        loadFollowingRow();
+      } else {
+        load({ silent: true });
+        loadMessages({ silent: true });
+        loadFollowingRow({ silent: true });
+      }
       // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [uid])
   );
@@ -289,7 +364,7 @@ export default function InboxScreen() {
             status={status}
             notifications={notifications}
             isRefreshing={isRefreshing}
-            onRefresh={() => load(true)}
+            onRefresh={() => load({ isRefresh: true })}
             onRetry={() => load()}
             onRowPress={handleRowPress}
           />
@@ -302,7 +377,7 @@ export default function InboxScreen() {
             otherProfiles={otherProfiles}
             currentUid={uid}
             isRefreshing={isMessagesRefreshing}
-            onRefresh={() => loadMessages(true)}
+            onRefresh={() => loadMessages({ isRefresh: true })}
             onRetry={() => loadMessages()}
             onRowPress={handleConversationPress}
           />

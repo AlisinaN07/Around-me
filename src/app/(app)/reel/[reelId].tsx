@@ -1,6 +1,6 @@
 import { Ionicons } from '@expo/vector-icons';
 import { router, useFocusEffect, useLocalSearchParams } from 'expo-router';
-import { useCallback, useState } from 'react';
+import { useCallback, useRef, useState } from 'react';
 import { Pressable, StyleSheet, View } from 'react-native';
 
 import { EmptyState } from '@/components/EmptyState';
@@ -73,10 +73,29 @@ export default function ReelDetailScreen() {
     }
   }, [reelId, musicHash]);
 
+  // Stale-while-revalidate — same key-comparison pattern already proven on
+  // Home/Events/Profile (see their own doc comments). `reelId`/`musicHash`
+  // are the whole of what `load` depends on (fetchReel/fetchProfileReels/
+  // fetchReelsByMusicHash are all viewer-independent public reads — no
+  // uid/scope dimension exists here the way it does on Home/Events), so
+  // the key is just the two of them together. A refocus with an unchanged
+  // key (the ordinary "swiped into this Reel, tapped the author, came
+  // back" case) is a no-op: `reels` and `initialIndex` are left exactly as
+  // they are, so ReelFeed's own scroll position survives untouched.
+  // Deliberately a skip, not a live silent revalidate — ReelFeed resets its
+  // internal activeIndex to 0 on ANY `reels` array-reference change (see
+  // its own effect), so replacing `reels` here even with identical data
+  // would still snap playback back to this list's first item; skipping
+  // the fetch entirely avoids that regardless. A genuine key change (a
+  // different reelId/musicHash) still triggers `load()` for real.
+  const loadedKeyRef = useRef<string | null>(null);
   useFocusEffect(
     useCallback(() => {
+      const key = `${reelId}:${musicHash ?? ''}`;
+      if (loadedKeyRef.current === key) return;
+      loadedKeyRef.current = key;
       load();
-    }, [load])
+    }, [reelId, musicHash, load])
   );
 
   // Deleting a Post here removes it from the still-visible list (same

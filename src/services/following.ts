@@ -21,10 +21,30 @@ import {
 import { fetchPublicProfile } from '@/services/publicProfile';
 import type { Follow, PublicProfile } from '@/types/social';
 import type { Notification } from '@/types/notification';
+import { TtlCache } from '@/utils/requestCache';
 
 import { firestore } from './firestore';
 import { buildNotificationId, notificationRef } from './notifications';
 import { trackContentInteraction } from './recommendations/interactions';
+
+// Phase 2 perf pass — isFollowing is called once per feed item's own
+// follow-badge/pill (ReelFeedItem, EventDetail's author row, the public
+// profile screen, ...), so the same (viewer, author) pair is checked
+// independently and often simultaneously by every one of that author's
+// items on screen at once. Keyed by `${followerUid}:${targetUid}` — a
+// follow relationship is inherently a PAIR, never shared across different
+// viewers the way a public profile is, so this key (not just targetUid)
+// is what keeps it account-safe. 45s TTL, inside the suggested 30-60s
+// range. followUser/unfollowUser update this directly with the known new
+// value on success (see their own bodies below) rather than merely
+// invalidating — they already know the answer, so there's no reason to
+// force a second read just to repopulate the cache.
+const FOLLOW_CACHE_TTL_MS = 45_000;
+const followCache = new TtlCache<boolean>(FOLLOW_CACHE_TTL_MS);
+
+function followCacheKey(followerUid: string, targetUid: string): string {
+  return `${followerUid}:${targetUid}`;
+}
 
 /**
  * Fire-and-forget — a recommendation-signal write never blocks or fails
@@ -85,6 +105,10 @@ export async function followUser(followerUid: string, targetUid: string): Promis
 
   const existing = await getDoc(followRef(followerUid, targetUid));
   if (existing.exists()) {
+    // Already following — the redundant call still confirms the real,
+    // current state, so this is a fine place to (re)populate the cache
+    // too rather than leave it to the next isFollowing() call.
+    followCache.set(followCacheKey(followerUid, targetUid), true);
     return { ok: true };
   }
 
@@ -132,6 +156,12 @@ export async function followUser(followerUid: string, targetUid: string): Promis
   } catch {
     return { ok: false, error: 'unknown', message: "Couldn't follow this user." };
   }
+  // Phase 2 perf pass — update, not just invalidate: the write above just
+  // succeeded, so the new value is already known with certainty, and
+  // writing it directly means the very next isFollowing(followerUid,
+  // targetUid) call (e.g. the same screen re-rendering right after this
+  // resolves) reflects it immediately, with no extra Firestore read.
+  followCache.set(followCacheKey(followerUid, targetUid), true);
   trackFollowSignal(followerUid, targetUid, 'follow', targetProfile?.cityKey ?? '', targetProfile?.countryCode ?? '');
   return { ok: true };
 }
@@ -153,14 +183,23 @@ export async function unfollowUser(followerUid: string, targetUid: string): Prom
   } catch {
     return { ok: false, error: 'unknown', message: "Couldn't unfollow this user." };
   }
+  // Phase 2 perf pass — see followUser's own doc comment just above.
+  followCache.set(followCacheKey(followerUid, targetUid), false);
   trackFollowSignal(followerUid, targetUid, 'unfollow', targetProfile?.cityKey ?? '', targetProfile?.countryCode ?? '');
   return { ok: true };
 }
 
 export async function isFollowing(followerUid: string, targetUid: string): Promise<boolean> {
+  const key = followCacheKey(followerUid, targetUid);
+  const cached = followCache.getFresh(key);
+  if (cached !== undefined) return cached;
   if (!firestore) return false;
-  const snapshot = await getDoc(followRef(followerUid, targetUid));
-  return snapshot.exists();
+  const result = await followCache.dedupe(key, async () => {
+    const snapshot = await getDoc(followRef(followerUid, targetUid));
+    return snapshot.exists();
+  });
+  followCache.set(key, result);
+  return result;
 }
 
 /** Server-side aggregation count — never fetches every follow document just to count them. */

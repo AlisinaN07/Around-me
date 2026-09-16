@@ -1,6 +1,6 @@
 import { Ionicons } from '@expo/vector-icons';
 import { router } from 'expo-router';
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ActivityIndicator, Modal, PanResponder, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
@@ -17,6 +17,26 @@ import type { Reel, SelectedReelMusic } from '@/types/reel';
 import type { PublicProfile } from '@/types/social';
 
 type LoadStatus = 'loading' | 'loaded' | 'error';
+
+// Phase 1 perf pass — small in-memory cache, same module-level Map shape
+// already proven by reels.ts's own playbackUrlCache and by
+// ReelCommentsSheet's own commentsCache. Keyed by `musicHash` ALONE —
+// origin profile and the reels-sharing-this-sound grid are not
+// viewer-specific, so two different Reels using the same sound (or the
+// same Reel reopened) correctly share one cached entry. `savedByUid` is
+// the one genuinely viewer-specific field (a Save toggle is per-account)
+// — kept as its own small map INSIDE the shared entry rather than as a
+// separate cache, so it rides along with the same TTL/entry lifecycle
+// without leaking one viewer's save-state to another sharing the same
+// session (see this file's own "account-safe" requirement).
+type SoundCacheEntry = {
+  originProfile: PublicProfile | null;
+  soundReels: Reel[];
+  savedByUid: Record<string, boolean>;
+  fetchedAt: number;
+};
+const SOUND_CACHE_TTL_MS = 90_000;
+const soundCache = new Map<string, SoundCacheEntry>();
 
 // How far (px) a drag on the header/grabber zone has to travel before it
 // counts as a deliberate swipe rather than an accidental wobble — same
@@ -101,68 +121,153 @@ export function SoundSheet({ visible, reel, onClose, onToast }: SoundSheetProps)
     [isExpanded]
   );
 
-  // Loads fresh every time the sheet actually opens for this sound —
-  // never stale data left over from a previously-viewed one.
+  // Guards the SILENT path against overlapping requests — same shape
+  // already proven on Home/Events/Profile/Inbox/ReelCommentsSheet.
+  const isLoadInFlightRef = useRef(false);
+  // Same cancellation guard the original single-effect version used
+  // (`cancelled`), now a ref so both the effect below AND `load` itself
+  // can see it — set true on cleanup (sheet closed / reel changed /
+  // unmounted) so a still-in-flight fetch never applies stale results
+  // after the fact.
+  const cancelledRef = useRef(false);
+
+  /**
+   * `silent` (default false) is this sheet's stale-while-revalidate
+   * behavior, same shape as every other Phase 1 fix: a non-silent call is
+   * a REAL load — it sets `status` to 'loading' (which is what blanks the
+   * sheet to its spinner — see the render below), and is where
+   * resolveOwnSoundOrigin's own one-time resolution happens, same as
+   * before this pattern existed. A silent call is a background
+   * revalidate — it never touches `status`, so whatever's already shown
+   * (from cache — see the opening effect below) stays up while this
+   * refetches quietly behind it; on success it updates
+   * originProfile/soundReels/isSaved/the cache entry in place, and on
+   * failure it leaves the already-shown sound and status untouched
+   * rather than surfacing the error state over content that was working
+   * a moment ago.
+   */
+  const load = useCallback(
+    async (options?: { silent?: boolean }) => {
+      if (!user) return;
+      const silent = options?.silent ?? false;
+      if (silent && isLoadInFlightRef.current) return;
+      isLoadInFlightRef.current = true;
+      cancelledRef.current = false;
+      if (!silent) {
+        setStatus('loading');
+        setIsExpanded(false);
+      }
+      try {
+        let hash = musicHash;
+        let originUid = originAuthorUid;
+
+        // Own captured audio, never resolved before — resolve it now,
+        // exactly once, before doing anything else. A failure here just
+        // means `hash` stays '' and this falls through to the degraded
+        // "just this one Reel, no Save/Use-audio" view below, same as
+        // before this sheet supported resolving own audio at all.
+        if (!hash && reel.musicSourceType !== 'device') {
+          const result = await resolveOwnSoundOrigin(reel.reelId);
+          if (cancelledRef.current) return;
+          if (result.ok) {
+            hash = result.musicHash;
+            originUid = result.originAuthorUid;
+            setMusicHash(hash);
+            setOriginAuthorUid(originUid);
+          }
+        }
+
+        if (!hash) {
+          // Degraded case (own audio never resolved) — no real sound
+          // identity to cache by, so this always fetches fresh, same as
+          // before this pattern existed.
+          const profile = await fetchPublicProfile(originUid);
+          if (cancelledRef.current) return;
+          setOriginProfile(profile);
+          setSoundReels([reel]);
+          setIsSaved(false);
+          setStatus('loaded');
+          return;
+        }
+
+        const [profile, reels, saved] = await Promise.all([
+          fetchPublicProfile(originUid),
+          fetchReelsByMusicHash(hash),
+          isPostSaved(user.uid, 'sound', hash),
+        ]);
+        if (cancelledRef.current) return;
+        setOriginProfile(profile);
+        setSoundReels(reels);
+        setIsSaved(saved);
+        setStatus('loaded');
+        // Phase 1 perf pass — a successful load (real or silent) is
+        // exactly what keeps the cache fresh; see soundCache's own doc
+        // comment. Merges into any existing savedByUid map rather than
+        // replacing it outright, so a different viewer's own cached
+        // save-state (same session, rare) survives this write too.
+        const existing = soundCache.get(hash);
+        soundCache.set(hash, {
+          originProfile: profile,
+          soundReels: reels,
+          savedByUid: { ...existing?.savedByUid, [user.uid]: saved },
+          fetchedAt: Date.now(),
+        });
+      } catch {
+        if (!cancelledRef.current && !silent) setStatus('error');
+      } finally {
+        isLoadInFlightRef.current = false;
+      }
+    },
+    // musicHash/originAuthorUid are deliberately NOT dependencies — this
+    // reads their current value once per call and may itself set them;
+    // depending on them would just loop (same reasoning as before this
+    // pattern existed).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [reel, user]
+  );
+
+  // Stale-while-revalidate, keyed by musicHash (see soundCache's own doc
+  // comment). Opening the sheet:
+  //  - musicHash already resolved AND a cache entry exists within
+  //    SOUND_CACHE_TTL_MS: applied directly, instantly, with NO fetch at
+  //    all — the literal "reopening the same sound shows cached data
+  //    immediately" requirement, and — since the cache is keyed by
+  //    musicHash alone — this is exactly what makes a DIFFERENT Reel
+  //    sharing the same sound reuse this same cached entry too.
+  //  - A cached entry PAST its TTL: still applied immediately (nothing
+  //    ever blanks), then silently revalidated in the background.
+  //  - No cache entry, or musicHash not resolved yet (own-captured-audio,
+  //    first open): a real load, spinner and all — `load()` itself is
+  //    where resolveOwnSoundOrigin's one-time resolution happens.
+  // Never fetches anything while closed, and never prefetches ahead of a
+  // real open (see this file's own Do-NOT-prefetch requirement).
   useEffect(() => {
     if (!visible || !user) return;
-    let cancelled = false;
+    cancelledRef.current = false;
     // Resets fresh every time the sheet opens — same prop-driven-reset
     // pattern as ReelFeedItem/ReportModal.
     // eslint-disable-next-line react-hooks/set-state-in-effect
-    setStatus('loading');
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     setIsExpanded(false);
 
-    (async () => {
-      let hash = musicHash;
-      let originUid = originAuthorUid;
-
-      // Own captured audio, never resolved before — resolve it now,
-      // exactly once, before doing anything else. A failure here just
-      // means `hash` stays '' and this falls through to the degraded
-      // "just this one Reel, no Save/Use-audio" view below, same as
-      // before this sheet supported resolving own audio at all.
-      if (!hash && reel.musicSourceType !== 'device') {
-        const result = await resolveOwnSoundOrigin(reel.reelId);
-        if (cancelled) return;
-        if (result.ok) {
-          hash = result.musicHash;
-          originUid = result.originAuthorUid;
-          setMusicHash(hash);
-          setOriginAuthorUid(originUid);
-        }
-      }
-
-      if (!hash) {
-        const profile = await fetchPublicProfile(originUid);
-        if (cancelled) return;
-        setOriginProfile(profile);
-        setSoundReels([reel]);
-        setIsSaved(false);
-        setStatus('loaded');
-        return;
-      }
-
-      const [profile, reels, saved] = await Promise.all([
-        fetchPublicProfile(originUid),
-        fetchReelsByMusicHash(hash),
-        isPostSaved(user.uid, 'sound', hash),
-      ]);
-      if (cancelled) return;
-      setOriginProfile(profile);
-      setSoundReels(reels);
-      setIsSaved(saved);
+    const cached = musicHash ? soundCache.get(musicHash) : undefined;
+    if (cached) {
+      setOriginProfile(cached.originProfile);
+      setSoundReels(cached.soundReels);
+      setIsSaved(cached.savedByUid[user.uid] ?? false);
       setStatus('loaded');
-    })().catch(() => {
-      if (!cancelled) setStatus('error');
-    });
+      const isFresh = Date.now() - cached.fetchedAt < SOUND_CACHE_TTL_MS;
+      if (!isFresh) load({ silent: true });
+    } else {
+      load();
+    }
 
     return () => {
-      cancelled = true;
+      cancelledRef.current = true;
     };
-    // musicHash/originAuthorUid are deliberately NOT dependencies — this
-    // effect reads their current value once per open and may itself set
-    // them; re-running when they change would just loop.
+    // musicHash/originAuthorUid are deliberately NOT dependencies — same
+    // reasoning as `load`'s own doc comment just above: reading the
+    // current value once per open is correct, re-running when they
+    // change (which `load` itself may cause) would just loop.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [visible, reel, user]);
 
@@ -201,7 +306,17 @@ export function SoundSheet({ visible, reel, onClose, onToast }: SoundSheetProps)
       onToast(result.message);
       return;
     }
-    setIsSaved(!wasSaved);
+    const nextSaved = !wasSaved;
+    setIsSaved(nextSaved);
+    // Keep the cache entry (if any) in step with this same known,
+    // deterministic update — a real write already succeeded above, this
+    // just mirrors it into the cache exactly like it's already mirrored
+    // into local state, so a close-then-reopen within TTL doesn't show a
+    // stale pre-toggle save state. See soundCache's own doc comment —
+    // never a reason to invalidate the whole entry here, only update the
+    // one viewer's own field within it.
+    const cached = soundCache.get(musicHash);
+    if (cached) soundCache.set(musicHash, { ...cached, savedByUid: { ...cached.savedByUid, [user.uid]: nextSaved } });
     onToast(wasSaved ? 'Removed from saved' : 'Sound saved');
   };
 

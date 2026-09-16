@@ -26,6 +26,28 @@ import { formatTimeAgo } from '@/utils/timeFormat';
 
 type LoadStatus = 'loading' | 'loaded' | 'error';
 
+type CommentReactionState = ReelCommentReactionCounts & { myReaction: ReelCommentReactionType | null };
+
+// Phase 1 perf pass — small in-memory cache, same module-level Map shape
+// already proven by reels.ts's own playbackUrlCache. Keyed by
+// `${reelId}:${viewerUid}`, NOT reelId alone — myReaction below is
+// viewer-specific, so caching by reelId only would leak one viewer's own
+// reaction state to a different signed-in account sharing the same
+// session (see this file's own "account-safe" requirement). '' stands in
+// for signed-out, its own bucket, never mixed with a real uid's.
+type CommentsCacheEntry = {
+  comments: ReelComment[];
+  commentCount: number;
+  reactions: Record<string, CommentReactionState>;
+  fetchedAt: number;
+};
+const COMMENTS_CACHE_TTL_MS = 45_000;
+const commentsCache = new Map<string, CommentsCacheEntry>();
+
+function commentsCacheKey(reelId: string, uid: string | undefined): string {
+  return `${reelId}:${uid ?? ''}`;
+}
+
 type ReelCommentsSheetProps = {
   visible: boolean;
   reelId: string;
@@ -93,56 +115,116 @@ export function ReelCommentsSheet({ visible, reelId, onClose, onCommentCountChan
   // from this map (right after the list loads, before its own reaction
   // fetch resolves) is treated as zero counts / no reaction, never as an
   // error — see the render below's `reactions[comment.commentId] ?? ...`.
-  const [reactions, setReactions] = useState<Record<string, ReelCommentReactionCounts & { myReaction: ReelCommentReactionType | null }>>({});
+  const [reactions, setReactions] = useState<Record<string, CommentReactionState>>({});
   const [reactingCommentId, setReactingCommentId] = useState<string | null>(null);
 
-  const load = useCallback(async () => {
-    setStatus('loading');
-    let list: ReelComment[];
-    try {
-      const [fetchedList, total] = await Promise.all([fetchReelComments(reelId), fetchReelCommentCount(reelId)]);
-      list = fetchedList;
-      setComments(list);
-      onCommentCountChange?.(total);
-      setStatus('loaded');
-    } catch {
-      setStatus('error');
-      return;
-    }
+  const cacheKey = commentsCacheKey(reelId, user?.uid);
 
-    // Reaction counts/own-reaction are loaded separately, per comment,
-    // deliberately OUTSIDE the try/catch above: the comment list itself
-    // is already showing (status is 'loaded') by this point, so a slow or
-    // failed reaction fetch for one comment must never flip the whole
-    // sheet to an error state — it just leaves that one comment's
-    // reactions at their default (0/0/none), caught individually per
-    // comment rather than letting one failure reject the whole Promise.all.
-    const entries = await Promise.all(
-      list.map(async (comment) => {
-        try {
-          const [counts, myReaction] = await Promise.all([
-            fetchReelCommentReactionCounts(reelId, comment.commentId),
-            user ? fetchMyReelCommentReaction(reelId, comment.commentId, user.uid) : Promise.resolve(null),
-          ]);
-          return [comment.commentId, { ...counts, myReaction }] as const;
-        } catch {
-          return [comment.commentId, { likeCount: 0, dislikeCount: 0, myReaction: null }] as const;
-        }
-      })
-    );
-    setReactions(Object.fromEntries(entries));
-  }, [reelId, onCommentCountChange, user]);
+  // Guards the SILENT path against overlapping requests — the same shape
+  // already proven on Home/Events/Profile/Inbox: a silent revalidate skips
+  // entirely rather than overlap one already running.
+  const isLoadInFlightRef = useRef(false);
 
-  // Loads fresh every time the sheet opens for this Reel — never stale
-  // data left over from a previous open, and nothing fetched while closed.
+  /**
+   * `silent` (default false) is this sheet's stale-while-revalidate
+   * behavior: a non-silent call is a REAL load — it sets `status` to
+   * 'loading', which is what actually blanks the sheet to its spinner
+   * (see the render below) — used for the first-ever open of a given
+   * Reel's comments (nothing cached yet) and an explicit retry (the
+   * error state's "Try again"). A silent call is a background
+   * revalidate — it never touches `status`, so whatever's already shown
+   * (from cache — see the opening effect below) stays up while this
+   * refetches quietly behind it; on success it updates `comments`/
+   * `reactions`/the cache entry in place, and on failure it leaves the
+   * already-shown comments and status untouched rather than surfacing
+   * the error state over content that was working a moment ago.
+   */
+  const load = useCallback(
+    async (options?: { silent?: boolean }) => {
+      const silent = options?.silent ?? false;
+      if (silent && isLoadInFlightRef.current) return;
+      isLoadInFlightRef.current = true;
+      if (!silent) setStatus('loading');
+      let list: ReelComment[];
+      let total: number;
+      try {
+        [list, total] = await Promise.all([fetchReelComments(reelId), fetchReelCommentCount(reelId)]);
+        setComments(list);
+        onCommentCountChange?.(total);
+        setStatus('loaded');
+      } catch {
+        // Silent revalidate failure: leave whatever's already rendered
+        // (comments/reactions AND status) exactly as it is — a background
+        // refresh going wrong is never grounds to blank a sheet that was
+        // working a moment ago. A non-silent failure still shows the real
+        // error state, same as before this pattern existed.
+        if (!silent) setStatus('error');
+        isLoadInFlightRef.current = false;
+        return;
+      }
+
+      // Reaction counts/own-reaction are loaded separately, per comment,
+      // deliberately OUTSIDE the try/catch above: the comment list itself
+      // is already showing (status is 'loaded') by this point, so a slow or
+      // failed reaction fetch for one comment must never flip the whole
+      // sheet to an error state — it just leaves that one comment's
+      // reactions at their default (0/0/none), caught individually per
+      // comment rather than letting one failure reject the whole Promise.all.
+      const entries = await Promise.all(
+        list.map(async (comment) => {
+          try {
+            const [counts, myReaction] = await Promise.all([
+              fetchReelCommentReactionCounts(reelId, comment.commentId),
+              user ? fetchMyReelCommentReaction(reelId, comment.commentId, user.uid) : Promise.resolve(null),
+            ]);
+            return [comment.commentId, { ...counts, myReaction }] as const;
+          } catch {
+            return [comment.commentId, { likeCount: 0, dislikeCount: 0, myReaction: null }] as const;
+          }
+        })
+      );
+      const reactionsByCommentId = Object.fromEntries(entries);
+      setReactions(reactionsByCommentId);
+      // Phase 1 perf pass — a successful load (real or silent) is exactly
+      // what keeps the cache fresh; see commentsCache's own doc comment.
+      commentsCache.set(cacheKey, { comments: list, commentCount: total, reactions: reactionsByCommentId, fetchedAt: Date.now() });
+      isLoadInFlightRef.current = false;
+    },
+    [reelId, onCommentCountChange, user, cacheKey]
+  );
+
+  // Stale-while-revalidate, keyed by cacheKey (reelId + viewer uid — see
+  // commentsCache's own doc comment). Opening the sheet:
+  //  - A cached entry within COMMENTS_CACHE_TTL_MS: applied directly,
+  //    instantly, with NO fetch at all — this is the literal "reopening
+  //    within TTL shows cached comments immediately" requirement.
+  //  - A cached entry PAST its TTL: still applied immediately (so nothing
+  //    ever blanks), then silently revalidated in the background.
+  //  - No cached entry at all (first time this Reel's comments have ever
+  //    been opened this session): a real load, spinner and all.
+  // Never fetches anything while closed, and never prefetches ahead of a
+  // real open (see this file's own Do-NOT-prefetch requirement).
   useEffect(() => {
-    if (visible) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
+    if (!visible) return;
+    // Resets fresh every time the sheet opens — same prop-driven-reset
+    // pattern as ReelFeedItem/ReportModal.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setReplyingTo(null);
+    setExpandedThreads(new Set());
+
+    const cached = commentsCache.get(cacheKey);
+    if (cached) {
+      setComments(cached.comments);
+      setReactions(cached.reactions);
+      setStatus('loaded');
+      onCommentCountChange?.(cached.commentCount);
+      const isFresh = Date.now() - cached.fetchedAt < COMMENTS_CACHE_TTL_MS;
+      if (!isFresh) load({ silent: true });
+    } else {
       load();
-      setReplyingTo(null);
-      setExpandedThreads(new Set());
     }
-  }, [visible, load]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visible, cacheKey]);
 
   // Groups the one already-fetched, newest-first list into top-level
   // comments and a parentCommentId -> replies map — no second query, no
@@ -250,7 +332,17 @@ export function ReelCommentsSheet({ visible, reelId, onClose, onCommentCountChan
       const nextReaction = wasSameReaction ? null : type;
       if (nextReaction === 'like') likeCount += 1;
       if (nextReaction === 'dislike') dislikeCount += 1;
-      return { ...prev, [commentId]: { likeCount: Math.max(0, likeCount), dislikeCount: Math.max(0, dislikeCount), myReaction: nextReaction } };
+      const next = { ...prev, [commentId]: { likeCount: Math.max(0, likeCount), dislikeCount: Math.max(0, dislikeCount), myReaction: nextReaction } };
+      // Keep the cache entry (if any) in step with this same known,
+      // deterministic update — a real write already succeeded above, this
+      // just mirrors it into the cache exactly like it's already mirrored
+      // into local state, so a close-then-reopen within TTL doesn't show
+      // a stale pre-reaction snapshot. See commentsCache's own doc
+      // comment — never a reason to invalidate the whole entry here, only
+      // update the one field that actually changed.
+      const cached = commentsCache.get(cacheKey);
+      if (cached) commentsCache.set(cacheKey, { ...cached, reactions: next });
+      return next;
     });
   };
 
@@ -292,7 +384,7 @@ export function ReelCommentsSheet({ visible, reelId, onClose, onCommentCountChan
             ) : status === 'error' ? (
               <View style={styles.centered}>
                 <Text style={styles.errorText}>Couldn&apos;t load comments.</Text>
-                <Pressable onPress={load} accessibilityRole="button">
+                <Pressable onPress={() => load()} accessibilityRole="button">
                   <Text style={styles.retryLink}>Try again</Text>
                 </Pressable>
               </View>
@@ -399,8 +491,6 @@ export function ReelCommentsSheet({ visible, reelId, onClose, onCommentCountChan
     </Modal>
   );
 }
-
-type CommentReactionState = ReelCommentReactionCounts & { myReaction: ReelCommentReactionType | null };
 
 /**
  * One comment or reply row: avatar, name (+ "You" badge), body, and a

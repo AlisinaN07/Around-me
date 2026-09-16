@@ -188,20 +188,46 @@ export default function HomeScreen() {
   }, [activeScope, user]);
 
   const activeScopeKey = useMemo(() => browseScopeKey(activeScope), [activeScope]);
+  // Everything loadForYou/loadFollowing's own fetches actually depend on
+  // besides the mode itself — account, Active Scope, and (For You only)
+  // the viewer's own Home City, which getForYouReels also reads directly.
+  // A CHANGE in this key is the one thing that should ever invalidate and
+  // reload an already-loaded feed; identical keys across a focus event
+  // mean nothing real changed, so there's nothing to reload.
+  const feedLoadKey = `${user?.uid ?? ''}:${activeScopeKey}:${homeCity?.cityKey ?? ''}`;
 
-  // Reloads whenever Home regains focus, Active Scope changes, or the
-  // visible mode changes — same one-shot-per-visit pattern the rest of
-  // this app's discovery surfaces use, no realtime listener.
+  // Stale-while-revalidate — the LAST feedLoadKey each mode was actually
+  // (re)loaded for. Expo Router keeps Home mounted (just hidden) when the
+  // user switches tabs — see ReelFeed's own doc comment — so the feed and
+  // its scroll position are never really lost by leaving and coming back;
+  // the only thing that WAS discarding them was this effect unconditionally
+  // re-calling loadForYou/loadFollowing (both of which clear their list
+  // before re-fetching — see their own comments) on every single refocus,
+  // even when nothing had actually changed. Comparing against the key
+  // below is what makes a mere refocus a no-op: the existing feed (and
+  // wherever the viewer scrolled to) stays exactly as it was, instantly,
+  // with no network request at all — never "a newly-ranked feed just
+  // because the screen regained focus". A REAL change — switching mode,
+  // switching account, or the Active Scope/Home City actually changing —
+  // still reloads for real, exactly as before (loadForYou/loadFollowing
+  // are completely unchanged; only when they're called is different).
+  const loadedForYouKeyRef = useRef<string | null>(null);
+  const loadedFollowingKeyRef = useRef<string | null>(null);
+
   useFocusEffect(
     useCallback(() => {
       if (!isCityReady) return;
       if (mode === 'forYou') {
+        if (loadedForYouKeyRef.current === feedLoadKey) return;
+        loadedForYouKeyRef.current = feedLoadKey;
         loadForYou();
       } else {
+        if (loadedFollowingKeyRef.current === feedLoadKey) return;
+        loadedFollowingKeyRef.current = feedLoadKey;
         loadFollowing();
       }
       // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [activeScopeKey, isCityReady, mode])
+    }, [feedLoadKey, isCityReady, mode])
   );
 
   const visibleForYouReels = useMemo(

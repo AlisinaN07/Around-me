@@ -216,6 +216,25 @@ export default function CreateReelCameraScreen() {
   const [isRecording, setIsRecording] = useState(false);
   const [elapsedMs, setElapsedMs] = useState(0);
   const [mountError, setMountError] = useState<string | null>(null);
+  // Works around a long-standing, still-open expo-camera bug (native
+  // AVFoundation/Camera2, not this app's own code — see e.g.
+  // github.com/expo/expo issues #1057/#18234/#32058): the FIRST time a
+  // CameraView actually switches into `mode="video"`, the native capture
+  // session reconfigures itself (attaching a movie-file output) and that
+  // reconfiguration itself briefly shows black — which is exactly the
+  // glitch reported here, since without this, that reconfiguration was
+  // happening right when the record button was tapped. The reported
+  // community workaround (there's no real fix upstream yet) is to mount
+  // the CameraView in `mode="picture"` first, then flip it to "video"
+  // shortly after, once the live preview is already showing — moving the
+  // ONE reconfiguration-and-flash to a moment nobody's watching for it
+  // (just after the camera opens) instead of the moment they tap Record.
+  // See the CameraView `mode` prop below for where this is actually used.
+  const [hasPrimedVideoMode, setHasPrimedVideoMode] = useState(false);
+  useEffect(() => {
+    const timer = setTimeout(() => setHasPrimedVideoMode(true), 300);
+    return () => clearTimeout(timer);
+  }, []);
 
   // The capture-mode row above the record button: a horizontally-scrolling
   // picker (see CAPTURE_MODE_ITEMS) — whichever cell is centered over the
@@ -813,7 +832,10 @@ export default function CreateReelCameraScreen() {
           setError("Couldn't upload your Story.");
           return;
         }
-        const publishResult = await publishStory(draftResult.story.storyId);
+        // authorUid passed through so publishStory can invalidate its own
+        // active-story cache immediately (Phase 2 perf pass) instead of
+        // this author's story ring taking up to 60s to appear elsewhere.
+        const publishResult = await publishStory(draftResult.story.storyId, draftResult.story.authorUid);
         if (!publishResult.ok) {
           await discardStoryDraft(draftResult.story.storyId, draftResult.story.storagePath);
           storyDraftRef.current = null;
@@ -997,6 +1019,15 @@ export default function CreateReelCameraScreen() {
     );
   }
 
+  // The real target mode for whatever's currently selected — 'picture'
+  // stays 'picture' the whole time (never affected by the black-flash
+  // workaround, which is specifically about the picture->video switch).
+  // Before hasPrimedVideoMode, this is forced to 'picture' regardless of
+  // the real target — see hasPrimedVideoMode's own doc comment above for
+  // why.
+  const targetCameraMode: 'picture' | 'video' = captureMode === 'photo' ? 'picture' : 'video';
+  const cameraViewMode: 'picture' | 'video' = hasPrimedVideoMode ? targetCameraMode : 'picture';
+
   return (
     <View style={styles.container} {...pinchResponder.panHandlers}>
       <SwipeBackEdge onBack={() => router.back()} />
@@ -1005,8 +1036,19 @@ export default function CreateReelCameraScreen() {
         style={StyleSheet.absoluteFill}
         facing={facing}
         mirror={facing === 'front'}
-        mode={captureMode === 'photo' ? 'picture' : 'video'}
+        mode={cameraViewMode}
         zoom={zoom}
+        // CameraView defaults this to 'auto', which can resolve to
+        // 'cinematic' stabilization — Apple's own docs note cinematic
+        // stabilization applies EXTRA CROPPING (a real, visible zoom-in,
+        // not a bug) that only kicks in once actual recording starts, not
+        // during plain preview. That's the exact "glitches and zooms in a
+        // little by itself" moment reported when tapping Record — this
+        // app has no use for stabilization at all (no filters/effects
+        // pipeline that would need a stabilized frame), so turning it off
+        // removes that native reconfiguration (and its crop/zoom) rather
+        // than trying to hide or compensate for it.
+        videoStabilizationMode="off"
         // Music selected -> mic off (the chosen track is the only audio
         // for this take); no music -> mic on, unchanged default. See
         // ReelMusicSourceType's doc comment in src/types/reel.ts.

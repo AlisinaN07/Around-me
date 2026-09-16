@@ -1,6 +1,6 @@
 import { Ionicons } from '@expo/vector-icons';
 import { router, useFocusEffect } from 'expo-router';
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
@@ -82,65 +82,150 @@ export default function EventsScreen() {
 
   const cityLabel = activeScopeLabel;
 
-  const loadForYou = useCallback(async () => {
-    setForYouStatus('loading');
-    // Clears the previous scope's sections immediately so a scope switch
-    // never leaves stale cards on screen during the fetch (same rule
-    // every other discovery surface in this app follows).
-    setForYouSections(null);
-    try {
-      const result = await fetchDiscoverySections(activeScope, SECTION_LIMIT);
-      // Reorders each existing time-based section by relevance (interest/
-      // location/event-time/creator-affinity/freshness) — see
-      // rankEventSections' own doc comment for why this keeps Events'
-      // existing sectioned UX rather than replacing it with one flat feed.
-      // Falls back to the plain chronological sections if ranking itself
-      // fails for any reason (never a harder error over an otherwise
-      // successful fetch) — only meaningful when signed in.
-      const ranked = user
-        ? await rankEventSections(
-            user.uid,
-            result,
-            activeScope,
-            homeCity?.cityKey ?? '',
-            homeCity?.countryCode ?? '',
-            profile?.interests,
-            feedSessionId
-          ).catch(() => result)
-        : result;
-      setForYouSections(ranked);
-      setForYouStatus('loaded');
-    } catch {
-      setForYouStatus('error');
-    }
-  }, [activeScope, user, homeCity, profile, feedSessionId]);
+  // Whether each mode's OWN fetch is currently in flight — a silent
+  // revalidate for that mode skips entirely rather than overlap one
+  // already running (covers both "two silent revalidates overlap" from
+  // rapidly leaving/returning, and "a silent revalidate fires before the
+  // very first real load for this mode has even resolved yet"). A
+  // non-silent call never checks this — an explicit real load (first-ever
+  // load, or ErrorState's Try again) is never silently dropped just
+  // because a background revalidate happens to be running.
+  const isForYouLoadInFlightRef = useRef(false);
+  const isFollowingLoadInFlightRef = useRef(false);
 
-  const loadFollowing = useCallback(async () => {
-    if (!user) return;
-    setFollowingStatus('loading');
-    setFollowingSections(null);
-    try {
-      const result = await fetchFollowingDiscoverySections(user.uid, activeScope, SECTION_LIMIT);
-      setFollowingSections(result.sections);
-      setFollowsAnyone(result.followsAnyone);
-      setFollowingStatus('loaded');
-    } catch {
-      setFollowingStatus('error');
-    }
-  }, [activeScope, user]);
+  /**
+   * `silent` (default false) is Events' stale-while-revalidate behavior,
+   * same pattern as Home/Profile's own (see their doc comments): a
+   * non-silent call is a REAL load — it clears `forYouSections` and sets
+   * `forYouStatus` to 'loading' first, which is what actually blanks the
+   * screen to the skeleton (see the render below, gated on `status`) —
+   * used for the first-ever load of this mode and an explicit retry
+   * (ErrorState's onRetry). A silent call is a background revalidate — it
+   * never touches `forYouStatus`/`forYouSections` going in, so every
+   * already-rendered section (Happening Now/Today/Coming Up/This Weekend)
+   * stays exactly as it is while this refetches quietly behind it; on
+   * success it replaces `forYouSections` with the fresh, freshly-ranked
+   * result (updating every derived section in place, since they're all
+   * `useMemo`s of `sections`), and on failure it leaves the already-shown
+   * sections and status untouched rather than surfacing the error state
+   * over content that was working fine a moment ago.
+   */
+  const loadForYou = useCallback(
+    async (options?: { silent?: boolean }) => {
+      const silent = options?.silent ?? false;
+      if (silent && isForYouLoadInFlightRef.current) return;
+      isForYouLoadInFlightRef.current = true;
+      if (!silent) {
+        setForYouStatus('loading');
+        // Clears the previous scope's sections immediately so a scope
+        // switch never leaves stale cards on screen during the fetch
+        // (same rule every other discovery surface in this app follows)
+        // — only for a REAL load; a silent revalidate must never blank
+        // what's already shown.
+        setForYouSections(null);
+      }
+      try {
+        const result = await fetchDiscoverySections(activeScope, SECTION_LIMIT);
+        // Reorders each existing time-based section by relevance (interest/
+        // location/event-time/creator-affinity/freshness) — see
+        // rankEventSections' own doc comment for why this keeps Events'
+        // existing sectioned UX rather than replacing it with one flat feed.
+        // Falls back to the plain chronological sections if ranking itself
+        // fails for any reason (never a harder error over an otherwise
+        // successful fetch) — only meaningful when signed in.
+        const ranked = user
+          ? await rankEventSections(
+              user.uid,
+              result,
+              activeScope,
+              homeCity?.cityKey ?? '',
+              homeCity?.countryCode ?? '',
+              profile?.interests,
+              feedSessionId
+            ).catch(() => result)
+          : result;
+        setForYouSections(ranked);
+        setForYouStatus('loaded');
+      } catch {
+        // Silent revalidate failure: leave whatever's already rendered
+        // (sections AND status) untouched — a background refresh going
+        // wrong is never grounds to blank a screen that was working a
+        // moment ago. A non-silent failure still shows the real error
+        // state, same as before this pattern existed.
+        if (!silent) setForYouStatus('error');
+      } finally {
+        isForYouLoadInFlightRef.current = false;
+      }
+    },
+    [activeScope, user, homeCity, profile, feedSessionId]
+  );
+
+  const loadFollowing = useCallback(
+    async (options?: { silent?: boolean }) => {
+      if (!user) return;
+      const silent = options?.silent ?? false;
+      if (silent && isFollowingLoadInFlightRef.current) return;
+      isFollowingLoadInFlightRef.current = true;
+      if (!silent) {
+        setFollowingStatus('loading');
+        setFollowingSections(null);
+      }
+      try {
+        const result = await fetchFollowingDiscoverySections(user.uid, activeScope, SECTION_LIMIT);
+        setFollowingSections(result.sections);
+        setFollowsAnyone(result.followsAnyone);
+        setFollowingStatus('loaded');
+      } catch {
+        if (!silent) setFollowingStatus('error');
+      } finally {
+        isFollowingLoadInFlightRef.current = false;
+      }
+    },
+    [activeScope, user]
+  );
 
   const activeScopeKey = useMemo(() => browseScopeKey(activeScope), [activeScope]);
+  // Everything loadForYou/loadFollowing's own fetches actually depend on
+  // besides mode itself — account, Active Scope, and (For You's ranking
+  // step only) the viewer's own Home City — same composition as Home's own
+  // feedLoadKey (src/app/(app)/(tabs)/index.tsx), for the same reason: a
+  // CHANGE here is the one thing that should ever invalidate and reload
+  // an already-loaded mode; an unchanged key across a focus event means
+  // nothing real changed, so a mere refocus revalidates silently instead
+  // of reloading for real. (profile.interests, a ranking-only input, is
+  // deliberately NOT part of this key — same trade-off Home's own
+  // feedLoadKey makes, for the same reason: it affects ORDER, not which
+  // events exist, and including it would mean any interests edit
+  // force-reloads Events on every return.)
+  const feedLoadKey = `${user?.uid ?? ''}:${activeScopeKey}:${homeCity?.cityKey ?? ''}`;
+
+  // The LAST feedLoadKey each mode was actually (re)loaded for — see
+  // Home's own identical pair of refs for the full reasoning. Comparing
+  // against this is what makes a mere refocus with nothing changed a
+  // silent revalidate instead of a full reload.
+  const loadedForYouKeyRef = useRef<string | null>(null);
+  const loadedFollowingKeyRef = useRef<string | null>(null);
 
   useFocusEffect(
     useCallback(() => {
       if (!isCityReady) return;
       if (mode === 'forYou') {
-        loadForYou();
+        if (loadedForYouKeyRef.current === feedLoadKey) {
+          loadForYou({ silent: true });
+        } else {
+          loadedForYouKeyRef.current = feedLoadKey;
+          loadForYou();
+        }
       } else {
-        loadFollowing();
+        if (loadedFollowingKeyRef.current === feedLoadKey) {
+          loadFollowing({ silent: true });
+        } else {
+          loadedFollowingKeyRef.current = feedLoadKey;
+          loadFollowing();
+        }
       }
       // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [activeScopeKey, isCityReady, mode])
+    }, [feedLoadKey, isCityReady, mode])
   );
 
   const status = mode === 'forYou' ? forYouStatus : followingStatus;
@@ -265,40 +350,52 @@ export default function EventsScreen() {
             </View>
           ) : (
             <>
-              {happeningNow.length > 0 ? (
-                <View style={styles.section}>
-                  <SectionHeader
-                    title="Happening Now"
-                    badge={<Pill label="LIVE" tone="live" />}
-                    actionLabel={happeningNow.length > SECTION_COLLAPSED_LIMIT ? 'Show more' : undefined}
-                    onActionPress={() => openSection('happeningNow')}
-                  />
+              {/* Happening Now / Today-or-Tonight / Coming Up always render,
+                  even with nothing in them — a bare EmptyState takes the
+                  rail's place instead of the section vanishing, so the
+                  screen's own rhythm (what's live, what's today, what's
+                  next) stays visible regardless of how much is in it right
+                  now. This Weekend below is unaffected — it stays
+                  conditional since it's a bonus carve-out of Coming Up, not
+                  one of these three anchor sections. */}
+              <View style={styles.section}>
+                <SectionHeader
+                  title="Happening Now"
+                  badge={<Pill label="LIVE" tone="live" />}
+                  actionLabel={happeningNow.length > SECTION_COLLAPSED_LIMIT ? 'Show more' : undefined}
+                  onActionPress={() => openSection('happeningNow')}
+                />
+                {happeningNow.length > 0 ? (
                   <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.heroRail} style={styles.heroRailScroll}>
                     {happeningNow.slice(0, SECTION_COLLAPSED_LIMIT).map((item) => (
                       <EventCard key={item.contentId} item={item} variant="hero" />
                     ))}
                   </ScrollView>
-                </View>
-              ) : null}
+                ) : (
+                  <EmptyState bare icon="calendar-outline" title="Nothing happening right now." />
+                )}
+              </View>
 
-              {today.length > 0 ? (
-                <View style={styles.section}>
-                  <SectionHeader
-                    title={sections?.todayLabel ?? 'Today'}
-                    actionLabel={today.length > SECTION_COLLAPSED_LIMIT ? 'Show more' : undefined}
-                    onActionPress={() => openSection('today')}
-                  />
-                  {/* Same horizontal hero rail as Happening Now above — every
-                      one of these three rails teases SECTION_COLLAPSED_LIMIT
-                      cards, then "Show more" opens /events/section for the
-                      rest, same variant, full-size. */}
+              <View style={styles.section}>
+                <SectionHeader
+                  title={sections?.todayLabel ?? 'Today'}
+                  actionLabel={today.length > SECTION_COLLAPSED_LIMIT ? 'Show more' : undefined}
+                  onActionPress={() => openSection('today')}
+                />
+                {/* Same horizontal hero rail as Happening Now above — every
+                    one of these three rails teases SECTION_COLLAPSED_LIMIT
+                    cards, then "Show more" opens /events/section for the
+                    rest, same variant, full-size. */}
+                {today.length > 0 ? (
                   <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.heroRail} style={styles.heroRailScroll}>
                     {today.slice(0, SECTION_COLLAPSED_LIMIT).map((item) => (
                       <EventCard key={item.contentId} item={item} variant="hero" />
                     ))}
                   </ScrollView>
-                </View>
-              ) : null}
+                ) : (
+                  <EmptyState bare icon="calendar-outline" title={`No events ${sections?.todayLabel === 'Tonight' ? 'tonight' : 'today'}.`} />
+                )}
+              </View>
 
               {thisWeekend.length > 0 ? (
                 <View style={styles.section}>
@@ -311,21 +408,23 @@ export default function EventsScreen() {
                 </View>
               ) : null}
 
-              {comingUp.length > 0 ? (
-                <View style={styles.section}>
-                  <SectionHeader
-                    title="Coming Up"
-                    actionLabel={comingUp.length > SECTION_COLLAPSED_LIMIT ? 'Show more' : undefined}
-                    onActionPress={() => openSection('comingUp')}
-                  />
-                  {/* Same horizontal hero rail as Happening Now/Tonight above. */}
+              <View style={styles.section}>
+                <SectionHeader
+                  title="Coming Up"
+                  actionLabel={comingUp.length > SECTION_COLLAPSED_LIMIT ? 'Show more' : undefined}
+                  onActionPress={() => openSection('comingUp')}
+                />
+                {/* Same horizontal hero rail as Happening Now/Tonight above. */}
+                {comingUp.length > 0 ? (
                   <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.heroRail} style={styles.heroRailScroll}>
                     {comingUp.slice(0, SECTION_COLLAPSED_LIMIT).map((item) => (
                       <EventCard key={item.contentId} item={item} variant="hero" />
                     ))}
                   </ScrollView>
-                </View>
-              ) : null}
+                ) : (
+                  <EmptyState bare icon="calendar-outline" title="Nothing coming up yet." />
+                )}
+              </View>
             </>
           )}
 

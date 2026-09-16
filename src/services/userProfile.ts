@@ -22,6 +22,7 @@ import { buildCityKey } from '@/utils/cityKey';
 import { normalizeUsername } from '@/utils/username';
 
 import { firestore } from './firestore';
+import { invalidatePublicProfile } from './publicProfile';
 import { storage } from './storage';
 
 const USERS_COLLECTION = 'users';
@@ -199,6 +200,15 @@ export async function createInitialUserProfile(
     return { ok: false, error: 'unknown', message: 'Something went wrong creating your profile.' };
   }
 
+  // Phase 2 perf pass — invalidate fetchPublicProfile's own cache
+  // (src/services/publicProfile.ts) the instant a publicProfiles/{uid}
+  // write actually commits, rather than letting it serve up to 60s of
+  // stale (here: nonexistent) data. A brand-new profile has nothing
+  // cached yet, so this is a no-op safety net for this one call site —
+  // every OTHER write below (display name/photo/cover/Business
+  // conversion) is where this actually matters.
+  invalidatePublicProfile(input.uid);
+
   const profile = await fetchUserProfile(input.uid);
   if (!profile) {
     return { ok: false, error: 'unknown', message: 'Profile was created but could not be read back.' };
@@ -336,6 +346,14 @@ export async function updateMyProfile(input: UpdateProfileInput): Promise<Update
     return { ok: false, error: 'unknown', message: "Couldn't save your profile." };
   }
 
+  // Phase 2 perf pass — see createInitialUserProfile's own doc comment on
+  // invalidatePublicProfile above for the full reasoning. This is the
+  // call site it actually matters for: display name/username/bio just
+  // changed, and every other screen's cached copy (Home's feed, Inbox,
+  // Event detail's author row, ...) must stop serving the old one
+  // immediately, not up to 60s from now.
+  invalidatePublicProfile(input.uid);
+
   const profile = await fetchUserProfile(input.uid);
   if (!profile) {
     return { ok: false, error: 'unknown', message: 'Profile was updated but could not be read back.' };
@@ -387,6 +405,9 @@ export async function updateMyProfilePhoto(uid: string, photoURL: string): Promi
     }
     return { ok: false, error: 'unknown', message: "Couldn't save your profile photo." };
   }
+
+  // Phase 2 perf pass — see createInitialUserProfile's own doc comment.
+  invalidatePublicProfile(uid);
 
   const profile = await fetchUserProfile(uid);
   if (!profile) {
@@ -446,6 +467,13 @@ export async function upgradeToBusinessAccount(uid: string): Promise<UpgradeToBu
     }
     return { ok: false, error: 'unknown', message: "Couldn't switch your account type." };
   }
+
+  // Phase 2 perf pass — see createInitialUserProfile's own doc comment.
+  // accountType affects public-facing behavior (Profile's own Events-only
+  // layout, EventCard's own gating) — a cached copy still reporting
+  // 'personal' for up to 60s after switching would be a real, visible bug,
+  // not just staleness.
+  invalidatePublicProfile(uid);
 
   const profile = await fetchUserProfile(uid);
   if (!profile) {
@@ -570,6 +598,9 @@ export async function updateMyProfileCoverPhoto(uid: string, coverPhotoURL: stri
     }
     return { ok: false, error: 'unknown', message: "Couldn't save your cover photo." };
   }
+
+  // Phase 2 perf pass — see createInitialUserProfile's own doc comment.
+  invalidatePublicProfile(uid);
 
   const profile = await fetchUserProfile(uid);
   if (!profile) {

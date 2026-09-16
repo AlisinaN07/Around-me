@@ -22,6 +22,7 @@ import {
 import type { PublicProfile } from '@/types/social';
 import type { UsernameReservation } from '@/types/user';
 import { normalizeUsername } from '@/utils/username';
+import { TtlCache } from '@/utils/requestCache';
 
 import { firestore } from './firestore';
 import { fetchUserProfile } from './userProfile';
@@ -30,13 +31,60 @@ const PUBLIC_PROFILES_COLLECTION = 'publicProfiles';
 const USERNAMES_COLLECTION = 'usernames';
 const SEARCH_RESULT_LIMIT = 20;
 
+// Phase 2 perf pass — fetchPublicProfile is called from ~20 call sites
+// across the app (every feed item's author, Inbox's rows and following
+// row, chat, SoundSheet, Event detail's author row, ...) with no sharing
+// between them today; this is the single highest-leverage cache in the
+// app (see the Phase 0 audit). Keyed by `uid` alone — a public profile is
+// the same document for every viewer, nothing account-specific to worry
+// about here (unlike isFollowing/isPostSaved below). 60s TTL: profiles
+// change rarely enough that a full minute of staleness is unnoticeable,
+// but see invalidatePublicProfile below for the cases that can't wait
+// even that long.
+const PUBLIC_PROFILE_CACHE_TTL_MS = 60_000;
+const profileCache = new TtlCache<PublicProfile>(PUBLIC_PROFILE_CACHE_TTL_MS);
+
+/**
+ * Call after any write that changes the CURRENT user's own
+ * publicProfiles/{uid} document (photo, cover photo, display name/
+ * username/bio, interests, Business conversion — see userProfile.ts's own
+ * updateMyProfile/updateMyProfilePhoto/updateMyProfileCoverPhoto/
+ * upgradeToBusinessAccount, each of which calls this on success) so the
+ * next fetchPublicProfile for this uid — anywhere in the app — does a
+ * real read instead of serving up to 60s of stale data. Exported rather
+ * than folded into fetchPublicProfile's own file-private cache object so
+ * userProfile.ts (which owns every actual public-profile write) can call
+ * it without reaching into this module's internals.
+ */
+export function invalidatePublicProfile(uid: string): void {
+  profileCache.delete(uid);
+}
+
 /** Normalizes a missing `bio`/`photoURL` (public profiles created before those fields existed) to '' — see fetchUserProfile's identical rule. */
 export async function fetchPublicProfile(uid: string): Promise<PublicProfile | null> {
+  const cached = profileCache.getFresh(uid);
+  if (cached) return cached;
   if (!firestore) return null;
-  const snapshot = await getDoc(doc(firestore, PUBLIC_PROFILES_COLLECTION, uid));
-  if (!snapshot.exists()) return null;
-  const data = snapshot.data() as PublicProfile;
-  return { ...data, bio: data.bio ?? '', photoURL: data.photoURL ?? '', coverPhotoURL: data.coverPhotoURL ?? '' };
+  // Narrowed local binding — the null-check above doesn't carry into the
+  // closure passed to dedupe() below (same reasoning as every
+  // runTransaction callback elsewhere in this codebase, e.g.
+  // userProfile.ts's own `const db = firestore`).
+  const db = firestore;
+  // Dedupe first, cache after: a "not found" result (a genuinely missing
+  // profile, or the exact instant before ensureMyPublicProfile's own
+  // create commits — see its read-after-write) is deliberately never
+  // written to the cache, so it can never keep reporting "not found"
+  // after the profile actually starts existing. Concurrent callers for
+  // the SAME uid (e.g. several ReelFeedItems by the same author mounting
+  // at once) still only ever trigger one real Firestore read either way.
+  const profile = await profileCache.dedupe(uid, async () => {
+    const snapshot = await getDoc(doc(db, PUBLIC_PROFILES_COLLECTION, uid));
+    if (!snapshot.exists()) return null;
+    const data = snapshot.data() as PublicProfile;
+    return { ...data, bio: data.bio ?? '', photoURL: data.photoURL ?? '', coverPhotoURL: data.coverPhotoURL ?? '' };
+  });
+  if (profile) profileCache.set(uid, profile);
+  return profile;
 }
 
 /** Resolves a username to a uid via the existing usernames/{usernameLower} reservation, then reads the public profile — never scans publicProfiles itself. */

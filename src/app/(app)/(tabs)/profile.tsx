@@ -139,71 +139,126 @@ export default function ProfileScreen() {
   const [activeTab, setActiveTab] = useState<ProfileTab>('post');
   const [eventStatusTab, setEventStatusTab] = useState<EventStatusTab>('live');
 
-  const load = useCallback(async () => {
-    if (!user) return;
-    setStatus('loading');
-    try {
-      const [followers, following, textPostCount, reelCount, eventCount, likedResult, userContent, userReels, userReposts, userActivities, userSavedPosts] =
-        await Promise.all([
-          fetchFollowerCount(user.uid),
-          fetchFollowingCount(user.uid),
-          // Three exact server-side aggregations — see fetchProfilePostCount's,
-          // fetchProfileReelCount's, and fetchProfileEventCount's own doc
-          // comments for why none is ever derived from the bounded
-          // mixed/Reel queries below. A failure here falls into the same
-          // catch as every other profile fetch, so a failed count is never
-          // shown as a confident (wrong) 0 — the whole screen shows its
-          // error state instead. eventCount is fetched unconditionally
-          // (Personal accounts just never display it) — same "fetch
-          // everything a profile might need" rule the rest of this Promise.all
-          // already follows.
-          fetchProfilePostCount(user.uid),
-          fetchProfileReelCount(user.uid),
-          fetchProfileEventCount(user.uid),
-          // Step 41.2H.4 — the ONE stat allowed to be simply absent for a
-          // given load: fetchLifetimeLikedCount never throws (see its own
-          // doc comment), so its presence here doesn't put Liked on the
-          // same all-or-nothing footing as the counts above.
-          fetchLifetimeLikedCount(user.uid),
-          // One bounded, mixed query (see PROFILE_CONTENT_LIMIT) — split
-          // into the unified Posts tab's text-Post half and the Business
-          // Events tab in-memory below, rather than running separate
-          // queries. The Posts TAB stays bounded by this same fetch (merged
-          // with the separately-bounded Reels fetch below); only the Posts
-          // STAT above is exact.
-          fetchPublicUserContent(user.uid, PROFILE_CONTENT_LIMIT),
-          fetchProfileReels(user.uid),
-          // PUBLIC (Step 41.2F) — same query a visitor's public profile view
-          // would run for this uid; fetched here unconditionally like every
-          // other tab's data, regardless of which tab is currently active.
-          fetchProfileReposts(user.uid),
-          // PUBLIC (Step 41.2G) — one bounded collectionGroup query; see
-          // fetchProfileActivities' own doc comment.
-          fetchProfileActivities(user.uid),
-          // Private to this account (Step 41.2E) — fetched here unconditionally,
-          // same as every other own-Profile tab's data, regardless of which tab
-          // is currently active; never fetched on the public profile route.
-          fetchSavedPosts(user.uid),
-        ]);
-      setFollowerCount(followers);
-      setFollowingCount(following);
-      setPostsCount(textPostCount + reelCount);
-      setEventsCount(eventCount);
-      setLikedCount(likedResult.ready ? likedResult.likedCount : undefined);
-      setContent(userContent);
-      setReels(userReels);
-      setRepostedPosts(userReposts);
-      setActivities(userActivities);
-      setSavedPosts(userSavedPosts);
-      setStatus('loaded');
-    } catch {
-      setStatus('error');
-    }
-  }, [user]);
+  // Whether ANY load (real or silent) is currently in flight — a silent
+  // call skips entirely rather than overlap one (see `load` below). This
+  // covers both "two silent revalidates overlap" (rapidly flipping tabs
+  // back and forth) AND "a silent revalidate fires while the very first
+  // real load hasn't resolved yet" (returning to Profile again quickly,
+  // before its first-ever fetch finished) — both are real duplicate-
+  // request risks this pattern introduces, not just the first. A
+  // non-silent call never checks this: an explicit real load (first-ever
+  // mount, or ErrorState's Try again) should never be silently dropped
+  // just because a background revalidate happens to be running.
+  const isLoadInFlightRef = useRef(false);
 
+  /**
+   * `silent` (default false) is the whole of Profile's stale-while-
+   * revalidate behavior: a non-silent call is a REAL load — it sets
+   * status to 'loading' first, which blanks the screen to the skeleton
+   * (see the render below, gated purely on `status`) — used for the
+   * first-ever load and an explicit retry (ErrorState's onRetry). A
+   * silent call is a background revalidate — it never touches `status`
+   * going in, so whatever's already rendered stays exactly as it is
+   * (numbers, grids, everything) while this refetches over top of it;
+   * on success it updates all the same state as a real load would
+   * (seamlessly refreshing counts/content in place), and on failure it
+   * leaves the already-shown data untouched rather than surfacing the
+   * error screen over content that was working fine a moment ago.
+   */
+  const load = useCallback(
+    async (options?: { silent?: boolean }) => {
+      if (!user) return;
+      const silent = options?.silent ?? false;
+      if (silent && isLoadInFlightRef.current) return;
+      isLoadInFlightRef.current = true;
+      if (!silent) setStatus('loading');
+      try {
+        const [followers, following, textPostCount, reelCount, eventCount, likedResult, userContent, userReels, userReposts, userActivities, userSavedPosts] =
+          await Promise.all([
+            fetchFollowerCount(user.uid),
+            fetchFollowingCount(user.uid),
+            // Three exact server-side aggregations — see fetchProfilePostCount's,
+            // fetchProfileReelCount's, and fetchProfileEventCount's own doc
+            // comments for why none is ever derived from the bounded
+            // mixed/Reel queries below. A failure here falls into the same
+            // catch as every other profile fetch, so a failed count is never
+            // shown as a confident (wrong) 0 — the whole screen shows its
+            // error state instead. eventCount is fetched unconditionally
+            // (Personal accounts just never display it) — same "fetch
+            // everything a profile might need" rule the rest of this Promise.all
+            // already follows.
+            fetchProfilePostCount(user.uid),
+            fetchProfileReelCount(user.uid),
+            fetchProfileEventCount(user.uid),
+            // Step 41.2H.4 — the ONE stat allowed to be simply absent for a
+            // given load: fetchLifetimeLikedCount never throws (see its own
+            // doc comment), so its presence here doesn't put Liked on the
+            // same all-or-nothing footing as the counts above.
+            fetchLifetimeLikedCount(user.uid),
+            // One bounded, mixed query (see PROFILE_CONTENT_LIMIT) — split
+            // into the unified Posts tab's text-Post half and the Business
+            // Events tab in-memory below, rather than running separate
+            // queries. The Posts TAB stays bounded by this same fetch (merged
+            // with the separately-bounded Reels fetch below); only the Posts
+            // STAT above is exact.
+            fetchPublicUserContent(user.uid, PROFILE_CONTENT_LIMIT),
+            fetchProfileReels(user.uid),
+            // PUBLIC (Step 41.2F) — same query a visitor's public profile view
+            // would run for this uid; fetched here unconditionally like every
+            // other tab's data, regardless of which tab is currently active.
+            fetchProfileReposts(user.uid),
+            // PUBLIC (Step 41.2G) — one bounded collectionGroup query; see
+            // fetchProfileActivities' own doc comment.
+            fetchProfileActivities(user.uid),
+            // Private to this account (Step 41.2E) — fetched here unconditionally,
+            // same as every other own-Profile tab's data, regardless of which tab
+            // is currently active; never fetched on the public profile route.
+            fetchSavedPosts(user.uid),
+          ]);
+        setFollowerCount(followers);
+        setFollowingCount(following);
+        setPostsCount(textPostCount + reelCount);
+        setEventsCount(eventCount);
+        setLikedCount(likedResult.ready ? likedResult.likedCount : undefined);
+        setContent(userContent);
+        setReels(userReels);
+        setRepostedPosts(userReposts);
+        setActivities(userActivities);
+        setSavedPosts(userSavedPosts);
+        setStatus('loaded');
+      } catch {
+        // Silent revalidate failure: leave whatever's already rendered
+        // (data AND status) untouched — a background refresh going wrong
+        // is never grounds to blank a screen that was working a moment
+        // ago. A non-silent failure still shows the real error state, same
+        // as before this pattern existed.
+        if (!silent) setStatus('error');
+      } finally {
+        isLoadInFlightRef.current = false;
+      }
+    },
+    [user]
+  );
+
+  // Stale-while-revalidate: the FIRST time this uid is ever focused (a
+  // fresh sign-in, or the very first mount) gets a real load — the
+  // skeleton is expected then, there's nothing to show yet. Every later
+  // refocus with the SAME uid (the ordinary "left Profile, came back"
+  // case) is a silent background revalidate instead: whatever's already
+  // rendered — header, counts, every tab's content — stays up showing
+  // exactly as it was while this refetches quietly behind it, only
+  // updating once the fresh data actually arrives. A genuine account
+  // switch (uid actually changes) still gets a real load, same as before.
+  const loadedProfileUidRef = useRef<string | null>(null);
   useFocusEffect(
     useCallback(() => {
-      load();
+      if (!user) return;
+      if (loadedProfileUidRef.current !== user.uid) {
+        loadedProfileUidRef.current = user.uid;
+        load();
+      } else {
+        load({ silent: true });
+      }
       // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [user?.uid])
   );

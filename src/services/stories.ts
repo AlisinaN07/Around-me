@@ -36,6 +36,7 @@ import { httpsCallable } from 'firebase/functions';
 
 import { REEL_MAX_DURATION_MS, REEL_MAX_FILE_SIZE_BYTES, REEL_PHOTO_MAX_FILE_SIZE_BYTES, type ReelMediaType } from '@/types/reel';
 import { STORY_EXPIRY_MS, type Story, type StoryGroup } from '@/types/story';
+import { TtlCache } from '@/utils/requestCache';
 
 import { fetchFollowingUids } from './following';
 import { firestore } from './firestore';
@@ -48,6 +49,22 @@ const STORIES_COLLECTION = 'stories';
 // the Firestore JS SDK's own limit for an 'in' filter's value list.
 const FOLLOWED_UID_CHUNK_SIZE = 10;
 const MAX_FOLLOWED_UIDS_FOR_STORIES = 30;
+
+// Phase 2 perf pass — fetchActiveStoriesForAuthor is the one canonical
+// per-author fetch path here (fetchActiveStoriesForFollowing below is a
+// separate, bulk, multi-author query with a different shape — left
+// uncached this phase, see this file's own Phase 2 notes at its call
+// sites) — called once per Reel by ReelFeedItem's own story ring AND by
+// the Story viewer screen, so the same author's active Stories are
+// re-queried independently by every one of their Reels visible at once.
+// Keyed by `authorUid` alone — "does this author currently have an
+// active Story" is the same fact for every viewer, nothing account-
+// specific (unlike isFollowing/isPostSaved). 60s TTL, per the suggested
+// range. publishStory/deleteMyStory invalidate this on success (see their
+// own bodies below) — markStoryViewed deliberately does NOT, since a
+// story's active/expired status never depends on who's viewed it.
+const ACTIVE_STORIES_CACHE_TTL_MS = 60_000;
+const activeStoriesCache = new TtlCache<Story[]>(ACTIVE_STORIES_CACHE_TTL_MS);
 
 export function storyRef(storyId: string) {
   return doc(firestore!, STORIES_COLLECTION, storyId);
@@ -214,7 +231,18 @@ export function uploadStoryMedia(
 
 export type PublishStoryResult = { ok: true } | { ok: false; message: string };
 
-export async function publishStory(storyId: string): Promise<PublishStoryResult> {
+/**
+ * `authorUid` is optional purely for cache invalidation (see
+ * activeStoriesCache's own doc comment above) — the caller already has it
+ * on hand (the draft it just created/uploaded — see camera.tsx's own call
+ * site) so passing it costs nothing and avoids an extra read here just to
+ * look it back up. Omitting it just means fetchActiveStoriesForAuthor
+ * keeps serving its previous (stale, "no active Story yet") answer for up
+ * to ACTIVE_STORIES_CACHE_TTL_MS after this call — never a correctness
+ * bug, only a staleness window, so this stays optional rather than a
+ * required, behavior-changing param.
+ */
+export async function publishStory(storyId: string, authorUid?: string): Promise<PublishStoryResult> {
   if (!firestore) {
     return { ok: false, message: 'Firestore is not available.' };
   }
@@ -234,6 +262,11 @@ export async function publishStory(storyId: string): Promise<PublishStoryResult>
   } catch {
     return { ok: false, message: "Couldn't publish this Story." };
   }
+  // Phase 2 perf pass — this Story just became active; anyone already
+  // holding a cached "no active Stories" answer for this author (e.g. an
+  // already-rendered ReelFeedItem of theirs) must see the new ring within
+  // this same session, not up to 60s from now.
+  if (authorUid) activeStoriesCache.delete(authorUid);
   return { ok: true };
 }
 
@@ -269,12 +302,19 @@ export async function discardStoryDraft(storyId: string, storagePath: string): P
 export async function deleteMyStory(storyId: string): Promise<{ ok: true } | { ok: false; message: string }> {
   if (!firestore) return { ok: false, message: 'Firestore is not available.' };
   const snapshot = await getDoc(storyRef(storyId));
-  const storagePath = snapshot.exists() ? (snapshot.data() as Story).storagePath : undefined;
+  // Reads authorUid off the SAME snapshot already fetched for storagePath
+  // below — no extra Firestore read just for cache invalidation.
+  const existing = snapshot.exists() ? (snapshot.data() as Story) : undefined;
+  const storagePath = existing?.storagePath;
   try {
     await deleteDoc(storyRef(storyId));
   } catch {
     return { ok: false, message: "Couldn't delete this Story." };
   }
+  // Phase 2 perf pass — see publishStory's own doc comment above. A
+  // deleted Story might have been this author's only active one; either
+  // way, the cached answer for them is no longer necessarily correct.
+  if (existing?.authorUid) activeStoriesCache.delete(existing.authorUid);
   if (storage && storagePath) {
     await deleteObject(ref(storage, storagePath)).catch(() => undefined);
   }
@@ -370,18 +410,32 @@ export async function fetchActiveStoriesForFollowing(viewerUid: string): Promise
  * permission failure the same as "nothing to show."
  */
 export async function fetchActiveStoriesForAuthor(authorUid: string): Promise<Story[]> {
+  const cached = activeStoriesCache.getFresh(authorUid);
+  if (cached !== undefined) return cached;
   if (!firestore) return [];
+  // Narrowed local binding — same reasoning as every other cached fetch
+  // this phase (e.g. publicProfile.ts's own `const db = firestore`).
+  const db = firestore;
   try {
-    const snapshot = await getDocs(
-      query(
-        collection(firestore, STORIES_COLLECTION),
-        where('authorUid', '==', authorUid),
-        where('status', '==', 'published'),
-        where('expiresAt', '>', Timestamp.now()),
-        orderBy('expiresAt', 'asc')
-      )
-    );
-    return snapshot.docs.map((docSnapshot) => docSnapshot.data() as Story);
+    // A genuinely empty result (no active Stories right now) IS cached —
+    // that's a real, stable fact, not a failure. A thrown error is NOT:
+    // it's caught here, outside dedupe()'s own fetchFn, specifically so a
+    // transient query failure is never written to the cache as if it were
+    // "confirmed no active Stories" for the next 60s.
+    const stories = await activeStoriesCache.dedupe(authorUid, async () => {
+      const snapshot = await getDocs(
+        query(
+          collection(db, STORIES_COLLECTION),
+          where('authorUid', '==', authorUid),
+          where('status', '==', 'published'),
+          where('expiresAt', '>', Timestamp.now()),
+          orderBy('expiresAt', 'asc')
+        )
+      );
+      return snapshot.docs.map((docSnapshot) => docSnapshot.data() as Story);
+    });
+    activeStoriesCache.set(authorUid, stories);
+    return stories;
   } catch {
     return [];
   }

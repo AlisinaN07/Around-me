@@ -15,12 +15,29 @@ import { fetchReel, fetchReelsByMusicHash } from '@/services/reels';
 import type { PostContent } from '@/types/content';
 import type { Reel } from '@/types/reel';
 import type { SavedPost, SavedTargetType } from '@/types/saved';
+import { TtlCache } from '@/utils/requestCache';
 
 import { firestore } from './firestore';
 import { trackContentInteraction } from './recommendations/interactions';
 
 const SAVED_SUBCOLLECTION = 'saved';
 const DEFAULT_SAVED_LIMIT = 40;
+
+// Phase 2 perf pass — isPostSaved backs every per-item Save toggle
+// (ReelFeedItem, SoundSheet's own Save state — see its Phase 1 cache,
+// which calls this on a miss — EngagementSection, ...), independently
+// per item with no sharing today. Keyed by `${uid}:${targetType}:${targetId}`
+// — inherently account-safe, since a save relationship only ever exists
+// for the one account that made it (there's no equivalent of a public
+// profile's "same document for everyone" case here). 45s TTL, inside the
+// suggested 30-60s range. savePost/unsavePost update this directly with
+// the known new value on success (see their own bodies below).
+const SAVED_CACHE_TTL_MS = 45_000;
+const savedCache = new TtlCache<boolean>(SAVED_CACHE_TTL_MS);
+
+function savedCacheKey(uid: string, targetType: SavedTargetType, targetId: string): string {
+  return `${uid}:${targetType}:${targetId}`;
+}
 
 function savedId(targetType: SavedTargetType, targetId: string): string {
   return `${targetType}_${targetId}`;
@@ -89,6 +106,11 @@ export async function savePost(uid: string, targetType: SavedTargetType, targetI
   } catch {
     return { ok: false, error: 'unknown', message: "Couldn't save this post." };
   }
+  // Phase 2 perf pass — update, not just invalidate: the write above just
+  // succeeded, so the new value is already known with certainty — see
+  // followUser's own identical comment in following.ts for the same
+  // reasoning.
+  savedCache.set(savedCacheKey(uid, targetType, targetId), true);
   trackSaveSignal(uid, targetType, targetId, 'save').catch(() => {});
   return { ok: true };
 }
@@ -101,14 +123,22 @@ export async function unsavePost(uid: string, targetType: SavedTargetType, targe
   } catch {
     return { ok: false, error: 'unknown', message: "Couldn't remove this from your saved posts." };
   }
+  savedCache.set(savedCacheKey(uid, targetType, targetId), false);
   trackSaveSignal(uid, targetType, targetId, 'unsave').catch(() => {});
   return { ok: true };
 }
 
 export async function isPostSaved(uid: string, targetType: SavedTargetType, targetId: string): Promise<boolean> {
+  const key = savedCacheKey(uid, targetType, targetId);
+  const cached = savedCache.getFresh(key);
+  if (cached !== undefined) return cached;
   if (!firestore) return false;
-  const snapshot = await getDoc(savedRef(uid, targetType, targetId));
-  return snapshot.exists();
+  const result = await savedCache.dedupe(key, async () => {
+    const snapshot = await getDoc(savedRef(uid, targetType, targetId));
+    return snapshot.exists();
+  });
+  savedCache.set(key, result);
+  return result;
 }
 
 /**
