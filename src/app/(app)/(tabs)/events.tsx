@@ -1,6 +1,6 @@
 import { Ionicons } from '@expo/vector-icons';
 import { router, useFocusEffect } from 'expo-router';
-import { useCallback, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
@@ -22,6 +22,7 @@ import { browseScopeKey } from '@/types/browseScope';
 import type { ActivityContent, EventContent } from '@/types/content';
 import { canCreateEvent } from '@/utils/accountCapabilities';
 import { getWeekendWindow } from '@/utils/dateWindows';
+import { prefetchImageOnce } from '@/utils/imagePrefetch';
 
 type LoadStatus = 'loading' | 'loaded' | 'error';
 export type EventsMode = 'forYou' | 'following';
@@ -265,6 +266,29 @@ export default function EventsScreen() {
   }, [upcomingAll]);
   const thisWeekend = weekendSplit.thisWeekend;
   const comingUp = weekendSplit.comingUp;
+
+  // Phase 3 perf pass — coverPhotoURL is already a resolved HTTPS URL
+  // straight off each EventContent document (never a Storage path
+  // needing its own resolve step, unlike a Reel's thumbnailStoragePath),
+  // so this only ever prefetches bytes for a URL already in hand — never
+  // an extra Firestore/Storage read. Scoped to EXACTLY the cards these
+  // four rails already render on screen right now (each hero rail's own
+  // .slice(0, SECTION_COLLAPSED_LIMIT), same slice the JSX below uses;
+  // This Weekend's own grid is never collapsed, so its full array is
+  // "already fetched and visible" as-is) — never the rest of a
+  // SECTION_LIMIT-sized section sitting behind "Show more", which stays
+  // unfetched-for-images until that screen is actually opened.
+  useEffect(() => {
+    const visibleEvents = [
+      ...happeningNow.slice(0, SECTION_COLLAPSED_LIMIT),
+      ...today.slice(0, SECTION_COLLAPSED_LIMIT),
+      ...thisWeekend,
+      ...comingUp.slice(0, SECTION_COLLAPSED_LIMIT),
+    ];
+    for (const item of visibleEvents) {
+      if (item.type === 'event') prefetchImageOnce(item.coverPhotoURL);
+    }
+  }, [happeningNow, today, thisWeekend, comingUp]);
 
   const totalRealItems = sections ? sections.happeningNow.length + sections.today.length + sections.upcoming.length : 0;
   const totalFilteredItems = happeningNow.length + today.length + upcomingAll.length;

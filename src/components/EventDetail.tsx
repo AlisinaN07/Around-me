@@ -21,6 +21,7 @@ import { fetchPublicProfile } from '@/services/publicProfile';
 import { trackContentInteraction } from '@/services/recommendations/interactions';
 import type { EventContent, EventResponse, EventResponseStatus } from '@/types/content';
 import { buildContentShareUrl, shareContent } from '@/utils/contentShare';
+import { prefetchImageOnce } from '@/utils/imagePrefetch';
 import { formatEventTime } from '@/utils/timeFormat';
 
 type LoadStatus = 'loading' | 'loaded' | 'error';
@@ -106,7 +107,11 @@ export function EventDetail({ content, onToast }: EventDetailProps) {
   useEffect(() => {
     let cancelled = false;
     fetchPublicProfile(content.authorUid).then((authorProfile) => {
-      if (!cancelled) setAuthorPhotoURL(authorProfile?.photoURL ?? '');
+      if (cancelled) return;
+      setAuthorPhotoURL(authorProfile?.photoURL ?? '');
+      // Phase 3 perf pass — reuses the Phase 2 public-profile cache
+      // above (no extra Firestore read just for this).
+      prefetchImageOnce(authorProfile?.photoURL);
     });
     return () => {
       cancelled = true;

@@ -13,6 +13,7 @@ import { fetchReelsByMusicHash, resolveOwnSoundOrigin } from '@/services/reels';
 import { isPostSaved, savePost, unsavePost } from '@/services/saved';
 import { addReelToMyStory, resolveSoundAudioUrl } from '@/services/stories';
 import { fetchPublicProfile } from '@/services/publicProfile';
+import { prefetchImageOnce } from '@/utils/imagePrefetch';
 import type { Reel, SelectedReelMusic } from '@/types/reel';
 import type { PublicProfile } from '@/types/social';
 
@@ -187,6 +188,9 @@ export function SoundSheet({ visible, reel, onClose, onToast }: SoundSheetProps)
           setSoundReels([reel]);
           setIsSaved(false);
           setStatus('loaded');
+          // Phase 3 perf pass — reuses the Phase 2 public-profile cache
+          // above (no extra Firestore read just for this).
+          prefetchImageOnce(profile?.photoURL);
           return;
         }
 
@@ -200,6 +204,9 @@ export function SoundSheet({ visible, reel, onClose, onToast }: SoundSheetProps)
         setSoundReels(reels);
         setIsSaved(saved);
         setStatus('loaded');
+        // Phase 3 perf pass — reuses the Phase 2 public-profile cache
+        // above (no extra Firestore read just for this).
+        prefetchImageOnce(profile?.photoURL);
         // Phase 1 perf pass — a successful load (real or silent) is
         // exactly what keeps the cache fresh; see soundCache's own doc
         // comment. Merges into any existing savedByUid map rather than
@@ -255,6 +262,10 @@ export function SoundSheet({ visible, reel, onClose, onToast }: SoundSheetProps)
       setSoundReels(cached.soundReels);
       setIsSaved(cached.savedByUid[user.uid] ?? false);
       setStatus('loaded');
+      // Phase 3 perf pass — cheap to call again even if this exact URL
+      // was already prefetched earlier this session (prefetchImageOnce's
+      // own in-session Set no-ops instantly in that case).
+      prefetchImageOnce(cached.originProfile?.photoURL);
       const isFresh = Date.now() - cached.fetchedAt < SOUND_CACHE_TTL_MS;
       if (!isFresh) load({ silent: true });
     } else {

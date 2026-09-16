@@ -22,6 +22,7 @@ import { fetchActiveStoriesForAuthor, hasViewedStory } from '@/services/stories'
 import type { Reel } from '@/types/reel';
 import type { RankingAttribution } from '@/types/recommendation';
 import type { PublicProfile } from '@/types/social';
+import { prefetchImageOnce } from '@/utils/imagePrefetch';
 import { buildReelShareUrl, shareReel } from '@/utils/reelShare';
 
 // How far (px) a horizontal drag has to travel before it counts as a
@@ -74,6 +75,30 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
   const [playbackUrl, setPlaybackUrl] = useState<string | null>(null);
   const [urlStatus, setUrlStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
   const [playbackFailed, setPlaybackFailed] = useState(false);
+  // Phase 3 perf pass — whether the player has actually reported a real
+  // frame to show ('readyToPlay', set by the statusChange listener
+  // below), as opposed to merely having a resolved playbackUrl. Gates the
+  // thumbnail overlay's own hide condition in the render below: a
+  // resolved URL alone doesn't mean the video has anything to actually
+  // display yet (it can still be buffering its first frame), so the
+  // thumbnail stays up until this is genuinely true. Reset alongside
+  // urlStatus/playbackFailed everywhere they reset (this effect, retry)
+  // since it describes the same playback attempt's lifecycle.
+  const [isVideoReady, setIsVideoReady] = useState(false);
+  // Phase 3 perf pass — a still cover frame shown instead of a blank/
+  // black state while the real video above is still resolving its
+  // playbackUrl and/or buffering its first frame (see the render below).
+  // Never fetched for a photo Reel: its thumbnailStoragePath is the exact
+  // same object as its own full image (see Reel.thumbnailStoragePath's
+  // doc comment in src/types/reel.ts), so there's nothing distinct to
+  // show early. Reuses the exact same shouldPrepare gate as playbackUrl
+  // above — this never widens the existing prepare window — and the
+  // exact same resolveReelPlaybackUrl cache (keyed by storagePath, the
+  // same function ReelPreviewCard's own thumbnail already resolves
+  // through), so an already-resolved thumbnail this session is an
+  // instant cache hit, never a second real Storage metadata read.
+  const [thumbnailUrl, setThumbnailUrl] = useState<string | null>(null);
+  const [thumbnailFailed, setThumbnailFailed] = useState(false);
 
   const [isLiked, setIsLiked] = useState(false);
   const [likeCount, setLikeCount] = useState(0);
@@ -132,12 +157,14 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
       setPlaybackUrl(null);
       setUrlStatus('idle');
       setPlaybackFailed(false);
+      setIsVideoReady(false);
       return;
     }
     // Resets fresh whenever the item's own reel (and therefore its
     // storagePath) changes — the same prop-driven-reset pattern already
     // used in ReportModal.
     setUrlStatus('loading');
+    setIsVideoReady(false);
     resolveReelPlaybackUrl(reel.storagePath).then((url) => {
       if (cancelled) return;
       if (url) {
@@ -151,6 +178,37 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
       cancelled = true;
     };
   }, [reel.storagePath, shouldPrepare]);
+
+  // Phase 3 perf pass — see thumbnailUrl's own doc comment above. Gated
+  // on the exact same shouldPrepare window as playbackUrl (never resolved
+  // for an item outside it — this doesn't widen that window at all), and
+  // skipped entirely for a photo Reel (nothing distinct to show early —
+  // see thumbnailUrl's own doc comment). A successfully-resolved
+  // thumbnail is also prefetched (Image.prefetch, deduped in-session by
+  // prefetchImageOnce) so it's already warm in RN's own image cache by
+  // the time the render below actually mounts an <Image> for it — most
+  // useful for the neighbor this item becomes just before it's scrolled
+  // to, exactly like playbackUrl's own preload window already does for
+  // video.
+  useEffect(() => {
+    let cancelled = false;
+    if (isPhoto || !shouldPrepare) {
+      // Out of the preload window, or nothing distinct to preload — same
+      // prop-driven-reset pattern as playbackUrl above.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setThumbnailUrl(null);
+      setThumbnailFailed(false);
+      return;
+    }
+    resolveReelPlaybackUrl(reel.thumbnailStoragePath).then((url) => {
+      if (cancelled) return;
+      setThumbnailUrl(url);
+      if (url) prefetchImageOnce(url);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [reel.thumbnailStoragePath, shouldPrepare, isPhoto]);
 
   useEffect(() => {
     let cancelled = false;
@@ -211,7 +269,12 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
   useEffect(() => {
     let cancelled = false;
     fetchPublicProfile(reel.authorUid).then((authorProfile) => {
-      if (!cancelled) setAuthorPhotoURL(authorProfile?.photoURL ?? '');
+      if (cancelled) return;
+      setAuthorPhotoURL(authorProfile?.photoURL ?? '');
+      // Phase 3 perf pass — reuses the Phase 2 public-profile cache above
+      // (no extra Firestore read just for this); only warms RN's own
+      // image cache for a photo it already has in hand.
+      prefetchImageOnce(authorProfile?.photoURL);
     });
     return () => {
       cancelled = true;
@@ -281,7 +344,11 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
       return;
     }
     fetchPublicProfile(reel.soundOriginAuthorUid).then((profile) => {
-      if (!cancelled) setSoundOriginProfile(profile);
+      if (cancelled) return;
+      setSoundOriginProfile(profile);
+      // Phase 3 perf pass — same reasoning as authorPhotoURL's own
+      // prefetch above.
+      prefetchImageOnce(profile?.photoURL);
     });
     return () => {
       cancelled = true;
@@ -326,6 +393,12 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
       if (playerStatus === 'error') {
         setPlaybackFailed(true);
       }
+      // Phase 3 perf pass — drives the thumbnail overlay's own hide
+      // condition in the render below: only a real 'readyToPlay' means
+      // the video actually has a frame to show, at which point the
+      // thumbnail (shown instead of a blank state up to now) is no
+      // longer needed. See isVideoReady's own doc comment above.
+      setIsVideoReady(playerStatus === 'readyToPlay');
     });
     return () => {
       // Same native-player-already-released race as the watch-summary
@@ -529,6 +602,7 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
     setPlaybackUrl(null);
     setPlaybackFailed(false);
     setUrlStatus('loading');
+    setIsVideoReady(false);
     resolveReelPlaybackUrl(reel.storagePath).then((url) => {
       if (url) {
         setPlaybackUrl(url);
@@ -688,6 +762,27 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
           )}
         </View>
       )}
+
+      {/* Phase 3 perf pass — the real cover frame instead of the plain
+          fallback background/spinner above while the video is still
+          resolving its URL and/or buffering its first frame. Sits on top
+          (absolute, after the block above in paint order) so it's what's
+          actually visible regardless of what the fallback/still-buffering
+          video surface underneath looks like, and disappears the instant
+          isVideoReady flips true. Never shown for a photo Reel (see
+          thumbnailUrl's own doc comment), never once the thumbnail image
+          itself failed to load (thumbnailFailed — degrades to exactly the
+          fallback above, untouched), and never over a genuine playback
+          error (playbackFailed) — that error/Retry UI must stay visible,
+          not be hidden behind a static image forever. */}
+      {!isPhoto && thumbnailUrl && !thumbnailFailed && !isVideoReady && !playbackFailed ? (
+        <Image
+          source={{ uri: thumbnailUrl }}
+          style={StyleSheet.absoluteFill}
+          resizeMode="cover"
+          onError={() => setThumbnailFailed(true)}
+        />
+      ) : null}
 
       <View style={styles.actionRail}>
         <View style={styles.actionAvatarWrap}>

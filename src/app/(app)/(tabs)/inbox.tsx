@@ -21,6 +21,7 @@ import type { Conversation } from '@/types/message';
 import type { Notification } from '@/types/notification';
 import type { PublicProfile } from '@/types/social';
 import type { StoryGroup } from '@/types/story';
+import { prefetchImageOnce } from '@/utils/imagePrefetch';
 
 type InboxMode = 'activity' | 'messages';
 type LoadStatus = 'loading' | 'loaded' | 'error';
@@ -92,10 +93,18 @@ export default function InboxScreen() {
           fetchActiveStoriesForFollowing(uid),
         ]);
         setMyProfile(me);
+        // Phase 3 perf pass — reuses the Phase 2 public-profile cache
+        // above (no extra Firestore read just for this); only warms RN's
+        // own image cache for a photo already in hand. myProfile's own
+        // avatar is the leftmost item in this same row, so it's included
+        // too.
+        prefetchImageOnce(me?.photoURL);
         // Bounded by fetchFollowingUids' own default limit — same bounded
         // Promise.all reasoning as loadMessages' own otherProfiles fetch below.
         const profiles = await Promise.all(followedUids.map((followedUid) => fetchPublicProfile(followedUid)));
-        setFollowingProfiles(profiles.filter((profile): profile is PublicProfile => profile !== null));
+        const followedProfiles = profiles.filter((profile): profile is PublicProfile => profile !== null);
+        setFollowingProfiles(followedProfiles);
+        followedProfiles.forEach((profile) => prefetchImageOnce(profile.photoURL));
         setStoryGroupByUid(new Map(activeStoryGroups.map((group) => [group.authorUid, group])));
 
         // One hasViewedStory call per active Story across every group shown
@@ -207,6 +216,11 @@ export default function InboxScreen() {
         });
         setConversations(items);
         setOtherProfiles(profilesByUid);
+        // Phase 3 perf pass — same reasoning as loadFollowingRow's own
+        // prefetch above: reuses these already-fetched profiles, no extra
+        // Firestore read, only warms RN's own image cache for this
+        // already-bounded (DEFAULT_CONVERSATIONS_LIMIT) page of rows.
+        profiles.forEach((profile) => prefetchImageOnce(profile?.photoURL));
         setMessagesStatus('loaded');
       } catch {
         if (!silent) setMessagesStatus('error');

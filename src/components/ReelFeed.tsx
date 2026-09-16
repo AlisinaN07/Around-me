@@ -15,8 +15,9 @@ import { Colors, Radius, Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
 import { blockUser } from '@/services/blocks';
 import { trackContentInteraction } from '@/services/recommendations/interactions';
-import { deleteMyReel } from '@/services/reels';
+import { deleteMyReel, resolveReelPlaybackUrl } from '@/services/reels';
 import { isPostReposted, repostPost, undoRepost } from '@/services/reposts';
+import { prefetchImageOnce } from '@/utils/imagePrefetch';
 import { buildReelShareUrl } from '@/utils/reelShare';
 import type { Reel } from '@/types/reel';
 import type { RankingAttribution } from '@/types/recommendation';
@@ -149,6 +150,36 @@ export function ReelFeed({
       setActiveIndex(firstVisible.index);
     }
   }, []);
+
+  // Phase 3 perf pass — thumbnail-only image prefetch, deliberately
+  // SEPARATE from `shouldPrepare` below (still exactly `Math.abs(index -
+  // activeIndex) <= 1`, completely unchanged — this never widens the real
+  // video preload window). ReelFeedItem's own thumbnail-resolving effect
+  // (gated on that same shouldPrepare) already resolves+prefetches a
+  // thumbnail for the active Reel and its immediate neighbor on each
+  // side — this only needs to reach ONE step further, the item at
+  // activeIndex + 2, which is never "prepared" and so never resolves its
+  // own thumbnail otherwise. Deliberately NOT activeIndex/activeIndex + 1
+  // too: resolveReelPlaybackUrl's own cache (reels.ts) only dedupes AFTER
+  // a call resolves, not concurrent in-flight calls for the same key —
+  // calling it here for those already-covered indices raced with
+  // ReelFeedItem's own call for the SAME storagePath and produced two
+  // real Storage getDownloadURL requests instead of one (confirmed live
+  // in a browser preview). Restricting this to the one index
+  // ReelFeedItem never touches avoids that race entirely rather than
+  // adding request-level dedup to a widely-shared function. A still cover
+  // frame is a tiny image, not a video, so reaching one step past the
+  // real preload window is safe: `reels` is already the full loaded page
+  // (never fetches another page just for this), and this never touches
+  // video bytes at all. prefetchImageOnce's own in-session Set is what
+  // keeps scrolling back and forth from re-issuing the same request.
+  useEffect(() => {
+    const reel = reels[activeIndex + 2];
+    if (!reel || reel.mediaType === 'photo') return;
+    resolveReelPlaybackUrl(reel.thumbnailStoragePath).then((url) => {
+      if (url) prefetchImageOnce(url);
+    });
+  }, [reels, activeIndex]);
 
   // Impression/watch-behavior tracking used to live here as a dwell-time
   // approximation across the whole list (keyed on activeIndex) — replaced
