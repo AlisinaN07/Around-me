@@ -19,6 +19,8 @@ type MediaCardProps = {
   /** A fixed pixel height, or a percentage string to fill a sized parent (e.g. ReelPreviewCard's aspectRatio box). */
   height: number | `${number}%`;
   radius?: number;
+  /** False removes the 1px border — for a full-bleed hero (DetailHero) where a border reads as a stray rectangle around the edge-to-edge photo. Every other caller keeps the default border. */
+  bordered?: boolean;
   children?: ReactNode;
 };
 
@@ -35,10 +37,10 @@ type MediaCardProps = {
  * and Post still have no image field of their own, so they still always
  * fall through to the gradient/emoji fallback.
  */
-export function MediaCard({ source, emoji, fallbackIcon = 'image-outline', height, radius = Radius.lg, children }: MediaCardProps) {
+export function MediaCard({ source, emoji, fallbackIcon = 'image-outline', height, radius = Radius.lg, bordered = true, children }: MediaCardProps) {
   const resolvedSource = typeof source === 'string' ? { uri: source } : source;
   return (
-    <View style={[styles.container, { height, borderRadius: radius }]}>
+    <View style={[styles.container, { height, borderRadius: radius }, !bordered && styles.borderless]}>
       {resolvedSource ? (
         <Image source={resolvedSource} style={StyleSheet.absoluteFill} resizeMode="cover" />
       ) : (
@@ -58,6 +60,9 @@ const styles = StyleSheet.create({
     backgroundColor: Colors.surface,
     borderWidth: 1,
     borderColor: Colors.border,
+  },
+  borderless: {
+    borderWidth: 0,
   },
   fallback: {
     alignItems: 'center',

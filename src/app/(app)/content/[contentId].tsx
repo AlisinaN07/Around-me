@@ -189,7 +189,12 @@ export default function ContentDetailScreen() {
   if (status === 'loaded' && content && content.type !== 'post') {
     return (
       <>
-        <MediaDetailScreen content={content} onOptionsPress={() => setIsOptionsMenuOpen(true)} />
+        <MediaDetailScreen content={content} onOptionsPress={() => setIsOptionsMenuOpen(true)} onToast={showToast} />
+        {toastMessage ? (
+          <View style={styles.toast} pointerEvents="none">
+            <Text style={styles.toastText}>{toastMessage}</Text>
+          </View>
+        ) : null}
         <OptionsMenu visible={isOptionsMenuOpen} onClose={() => setIsOptionsMenuOpen(false)} options={optionsMenuOptions} />
         {user ? (
           <ReportModal
@@ -290,15 +295,17 @@ export default function ContentDetailScreen() {
 type MediaDetailScreenProps = {
   content: EventContent | ActivityContent;
   onOptionsPress: () => void;
+  /** Only actually used by EventDetail's Share button today (Activity has none) — see this file's own toast overlay, rendered by the caller, not here. */
+  onToast: (message: string) => void;
 };
 
 /** Full-bleed hero + body for Event/Activity detail (Step 29) — see the branch above for why this bypasses HeaderScreenLayout. */
-function MediaDetailScreen({ content, onOptionsPress }: MediaDetailScreenProps) {
+function MediaDetailScreen({ content, onOptionsPress, onToast }: MediaDetailScreenProps) {
   return (
     <SafeAreaView style={styles.mediaSafeArea} edges={['top']}>
       {/* Same handler DetailHero's own back button calls. */}
       <SwipeBackEdge onBack={() => router.back()} />
-      <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.mediaScrollContent}>
+      <ScrollView style={styles.mediaScroll} showsVerticalScrollIndicator={false} contentContainerStyle={styles.mediaScrollContent}>
         <View style={styles.mediaPage}>
           <DetailHero
             title={content.title}
@@ -309,7 +316,7 @@ function MediaDetailScreen({ content, onOptionsPress }: MediaDetailScreenProps) 
             coverPhotoURL={content.type === 'event' ? content.coverPhotoURL : undefined}
           />
           <View style={styles.mediaBody}>
-            {content.type === 'activity' ? <ActivityDetail content={content} /> : <EventDetail content={content} />}
+            {content.type === 'activity' ? <ActivityDetail content={content} /> : <EventDetail content={content} onToast={onToast} />}
           </View>
         </View>
       </ScrollView>
@@ -331,15 +338,26 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: Colors.background,
   },
+  // flex: 1 (both here and on mediaScrollContent's flexGrow below) is
+  // what makes EventDetail's own flex:1 + spacer able to reach the real
+  // screen bottom instead of just this component's natural content
+  // height — see EventDetail.tsx's own `container`/`spacer` styles for
+  // the other half of this chain.
+  mediaScroll: {
+    flex: 1,
+  },
   mediaScrollContent: {
+    flexGrow: 1,
     alignItems: 'center',
     paddingBottom: Spacing.xxl,
   },
   mediaPage: {
+    flex: 1,
     width: '100%',
     maxWidth: Layout.maxContentWidth,
   },
   mediaBody: {
+    flex: 1,
     paddingHorizontal: Spacing.lg,
     paddingTop: Spacing.lg,
   },

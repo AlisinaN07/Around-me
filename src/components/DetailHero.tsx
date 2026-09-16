@@ -41,7 +41,7 @@ export function DetailHero({ title, categoryId, startsAt, endsAt, onOptionsPress
   const ended = endsAt.toMillis() <= now.getTime();
 
   return (
-    <MediaCard source={coverPhotoURL} emoji={category?.emoji} height={HERO_HEIGHT} radius={0}>
+    <MediaCard source={coverPhotoURL} emoji={category?.emoji} height={HERO_HEIGHT} radius={0} bordered={false}>
       <LinearGradient colors={['rgba(10, 10, 13, 0.75)', 'transparent']} style={styles.topScrim} pointerEvents="none" />
       <View style={styles.topRow} pointerEvents="box-none">
         <Pressable onPress={() => router.back()} style={styles.iconButton} hitSlop={8} accessibilityRole="button" accessibilityLabel="Back">
@@ -62,7 +62,11 @@ export function DetailHero({ title, categoryId, startsAt, endsAt, onOptionsPress
         </View>
       ) : null}
 
-      <LinearGradient colors={['transparent', 'rgba(10, 10, 13, 0.95)']} style={styles.bottomScrim} pointerEvents="none">
+      {/* Fully opaque at the very bottom (not 95%) — it exactly matches
+          Colors.background (#0A0A0D = rgb(10, 10, 13)), so the photo fades
+          all the way into the page behind it with no seam where the hero's
+          fixed-height box ends and the rest of the screen begins. */}
+      <LinearGradient colors={['transparent', 'rgba(10, 10, 13, 1)']} style={styles.bottomScrim} pointerEvents="none">
         {category ? (
           <Text style={styles.categoryLabel}>
             {category.emoji} {category.label}

@@ -17,7 +17,6 @@ import { useProfile } from '@/hooks/useProfile';
 import { createEvent, generateEventDraftId, uploadEventCoverPhoto } from '@/services/content';
 import { DESCRIPTION_MAX_LENGTH, PLACE_NAME_MAX_LENGTH, TITLE_MAX_LENGTH } from '@/types/content';
 import { canCreateEvent } from '@/utils/accountCapabilities';
-import { formatCityDisplayName } from '@/utils/cityDisplay';
 import { addHours, roundUpToNextHalfHour } from '@/utils/timeFormat';
 
 const DEFAULT_START = roundUpToNextHalfHour(new Date());
@@ -218,7 +217,7 @@ export default function CreateEventScreen() {
 
       <FormField
         label="Title"
-        placeholder="Live music tonight"
+        placeholder="Choose a title for your event"
         value={title}
         onChangeText={(text) => {
           setTitle(text);
@@ -230,7 +229,7 @@ export default function CreateEventScreen() {
 
       <FormField
         label="Description"
-        placeholder="What's happening, who's playing, why it's worth going..."
+        placeholder="What's happening...."
         value={description}
         onChangeText={(text) => {
           setDescription(text);
@@ -255,7 +254,6 @@ export default function CreateEventScreen() {
       <PlaceSelector
         label="Place"
         cityKey={profile?.cityKey ?? ''}
-        cityLabel={profile?.cityName ? formatCityDisplayName(profile.cityName) : 'your city'}
         value={place}
         onChange={(next) => {
           setPlace(next);
