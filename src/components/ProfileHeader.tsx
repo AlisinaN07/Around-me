@@ -8,6 +8,13 @@ import { StatItem } from '@/components/StatItem';
 import { Colors, Layout, Radius, Spacing, Typography } from '@/constants/theme';
 
 const AVATAR_SIZE = 96;
+// A dedicated blue, not one of the shared theme's own tokens — this badge
+// is the one place in the app that needs a neutral "verified/official"
+// blue (matching the convention real platforms use for a business/
+// verified mark), distinct from Colors.accent's own red brand color,
+// which would read as just another accent highlight here rather than a
+// distinct status indicator.
+const BUSINESS_BADGE_COLOR = '#3B82F6';
 // How tall the visible cover banner is. Bigger than a plain "card behind
 // the avatar" — it reaches down to just above the display name, so the
 // photo (and its fade) fills the whole space behind the avatar instead of
@@ -23,10 +30,10 @@ const IDENTITY_TOP_OFFSET = 88;
 
 type ProfileHeaderProps = {
   displayName: string;
+  /** True for a Business account (see isBusinessAccount) — shows a small blue "B" badge right next to the display name, the one visual marker distinguishing a company account from a Personal one on this shared header. Defaults to false so an unmigrated caller keeps the exact same look as before this existed. */
+  isBusiness?: boolean;
   username: string;
   cityLabel: string;
-  /** Real, optional free-text bio (Step 33) — rendered only when non-empty, never a placeholder like "Add a bio". */
-  bio?: string;
   /** Real, already-resolved profile photo download URL — see UserProfile.photoURL. Falls back to the initials Avatar when empty/absent. */
   photoURL?: string;
   /**
@@ -68,19 +75,24 @@ type ProfileHeaderProps = {
 };
 
 /**
- * Shared identity block — cover banner, avatar, name, username, city, bio,
- * Posts/Following/Followers/Liked stats (Step 27, bio added Step 33, Liked
- * added Step 41.2H.4, cover banner added later). Used by both the own
- * Profile tab and the public profile route so they read as one visual
- * system rather than two (Step 27 Section 19). Carries no verification-
- * badge slot and no online-status indicator — neither exists in the real
- * schema.
+ * Shared identity block — cover banner, avatar, name, username, city,
+ * Posts/Following/Followers/Liked stats (Step 27, cover banner added
+ * later). Bio renders separately, further down each caller's own screen
+ * (below Edit profile / Follow-Message — see profile.tsx and
+ * user/[uid]/index.tsx) rather than here, per later feedback that it
+ * read better there than tucked right under the city. Used by both the
+ * own Profile tab and the public profile route so they read as one
+ * visual system rather than two (Step 27 Section 19). Carries no online-status
+ * indicator — that doesn't exist in the real schema. The one real
+ * exception is `isBusiness`'s own small "B" badge next to the name: not a
+ * third-party verification mark, just this app's own honest "this is a
+ * company account" fact (see accountType in src/types/user.ts).
  */
 export function ProfileHeader({
   displayName,
+  isBusiness = false,
   username,
   cityLabel,
-  bio,
   photoURL,
   coverPhotoURL,
   coverEdgeInset = 0,
@@ -150,9 +162,16 @@ export function ProfileHeader({
           <Avatar name={displayName || '?'} photoURL={photoURL} size={AVATAR_SIZE} />
         )}
 
-        <Text style={styles.displayName} numberOfLines={1}>
-          {displayName}
-        </Text>
+        <View style={styles.nameRow}>
+          <Text style={styles.displayName} numberOfLines={1}>
+            {displayName}
+          </Text>
+          {isBusiness ? (
+            <View style={styles.businessBadge} accessibilityLabel="Business account">
+              <Text style={styles.businessBadgeText}>B</Text>
+            </View>
+          ) : null}
+        </View>
         {username ? <Text style={styles.username}>@{username}</Text> : null}
         {cityLabel ? (
           <View style={styles.locationRow}>
@@ -161,11 +180,6 @@ export function ProfileHeader({
               {cityLabel}
             </Text>
           </View>
-        ) : null}
-        {bio ? (
-          <Text style={styles.bio} numberOfLines={3}>
-            {bio}
-          </Text>
         ) : null}
 
         <View style={styles.statsRow}>
@@ -264,10 +278,39 @@ const styles = StyleSheet.create({
     borderRadius: Radius.full,
     backgroundColor: Colors.background,
   },
+  nameRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    marginTop: Spacing.sm,
+    // identity's own alignItems: 'center' would otherwise let this row
+    // stretch to the width of whatever's widest in the column (the stats
+    // row, the cover-bled banner, ...) — constraining it to its own
+    // content keeps the badge hugging the name instead of drifting off to
+    // the right edge of that wider box.
+    alignSelf: 'center',
+    maxWidth: '100%',
+  },
   displayName: {
     color: Colors.text,
     ...Typography.screenTitle,
-    marginTop: Spacing.sm,
+    // Lets a long name truncate (numberOfLines={1} above) before it ever
+    // pushes the badge next to it off-screen.
+    flexShrink: 1,
+  },
+  businessBadge: {
+    width: 18,
+    height: 18,
+    borderRadius: 9,
+    backgroundColor: BUSINESS_BADGE_COLOR,
+    alignItems: 'center',
+    justifyContent: 'center',
+    flexShrink: 0,
+  },
+  businessBadgeText: {
+    color: '#FFFFFF',
+    fontSize: 11,
+    fontWeight: '800',
   },
   username: {
     color: Colors.textSecondary,
@@ -283,20 +326,12 @@ const styles = StyleSheet.create({
     color: Colors.textSecondary,
     fontSize: 13,
   },
-  bio: {
-    color: Colors.text,
-    fontSize: 13,
-    lineHeight: 18,
-    textAlign: 'center',
-    marginTop: Spacing.sm,
-    paddingHorizontal: Spacing.lg,
-  },
   statsRow: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
     // `identity`'s own alignItems: 'center' shrink-wraps every other child
-    // in this block (avatar, name, bio, ...) — this row needs to ignore
+    // in this block (avatar, name, city, ...) — this row needs to ignore
     // that so justifyContent above has room to spread the stats out,
     // rather than bunching them in the middle. Full-width (100%) read as
     // too wide once built; 80% keeps the spread-out look while pulling

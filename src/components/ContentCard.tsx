@@ -135,11 +135,25 @@ export function ContentCard({ item, currentUid, showAuthor = true, showTypeBadge
       {showAuthor && <TypeAndCategoryBadges item={item} category={category} showType={showTypeBadge} />}
 
       {item.type === 'post' ? (
-        <Text style={styles.body}>{item.body}</Text>
+        // Clamped to one line, same reasoning as description below —
+        // this is a browsing-list card, not the full detail screen
+        // (which this card's own onPress already opens for the
+        // untruncated text), so every card in the list should read as
+        // one compact row regardless of how long its own text is.
+        <Text style={styles.body} numberOfLines={1}>
+          {item.body}
+        </Text>
       ) : (
         <>
           <Text style={styles.title}>{item.title}</Text>
-          <Text style={styles.description}>{item.description}</Text>
+          {/* Clamped to one line — an unbounded description used to blow
+              this card up to the length of its own text (visible once an
+              Event/Activity had a genuinely long one), dwarfing every
+              other card in the same list. Full text is one tap away on
+              the real detail screen (this card's own onPress). */}
+          <Text style={styles.description} numberOfLines={1}>
+            {item.description}
+          </Text>
         </>
       )}
 

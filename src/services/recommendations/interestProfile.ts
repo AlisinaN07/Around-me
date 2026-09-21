@@ -36,8 +36,13 @@ export async function fetchInterestProfile(uid: string, onboardingInterestIds: r
  * non-transient error (e.g. permission-denied) would just fail the exact
  * same way again, so retrying it only wastes a round trip and delays the
  * dev-time warning interactions.ts already logs on final failure.
+ *
+ * Exported so hashtagInterestProfile.ts's own read-modify-write
+ * transaction (Step: hashtag interest profile) can reuse the exact same
+ * retry policy rather than a second copy of this loop — both are the
+ * same "Firestore transaction, safe to blindly retry" shape.
  */
-async function runWithRetry<T>(task: () => Promise<T>): Promise<T> {
+export async function runWithRetry<T>(task: () => Promise<T>): Promise<T> {
   const { maxAttempts, backoffMs } = INTERACTION_RETRY;
   for (let attempt = 1; ; attempt++) {
     try {

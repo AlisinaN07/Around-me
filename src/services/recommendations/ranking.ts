@@ -11,6 +11,7 @@
  * arbitrarily with account age) never lets one dimension silently swamp
  * every other one just because its raw numbers happen to be bigger.
  */
+import { HASHTAG_MATCH_DECAY, HASHTAG_RANKING_MATCH_CAP, HASHTAG_RELEVANCE_WEIGHT } from './hashtagInterestConfig';
 import {
   EVENT_FRESHNESS_HALF_LIFE_HOURS,
   EVENT_LOCATION_WEIGHT_MULTIPLIER,
@@ -544,6 +545,59 @@ export function scoreCollaborativeAffinity(categoryId: string, profile: Recommen
   return Math.max(0, Math.min(1, collaborativeProfile.categoryScores[categoryId] ?? 0));
 }
 
+/**
+ * For You ranking integration — the user's own topical hashtag interest
+ * in ONE candidate Reel, from the Reel's own `hashtags` array (never a
+ * separate `hashtags/{hashtag}` document read — see this function's own
+ * call site in recommendationEngine.ts, and the global collection is
+ * irrelevant to per-user ranking anyway) and the caller's already-loaded
+ * `hashtagInterests` lookup (see hashtagInterestCache.ts — ONE bounded
+ * read per recommendation batch, never per candidate).
+ *
+ * EXACT canonical matching only (Step 5's own normalized hashtags on both
+ * sides — no semantic/topic-graph inference: `#realmadrid` never implies
+ * `#football` unless the user has a real, separately-earned `football`
+ * interest document).
+ *
+ * Bounded aggregation, not a plain sum — a Reel with many matching tags
+ * doesn't get unlimited credit for it: every matched interest score is
+ * collected, sorted STRONGEST first, and only the top
+ * HASHTAG_RANKING_MATCH_CAP contribute, each at a shrinking
+ * HASHTAG_MATCH_DECAY weight (1, 0.5, 0.25, ...) — a fourth+ match adds
+ * nothing further. The final `Math.min(1, ...)` is the hard ceiling this
+ * function's own contract promises: 0 for no match, up to but never
+ * exceeding 1 for several strong matches.
+ *
+ * Deterministic and Firestore-free — no different result for the same
+ * two inputs, ever, so this is directly unit-testable without a database.
+ */
+/** Shared, reused-not-reallocated empty map for the common "no hashtagInterests supplied" case (a brand-new user, or a caller that never loaded one) — computeItemScore's own two call sites default to this instead of allocating a fresh `new Map()` per candidate. */
+const EMPTY_HASHTAG_INTEREST_MAP: ReadonlyMap<string, number> = new Map();
+
+export function scoreHashtagRelevance(reelHashtags: readonly string[], hashtagInterests: ReadonlyMap<string, number>): number {
+  if (reelHashtags.length === 0 || hashtagInterests.size === 0) return 0;
+
+  const matchedScores: number[] = [];
+  const seen = new Set<string>();
+  for (const hashtag of reelHashtags) {
+    // Defensive dedupe — a Reel's own `hashtags` are already deduplicated
+    // at creation (Step 1's extractHashtags), but this function never
+    // assumes a caller's array is pre-validated.
+    if (seen.has(hashtag)) continue;
+    seen.add(hashtag);
+    const score = hashtagInterests.get(hashtag);
+    if (score !== undefined && score > 0) matchedScores.push(score);
+  }
+  if (matchedScores.length === 0) return 0;
+
+  matchedScores.sort((a, b) => b - a);
+  let total = 0;
+  for (let i = 0; i < Math.min(matchedScores.length, HASHTAG_RANKING_MATCH_CAP); i++) {
+    total += matchedScores[i] * HASHTAG_MATCH_DECAY[Math.min(i, HASHTAG_MATCH_DECAY.length - 1)];
+  }
+  return Math.min(1, total);
+}
+
 export type ScoreContext = {
   categoryId: string;
   creatorId: string;
@@ -577,6 +631,20 @@ export type ScoreContext = {
   videoDurationMs?: number;
   /** Recommendation Engine — Step 5 — the viewer's own trusted collaborative-filtering doc, when one exists (see collaborative.ts's getCachedCollaborativeProfile). `undefined`/`null` (no doc yet, or the account is ineligible/cold-start) means this dimension contributes exactly 0 — see scoreCollaborativeAffinity. */
   collaborativeProfile?: CollaborativeProfile | null;
+  /**
+   * For You ranking integration — Reels only. This candidate's own
+   * `hashtags` (the exact Reel.hashtags array — never fetched separately;
+   * omit/empty for a legacy Reel with none, or for any non-Reel content
+   * type, which correctly scores 0 via scoreHashtagRelevance's own empty-
+   * input guard) paired with the viewer's already-loaded top hashtag
+   * interests (see hashtagInterestCache.ts's getCachedHashtagInterestMap
+   * — ONE bounded read per batch, reused for every candidate here, never
+   * refetched per item). Both omitted together is the correct shape for
+   * a brand-new user (empty map) or content with no hashtags (empty
+   * array) — scoreHashtagRelevance returns exactly 0 for either.
+   */
+  reelHashtags?: readonly string[];
+  hashtagInterests?: ReadonlyMap<string, number>;
 };
 
 export type ScoreResult = {
@@ -590,6 +658,7 @@ export type ScoreResult = {
     freshness: number;
     popularity: number;
     collaborativeAffinity: number;
+    hashtagRelevance: number;
   };
 };
 
@@ -636,7 +705,7 @@ export function computeItemScore(
       return {
         totalScore: -Infinity,
         excluded: true,
-        breakdown: { interest: 0, creatorAffinity: 0, location: 0, time: 0, freshness: 0, popularity: 0, collaborativeAffinity: 0 },
+        breakdown: { interest: 0, creatorAffinity: 0, location: 0, time: 0, freshness: 0, popularity: 0, collaborativeAffinity: 0, hashtagRelevance: 0 },
       };
     }
     const breakdown = {
@@ -647,6 +716,10 @@ export function computeItemScore(
       freshness: scoreEventFreshness(context.publishedAtMs, nowMs),
       popularity: resolveQualityScore(context, true),
       collaborativeAffinity: scoreCollaborativeAffinity(context.categoryId, profile, context.collaborativeProfile),
+      // Events have no hashtags field at all (Step 1's scope was Reel-
+      // only) — scoreHashtagRelevance's own empty-array guard already
+      // returns exactly 0 here without any event-specific special-casing.
+      hashtagRelevance: scoreHashtagRelevance(context.reelHashtags ?? [], context.hashtagInterests ?? EMPTY_HASHTAG_INTEREST_MAP),
     };
     const respondedPenalty = scoreRespondedEventPenalty(!!context.hasRespondedToEvent);
     return { totalScore: weightedSum(breakdown, true) * respondedPenalty, excluded: false, breakdown };
@@ -660,6 +733,7 @@ export function computeItemScore(
     freshness: scoreFreshness(context.publishedAtMs, nowMs) + scoreNewContentBoost(context.publishedAtMs, nowMs),
     popularity: resolveQualityScore(context, false),
     collaborativeAffinity: scoreCollaborativeAffinity(context.categoryId, profile, context.collaborativeProfile),
+    hashtagRelevance: scoreHashtagRelevance(context.reelHashtags ?? [], context.hashtagInterests ?? EMPTY_HASHTAG_INTEREST_MAP),
   };
   const exposurePenalty = context.exposure
     ? scoreRepeatExposurePenalty(context.exposure.impressionCount, context.exposure.hasStrongEngagement)
@@ -689,6 +763,13 @@ function weightedSum(breakdown: ScoreResult['breakdown'], isEvent: boolean): num
     // that constant's own doc comment for why it can never overpower
     // `interest`) — added on top of, never replacing, every existing
     // dimension above.
-    breakdown.collaborativeAffinity * COLLABORATIVE_WEIGHT
+    breakdown.collaborativeAffinity * COLLABORATIVE_WEIGHT +
+    // For You ranking integration — hashtag relevance is likewise its own
+    // small, ADDITIVE dimension (HASHTAG_RELEVANCE_WEIGHT, see that
+    // constant's own doc comment in hashtagInterestConfig.ts for the full
+    // comparison against every weight above) — never replacing category
+    // interest/location/freshness/quality, only nudging a topically-
+    // relevant candidate upward within whatever those already decided.
+    breakdown.hashtagRelevance * HASHTAG_RELEVANCE_WEIGHT
   );
 }

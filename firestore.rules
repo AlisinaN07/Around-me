@@ -200,6 +200,41 @@ service cloud.firestore {
         allow delete: if false;
       }
 
+      // Recommendation Engine — hashtag interest profile —
+      // users/{uid}/hashtagInterests/{hashtag}: per-user, per-hashtag
+      // interest scores (see src/types/hashtagInterest.ts). A separate
+      // SUBCOLLECTION rather than a map field on recommendationProfile/
+      // main above — hashtag cardinality is unbounded (unlike the ~18-
+      // entry category catalog categoryScores already covers), so it can
+      // never be folded into that one bounded document the way
+      // categoryScores/creatorScores/cityScores are.
+      //
+      // Owner-only, same as recommendationProfile/main just above — a
+      // user can only ever read/corrupt THEIR OWN future recommendation
+      // inputs this way (once a later step actually uses this for
+      // ranking), never another user's data. Rules validates the SHAPE
+      // and numeric BOUNDS (score clamped to [0,1], counts non-negative
+      // integers, hashtag == this doc's own ID), not that a write exactly
+      // replays the client's own bounded-delta math — impractical to
+      // re-derive in Rules language, and unnecessary for the exact same
+      // reason recommendationProfile/main just above already accepts this
+      // same limitation (see isValidRecommendationProfileWrite's own doc
+      // comment: this is a self-harm-only risk, not a cross-user one).
+      // `allow delete` (unlike recommendationProfile/main's permanent
+      // `false`) is real here — the client's own low-score cleanup
+      // (hashtagInterestProfile.ts) deletes a hashtag whose score decayed/
+      // dropped to negligible rather than keeping a near-zero record
+      // forever.
+      match /hashtagInterests/{hashtag} {
+        allow read: if isOwner(uid);
+
+        allow create: if isOwner(uid) && isValidHashtagInterestWrite(hashtag, request.resource.data);
+
+        allow update: if isOwner(uid) && isValidHashtagInterestWrite(hashtag, request.resource.data);
+
+        allow delete: if isOwner(uid);
+      }
+
       // Recommendation Engine — Step 6 — users/{uid}/feedSessions/{sessionId}:
       // the trusted, backend-only-maintained per-session evaluation
       // summary (see functions/src/metrics.ts — built incrementally from
@@ -306,6 +341,23 @@ service cloud.firestore {
           'categoryScores', 'creatorScores', 'cityScores', 'excludedContentIds', 'recentImpressions',
           'stronglyEngagedContentIds', 'respondedEventIds', 'interactionCount', 'lastDecayAt', 'updatedAt'
         ]);
+    }
+
+    // Recommendation Engine — hashtag interest profile — see
+    // `match /hashtagInterests/{hashtag}` above for the full reasoning.
+    // `hashtagId` is this document's own ID (the path segment), matching
+    // the same "hashtag == doc ID, never a capitalization-variant
+    // duplicate" convention the global `hashtags/{hashtagId}` collection
+    // already uses (see that collection's own isValidHashtagShape,
+    // further down in this file).
+    function isValidHashtagInterestWrite(hashtagId, data) {
+      return data.hashtag == hashtagId
+        && data.score is number && data.score >= 0 && data.score <= 1
+        && data.positiveSignalCount is int && data.positiveSignalCount >= 0
+        && data.negativeSignalCount is int && data.negativeSignalCount >= 0
+        && isServerTimestamp(data.lastInteractionAt)
+        && isServerTimestamp(data.updatedAt)
+        && data.keys().hasOnly(['hashtag', 'score', 'positiveSignalCount', 'negativeSignalCount', 'lastInteractionAt', 'updatedAt']);
     }
 
     // Step 41.2E — target validation for a new Saved relationship. Rejects:
@@ -1329,7 +1381,7 @@ service cloud.firestore {
     function reelBaseKeys() {
       return [
         'reelId', 'authorUid', 'authorDisplayName', 'authorUsername',
-        'cityName', 'countryCode', 'cityKey', 'categoryId', 'caption',
+        'cityName', 'countryCode', 'cityKey', 'categoryId', 'caption', 'hashtags',
         'mediaType', 'needsPhotoVideoRender', 'storagePath', 'storageContentType', 'fileSizeBytes', 'durationMs',
         'width', 'height', 'status', 'visibility',
         'musicSourceType', 'musicTitle', 'musicStorageAudioPath',
@@ -1417,7 +1469,18 @@ service cloud.firestore {
         && data.categoryId is string
         && data.categoryId.size() > 0
         && data.caption is string
-        && data.caption.size() <= 500
+        && data.caption.size() <= 5000
+        // Every "#token" this Reel's own caption contains, normalized —
+        // see src/utils/hashtags.ts's extractHashtags, the single source
+        // of truth for what a hashtag actually is. Deliberately NOT
+        // re-parsed/re-validated against `data.caption` here char-by-char
+        // (Firestore Rules has no practical way to run that same
+        // Unicode-aware regex) — this only bounds the SHAPE (a real list
+        // of reasonably-sized lowercase strings) against abuse, the same
+        // scope firestore.rules already limits itself to for every other
+        // client-declared value.
+        && data.hashtags is list
+        && data.hashtags.size() <= 30
         && data.mediaType in ['video', 'photo']
         && data.needsPhotoVideoRender is bool
         // Only a 'video' draft can ever be pending photo-to-video
@@ -1517,6 +1580,7 @@ service cloud.firestore {
         && newData.cityKey == oldData.cityKey
         && newData.categoryId == oldData.categoryId
         && newData.caption == oldData.caption
+        && newData.hashtags == oldData.hashtags
         && newData.mediaType == oldData.mediaType
         // A Reel still awaiting photo-to-video rendering (see
         // Reel.needsPhotoVideoRender's own doc comment) can never publish —
@@ -1551,6 +1615,72 @@ service cloud.firestore {
         && newData.thumbnailHeight == oldData.thumbnailHeight
         && newData.createdAt == oldData.createdAt
         && newData.keys().hasOnly(reelBaseKeys());
+    }
+
+    // hashtags/{hashtagId} — global counter per unique, normalized hashtag
+    // (see src/types/hashtag.ts). `hashtagId` IS `name` — a client
+    // publishing a Reel with hashtags creates/increments these directly
+    // (see src/services/hashtags.ts's incrementHashtagCounts, called from
+    // publishReel), exactly like the existing content/{contentId}/
+    // stats/activity `participantCount` pattern above: a client may only
+    // ever CREATE with postCount == 1, or INCREMENT an existing doc by
+    // exactly 1 — never set an arbitrary value, and never decrement.
+    // Decrementing (a post carrying this hashtag being deleted) is NEVER
+    // client-writable at all — only the trusted Cloud Functions delete
+    // backend (Admin SDK, bypassing these Rules — see
+    // functions/src/index.ts's decrementHashtagCounts) can lower it,
+    // same trust boundary as reels/{reelId}/stats/engagement above being
+    // entirely non-client-writable in either direction.
+    match /hashtags/{hashtagId} {
+      function isValidHashtagShape(data) {
+        return data.name is string
+          && data.name == hashtagId
+          && data.postCount is int
+          && data.postCount >= 0
+          && isServerTimestamp(data.updatedAt)
+          && data.keys().hasOnly(['name', 'postCount', 'createdAt', 'updatedAt']);
+      }
+
+      allow read: if isSignedIn();
+
+      // The first published Reel ever to use this exact hashtag.
+      allow create: if isSignedIn()
+        && isValidHashtagShape(request.resource.data)
+        && request.resource.data.postCount == 1
+        && isServerTimestamp(request.resource.data.createdAt);
+
+      // Every later Reel publish (+1) adding this same hashtag.
+      // `createdAt` must stay byte-identical — only a fresh document's
+      // OWN create (above) may ever set it.
+      allow update: if isSignedIn()
+        && isValidHashtagShape(request.resource.data)
+        && request.resource.data.createdAt == resource.data.createdAt
+        && request.resource.data.postCount == resource.data.postCount + 1;
+
+      allow delete: if false;
+    }
+
+    // Trending Hashtags by City and Time Window —
+    // cityHashtagTrends/{cityId}__{hashtag}: trusted, server-aggregated
+    // per-(city,hashtag) recent activity (see
+    // functions/src/hashtagTrends.ts). Deliberately GIVEN NO client write
+    // path at all, unlike hashtags/{hashtagId} just above (which the
+    // client DOES write via a constrained +1 transaction): every field
+    // here (`recentPosts`/`recentEngagement` arrays, `lastActivityAt`) is
+    // derived from trusted Cloud Functions triggers reacting to a Reel's
+    // own publish/delete/engagement-stats changes — there is no
+    // analogous "one clearly-bounded client operation" to safely carve
+    // out the way hashtags/{hashtagId}'s exact `postCount + 1` is. This
+    // is discovery/public-app data for any authenticated Around Me user
+    // (Step 34) — same `isSignedIn()`-only read bar as hashtags/
+    // {hashtagId} above; no per-user scoping, since a trend is
+    // inherently about a city, not a viewer.
+    match /cityHashtagTrends/{docId} {
+      allow read: if isSignedIn();
+
+      allow create: if false;
+      allow update: if false;
+      allow delete: if false;
     }
 
     // stories/{storyId} — a separate root collection from reels/{reelId}

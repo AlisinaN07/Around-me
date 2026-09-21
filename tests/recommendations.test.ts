@@ -36,6 +36,7 @@ import {
   scoreContentQuality,
   scoreEventQuality,
   scoreEventTime,
+  scoreHashtagRelevance,
   scoreLocation,
   scoreNewContentBoost,
   scorePopularity,
@@ -43,6 +44,7 @@ import {
   smoothedRate,
   type ScoreResult,
 } from '../src/services/recommendations/ranking';
+import { HASHTAG_RELEVANCE_WEIGHT } from '../src/services/recommendations/hashtagInterestConfig';
 import { enqueueRecommendationInteraction, isCacheFresh, isDuplicateInteraction, resetDedupeStateForTesting } from '../src/services/recommendations/reliability';
 import { deriveSourceTags } from '../src/services/recommendations/attribution';
 import { assignExperimentVariant, hashUserToExperimentUnit, type ExperimentDefinition } from '../src/services/recommendations/experiments';
@@ -1000,7 +1002,17 @@ check('20. Zero confidence produces zero collaborative effect', () => {
 type ScoreResultBreakdown = ScoreResult['breakdown'];
 
 function breakdown(overrides: Partial<ScoreResultBreakdown> = {}): ScoreResultBreakdown {
-  return { interest: 0.5, creatorAffinity: 0.5, location: LOCATION_SCORE.worldwide, time: 1, freshness: 1, popularity: 0.5, collaborativeAffinity: 0, ...overrides };
+  return {
+    interest: 0.5,
+    creatorAffinity: 0.5,
+    location: LOCATION_SCORE.worldwide,
+    time: 1,
+    freshness: 1,
+    popularity: 0.5,
+    collaborativeAffinity: 0,
+    hashtagRelevance: 0,
+    ...overrides,
+  };
 }
 
 check('1. Consistent experiment assignment — the same user always lands in the same bucket', () => {
@@ -1183,6 +1195,288 @@ check('20. A missing analytics backend never breaks For You feed — scoring nee
     NOW
   );
   assert.ok(Number.isFinite(result.totalScore) && !result.excluded);
+});
+
+// ===========================================================================
+// For You ranking integration — hashtag interest (Step 6). scoreHashtagRelevance
+// itself (pure function tests) first, then computeItemScore/weightedSum
+// integration tests confirming the new dimension stays additive, bounded,
+// and fully backward-compatible with every pre-Step-6 call shape.
+// ===========================================================================
+
+check('scoreHashtagRelevance: no user interests at all returns 0', () => {
+  const score = scoreHashtagRelevance(['football'], new Map());
+  assert.equal(score, 0);
+});
+
+check('scoreHashtagRelevance: a Reel with no hashtags returns 0, regardless of how strong the user\'s interests are', () => {
+  const interests = new Map([['football', 0.9]]);
+  const score = scoreHashtagRelevance([], interests);
+  assert.equal(score, 0);
+});
+
+check('scoreHashtagRelevance: one strong exact match returns a strong positive relevance', () => {
+  const interests = new Map([['football', 0.9]]);
+  const score = scoreHashtagRelevance(['football'], interests);
+  assert.greater(score, 0.5, `Expected a strong relevance score, got ${score}`);
+});
+
+check('scoreHashtagRelevance: a non-matching hashtag returns 0 — no semantic inference', () => {
+  const interests = new Map([['football', 0.9]]);
+  const score = scoreHashtagRelevance(['cooking'], interests);
+  assert.equal(score, 0);
+});
+
+check('scoreHashtagRelevance: "#realmadrid" does NOT inherit "football"\'s interest — exact canonical matching only', () => {
+  const interests = new Map([['football', 0.95]]);
+  const score = scoreHashtagRelevance(['realmadrid'], interests);
+  assert.equal(score, 0);
+});
+
+check('scoreHashtagRelevance: multiple matching hashtags score higher than the single strongest one alone', () => {
+  const interests = new Map([
+    ['football', 0.9],
+    ['championsleague', 0.7],
+  ]);
+  const both = scoreHashtagRelevance(['football', 'championsleague'], interests);
+  const oneOnly = scoreHashtagRelevance(['football'], interests);
+  assert.greater(both, oneOnly, `Expected multiple matches (${both}) to score higher than one alone (${oneOnly})`);
+});
+
+check('scoreHashtagRelevance: diminishing returns — the marginal contribution of a 3rd match is smaller than the 1st', () => {
+  // Three DISTINCT, equal-strength interests isolates the DECAY curve
+  // itself (HASHTAG_MATCH_DECAY) from "which raw score is largest" —
+  // every match contributes the SAME raw 0.6, so any difference in the
+  // running total's growth is purely the diminishing-returns weighting.
+  const interests = new Map([
+    ['a', 0.6],
+    ['b', 0.6],
+    ['c', 0.6],
+  ]);
+  const withOne = scoreHashtagRelevance(['a'], interests);
+  const withTwo = scoreHashtagRelevance(['a', 'b'], interests);
+  const withThree = scoreHashtagRelevance(['a', 'b', 'c'], interests);
+  const secondMatchContribution = withTwo - withOne;
+  const thirdMatchContribution = withThree - withTwo;
+  assert.greater(withOne, 0);
+  assert.greater(secondMatchContribution, thirdMatchContribution - 1e-9);
+  assert.ok(thirdMatchContribution < withOne, `Expected the 3rd match's own contribution (${thirdMatchContribution}) to be smaller than the 1st match's full score (${withOne})`);
+});
+
+check('scoreHashtagRelevance: a 5th+ matching hashtag contributes nothing beyond the match cap', () => {
+  const interests = new Map([
+    ['a', 0.8],
+    ['b', 0.8],
+    ['c', 0.8],
+    ['d', 0.8],
+    ['e', 0.8],
+  ]);
+  const withThree = scoreHashtagRelevance(['a', 'b', 'c'], interests);
+  const withFive = scoreHashtagRelevance(['a', 'b', 'c', 'd', 'e'], interests);
+  assert.equal(withThree, withFive, `Expected the 4th/5th match to add nothing beyond the cap: withThree=${withThree}, withFive=${withFive}`);
+});
+
+check('scoreHashtagRelevance: result never exceeds 1.0 even with several maximal matches', () => {
+  const interests = new Map([
+    ['a', 1],
+    ['b', 1],
+    ['c', 1],
+  ]);
+  const score = scoreHashtagRelevance(['a', 'b', 'c'], interests);
+  assert.ok(score <= 1, `Expected <= 1, got ${score}`);
+});
+
+check('scoreHashtagRelevance: result is never negative, even with zero matches', () => {
+  const score = scoreHashtagRelevance(['unrelated'], new Map([['football', 0.9]]));
+  assert.ok(score >= 0, `Expected >= 0, got ${score}`);
+});
+
+check('scoreHashtagRelevance: inputs are trusted-canonical (same contract as every other profile-reading score* function) — a differently-cased tag simply does not match, by design, since both Reel.hashtags and hashtagInterests keys are ALREADY normalized upstream (Step 1/Step 5) before this function ever sees them', () => {
+  const interests = new Map([['football', 0.9]]);
+  assert.equal(scoreHashtagRelevance(['Football'], interests), 0);
+  assert.equal(scoreHashtagRelevance(['football'], interests) > 0, true);
+});
+
+check('scoreHashtagRelevance: an excessive Reel hashtag array does not gain unlimited score just from array size', () => {
+  const interests = new Map([['football', 0.9]]);
+  const manyUnrelatedPlusOneMatch = ['x1', 'x2', 'x3', 'x4', 'x5', 'x6', 'x7', 'x8', 'x9', 'x10', 'football'];
+  const justTheMatch = ['football'];
+  assert.equal(scoreHashtagRelevance(manyUnrelatedPlusOneMatch, interests), scoreHashtagRelevance(justTheMatch, interests));
+});
+
+check('scoreHashtagRelevance: duplicate hashtags in the same Reel array are not double-counted', () => {
+  const interests = new Map([['football', 0.9]]);
+  const deduped = scoreHashtagRelevance(['football'], interests);
+  const duplicated = scoreHashtagRelevance(['football', 'football', 'football'], interests);
+  assert.equal(deduped, duplicated);
+});
+
+// --- Ranking integration (computeItemScore/weightedSum) ---
+
+/** A baseline context with every hashtag-agnostic dimension held equal — only reelHashtags/hashtagInterests vary between candidates in these tests. */
+function baseReelContext(overrides: Partial<Parameters<typeof computeItemScore>[0]> = {}) {
+  return {
+    categoryId: 'sports',
+    creatorId: 'creatorA',
+    cityKey: HOME_CITY,
+    countryCode: HOME_COUNTRY,
+    publishedAtMs: NOW - 2 * 60 * 60 * 1000,
+    isFollowingCreator: false,
+    likeCount: 2,
+    commentCount: 0,
+    ...overrides,
+  };
+}
+
+check('Ranking integration: same quality otherwise — a hashtag match breaks the tie in the matching candidate\'s favor', () => {
+  const profile = freshProfile();
+  const hashtagInterests = new Map([['football', 0.9]]);
+  const candidateA = computeItemScore(
+    baseReelContext({ reelHashtags: ['football'], hashtagInterests }),
+    profile,
+    CITY_SCOPE,
+    HOME_CITY,
+    HOME_COUNTRY,
+    NOW
+  );
+  const candidateB = computeItemScore(
+    baseReelContext({ reelHashtags: ['cooking'], hashtagInterests }),
+    profile,
+    CITY_SCOPE,
+    HOME_CITY,
+    HOME_COUNTRY,
+    NOW
+  );
+  assert.greater(candidateA.totalScore, candidateB.totalScore, 'Expected the football-matching candidate to outrank the non-matching one');
+});
+
+check('Ranking integration: a strong hashtag match does NOT overwhelm substantially better other signals', () => {
+  const profile = freshProfile();
+  const hashtagInterests = new Map([['football', 1]]); // maximal possible hashtag interest
+  // Candidate A: perfect hashtag match, but weak on everything else — a
+  // different (non-home) city under an explicit home-CITY scope, no
+  // engagement, and old (past both the freshness half-life and the new-
+  // content-boost grace window).
+  const candidateA = computeItemScore(
+    {
+      categoryId: 'unknown_category',
+      creatorId: 'creatorA',
+      cityKey: 'us:somewhere',
+      countryCode: 'US',
+      publishedAtMs: NOW - 200 * 60 * 60 * 1000, // ~8 days old
+      isFollowingCreator: false,
+      likeCount: 0,
+      commentCount: 0,
+      reelHashtags: ['football'],
+      hashtagInterests,
+    },
+    profile,
+    CITY_SCOPE,
+    HOME_CITY,
+    HOME_COUNTRY,
+    NOW
+  );
+  // Candidate B: no hashtag match at all, but substantially better on
+  // every OTHER dimension — actually in the home city (a real same-city
+  // match under CITY_SCOPE, not merely equal treatment), fresh, and real
+  // engagement stats reading as high quality.
+  const strongStats: ContentEngagementStats = {
+    ...EMPTY_ENGAGEMENT_STATS,
+    impressions: 500,
+    meaningfulViews: 400,
+    likes: 80,
+    comments: 20,
+    saves: 40,
+    shares: 15,
+  };
+  const candidateB = computeItemScore(
+    {
+      categoryId: 'unknown_category',
+      creatorId: 'creatorB',
+      cityKey: HOME_CITY,
+      countryCode: HOME_COUNTRY,
+      publishedAtMs: NOW - 60 * 60 * 1000, // 1 hour old
+      isFollowingCreator: false,
+      likeCount: 0,
+      commentCount: 0,
+      engagementStats: strongStats,
+      hasVideo: true,
+      reelHashtags: ['cooking'],
+      hashtagInterests,
+    },
+    profile,
+    CITY_SCOPE,
+    HOME_CITY,
+    HOME_COUNTRY,
+    NOW
+  );
+  assert.greater(candidateB.totalScore, candidateA.totalScore, 'Expected substantially-better-everything-else Candidate B to still outrank a hashtag-only Candidate A');
+});
+
+check('Ranking integration: a new user (no hashtag interests at all) scores identically to before this integration existed', () => {
+  const profile = freshProfile();
+  const contextWithoutHashtagFields = baseReelContext();
+  const withNoHashtagFieldsAtAll = computeItemScore(contextWithoutHashtagFields, profile, CITY_SCOPE, HOME_CITY, HOME_COUNTRY, NOW);
+  const withEmptyHashtagInterests = computeItemScore(
+    baseReelContext({ reelHashtags: ['football', 'nightlife'], hashtagInterests: new Map() }),
+    profile,
+    CITY_SCOPE,
+    HOME_CITY,
+    HOME_COUNTRY,
+    NOW
+  );
+  assert.equal(withNoHashtagFieldsAtAll.totalScore, withEmptyHashtagInterests.totalScore, 'A brand-new user with zero hashtag interests must score every candidate identically regardless of that candidate\'s own hashtags');
+  assert.equal(withNoHashtagFieldsAtAll.breakdown.hashtagRelevance, 0);
+});
+
+check('Ranking integration: a Reel with no hashtags at all scores identically to omitting the field entirely (backward compatibility)', () => {
+  const profile = freshProfile();
+  const hashtagInterests = new Map([['football', 0.9]]);
+  const omitted = computeItemScore(baseReelContext({ hashtagInterests }), profile, CITY_SCOPE, HOME_CITY, HOME_COUNTRY, NOW);
+  const explicitEmpty = computeItemScore(baseReelContext({ reelHashtags: [], hashtagInterests }), profile, CITY_SCOPE, HOME_CITY, HOME_COUNTRY, NOW);
+  assert.equal(omitted.totalScore, explicitEmpty.totalScore);
+  assert.equal(omitted.breakdown.hashtagRelevance, 0);
+});
+
+check('Ranking integration: hashtagRelevance contributes at most HASHTAG_RELEVANCE_WEIGHT to totalScore, never more', () => {
+  const profile = freshProfile();
+  const hashtagInterests = new Map([
+    ['a', 1],
+    ['b', 1],
+    ['c', 1],
+  ]);
+  const withMaxHashtagRelevance = computeItemScore(
+    baseReelContext({ reelHashtags: ['a', 'b', 'c'], hashtagInterests }),
+    profile,
+    CITY_SCOPE,
+    HOME_CITY,
+    HOME_COUNTRY,
+    NOW
+  );
+  const withNoHashtagRelevance = computeItemScore(baseReelContext({ reelHashtags: [], hashtagInterests }), profile, CITY_SCOPE, HOME_CITY, HOME_COUNTRY, NOW);
+  const delta = withMaxHashtagRelevance.totalScore - withNoHashtagRelevance.totalScore;
+  assert.ok(delta <= HASHTAG_RELEVANCE_WEIGHT + 1e-9, `Expected the hashtag dimension's own contribution (${delta}) to never exceed its configured weight (${HASHTAG_RELEVANCE_WEIGHT})`);
+  assert.ok(delta > 0, 'Expected a real, positive contribution from a maximal hashtag match');
+});
+
+check('Ranking integration: several relevant hashtag matches provide a stronger but still-bounded boost than one match alone', () => {
+  const profile = freshProfile();
+  const hashtagInterests = new Map([
+    ['football', 0.9],
+    ['championsleague', 0.7],
+  ]);
+  const oneMatch = computeItemScore(baseReelContext({ reelHashtags: ['football'], hashtagInterests }), profile, CITY_SCOPE, HOME_CITY, HOME_COUNTRY, NOW);
+  const twoMatches = computeItemScore(
+    baseReelContext({ reelHashtags: ['football', 'championsleague'], hashtagInterests }),
+    profile,
+    CITY_SCOPE,
+    HOME_CITY,
+    HOME_COUNTRY,
+    NOW
+  );
+  assert.greater(twoMatches.totalScore, oneMatch.totalScore);
+  const delta = twoMatches.totalScore - oneMatch.totalScore;
+  assert.ok(delta <= HASHTAG_RELEVANCE_WEIGHT + 1e-9, `Expected the extra boost from a second match (${delta}) to stay within the hashtag dimension's own weight budget`);
 });
 
 runAsyncChecks().then(() => {

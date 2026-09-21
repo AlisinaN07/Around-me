@@ -82,15 +82,36 @@ function HeroCard({ item, now, onPress }: VariantCardProps) {
     <Pressable
       style={styles.heroCard}
       onPress={onPress ?? (() => router.push(`/content/${item.contentId}`))}
-      accessibilityRole="button"
+      // Same "link" (not "button") reasoning as PlaceRow/AuthorLink's own
+      // — see PlaceRow's doc comment for the full explanation. This card
+      // contains real Interested/Going action buttons (EventActionButtons
+      // below), which need to stay genuine <button>s; the whole-card tap
+      // target navigates away rather than performing an in-place action,
+      // so "link" is both the more accurate semantic AND what keeps
+      // react-native-web from rendering this as a <button> that would
+      // wrap those real buttons — an actual "<button> cannot contain a
+      // nested <button>" hydration warning, confirmed live, before this
+      // fix.
+      accessibilityRole="link"
       accessibilityLabel={`${isActivity ? 'Activity' : 'Event'}: ${item.title}`}
     >
       <MediaCard source={eventCoverSource(item)} emoji={category?.emoji} height={128} radius={Radius.lg}>
-        {badge ? (
-          <View style={styles.heroBadgeOverlay}>
+        {/* LIVE/TODAY/TONIGHT overlays this rail's own Happening Now/
+            Today-or-Tonight cards the same as before. Coming Up's own
+            cards (this same 'hero' variant, just a different rail —
+            see (tabs)/events.tsx) never get a `badge` here — Coming Up is
+            structurally everything AFTER Today/Tonight's window, so
+            isHappeningNow/starts-today are never true for them — so they
+            fall to the same DateBadge (weekday/day/month) UpcomingCard's
+            own cards already show below, per explicit request that Coming
+            Up show a real date on every card here too. */}
+        <View style={styles.heroBadgeOverlay}>
+          {badge ? (
             <Pill label={badge.label} tone={badge.tone === 'now' ? 'live' : 'neutral'} />
-          </View>
-        ) : null}
+          ) : (
+            <DateBadge date={item.startsAt.toDate()} />
+          )}
+        </View>
       </MediaCard>
 
       <View style={styles.heroBody}>
@@ -142,7 +163,9 @@ function RowCard({ item, now, onPress, responseStatus }: VariantCardProps & { re
     <Pressable
       style={styles.rowCard}
       onPress={onPress ?? (() => router.push(`/content/${item.contentId}`))}
-      accessibilityRole="button"
+      // "link", not "button" — see HeroCard's own doc comment above for
+      // why (this card also nests real EventActionButtons/Pill buttons).
+      accessibilityRole="link"
       accessibilityLabel={`${isActivity ? 'Activity' : 'Event'}: ${item.title}`}
     >
       <MediaCard source={eventCoverSource(item)} emoji={category?.emoji} height={64} radius={Radius.md} />
@@ -187,7 +210,11 @@ function UpcomingCard({ item, now, onPress }: VariantCardProps) {
     <Pressable
       style={styles.upcomingCard}
       onPress={onPress ?? (() => router.push(`/content/${item.contentId}`))}
-      accessibilityRole="button"
+      // "link", not "button" — see HeroCard's own doc comment above for
+      // why (this card also nests real EventActionButtons/Pill buttons).
+      // This was the specific variant the nested-<button> warning was
+      // first confirmed live on (Events tab's "Coming Up"/"This Weekend").
+      accessibilityRole="link"
       accessibilityLabel={`${isActivity ? 'Activity' : 'Event'}: ${item.title}`}
     >
       <MediaCard source={eventCoverSource(item)} emoji={category?.emoji} height={90} radius={Radius.lg}>
@@ -236,7 +263,18 @@ function PlaceRow({
         }}
         hitSlop={4}
         style={styles.placeRow}
-        accessibilityRole="button"
+        // "link", not "button" — same reasoning (and same fix) as
+        // AuthorLink's own accessibilityRole: this navigates to another
+        // screen rather than performing an in-place action, and every
+        // card variant that renders this (Hero/Row/Upcoming/Compact) nests
+        // it inside its own outer, whole-card Pressable — "button" here
+        // would render react-native-web's real <button> tag nested inside
+        // that outer element, which is invalid HTML (a confirmed "<button>
+        // cannot contain a nested <button>" hydration warning) whenever
+        // the outer card itself is also a real <button> (CompactCard,
+        // which has no EventActionButtons of its own to force ITS outer
+        // role to "link" too — see HeroCard's doc comment for that case).
+        accessibilityRole="link"
         accessibilityLabel={`View ${item.placeName}`}
       >
         <Ionicons name="location" size={iconSize} color={Colors.accent} />

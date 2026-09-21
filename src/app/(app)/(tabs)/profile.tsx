@@ -1,6 +1,6 @@
 import { Ionicons } from '@expo/vector-icons';
 import { router, useFocusEffect, useIsFocused } from 'expo-router';
-import { useCallback, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
@@ -21,7 +21,7 @@ import { useProfile } from '@/hooks/useProfile';
 import type { Content, EventContent, PostContent } from '@/types/content';
 import type { Reel } from '@/types/reel';
 import { fetchFollowerCount, fetchFollowingCount } from '@/services/following';
-import { fetchProfileEventCount, fetchProfilePostCount, fetchPublicUserContent } from '@/services/content';
+import { fetchProfileEventCount, fetchProfilePostCount, fetchPublicUserContent, setEventFeedHandoff } from '@/services/content';
 import { fetchLifetimeLikedCount } from '@/services/profileLiked';
 import { fetchProfileActivities, type ProfileActivity } from '@/services/profileActivities';
 import { fetchProfileReelCount, fetchProfileReels } from '@/services/reels';
@@ -285,6 +285,17 @@ export default function ProfileScreen() {
       return !live && item.endsAt.toMillis() < now.getTime();
     });
   }, [businessEvents, eventStatusTab]);
+
+  // Swipe-to-next-Event — hands this exact, already-loaded list to
+  // whichever Event the user taps next (see peekEventFeedHandoff's own
+  // doc comment in content.ts), so opening one from this Live/Upcoming/
+  // Past tab lets them swipe through the REST of this same tab instead of
+  // only ever seeing the one they tapped. Kept fresh on every change to
+  // this exact list (tab switch, a new Event finishing loading, ...) —
+  // never a stale one from a previous eventStatusTab.
+  useEffect(() => {
+    if (effectiveTab === 'event') setEventFeedHandoff(displayedEvents);
+  }, [effectiveTab, displayedEvents]);
   const mergedPosts = useMemo(() => mergeProfilePosts(reels, textPosts), [reels, textPosts]);
 
   return (
@@ -301,9 +312,9 @@ export default function ProfileScreen() {
             <>
               <ProfileHeader
                 displayName={profile?.displayName ?? ''}
+                isBusiness={isBusiness}
                 username={profile?.username ?? ''}
                 cityLabel={cityLabel}
-                bio={profile?.bio}
                 photoURL={profile?.photoURL}
                 coverPhotoURL={profile?.coverPhotoURL}
                 coverEdgeInset={Spacing.lg}
@@ -330,6 +341,15 @@ export default function ProfileScreen() {
               <View style={styles.editProfileButton}>
                 <Button label="Edit profile" variant="secondary" onPress={() => router.push('/profile/edit')} />
               </View>
+
+              {/* Moved here from ProfileHeader itself, below Edit profile
+                  rather than tucked right under the city — see
+                  ProfileHeader's own doc comment. */}
+              {profile?.bio ? (
+                <Text style={styles.bio} numberOfLines={3}>
+                  {profile.bio}
+                </Text>
+              ) : null}
 
               <View style={styles.interestsSection}>
                 <InterestPills interestIds={profile?.interests ?? []} />
@@ -481,6 +501,16 @@ const styles = StyleSheet.create({
   editProfileButton: {
     alignSelf: 'center',
     width: '100%',
+  },
+  // Same exact style ProfileHeader's own bio Text used before it moved
+  // here — see this file's own call site for why.
+  bio: {
+    color: Colors.text,
+    fontSize: 13,
+    lineHeight: 18,
+    textAlign: 'center',
+    marginTop: Spacing.sm,
+    paddingHorizontal: Spacing.lg,
   },
   interestsSection: {
     alignItems: 'center',

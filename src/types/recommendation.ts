@@ -89,6 +89,20 @@ export type TrackInteractionInput = {
   attribution?: RankingAttribution;
   /** The per-mount feed session this interaction happened within — see feedSessions.ts. Omitted for interactions with no active feed session (e.g. opening a shared deep link to one Reel outside any feed). */
   feedSessionId?: string;
+  /**
+   * Hashtag interest profile — this content's own normalized `hashtags`
+   * (Reel.hashtags — see src/types/reel.ts), when the caller has them at
+   * hand. Purely a TRANSIENT input to trackContentInteraction: never
+   * persisted onto RecommendationEvent itself (kept out of that
+   * immutable log/its Firestore rules entirely — no new surface there),
+   * only consumed to drive a users/{uid}/hashtagInterests/{hashtag}
+   * update (see recommendations/hashtagInterestProfile.ts). Omitted
+   * entirely for content with no hashtags (legacy Reels, or any
+   * non-Reel content type — hashtags don't exist on PostContent yet) or
+   * when the calling code doesn't have the content object in scope; both
+   * simply mean no hashtag-interest update happens for that interaction.
+   */
+  hashtags?: string[];
 };
 
 /** users/{uid}/recommendationEvents/{eventId} — see this file's own top doc comment. */
@@ -175,6 +189,8 @@ export type RankingBreakdown = {
   collaborativeAffinity: number;
   /** Dev-debug only — the viewer's OWN collaborative doc confidence (0 if none/ineligible), shown alongside collaborativeAffinity so a reviewer can tell "no collaborative signal" apart from "confident collaborative signal that happens to be 0 for this category". Never a neighbor identity or another user's data (Step 6/29). */
   collaborativeConfidence: number;
+  /** For You ranking integration — dev-debug only. This candidate's own [0,1] hashtag relevance contribution (see ranking.ts's scoreHashtagRelevance) — 0 for a brand-new user, a Reel with no hashtags, or simply no matching interest. */
+  hashtagRelevance: number;
 };
 
 /**

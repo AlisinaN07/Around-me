@@ -71,6 +71,7 @@ async function trackSaveSignal(uid: string, targetType: SavedTargetType, targetI
         creatorId: reel.authorUid,
         cityKey: reel.cityKey,
         countryCode: reel.countryCode,
+        hashtags: reel.hashtags,
       });
     } else {
       const content = await fetchContentById(targetId);

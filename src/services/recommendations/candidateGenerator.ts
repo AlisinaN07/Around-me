@@ -44,19 +44,10 @@ import type { Reel } from '@/types/reel';
 
 import { fetchMyBlockedUserIds } from '../blocks';
 import { fetchCityReels, fetchFollowingReels } from '../reels';
-import { CANDIDATE_POOL, SECONDARY_CITY_REEL_POOL_LIMIT } from './recommendationConfig';
-import { pickSecondaryCity } from './ranking';
-
-function widenScope(scope: BrowseScope, homeCountryCode: string): BrowseScope | null {
-  if (scope.kind === 'world') return null;
-  if (scope.kind === 'country') return { kind: 'world' };
-  return { kind: 'country', countryCode: homeCountryCode };
-}
+import { CANDIDATE_POOL } from './recommendationConfig';
 
 export type ReelCandidatePool = {
   candidates: Reel[];
-  /** True when scope had to widen (Step 8's graceful widening) because the active scope alone didn't have enough local content. */
-  widened: boolean;
 };
 
 /**
@@ -65,17 +56,25 @@ export type ReelCandidatePool = {
  * across feed pages — see recommendationEngine.ts) anything already shown
  * this session, so a second page never just re-ranks the exact same pool.
  *
- * Recommendation Engine — Step 3, Step 17 — `normalizedCityAffinity` (see
- * ranking.ts's normalizeCityAffinity, computed once by the caller from
- * the already-fetched profile) optionally adds ONE small, bounded
- * supplementary query for the single qualifying learned secondary city
- * (see pickSecondaryCity) — never one query per learned city, and never
- * more than SECONDARY_CITY_REEL_POOL_LIMIT items. This is a deliberate
- * exploration injection (Step 6/23's "Stockholm should occasionally
- * appear"), independent of the graceful-widening fallback below (that
- * one only ever fires when the pool is STARVED; this one fires purely
- * because a real learned preference exists, regardless of how rich the
- * home-scope pool already is).
+ * STRICT GEOGRAPHY, no exceptions: the candidate pool is exactly what the
+ * viewer's own explicitly selected `scope` returns — City stays City,
+ * Country stays that one country, World is everything. There is no
+ * fallback that ever widens a starved scope into a broader one (the old
+ * Step 8 "graceful widening" — city -> country -> world when the pool was
+ * thin — has been removed entirely, by explicit product decision): a
+ * Karlstad Reel must never appear under Stockholm, and a Swedish Reel
+ * must never appear under a different country, no matter how few Reels
+ * the selected scope currently has. The ONLY way to see broader content
+ * is to explicitly pick a broader scope (Country or World) — which
+ * already naturally includes it, via fetchCityReels' own
+ * 'country'/'world' query branches, with no widening needed.
+ *
+ * `homeCountryCode`/`normalizedCityAffinity` are accepted for call-site
+ * compatibility with recommendationEngine.ts (which still computes the
+ * latter for ranking.ts's own scoreLocation secondary-city bonus, and for
+ * Events' own separate secondary-city discovery section) but are no
+ * longer used to inject another city's/country's Reels as CANDIDATES
+ * here.
  */
 export async function generateReelCandidates(
   uid: string,
@@ -84,35 +83,19 @@ export async function generateReelCandidates(
   excludeReelIds: ReadonlySet<string>,
   normalizedCityAffinity: Record<string, number> = {}
 ): Promise<ReelCandidatePool> {
-  const secondaryCityKey = pickSecondaryCity(scope, normalizedCityAffinity);
+  void homeCountryCode;
+  void normalizedCityAffinity;
 
-  const [localPool, followingPool, secondaryPool, blockedUids] = await Promise.all([
+  const [localPool, followingPool, blockedUids] = await Promise.all([
     fetchCityReels(scope, CANDIDATE_POOL.localPoolLimit),
     fetchFollowingReels({ currentUid: uid, scope, limit: CANDIDATE_POOL.followingPoolLimit }).then((result) => result.reels),
-    secondaryCityKey ? fetchCityReels({ kind: 'city', cityKey: secondaryCityKey }, SECONDARY_CITY_REEL_POOL_LIMIT) : Promise.resolve([]),
     fetchMyBlockedUserIds(uid),
   ]);
 
-  let widened = false;
-  let combined = [...localPool, ...followingPool, ...secondaryPool];
-  let effectivePool = dedupeAndFilter(combined, blockedUids, excludeReelIds);
+  const combined = [...localPool, ...followingPool];
+  const effectivePool = dedupeAndFilter(combined, blockedUids, excludeReelIds);
 
-  // Step 8 — graceful widening: not enough local content, so widen scope
-  // city -> country -> world rather than serving a starved feed. Only
-  // ever widens ONE step per call (city/cities -> country, or
-  // country -> world) — recommendationEngine re-derives scope on the next
-  // page fetch anyway, so this doesn't need to recurse further here.
-  if (effectivePool.length < CANDIDATE_POOL.minLocalPoolBeforeWidening) {
-    const wider = widenScope(scope, homeCountryCode);
-    if (wider) {
-      widened = true;
-      const widerPool = await fetchCityReels(wider, CANDIDATE_POOL.localPoolLimit);
-      combined = [...combined, ...widerPool];
-      effectivePool = dedupeAndFilter(combined, blockedUids, excludeReelIds);
-    }
-  }
-
-  return { candidates: effectivePool, widened };
+  return { candidates: effectivePool };
 }
 
 function dedupeAndFilter(reels: Reel[], blockedUids: string[], excludeReelIds: ReadonlySet<string>): Reel[] {

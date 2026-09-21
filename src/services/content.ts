@@ -25,7 +25,7 @@ import { getDownloadURL, ref, uploadBytesResumable, type UploadTask } from 'fire
 
 import { INTERESTS } from '@/constants/interests';
 import type { ActivityContent, Content, EventContent, PostContent } from '@/types/content';
-import type { BrowseScope } from '@/types/browseScope';
+import { browseScopeKey, type BrowseScope } from '@/types/browseScope';
 import {
   BODY_MAX_LENGTH,
   DESCRIPTION_MAX_LENGTH,
@@ -685,19 +685,23 @@ export function fetchUpcomingActivities(cityKey: string, limitCount = DEFAULT_FE
 async function fetchByStartsAtWindowByType<T extends ActivityContent | EventContent>(
   type: 'activity' | 'event',
   scope: BrowseScope,
-  window: { start: Date; end: Date },
+  window: { start: Date; end?: Date },
   limitCount: number
 ): Promise<T[]> {
   if (!firestore) {
     return [];
   }
+  // `end` is optional — omitted entirely for "Upcoming" (see
+  // getUpcomingWindow's own doc comment: deliberately open-ended, capped
+  // only by `limitCount` below, never a second date cutoff), still
+  // required for a genuinely bounded window like Today/Tonight.
   const windowQuery = query(
     collection(firestore, CONTENT_COLLECTION),
     where('type', '==', type),
     ...scopeWhereClause(scope),
     where('status', '==', 'published'),
     where('startsAt', '>=', Timestamp.fromDate(window.start)),
-    where('startsAt', '<', Timestamp.fromDate(window.end)),
+    ...(window.end ? [where('startsAt', '<', Timestamp.fromDate(window.end))] : []),
     orderBy('startsAt', 'asc'),
     limit(limitCount)
   );
@@ -707,7 +711,7 @@ async function fetchByStartsAtWindowByType<T extends ActivityContent | EventCont
 
 async function fetchByStartsAtWindow(
   scope: BrowseScope,
-  window: { start: Date; end: Date },
+  window: { start: Date; end?: Date },
   limitCount: number
 ): Promise<(ActivityContent | EventContent)[]> {
   const [events, activities] = await Promise.all([
@@ -835,7 +839,7 @@ async function fetchFollowingHappeningNowEvents(authorUidChunks: string[][], sco
 async function fetchFollowingEventsByStartsAtWindow(
   authorUidChunks: string[][],
   scope: BrowseScope,
-  window: { start: Date; end: Date },
+  window: { start: Date; end?: Date },
   limitCount: number
 ): Promise<EventContent[]> {
   if (!firestore || authorUidChunks.length === 0) return [];
@@ -852,7 +856,9 @@ async function fetchFollowingEventsByStartsAtWindow(
             where('status', '==', 'published'),
             where('authorUid', 'in', chunk),
             where('startsAt', '>=', Timestamp.fromDate(window.start)),
-            where('startsAt', '<', Timestamp.fromDate(window.end)),
+            // `end` optional — see fetchByStartsAtWindowByType's own doc
+            // comment for why (getUpcomingWindow is now open-ended).
+            ...(window.end ? [where('startsAt', '<', Timestamp.fromDate(window.end))] : []),
             orderBy('startsAt', 'asc'),
             limit(limitCount)
           )
@@ -922,6 +928,111 @@ export async function fetchFollowingDiscoverySections(
     sections: { happeningNow, todayLabel: todayWindow.label, today, upcoming },
     followsAnyone: true,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4 perf pass — a small, short-lived HANDOFF cache from the Events
+// tab's own already-fetched DiscoverySections to its "Show more" screen
+// (src/app/(app)/events/section.tsx), which today re-runs the exact same
+// fetchDiscoverySections/fetchFollowingDiscoverySections call (same scope,
+// same SECTION_LIMIT) the instant it opens, even though the Events tab
+// almost always already has that exact result in memory. The Events tab
+// writes into this on every one of ITS OWN successful real fetches (see
+// (tabs)/events.tsx's own loadForYou/loadFollowing) — a real load, an
+// explicit retry, AND a silent revalidate alike — so this always reflects
+// exactly what the tab itself most recently, successfully saw. The
+// Section screen reads it FIRST and only falls back to a real fetch of
+// its own on a miss/stale entry, in which case it ALSO writes back here
+// (so a second "Show more" tap for a different rail in the same visit
+// benefits too, even if the Events tab itself was never revisited).
+//
+// Deliberately NOT built by wrapping fetchDiscoverySections/
+// fetchFollowingDiscoverySections themselves in a cache the way Phase 2
+// wrapped fetchPublicProfile: those two functions are also exactly what
+// the Events tab's OWN silent-revalidate calls on every refocus (see
+// events.tsx's own stale-while-revalidate doc comment) — if a cache lived
+// INSIDE them, that revalidate could itself become a same-TTL cache hit
+// and silently do nothing, masking real staleness (e.g. right after
+// creating a new event) on the Events tab itself, not just on the Section
+// screen. This handoff cache is intentionally external to both functions
+// and much shorter-lived than Phase 2's own 45-60s convention, so it only
+// ever serves the "the tab JUST fetched this, and Show more was tapped
+// moments later" case — never a stand-in for the tab's own revalidation
+// policy, which keeps calling the real functions directly, completely
+// unchanged by this cache's existence.
+// ---------------------------------------------------------------------------
+
+const SECTION_HANDOFF_TTL_MS = 20_000;
+const forYouSectionsHandoff = new Map<string, { sections: DiscoverySections; fetchedAt: number }>();
+const followingSectionsHandoff = new Map<string, { result: FollowingDiscoverySections; fetchedAt: number }>();
+
+function forYouHandoffKey(scope: BrowseScope, limitCount: number): string {
+  return `${browseScopeKey(scope)}:${limitCount}`;
+}
+function followingHandoffKey(uid: string, scope: BrowseScope, limitCount: number): string {
+  return `${uid}:${browseScopeKey(scope)}:${limitCount}`;
+}
+
+/**
+ * A fresh-enough peek at the Events tab's own most recent successful
+ * fetchDiscoverySections result for this exact (scope, limitCount) —
+ * `undefined` on a miss or a stale entry, in which case the caller (only
+ * ever the "Show more" screen — the Events tab itself never reads this
+ * back) should fall back to a real fetchDiscoverySections call, then call
+ * setForYouSectionsHandoff with its result.
+ */
+export function peekForYouSectionsHandoff(scope: BrowseScope, limitCount: number): DiscoverySections | undefined {
+  const entry = forYouSectionsHandoff.get(forYouHandoffKey(scope, limitCount));
+  if (!entry || Date.now() - entry.fetchedAt >= SECTION_HANDOFF_TTL_MS) return undefined;
+  return entry.sections;
+}
+
+/** Same as peekForYouSectionsHandoff, Following-scoped (also keyed by uid — see followingHandoffKey). */
+export function peekFollowingSectionsHandoff(uid: string, scope: BrowseScope, limitCount: number): FollowingDiscoverySections | undefined {
+  const entry = followingSectionsHandoff.get(followingHandoffKey(uid, scope, limitCount));
+  if (!entry || Date.now() - entry.fetchedAt >= SECTION_HANDOFF_TTL_MS) return undefined;
+  return entry.result;
+}
+
+/** Called by both the Events tab (after every real fetchDiscoverySections) and the "Show more" screen (after its own, on a miss) — see this cache's own doc comment above. */
+export function setForYouSectionsHandoff(scope: BrowseScope, limitCount: number, sections: DiscoverySections): void {
+  forYouSectionsHandoff.set(forYouHandoffKey(scope, limitCount), { sections, fetchedAt: Date.now() });
+}
+
+/** Same as setForYouSectionsHandoff, Following-scoped. */
+export function setFollowingSectionsHandoff(uid: string, scope: BrowseScope, limitCount: number, result: FollowingDiscoverySections): void {
+  followingSectionsHandoff.set(followingHandoffKey(uid, scope, limitCount), { result, fetchedAt: Date.now() });
+}
+
+// ---------------------------------------------------------------------------
+// Swipe-to-next-Event handoff — a small in-memory peek, same shape and
+// same reasoning as the Sections handoff just above (an in-memory,
+// short-TTL, "the caller already has this exact list in hand" pass-
+// through — never a URL param, since Content items carry Firestore
+// Timestamp fields that don't survive URL serialization, same note
+// events/section.tsx's own doc comment already makes). Written by any
+// screen whose own already-loaded, already-fetched EventContent list is
+// what a swipe-through should page through right before it navigates
+// into one of its own items — today that's Profile's own Live/Upcoming/
+// Past Events tabs and the Events tab's own rails (see their own call
+// sites) — and read once by content/[contentId].tsx on mount to decide
+// whether to show a plain single Event (a share link, search result, or
+// any other entry point that never wrote this) or a full swipeable feed
+// through this exact list. A stale/missing entry, or one that doesn't
+// actually contain the Event just navigated to, always falls back to the
+// single-Event behavior — never a crash, never the wrong list.
+const EVENT_FEED_HANDOFF_TTL_MS = 20_000;
+let eventFeedHandoff: { events: EventContent[]; fetchedAt: number } | null = null;
+
+/** Call right before navigating into one of `events`' own items — see this handoff's own doc comment above. */
+export function setEventFeedHandoff(events: EventContent[]): void {
+  eventFeedHandoff = { events, fetchedAt: Date.now() };
+}
+
+/** `undefined` on a miss or a stale entry — see this handoff's own doc comment above for what the caller should do then (fall back to a single Event). */
+export function peekEventFeedHandoff(): EventContent[] | undefined {
+  if (!eventFeedHandoff || Date.now() - eventFeedHandoff.fetchedAt >= EVENT_FEED_HANDOFF_TTL_MS) return undefined;
+  return eventFeedHandoff.events;
 }
 
 /**

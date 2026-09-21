@@ -366,12 +366,49 @@ async function deleteOwnContent(db: Firestore, uid: string): Promise<{ deleted: 
 // removeReportedReel's storage-retry branch.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Hashtag counts — the DECREMENT half of the hashtag foundation (see
+// src/services/hashtags.ts for the increment half, which runs client-side
+// at publish time, and src/types/hashtag.ts for the collection shape).
+// Decrementing is deliberately NEVER a client-writable operation at all —
+// firestore.rules' `match /hashtags/{hashtagId}` only ever allows a
+// client to CREATE a hashtag doc or INCREMENT an existing one by exactly
+// 1; this Admin-SDK path (bypassing those Rules entirely) is the only way
+// postCount ever goes down. A transaction per hashtag (read current
+// value, floor the decrement at 0, write it back) rather than a bare
+// negative increment — same reasoning src/services/hashtags.ts's own
+// incrementHashtagCounts doc comment gives for using a transaction over a
+// FieldValue sentinel, plus the explicit "never below 0" requirement a
+// plain increment(-1) can't enforce by itself. A hashtag doc that's
+// somehow already missing (shouldn't happen — every hashtag here was
+// necessarily incremented into existence at publish time) is silently
+// skipped rather than treated as an error, matching this file's own
+// "missing document = already handled" idempotency convention.
+// ---------------------------------------------------------------------------
+
+async function decrementHashtagCounts(db: Firestore, hashtags: string[]): Promise<void> {
+  for (const name of hashtags) {
+    const ref = db.doc(`hashtags/${name}`);
+    await db.runTransaction(async (tx) => {
+      const snap = await tx.get(ref);
+      if (!snap.exists) return;
+      const current = typeof snap.data()?.postCount === 'number' ? (snap.data()!.postCount as number) : 0;
+      tx.update(ref, { postCount: Math.max(0, current - 1), updatedAt: FieldValue.serverTimestamp() });
+    });
+  }
+}
+
 async function deleteReelDocumentAndSubcollections(
   db: Firestore,
   bucket: ReturnType<ReturnType<typeof getStorage>['bucket']>,
   reelId: string,
   storagePath: string | undefined,
-  receivedPostLikesPolicy: ReceivedPostLikesPolicy
+  receivedPostLikesPolicy: ReceivedPostLikesPolicy,
+  // Only ever the Reel's own `hashtags` (or [] for one that was never
+  // published — see this parameter's callers) — a draft that never
+  // published never incremented these counts in the first place, so
+  // there's nothing to undo for it.
+  hashtagsToDecrement: string[]
 ): Promise<{ storageDeleted: boolean }> {
   // Step 41.2H.2 — every Reel is inherently a social Post (no Event/
   // Activity equivalent exists for Reels), so this paired cleanup runs
@@ -389,6 +426,10 @@ async function deleteReelDocumentAndSubcollections(
   // cleanup above — a compound-equality query, no composite index, bounded
   // to exactly the reposts of this one Reel.
   await drainQuery(db, () => db.collection('reposts').where('targetType', '==', 'reel').where('targetId', '==', reelId));
+
+  if (hashtagsToDecrement.length > 0) {
+    await decrementHashtagCounts(db, hashtagsToDecrement);
+  }
 
   let storageDeleted = false;
   if (storagePath) {
@@ -415,10 +456,15 @@ async function deleteOwnReels(
     const snap = await db.collection('reels').where('authorUid', '==', uid).limit(OWNED_DOC_PAGE_SIZE).get();
     if (snap.empty) break;
     for (const docSnap of snap.docs) {
-      const storagePath = docSnap.data()?.storagePath as string | undefined;
+      const reelData = docSnap.data();
+      const storagePath = reelData?.storagePath as string | undefined;
+      // Only a published Reel ever incremented these — see
+      // deleteReelDocumentAndSubcollections' own `hashtagsToDecrement`
+      // doc comment.
+      const hashtagsToDecrement = reelData?.status === 'published' ? ((reelData?.hashtags as string[] | undefined) ?? []) : [];
       // Step 41.2H.2.1 — same reasoning as deleteOwnContent's own call
       // site: the author's account is going away entirely.
-      const result = await deleteReelDocumentAndSubcollections(db, bucket, docSnap.id, storagePath, 'remove');
+      const result = await deleteReelDocumentAndSubcollections(db, bucket, docSnap.id, storagePath, 'remove', hashtagsToDecrement);
       if (storagePath) {
         if (result.storageDeleted) storageDeleted += 1;
         else storageAlreadyMissing += 1;
@@ -976,10 +1022,15 @@ export const removeReportedReel = onCall({ region: REGION, timeoutSeconds: 300, 
   const targetAlreadyMissing = !reelSnap.exists;
 
   if (reelSnap.exists) {
-    const storagePath = reelSnap.data()?.storagePath as string | undefined;
+    const reelData = reelSnap.data();
+    const storagePath = reelData?.storagePath as string | undefined;
+    // Only a published Reel ever incremented these — see
+    // deleteReelDocumentAndSubcollections' own `hashtagsToDecrement` doc
+    // comment.
+    const hashtagsToDecrement = reelData?.status === 'published' ? ((reelData?.hashtags as string[] | undefined) ?? []) : [];
     // Step 41.2H.2.1 — moderation removal never earned legitimate
     // reputation credit to begin with.
-    await deleteReelDocumentAndSubcollections(db, bucket, reelId, storagePath, 'remove');
+    await deleteReelDocumentAndSubcollections(db, bucket, reelId, storagePath, 'remove', hashtagsToDecrement);
   } else {
     const inferredStoragePath = `reels/${reportedAuthorUid}/${reelId}/source`;
     await bucket.file(inferredStoragePath).delete({ ignoreNotFound: true });
@@ -1286,11 +1337,15 @@ export const deleteMyReel = onCall({ region: REGION, timeoutSeconds: 300, memory
 
   const bucket = getStorage().bucket();
   const storagePath = reel.storagePath as string | undefined;
+  // Only a published Reel ever incremented these — see
+  // deleteReelDocumentAndSubcollections' own `hashtagsToDecrement` doc
+  // comment.
+  const hashtagsToDecrement = reel.status === 'published' ? ((reel.hashtags as string[] | undefined) ?? []) : [];
 
   await drainNotificationsByField(db, 'reelId', reelId);
   // Step 41.2H.2.1 — voluntary author self-delete: same reasoning as
   // deleteMyContent above — received postLikes survive.
-  await deleteReelDocumentAndSubcollections(db, bucket, reelId, storagePath, 'preserve');
+  await deleteReelDocumentAndSubcollections(db, bucket, reelId, storagePath, 'preserve', hashtagsToDecrement);
 
   return { reelId, deleted: true as const };
 });
@@ -1880,3 +1935,9 @@ export * from './collaborative';
 // file for the same reason as engagementStats.ts.
 // ---------------------------------------------------------------------------
 export * from './metrics';
+
+// ---------------------------------------------------------------------------
+// Trending Hashtags by City and Time Window — own file for the same
+// reason as engagementStats.ts.
+// ---------------------------------------------------------------------------
+export * from './hashtagTrends';

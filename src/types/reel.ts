@@ -11,7 +11,8 @@ export type ReelStatus = 'uploading' | 'published';
 /** Only "city" exists in this MVP — same as content visibility. */
 export type ReelVisibility = 'city';
 
-export const REEL_CAPTION_MAX_LENGTH = 500;
+/** Also enforced server-side — see isValidReelCreate's `data.caption.size() <= 5000` in firestore.rules, which must be kept in sync with this. */
+export const REEL_CAPTION_MAX_LENGTH = 5000;
 
 /** Hard Storage-enforced cap on uploaded file size. */
 export const REEL_MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024;
@@ -129,6 +130,22 @@ export type Reel = {
   cityKey: string;
   categoryId: string;
   caption: string;
+  /**
+   * Every "#token" found in `caption` at creation time — normalized
+   * lowercase, deduplicated, never re-derived later (see
+   * src/utils/hashtags.ts's extractHashtags and src/services/reels.ts's
+   * createReelDraft, the only place this is ever computed). `caption`
+   * itself is always stored exactly as the author typed it; this is a
+   * separate, derived field purely for lookup/counting — never the
+   * source of truth for what the caption says.
+   *
+   * Always `[]` on a legacy Reel published before this field existed —
+   * see normalizeReel. Immutable after creation, same as `caption` itself
+   * (there is no caption-editing flow — see isValidReelPublish in
+   * firestore.rules, which requires `hashtags` stay byte-identical
+   * through publish).
+   */
+  hashtags: string[];
   mediaType: ReelMediaType;
   /**
    * True ONLY during the brief window between a "FOTO"-mode-with-music
@@ -337,17 +354,21 @@ export type SelectedReelVideo = {
 };
 
 /**
- * UI/runtime-only state for a "FOTO" mode photo the user has captured but
- * not yet published — the mediaType == 'photo' counterpart to
- * SelectedReelVideo above, with no `durationMs` (a photo has none) and no
- * `source` (always the camera — there is no library-photo picker for
- * Posts). `expo-camera`'s `takePictureAsync()` returns width/height/uri
- * directly (unlike `recordAsync()`, nothing here needs a post-capture
- * probe), so every field besides `mimeType` — which the camera doesn't
- * report at all — is non-null from the moment a photo is taken.
+ * UI/runtime-only state for a "FOTO" mode photo the user has captured or
+ * picked but not yet published — the mediaType == 'photo' counterpart to
+ * SelectedReelVideo above, with no `durationMs` (a photo has none).
+ * `source` mirrors SelectedReelVideo's own — the Library "Choose from
+ * library" button can hand back either a video OR a photo (expo-image-
+ * picker's `mediaTypes: ['images', 'videos']`), so a photo is no longer
+ * camera-only. `expo-camera`'s `takePictureAsync()` returns width/height/
+ * uri directly (unlike `recordAsync()`, nothing here needs a post-capture
+ * probe) — every field besides `mimeType`, which the camera doesn't
+ * report at all, is non-null from the moment a photo is taken; a library
+ * pick already reports all of these directly, same as a library video.
  */
 export type SelectedReelPhoto = {
   uri: string;
+  source: 'camera' | 'library';
   fileSizeBytes: number | null;
   width: number | null;
   height: number | null;

@@ -7,6 +7,7 @@ import { VideoView, useVideoPlayer } from 'expo-video';
 
 import { AuthorLink } from '@/components/AuthorLink';
 import { Avatar } from '@/components/Avatar';
+import { HighlightedText } from '@/components/HighlightedText';
 import { ReelCommentsSheet } from '@/components/ReelCommentsSheet';
 import { SoundSheet } from '@/components/SoundSheet';
 import { Colors, Radius, Spacing } from '@/constants/theme';
@@ -524,6 +525,7 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
       creatorId: reel.authorUid,
       cityKey: reel.cityKey,
       countryCode: reel.countryCode,
+      hashtags: reel.hashtags,
       attribution,
       feedSessionId,
     }).catch(() => {});
@@ -543,6 +545,7 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
           creatorId: reel.authorUid,
           cityKey: reel.cityKey,
           countryCode: reel.countryCode,
+          hashtags: reel.hashtags,
           watchDurationMs: dwellMs,
           videoDurationMs: durationMs,
           attribution,
@@ -579,6 +582,7 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
         creatorId: reel.authorUid,
         cityKey: reel.cityKey,
         countryCode: reel.countryCode,
+        hashtags: reel.hashtags,
         watchDurationMs: maxWatchedMsRef.current,
         videoDurationMs,
         isRewatch: playToEndRef.current >= 2,
@@ -692,6 +696,7 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
         creatorId: reel.authorUid,
         cityKey: reel.cityKey,
         countryCode: reel.countryCode,
+        hashtags: reel.hashtags,
         attribution,
         feedSessionId,
       }).catch(() => {});
@@ -915,7 +920,10 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
           <Text style={styles.authorName}>{reel.authorDisplayName}</Text>
         </AuthorLink>
 
-        {reel.caption ? <Text style={styles.caption}>{reel.caption}</Text> : null}
+        {/* TEMP-VERIFY-ONLY: appending a test hashtag for a live rendering smoke test — reverting immediately after. */}
+        {reel.caption ? (
+          <HighlightedText text={`${reel.caption} #liveTest`} style={styles.caption} hashtagStyle={styles.captionHashtag} />
+        ) : null}
 
         {categoryLabel ? (
           <View style={styles.categoryChip}>
@@ -1048,6 +1056,10 @@ const styles = StyleSheet.create({
     color: Colors.text,
     fontSize: 14,
     lineHeight: 20,
+  },
+  captionHashtag: {
+    color: Colors.accent,
+    fontWeight: '700',
   },
   categoryChip: {
     alignSelf: 'flex-start',

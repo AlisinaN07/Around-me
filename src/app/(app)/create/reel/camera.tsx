@@ -53,6 +53,7 @@ import {
 import { createStoryDraft, discardStoryDraft, publishStory, uploadStoryMedia, type UploadStoryMediaHandle } from '@/services/stories';
 import {
   REEL_MAX_DURATION_MS,
+  REEL_PHOTO_MAX_FILE_SIZE_BYTES,
   type ReelMediaType,
   type SelectedReelMusic,
   type SelectedReelPhoto,
@@ -571,6 +572,7 @@ export default function CreateReelCameraScreen() {
       }
       setPhoto({
         uri: result.uri,
+        source: 'camera',
         fileSizeBytes: new File(result.uri).size || null,
         width: result.width || null,
         height: result.height || null,
@@ -615,25 +617,64 @@ export default function CreateReelCameraScreen() {
     // A library-picked video already has its own audio track — music is
     // only ever meaningful for a fresh camera recording (see `music`'s own
     // doc comment above), so any prior pick is cleared here rather than
-    // left as confusing latent state.
+    // left as confusing latent state. A library-picked PHOTO never had
+    // music to begin with, so this is harmless there too.
     setMusic(null);
-    // Requested only when the user explicitly chooses a video — never on
-    // screen mount (see the Step 18 spec's minimum-permissions rule).
+    // Requested only when the user explicitly chooses something from their
+    // library — never on screen mount (see the Step 18 spec's minimum-
+    // permissions rule).
     const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
     if (!permission.granted) {
-      setError('Around Me needs access to your photo library to choose a video.');
+      setError('Around Me needs access to your photo library to choose a photo or video.');
       return;
     }
 
+    // Per explicit request: the library picker offers BOTH photos and
+    // videos (previously videos only) — matching what "FOTO" mode's own
+    // camera capture already lets a user post (a single still, see
+    // handleTakePicture above). Whichever the user actually picks decides
+    // which branch below runs; there's no separate UI for choosing a type
+    // up front, same as the system picker itself doesn't ask.
     const result = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: ['videos'],
+      mediaTypes: ['images', 'videos'],
       quality: 1,
     });
     if (result.canceled || result.assets.length === 0) return;
 
     const asset = result.assets[0];
-    if (asset.type && asset.type !== 'video') {
-      setError('Choose a video, not a photo.');
+
+    if (asset.type === 'image') {
+      const candidate: SelectedReelPhoto = {
+        uri: asset.uri,
+        source: 'library',
+        fileSizeBytes: asset.fileSize && asset.fileSize > 0 ? asset.fileSize : null,
+        width: asset.width || null,
+        height: asset.height || null,
+        mimeType: asset.mimeType ?? null,
+      };
+      // Same fields/limits reels.ts's own createReelDraft independently
+      // re-validates server-side (see REEL_PHOTO_MAX_FILE_SIZE_BYTES) —
+      // this just rejects an unusable pick before ever attempting an
+      // upload, the same role validateSelectedReelVideo plays for a
+      // library video just below.
+      if (!candidate.mimeType || !candidate.mimeType.startsWith('image/')) {
+        setError('That file type is not a supported photo.');
+        return;
+      }
+      if (candidate.fileSizeBytes === null || candidate.fileSizeBytes <= 0) {
+        setError("Couldn't determine this photo's file size — try a different photo.");
+        return;
+      }
+      if (candidate.fileSizeBytes > REEL_PHOTO_MAX_FILE_SIZE_BYTES) {
+        setError('Photo must be under 10 MB.');
+        return;
+      }
+      if (!candidate.width || !candidate.height) {
+        setError("Couldn't read this photo's dimensions — try a different photo.");
+        return;
+      }
+      setPhoto(candidate);
+      setStage('preview');
       return;
     }
 
@@ -911,7 +952,12 @@ export default function CreateReelCameraScreen() {
           <View style={styles.previewBottomRow}>
             <Pressable style={styles.retakeButton} onPress={handleRetake} accessibilityRole="button">
               <Ionicons name="refresh" size={16} color={Colors.text} />
-              <Text style={styles.retakeText}>{photo || video?.source === 'camera' ? 'Retake' : 'Choose another'}</Text>
+              <Text style={styles.retakeText}>
+                {/* A camera-shot photo/video says "Retake" (you can shoot
+                    it again); a library pick — photo or video — says
+                    "Choose another" instead. */}
+                {photo?.source === 'camera' || video?.source === 'camera' ? 'Retake' : 'Choose another'}
+              </Text>
             </Pressable>
             <View style={styles.previewActionsRight}>
               {/* Publishes this exact video/photo directly as an ephemeral
@@ -965,8 +1011,12 @@ export default function CreateReelCameraScreen() {
           </Pressable>
         </View>
         <View style={styles.centered}>
-          <Ionicons name="videocam-outline" size={40} color={Colors.textSecondary} />
-          <Text style={styles.deniedTitle}>Choose a video to share.</Text>
+          {/* "images-outline" (not "videocam-outline") — the same generic
+              library icon the native capture screen's own Library button
+              uses below — since this button now accepts either a photo or
+              a video, per explicit request. */}
+          <Ionicons name="images-outline" size={40} color={Colors.textSecondary} />
+          <Text style={styles.deniedTitle}>Choose a photo or video to share.</Text>
           {error ? <Text style={styles.errorText}>{error}</Text> : null}
           <View style={styles.deniedActions}>
             <Button label="Choose from library" onPress={handleChooseFromLibrary} />

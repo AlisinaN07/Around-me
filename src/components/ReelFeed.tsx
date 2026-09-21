@@ -266,6 +266,7 @@ export function ReelFeed({
         creatorId: reel.authorUid,
         cityKey: reel.cityKey,
         countryCode: reel.countryCode,
+        hashtags: reel.hashtags,
         attribution: attributionByReelId?.[reel.reelId],
         feedSessionId,
       }).catch(() => {});

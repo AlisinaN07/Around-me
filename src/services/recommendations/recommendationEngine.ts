@@ -27,6 +27,7 @@ import { getCachedCollaborativeProfile } from './collaborative';
 import { applyDiversity } from './diversity';
 import { generateReelCandidates } from './candidateGenerator';
 import { fetchEngagementStatsBatch } from './engagementStats';
+import { getCachedHashtagInterestMap } from './hashtagInterestCache';
 import { getCachedInterestProfile } from './profileCache';
 import { FOR_YOU_PAGE_SIZE, RANKING_CONFIG_VERSION, SECONDARY_CITY_EVENT_SECTION_LIMIT, SESSION_JITTER_WEIGHT } from './recommendationConfig';
 import { computeItemScore, hashToUnitInterval, normalizeCityAffinity, pickSecondaryCity, scoreExploration, type ScoreResult } from './ranking';
@@ -112,8 +113,6 @@ export type GetForYouReelsInput = {
 
 export type ForYouReelsPage = {
   reels: RankedItem<Reel>[];
-  /** True when the candidate pool needed to widen beyond the active scope (Step 8) to have enough content. */
-  widenedScope: boolean;
   /** Recommendation Engine — Step 6, Step 21 — coarse phase timings for THIS call, in ms. Cheap (a handful of Date.now() calls, no extra I/O) and always populated — "we need to know if intelligence makes the feed slow" without needing a separate profiling pass. DEVELOPMENT/observability only; never affects ranking (Step 29). */
   latencyMs: { profileAndCollaborativeRead: number; candidateGeneration: number; scoringAndDiversity: number; statsRead: number; total: number };
 };
@@ -137,9 +136,16 @@ export async function getForYouReels(input: GetForYouReelsInput): Promise<ForYou
   // candidate-generation dependency (unlike the profile above), so it's
   // fetched in parallel with candidate generation rather than blocking it.
   const afterProfileAt = Date.now();
-  const [candidatePool, collaborativeProfile] = await Promise.all([
+  // For You ranking integration — the caller's own top hashtag interests,
+  // loaded ONCE per batch (see hashtagInterestCache.ts) alongside the
+  // collaborative profile — neither has a candidate-generation dependency
+  // (unlike `profile` above), so both fetch in parallel with it. Reused
+  // as-is for every candidate scored below; never refetched per page
+  // within this cache's TTL, never refetched per candidate at all.
+  const [candidatePool, collaborativeProfile, hashtagInterests] = await Promise.all([
     generateReelCandidates(input.uid, input.scope, input.homeCountryCode, input.excludeReelIds, normalizedCityAffinity),
     getCachedCollaborativeProfile(input.uid),
+    getCachedHashtagInterestMap(input.uid),
   ]);
   const afterCandidatesAt = Date.now();
 
@@ -148,7 +154,6 @@ export async function getForYouReels(input: GetForYouReelsInput): Promise<ForYou
   if (eligible.length === 0) {
     return {
       reels: [],
-      widenedScope: candidatePool.widened,
       latencyMs: {
         profileAndCollaborativeRead: afterProfileAt - startedAt,
         candidateGeneration: afterCandidatesAt - afterProfileAt,
@@ -177,6 +182,8 @@ export async function getForYouReels(input: GetForYouReelsInput): Promise<ForYou
         commentCount: 0,
         collaborativeProfile,
         exposure: exposureContextFor(profile, reel.reelId),
+        reelHashtags: reel.hashtags,
+        hashtagInterests,
       },
       profile,
       input.scope,
@@ -221,6 +228,8 @@ export async function getForYouReels(input: GetForYouReelsInput): Promise<ForYou
         videoDurationMs: entry.item.durationMs,
         collaborativeProfile,
         exposure: exposureContextFor(profile, entry.item.reelId),
+        reelHashtags: entry.item.hashtags,
+        hashtagInterests,
       },
       profile,
       input.scope,
@@ -259,7 +268,6 @@ export async function getForYouReels(input: GetForYouReelsInput): Promise<ForYou
 
   return {
     reels: page,
-    widenedScope: candidatePool.widened,
     latencyMs: {
       profileAndCollaborativeRead: afterProfileAt - startedAt,
       candidateGeneration: afterCandidatesAt - afterProfileAt,

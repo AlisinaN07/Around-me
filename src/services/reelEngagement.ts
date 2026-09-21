@@ -48,6 +48,7 @@ function trackReelSignal(uid: string, reel: Reel, action: 'like' | 'unlike' | 'c
     creatorId: reel.authorUid,
     cityKey: reel.cityKey,
     countryCode: reel.countryCode,
+    hashtags: reel.hashtags,
   }).catch(() => {});
 }
 

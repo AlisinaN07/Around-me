@@ -16,7 +16,14 @@ import { Colors, Layout, Radius, Spacing, Typography } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
 import { useProfile } from '@/hooks/useProfile';
 import { useCity } from '@/providers/CityProvider';
-import { fetchDiscoverySections, fetchFollowingDiscoverySections, type DiscoverySections } from '@/services/content';
+import {
+  fetchDiscoverySections,
+  fetchFollowingDiscoverySections,
+  setForYouSectionsHandoff,
+  setFollowingSectionsHandoff,
+  setEventFeedHandoff,
+  type DiscoverySections,
+} from '@/services/content';
 import { rankEventSections } from '@/services/recommendations/recommendationEngine';
 import { browseScopeKey } from '@/types/browseScope';
 import type { ActivityContent, EventContent } from '@/types/content';
@@ -127,6 +134,15 @@ export default function EventsScreen() {
       }
       try {
         const result = await fetchDiscoverySections(activeScope, SECTION_LIMIT);
+        // Phase 4 perf pass — hands this exact (unranked) result to the
+        // "Show more" screen (src/app/(app)/events/section.tsx), which
+        // otherwise re-runs this identical query the instant it opens —
+        // see setForYouSectionsHandoff's own doc comment in content.ts.
+        // Written on every real load AND every silent revalidate alike
+        // (this line runs regardless of `silent`), so this handoff never
+        // goes stale relative to whatever the Events tab itself most
+        // recently, successfully saw.
+        setForYouSectionsHandoff(activeScope, SECTION_LIMIT, result);
         // Reorders each existing time-based section by relevance (interest/
         // location/event-time/creator-affinity/freshness) — see
         // rankEventSections' own doc comment for why this keeps Events'
@@ -173,6 +189,8 @@ export default function EventsScreen() {
       }
       try {
         const result = await fetchFollowingDiscoverySections(user.uid, activeScope, SECTION_LIMIT);
+        // Phase 4 perf pass — same handoff as loadForYou's own, above.
+        setFollowingSectionsHandoff(user.uid, activeScope, SECTION_LIMIT, result);
         setFollowingSections(result.sections);
         setFollowsAnyone(result.followsAnyone);
         setFollowingStatus('loaded');
@@ -267,28 +285,42 @@ export default function EventsScreen() {
   const thisWeekend = weekendSplit.thisWeekend;
   const comingUp = weekendSplit.comingUp;
 
+  // Shared by the image-prefetch and swipe-to-next-Event handoff effects
+  // just below — EXACTLY the cards these four rails render on screen
+  // right now, in the same top-to-bottom order they're actually shown
+  // (each hero rail's own .slice(0, SECTION_COLLAPSED_LIMIT), same slice
+  // the JSX below uses; This Weekend's own grid is never collapsed, so
+  // its full array is "already fetched and visible" as-is), Events only
+  // — never the rest of a SECTION_LIMIT-sized section sitting behind
+  // "Show more", which neither effect below should touch.
+  const visibleEvents = useMemo(
+    () =>
+      [
+        ...happeningNow.slice(0, SECTION_COLLAPSED_LIMIT),
+        ...today.slice(0, SECTION_COLLAPSED_LIMIT),
+        ...thisWeekend,
+        ...comingUp.slice(0, SECTION_COLLAPSED_LIMIT),
+      ].filter((item): item is EventContent => item.type === 'event'),
+    [happeningNow, today, thisWeekend, comingUp]
+  );
+
   // Phase 3 perf pass — coverPhotoURL is already a resolved HTTPS URL
   // straight off each EventContent document (never a Storage path
   // needing its own resolve step, unlike a Reel's thumbnailStoragePath),
   // so this only ever prefetches bytes for a URL already in hand — never
-  // an extra Firestore/Storage read. Scoped to EXACTLY the cards these
-  // four rails already render on screen right now (each hero rail's own
-  // .slice(0, SECTION_COLLAPSED_LIMIT), same slice the JSX below uses;
-  // This Weekend's own grid is never collapsed, so its full array is
-  // "already fetched and visible" as-is) — never the rest of a
-  // SECTION_LIMIT-sized section sitting behind "Show more", which stays
-  // unfetched-for-images until that screen is actually opened.
+  // an extra Firestore/Storage read.
   useEffect(() => {
-    const visibleEvents = [
-      ...happeningNow.slice(0, SECTION_COLLAPSED_LIMIT),
-      ...today.slice(0, SECTION_COLLAPSED_LIMIT),
-      ...thisWeekend,
-      ...comingUp.slice(0, SECTION_COLLAPSED_LIMIT),
-    ];
-    for (const item of visibleEvents) {
-      if (item.type === 'event') prefetchImageOnce(item.coverPhotoURL);
-    }
-  }, [happeningNow, today, thisWeekend, comingUp]);
+    for (const item of visibleEvents) prefetchImageOnce(item.coverPhotoURL);
+  }, [visibleEvents]);
+
+  // Swipe-to-next-Event — hands this exact, currently-visible list to
+  // whichever Event the user taps next (see peekEventFeedHandoff's own
+  // doc comment in content.ts), so opening one from this tab lets them
+  // swipe through the rest of what's shown here instead of only ever
+  // seeing the one they tapped.
+  useEffect(() => {
+    setEventFeedHandoff(visibleEvents);
+  }, [visibleEvents]);
 
   const totalRealItems = sections ? sections.happeningNow.length + sections.today.length + sections.upcoming.length : 0;
   const totalFilteredItems = happeningNow.length + today.length + upcomingAll.length;

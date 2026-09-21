@@ -469,10 +469,49 @@ export async function resolveStoryPlaybackUrl(storagePath: string): Promise<stri
 // privacy model real Stories features use.
 // ---------------------------------------------------------------------------
 
+// Phase 4 perf pass — hasViewedStory backs the seen/unseen ring in BOTH
+// Inbox's FollowingAvatarRow AND ReelFeedItem's own story ring, each
+// calling it independently once per (story, viewer) pair with no sharing
+// at all — several Reels by the SAME author in one feed each ran their
+// own identical set of checks, and Inbox re-ran its own set on every
+// silent revalidate too. Keyed by `${storyId}:${viewerUid}` — inherently
+// account-safe (a view relationship only ever exists for the one viewer
+// who created it, same pair-key reasoning as isFollowing in
+// following.ts) and deliberately its OWN small cache, never merged into
+// activeStoriesCache above: that one is author-keyed and viewer-agnostic
+// (the same fact for everyone), this one is the opposite — mixing them
+// would leak one viewer's own watch history into a fact meant to be
+// shared, or vice versa.
+//
+// A CONFIRMED "viewed" (true) result is cached for the rest of this
+// session with NO expiry: Views are write-once/append-only (see this
+// section's own doc comment above) — a Story already seen can never
+// become unseen again, so caching that fact indefinitely carries zero
+// staleness risk. A "not yet viewed" (false) result gets a short TTL
+// instead, since the viewer might watch it any moment in this same
+// session — see markStoryViewed below, which writes `true` into this
+// cache directly the instant a real view is recorded (same "update, not
+// just invalidate" pattern as followUser/unfollowUser in following.ts),
+// so the short TTL is really only a safety net for a view recorded
+// through some OTHER path this cache doesn't see (there isn't one today).
+const HAS_VIEWED_STORY_FALSE_TTL_MS = 30_000;
+const hasViewedStoryCache = new Map<string, { viewed: boolean; cachedAt: number }>();
+// Dedupes concurrent lookups for the exact same (story, viewer) pair —
+// e.g. two Reels by the same author, both showing their story ring for
+// the first time in the same render pass — into one real read instead of
+// a race that fires it twice (the same class of bug Phase 3's own
+// thumbnail prefetch fix found and fixed in ReelFeed.tsx).
+const hasViewedStoryInFlight = new Map<string, Promise<boolean>>();
+
+function hasViewedStoryCacheKey(storyId: string, viewerUid: string): string {
+  return `${storyId}:${viewerUid}`;
+}
+
 export async function markStoryViewed(storyId: string, viewerUid: string): Promise<void> {
   if (!firestore) return;
   try {
     await setDoc(doc(firestore, STORIES_COLLECTION, storyId, 'views', viewerUid), { viewerUid, viewedAt: serverTimestamp() });
+    hasViewedStoryCache.set(hasViewedStoryCacheKey(storyId, viewerUid), { viewed: true, cachedAt: Date.now() });
   } catch {
     // Best-effort — a missed view mark is a minor cosmetic miss (the
     // author's view count undercounts by one), never a broken viewing
@@ -485,18 +524,35 @@ export async function markStoryViewed(storyId: string, viewerUid: string): Promi
  * seen/unseen ring color in FollowingAvatarRow (src/app/(app)/(tabs)/inbox.tsx)
  * is built from this, one call per Story currently shown in that row (a
  * small, bounded number — same read-cost shape as everything else in that
- * screen). Defaults to `false` (unseen) on any read failure — the honest
+ * screen), and ReelFeedItem's own story ring calls it the same way per
+ * Reel. Defaults to `false` (unseen) on any read failure — the honest
  * "don't know" case renders as if not yet watched, never a wrongly-gray
  * ring hiding new content.
  */
 export async function hasViewedStory(storyId: string, viewerUid: string): Promise<boolean> {
-  if (!firestore) return false;
-  try {
-    const snapshot = await getDoc(doc(firestore, STORIES_COLLECTION, storyId, 'views', viewerUid));
-    return snapshot.exists();
-  } catch {
-    return false;
+  const key = hasViewedStoryCacheKey(storyId, viewerUid);
+  const cached = hasViewedStoryCache.get(key);
+  if (cached && (cached.viewed || Date.now() - cached.cachedAt < HAS_VIEWED_STORY_FALSE_TTL_MS)) {
+    return cached.viewed;
   }
+  if (!firestore) return false;
+  const db = firestore;
+  const existing = hasViewedStoryInFlight.get(key);
+  if (existing) return existing;
+  const promise = (async () => {
+    try {
+      const snapshot = await getDoc(doc(db, STORIES_COLLECTION, storyId, 'views', viewerUid));
+      const viewed = snapshot.exists();
+      hasViewedStoryCache.set(key, { viewed, cachedAt: Date.now() });
+      return viewed;
+    } catch {
+      return false;
+    } finally {
+      hasViewedStoryInFlight.delete(key);
+    }
+  })();
+  hasViewedStoryInFlight.set(key, promise);
+  return promise;
 }
 
 // ---------------------------------------------------------------------------

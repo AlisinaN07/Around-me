@@ -309,9 +309,9 @@ export default function PublicProfileScreen() {
         <View style={styles.container}>
           <ProfileHeader
             displayName={profile.displayName}
+            isBusiness={isBusiness}
             username={profile.username}
             cityLabel={cityLabel}
-            bio={profile.bio}
             photoURL={profile.photoURL}
             coverPhotoURL={profile.coverPhotoURL}
             coverEdgeInset={Spacing.xl}
@@ -370,6 +370,17 @@ export default function PublicProfileScreen() {
               {!canMessage ? <Text style={styles.messageHint}>This person isn&apos;t accepting new conversations right now.</Text> : null}
             </View>
           )}
+
+          {/* Moved here from ProfileHeader itself, below the Follow/
+              Message row (or the This-is-you/Blocked one) rather than
+              tucked right under the city — see ProfileHeader's own doc
+              comment, and the own-Profile tab's identical placement below
+              its own Edit profile button. */}
+          {profile.bio ? (
+            <Text style={styles.bio} numberOfLines={3}>
+              {profile.bio}
+            </Text>
+          ) : null}
 
           <InterestPills interestIds={profile.interests} />
 
@@ -495,6 +506,16 @@ const styles = StyleSheet.create({
     color: Colors.textSecondary,
     fontSize: 12,
     textAlign: 'center',
+  },
+  // Same exact style ProfileHeader's own bio Text used before it moved
+  // here — see this file's own call site for why.
+  bio: {
+    color: Colors.text,
+    fontSize: 13,
+    lineHeight: 18,
+    textAlign: 'center',
+    marginTop: Spacing.sm,
+    paddingHorizontal: Spacing.lg,
   },
   blockedRow: {
     flexDirection: 'row',

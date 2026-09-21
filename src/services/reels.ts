@@ -27,9 +27,12 @@ import {
   query,
   serverTimestamp,
   setDoc,
+  startAfter,
   updateDoc,
   where,
+  type DocumentData,
   type QueryConstraint,
+  type QueryDocumentSnapshot,
   type WithFieldValue,
 } from 'firebase/firestore';
 import { deleteObject, getDownloadURL, ref, uploadBytesResumable, type UploadTask } from 'firebase/storage';
@@ -37,6 +40,7 @@ import { httpsCallable } from 'firebase/functions';
 
 import { INTERESTS } from '@/constants/interests';
 import type { BrowseScope } from '@/types/browseScope';
+import { EMPTY_ENGAGEMENT_STATS } from '@/types/engagementStats';
 import {
   REEL_CAPTION_MAX_LENGTH,
   REEL_MAX_DURATION_MS,
@@ -53,6 +57,9 @@ import {
 import { fetchFollowingUids } from './following';
 import { firestore } from './firestore';
 import { functions } from './functions';
+import { extractHashtags, incrementHashtagCounts } from './hashtags';
+import { fetchEngagementStatsBatch } from './recommendations/engagementStats';
+import { scoreContentQuality } from './recommendations/ranking';
 import { storage } from './storage';
 import { fetchUserProfile } from './userProfile';
 
@@ -104,10 +111,41 @@ export function normalizeReel(data: Reel): Reel {
     ...data,
     mediaType: data.mediaType ?? 'video',
     needsPhotoVideoRender: data.needsPhotoVideoRender ?? false,
+    // A Reel published before hashtags existed simply has no such key at
+    // all — see Reel.hashtags' own doc comment.
+    hashtags: data.hashtags ?? [],
     musicHash: data.musicHash ?? '',
     soundOriginAuthorUid: data.soundOriginAuthorUid ?? '',
     soundOriginReelId: data.soundOriginReelId ?? '',
   };
+}
+
+// ---------------------------------------------------------------------------
+// Swipe-to-next-post handoff — mirrors setEventFeedHandoff/
+// peekEventFeedHandoff (src/services/content.ts) for Events, applied to
+// Reels: a screen that already has a real, ordered list of Reels in
+// memory (e.g. the hashtag page's own Top/Recent results) calls
+// setReelFeedHandoff right before navigating into one of them, so
+// src/app/(app)/reel/[reelId].tsx can swipe through that EXACT list
+// instead of falling back to its own author/sound-based lookup. Same
+// short TTL and "read once" semantics as the Event version — see
+// content.ts's own doc comment for the full reasoning (avoids
+// serializing Timestamp-bearing Reel objects through a URL param, and
+// avoids a duplicate Firestore read for a list the caller already has in
+// memory).
+// ---------------------------------------------------------------------------
+const REEL_FEED_HANDOFF_TTL_MS = 20_000;
+let reelFeedHandoff: { reels: Reel[]; fetchedAt: number } | null = null;
+
+/** Call right before navigating into one of `reels`' own items — see this handoff's own doc comment above. */
+export function setReelFeedHandoff(reels: Reel[]): void {
+  reelFeedHandoff = { reels, fetchedAt: Date.now() };
+}
+
+/** `undefined` on a miss or a stale entry — see this handoff's own doc comment above for what the caller should do then (fall back to the author/sound Reel list). */
+export function peekReelFeedHandoff(): Reel[] | undefined {
+  if (!reelFeedHandoff || Date.now() - reelFeedHandoff.fetchedAt >= REEL_FEED_HANDOFF_TTL_MS) return undefined;
+  return reelFeedHandoff.reels;
 }
 
 export async function fetchReel(reelId: string): Promise<Reel | null> {
@@ -220,6 +258,11 @@ export async function createReelDraft(input: CreateReelDraftInput): Promise<Crea
   if (caption.length > REEL_CAPTION_MAX_LENGTH) {
     return { ok: false, error: 'invalid-input', message: `Caption must be ${REEL_CAPTION_MAX_LENGTH} characters or fewer.` };
   }
+  // Computed once, here, from the exact caption this draft is about to
+  // store — never re-derived later (captions are immutable — see
+  // Reel.hashtags' own doc comment). `caption` itself is stored unchanged
+  // right below; this is a separate, derived field.
+  const hashtags = extractHashtags(caption);
   if (!isValidCategoryId(input.categoryId)) {
     return { ok: false, error: 'invalid-input', message: 'Choose a valid category.' };
   }
@@ -306,6 +349,7 @@ export async function createReelDraft(input: CreateReelDraftInput): Promise<Crea
     cityKey: profile.cityKey,
     categoryId: input.categoryId,
     caption,
+    hashtags,
     mediaType: input.mediaType,
     needsPhotoVideoRender: isPhotoPendingRender,
     storagePath: reelStoragePath(profile.uid, draftRef.id),
@@ -661,6 +705,20 @@ export async function publishReel(reelId: string): Promise<PublishReelResult> {
   if (!published) {
     return { ok: false, error: 'unknown', message: 'Post was published but could not be read back.' };
   }
+
+  // Best-effort — this Reel is already genuinely published at this point
+  // (the update above succeeded); a hashtag-count hiccup shouldn't turn a
+  // successful publish into a reported failure. See incrementHashtagCounts'
+  // own doc comment for why this is deliberately a separate transaction
+  // from the publish write itself.
+  try {
+    await incrementHashtagCounts(published.hashtags ?? []);
+  } catch {
+    if (__DEV__) {
+      console.warn(`[reels] Couldn't update hashtag counts for Reel "${reelId}" — publish itself still succeeded.`);
+    }
+  }
+
   return { ok: true, reel: published };
 }
 
@@ -928,6 +986,124 @@ export async function fetchReelsByMusicHash(musicHash: string, limitCount = DEFA
   );
   const snapshot = await getDocs(soundReelsQuery);
   return snapshot.docs.map((docSnapshot) => normalizeReel(docSnapshot.data() as Reel));
+}
+
+// ---------------------------------------------------------------------------
+// Hashtag page (Step: hashtag discovery) — Recent/Top. Live here, not in
+// src/services/hashtags.ts, for the same reason fetchReelsByMusicHash
+// above lives here rather than in a hypothetical "music service": both
+// are Reel QUERIES filtered by some other dimension a Reel carries, and
+// this file already owns every other Reel query. hashtags.ts owns the
+// hashtags/{hashtagId} COLLECTION itself (getHashtag/searchHashtags/
+// incrementHashtagCounts) and the pure text utilities — not Reel
+// querying. Importing normalizeReel/REELS_COLLECTION from hashtags.ts
+// instead (the other direction) would create a real import cycle, since
+// reels.ts already imports extractHashtags/incrementHashtagCounts FROM
+// hashtags.ts.
+// ---------------------------------------------------------------------------
+
+const HASHTAG_PAGE_SIZE = 15;
+// The bounded pool Top ranks locally within — see getTopPostsForHashtag's
+// own doc comment for why this is a single fetch, not a query per page.
+const HASHTAG_TOP_CANDIDATE_POOL_LIMIT = 60;
+
+export type HashtagRecentPage = {
+  items: Reel[];
+  /** Pass back as `options.cursor` to fetch the next page — `undefined` once there's nothing more to fetch (this page came back shorter than the requested limit). */
+  cursor: QueryDocumentSnapshot<DocumentData> | undefined;
+};
+
+/**
+ * Recent tab — every currently-published Reel carrying this exact
+ * (already-normalized) hashtag, newest-published-first, cursor-paginated
+ * exactly like a real Firestore "load more" (see HashtagRecentPage) —
+ * the first genuine cursor-paginated query in this codebase (every
+ * existing Reel query so far has been a single bounded page — see e.g.
+ * fetchReelsByMusicHash above), added because Recent specifically needs
+ * to keep going arbitrarily far back in time without ever re-fetching
+ * pages already seen.
+ *
+ * Ordered by `publishedAt`, not `createdAt` — matching every other Reel
+ * query in this file (fetchCityReels, fetchFollowingReels,
+ * fetchProfileReels, fetchReelsByMusicHash all order by `publishedAt`),
+ * since that's when a Reel actually became a real, visible post; an
+ * "uploading" draft's own `createdAt` could be long before it ever
+ * publishes, or it may never publish at all. Needs its own composite
+ * index (`hashtags` array-contains + `status` + `publishedAt` desc) — see
+ * firestore.indexes.json.
+ */
+export async function getRecentPostsForHashtag(
+  hashtag: string,
+  options: { limitCount?: number; cursor?: QueryDocumentSnapshot<DocumentData> } = {}
+): Promise<HashtagRecentPage> {
+  if (!firestore || !hashtag) return { items: [], cursor: undefined };
+  const limitCount = options.limitCount ?? HASHTAG_PAGE_SIZE;
+
+  const constraints = [
+    where('hashtags', 'array-contains', hashtag),
+    where('status', '==', 'published'),
+    orderBy('publishedAt', 'desc'),
+    ...(options.cursor ? [startAfter(options.cursor)] : []),
+    limit(limitCount),
+  ];
+  const snapshot = await getDocs(query(collection(firestore, REELS_COLLECTION), ...constraints));
+
+  return {
+    items: snapshot.docs.map((docSnapshot) => normalizeReel(docSnapshot.data() as Reel)),
+    // A page shorter than what was asked for is the standard "no more
+    // results" signal — never an extra read just to check.
+    cursor: snapshot.docs.length === limitCount ? snapshot.docs[snapshot.docs.length - 1] : undefined,
+  };
+}
+
+/**
+ * Top tab — per explicit design constraint, NOT a second Firestore query
+ * per page: a single bounded candidate pool (the
+ * HASHTAG_TOP_CANDIDATE_POOL_LIMIT most recently published Reels carrying
+ * this hashtag — the exact same query/index getRecentPostsForHashtag
+ * itself uses, just without a cursor) is fetched ONCE, its engagement
+ * stats are read in one batch (fetchEngagementStatsBatch — the same
+ * trusted `stats/engagement` reads the For You feed itself is built on,
+ * see src/types/engagementStats.ts), and every candidate is scored with
+ * the SAME scoreContentQuality the For You ranking pipeline already uses
+ * (src/services/recommendations/ranking.ts) — no separate/invented
+ * "hashtag ranking formula", no per-post extra reads beyond the one
+ * batch. The full ranked list is returned in one call; the caller (the
+ * hashtag screen) pages through it by slicing this already-computed
+ * array in memory — "Show more" reveals more of the SAME fetch, never a
+ * repeated download of the same underlying data.
+ *
+ * A Reel with no stats doc yet scores using EMPTY_ENGAGEMENT_STATS —
+ * scoreContentQuality's own design (Bayesian-shrunk toward a neutral
+ * prior) already treats that as "no data yet", never a penalty.
+ */
+export async function getTopPostsForHashtag(hashtag: string, poolLimit = HASHTAG_TOP_CANDIDATE_POOL_LIMIT): Promise<Reel[]> {
+  if (!firestore || !hashtag) return [];
+
+  const snapshot = await getDocs(
+    query(
+      collection(firestore, REELS_COLLECTION),
+      where('hashtags', 'array-contains', hashtag),
+      where('status', '==', 'published'),
+      orderBy('publishedAt', 'desc'),
+      limit(poolLimit)
+    )
+  );
+  const candidates = snapshot.docs.map((docSnapshot) => normalizeReel(docSnapshot.data() as Reel));
+  if (candidates.length === 0) return [];
+
+  const statsById = await fetchEngagementStatsBatch(
+    'reel',
+    candidates.map((reel) => reel.reelId)
+  );
+  const scored = candidates.map((reel) => ({
+    reel,
+    // hasVideo/videoDurationMs — same convention recommendationEngine.ts's
+    // own Reel scoring call already uses (`mediaType !== 'photo'`).
+    score: scoreContentQuality(statsById.get(reel.reelId) ?? EMPTY_ENGAGEMENT_STATS, reel.mediaType !== 'photo', reel.durationMs),
+  }));
+  scored.sort((a, b) => b.score - a.score);
+  return scored.map((entry) => entry.reel);
 }
 
 /**

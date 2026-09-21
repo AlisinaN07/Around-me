@@ -6,7 +6,7 @@ import { Pressable, StyleSheet, View } from 'react-native';
 import { EmptyState } from '@/components/EmptyState';
 import { ReelFeed } from '@/components/ReelFeed';
 import { Colors } from '@/constants/theme';
-import { fetchProfileReels, fetchReel, fetchReelsByMusicHash } from '@/services/reels';
+import { fetchProfileReels, fetchReel, fetchReelsByMusicHash, peekReelFeedHandoff } from '@/services/reels';
 import type { Reel } from '@/types/reel';
 
 type LoadStatus = 'loading' | 'loaded' | 'error';
@@ -23,6 +23,12 @@ type LoadStatus = 'loading' | 'loaded' | 'error';
  * Not just the one tapped Reel, either — swiping up/down moves through a
  * whole list the tapped Reel belongs to, positioned to open exactly on
  * it. Which list depends on how this screen was reached:
+ *  - From a screen that already has its own real, ordered Reel list in
+ *    memory — currently just the hashtag page (src/app/(app)/hashtag/
+ *    [hashtag].tsx) — that exact list, via peekReelFeedHandoff (see
+ *    setReelFeedHandoff's own doc comment in src/services/reels.ts).
+ *    Checked FIRST, before either fallback below, since it's the most
+ *    specific "what was the viewer just looking at" signal available.
  *  - Normally (Profile grid, share links, search): that Reel's author's
  *    own Post list (fetchProfileReels, the same query the Profile grid
  *    itself is built from) — swiping moves through the rest of that
@@ -53,7 +59,16 @@ export default function ReelDetailScreen() {
         setStatus('error');
         return;
       }
-      const siblingReels = musicHash ? await fetchReelsByMusicHash(musicHash) : await fetchProfileReels(target.authorUid);
+      // A handoff list only counts if the tapped Reel is actually IN it —
+      // a stray/expired/unrelated handoff (e.g. this screen reached some
+      // other way moments after a different handoff was set) must never
+      // silently substitute the wrong sibling list.
+      const handoffReels = peekReelFeedHandoff();
+      const siblingReels = handoffReels?.some((candidate) => candidate.reelId === reelId)
+        ? handoffReels
+        : musicHash
+          ? await fetchReelsByMusicHash(musicHash)
+          : await fetchProfileReels(target.authorUid);
       const index = siblingReels.findIndex((candidate) => candidate.reelId === reelId);
       if (index === -1) {
         // Defensive only — same sound/author, same published status, so

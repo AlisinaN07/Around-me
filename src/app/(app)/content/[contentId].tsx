@@ -1,7 +1,7 @@
 import { Ionicons } from '@expo/vector-icons';
 import { router, useLocalSearchParams } from 'expo-router';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { FlatList, Pressable, ScrollView, StyleSheet, Text, View, type ViewToken } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { ActivityDetail } from '@/components/ActivityDetail';
@@ -17,11 +17,13 @@ import { ReportModal } from '@/components/ReportModal';
 import { SwipeBackEdge } from '@/components/SwipeBackEdge';
 import { Colors, Layout, Radius, Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
-import { deleteMyContent, fetchContentById } from '@/services/content';
+import { deleteMyContent, fetchContentById, peekEventFeedHandoff } from '@/services/content';
 import { trackContentInteraction } from '@/services/recommendations/interactions';
 import { isPostReposted, repostPost, undoRepost } from '@/services/reposts';
 import { isPostSaved, savePost, unsavePost } from '@/services/saved';
 import type { ActivityContent, Content, EventContent } from '@/types/content';
+
+const EVENT_FEED_VIEWABILITY_CONFIG = { itemVisiblePercentThreshold: 90 };
 
 type LoadStatus = 'loading' | 'loaded' | 'error';
 
@@ -31,7 +33,35 @@ const DELETE_LABEL: Record<Content['type'], string> = {
   event: 'Delete event?',
 };
 
+/**
+ * Swipe-to-next-Event — reads `peekEventFeedHandoff` ONCE per mount (a
+ * lazy initializer, not a plain call, so a LATER unrelated handoff write
+ * during this screen's own lifetime never retroactively hijacks it) to
+ * decide between two completely independent screens: `EventFeedScreen`
+ * (a real vertical swipeable feed through the caller's own already-
+ * loaded Event list — Profile's own Live/Upcoming/Past Events tabs and
+ * the Events tab's own rails, see their own call sites) when one was
+ * just handed off AND actually contains the Event being opened, or the
+ * existing `SingleContentScreen` (unchanged) for every other entry point
+ * (a share link, search result, or any other case that never wrote one).
+ * Kept as two separate components rather than one big conditional so
+ * neither one's hooks (most importantly SingleContentScreen's own
+ * fetchContentById effect) ever run for the branch that isn't taken —
+ * the swipeable feed already has its own data in hand and must never
+ * duplicate that read.
+ */
 export default function ContentDetailScreen() {
+  const { contentId } = useLocalSearchParams<{ contentId: string }>();
+  const [feedEvents] = useState(() => peekEventFeedHandoff());
+  const feedIndex = feedEvents?.findIndex((event) => event.contentId === contentId) ?? -1;
+
+  if (feedEvents && feedIndex !== -1) {
+    return <EventFeedScreen events={feedEvents} initialIndex={feedIndex} />;
+  }
+  return <SingleContentScreen />;
+}
+
+function SingleContentScreen() {
   const { contentId } = useLocalSearchParams<{ contentId: string }>();
   const { user } = useAuth();
   const [status, setStatus] = useState<LoadStatus>('loading');
@@ -299,8 +329,19 @@ type MediaDetailScreenProps = {
   onToast: (message: string) => void;
 };
 
-/** Full-bleed hero + body for Event/Activity detail (Step 29) — see the branch above for why this bypasses HeaderScreenLayout. */
+/**
+ * Full-bleed hero + body for Event/Activity detail (Step 29) — see the
+ * branch above for why this bypasses HeaderScreenLayout. An Event now
+ * owns its own complete screen (hero, scroll, and a footer PINNED at the
+ * real screen bottom — see EventDetail's own top doc comment) rather
+ * than being wrapped by one here, since Activity has no equivalent
+ * pinned-footer need and keeps the plain "everything scrolls together"
+ * layout below unchanged.
+ */
 function MediaDetailScreen({ content, onOptionsPress, onToast }: MediaDetailScreenProps) {
+  if (content.type === 'event') {
+    return <EventDetail content={content} onOptionsPress={onOptionsPress} onToast={onToast} />;
+  }
   return (
     <SafeAreaView style={styles.mediaSafeArea} edges={['top']}>
       {/* Same handler DetailHero's own back button calls. */}
@@ -313,14 +354,193 @@ function MediaDetailScreen({ content, onOptionsPress, onToast }: MediaDetailScre
             startsAt={content.startsAt}
             endsAt={content.endsAt}
             onOptionsPress={onOptionsPress}
-            coverPhotoURL={content.type === 'event' ? content.coverPhotoURL : undefined}
           />
           <View style={styles.mediaBody}>
-            {content.type === 'activity' ? <ActivityDetail content={content} /> : <EventDetail content={content} onToast={onToast} />}
+            <ActivityDetail content={content} />
           </View>
         </View>
       </ScrollView>
     </SafeAreaView>
+  );
+}
+
+type EventFeedScreenProps = {
+  events: EventContent[];
+  /** Which of `events` to open scrolled/playing to — see ReelFeed's own `initialIndex` prop for the identical convention this mirrors. */
+  initialIndex: number;
+};
+
+/**
+ * A real vertical, paged swipe-through of an already-loaded Event list —
+ * one full `EventDetail` per page, mirroring the exact same vertical
+ * FlatList/pagingEnabled/windowSize shape ReelFeed already uses for
+ * Reels (see its own doc comment). Each page still independently owns
+ * its own real-time response/follow/share state (EventDetail itself,
+ * completely unchanged) — this component's only job is paging between
+ * them and routing whichever page is currently VISIBLE (`activeIndex`,
+ * tracked the same viewability-threshold way ReelFeed tracks its own) to
+ * the right Options/Report/Delete target, and firing `event_open` once
+ * per Event as it becomes visible rather than only for the one initially
+ * opened (same reasoning as ReelFeedItem's own per-item impression
+ * tracking).
+ */
+function EventFeedScreen({ events, initialIndex }: EventFeedScreenProps) {
+  const { user } = useAuth();
+  // Horizontal, not vertical — EventDetail's own body scrolls VERTICALLY
+  // internally (the About description can be long — see its own "More"
+  // toggle), and nesting that inside an ALSO-vertical outer pager is a
+  // classic React Native gesture conflict: confirmed live, a vertical
+  // drag starting anywhere over the description just scrolled that inner
+  // ScrollView instead of paging to the next Event, since the innermost
+  // scrollable wins a same-axis gesture. Paging left/right instead puts
+  // the two gestures on different axes entirely, so both work
+  // unambiguously everywhere on screen — same reasoning real apps use for
+  // a horizontally-swiped card stack with vertically-scrolling content
+  // inside each card. The one accepted trade-off: each page's own
+  // SwipeBackEdge (EventDetail's own left-edge "swipe right to go back")
+  // still claims a rightward drag starting in that same ~32px left-edge
+  // strip specifically — swiping right to the PREVIOUS Event from
+  // anywhere else on screen is unaffected.
+  const [containerWidth, setContainerWidth] = useState(0);
+  const [containerHeight, setContainerHeight] = useState(0);
+  const [activeIndex, setActiveIndex] = useState(initialIndex);
+  const [optionsTarget, setOptionsTarget] = useState<EventContent | null>(null);
+  const [reportTarget, setReportTarget] = useState<EventContent | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<EventContent | null>(null);
+  const [isDeleting, setIsDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const showToast = useCallback((message: string) => {
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    setToastMessage(message);
+    toastTimerRef.current = setTimeout(() => setToastMessage(null), 2500);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    };
+  }, []);
+
+  // Same event_open tracking as SingleContentScreen's own effect, just
+  // keyed on the currently-VISIBLE page (activeIndex) instead of the one
+  // Event that screen ever shows — see this component's own doc comment.
+  useEffect(() => {
+    const active = events[activeIndex];
+    if (!user || !active) return;
+    trackContentInteraction({
+      userId: user.uid,
+      contentId: active.contentId,
+      contentType: 'content',
+      action: 'event_open',
+      categoryId: active.categoryId,
+      creatorId: active.authorUid,
+      cityKey: active.cityKey,
+      countryCode: active.countryCode,
+    }).catch(() => {});
+  }, [events, activeIndex, user]);
+
+  const onViewableItemsChanged = useCallback(({ viewableItems }: { viewableItems: ViewToken[] }) => {
+    const firstVisible = viewableItems.find((item) => item.isViewable);
+    if (firstVisible && typeof firstVisible.index === 'number') setActiveIndex(firstVisible.index);
+  }, []);
+
+  const optionsMenuOptions =
+    optionsTarget && user && user.uid === optionsTarget.authorUid
+      ? [{ label: 'Delete', destructive: true, onPress: () => setDeleteTarget(optionsTarget) }]
+      : optionsTarget
+        ? [{ label: 'Report', onPress: () => setReportTarget(optionsTarget) }]
+        : [];
+
+  // Same permanent, no-recycle-bin policy as SingleContentScreen's own
+  // delete — deleting the currently-open Event out of a swipeable feed
+  // has nowhere sensible to "advance" to that this simple client-side
+  // list can safely re-derive on its own (a neighbor's own place in the
+  // ORIGINAL list may itself now be stale), so this simply leaves the
+  // feed (back to wherever it was opened from) rather than trying to
+  // keep paging through a list this screen no longer fully trusts.
+  const handleConfirmDelete = async () => {
+    if (!deleteTarget || isDeleting) return;
+    setIsDeleting(true);
+    setDeleteError(null);
+    const result = await deleteMyContent(deleteTarget.contentId);
+    setIsDeleting(false);
+    if (!result.ok) {
+      setDeleteError(result.message);
+      return;
+    }
+    setDeleteTarget(null);
+    if (router.canGoBack()) router.back();
+    else router.replace('/events');
+  };
+
+  return (
+    <View
+      style={styles.feedContainer}
+      onLayout={(event) => {
+        setContainerWidth(event.nativeEvent.layout.width);
+        setContainerHeight(event.nativeEvent.layout.height);
+      }}
+    >
+      {containerWidth > 0 && containerHeight > 0 ? (
+        <FlatList
+          data={events}
+          keyExtractor={(item) => item.contentId}
+          horizontal
+          initialScrollIndex={initialIndex}
+          getItemLayout={(_, index) => ({ length: containerWidth, offset: containerWidth * index, index })}
+          renderItem={({ item }) => (
+            <View style={{ width: containerWidth, height: containerHeight }}>
+              <EventDetail content={item} onOptionsPress={() => setOptionsTarget(item)} onToast={showToast} />
+            </View>
+          )}
+          pagingEnabled
+          showsHorizontalScrollIndicator={false}
+          decelerationRate="fast"
+          snapToInterval={containerWidth}
+          snapToAlignment="start"
+          viewabilityConfig={EVENT_FEED_VIEWABILITY_CONFIG}
+          onViewableItemsChanged={onViewableItemsChanged}
+          // Same conservative render-window reasoning as ReelFeed's own
+          // identical props — only the active page plus its immediate
+          // neighbors are ever mounted at once, regardless of list length.
+          windowSize={3}
+          maxToRenderPerBatch={2}
+        />
+      ) : null}
+
+      {toastMessage ? (
+        <View style={styles.toast} pointerEvents="none">
+          <Text style={styles.toastText}>{toastMessage}</Text>
+        </View>
+      ) : null}
+
+      <OptionsMenu visible={!!optionsTarget} onClose={() => setOptionsTarget(null)} options={optionsMenuOptions} />
+
+      {user && reportTarget ? (
+        <ReportModal
+          visible={!!reportTarget}
+          onClose={() => setReportTarget(null)}
+          reporterUid={user.uid}
+          target={{ type: 'content', contentId: reportTarget.contentId }}
+        />
+      ) : null}
+
+      <ConfirmDialog
+        visible={!!deleteTarget}
+        title="Delete event?"
+        message={deleteError ?? "This can't be undone."}
+        confirmLabel="Delete"
+        isSubmitting={isDeleting}
+        onConfirm={handleConfirmDelete}
+        onCancel={() => {
+          setDeleteTarget(null);
+          setDeleteError(null);
+        }}
+      />
+    </View>
   );
 }
 
@@ -338,11 +558,15 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: Colors.background,
   },
-  // flex: 1 (both here and on mediaScrollContent's flexGrow below) is
-  // what makes EventDetail's own flex:1 + spacer able to reach the real
-  // screen bottom instead of just this component's natural content
-  // height — see EventDetail.tsx's own `container`/`spacer` styles for
-  // the other half of this chain.
+  feedContainer: {
+    flex: 1,
+    backgroundColor: Colors.background,
+  },
+  // This whole ScrollView/mediaPage/mediaBody stack is only reached by
+  // Activity content now — Event owns its own separate full-screen
+  // layout (see MediaDetailScreen's own doc comment above and
+  // EventDetail.tsx's return statement) with a pinned footer, not this
+  // plain scroll-everything-together one.
   mediaScroll: {
     flex: 1,
   },

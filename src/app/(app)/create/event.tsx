@@ -65,7 +65,10 @@ export default function CreateEventScreen() {
     const result = await ImagePicker.launchImageLibraryAsync({
       mediaTypes: ['images'],
       allowsEditing: true,
-      aspect: [3, 1],
+      // 4:5 (1080x1350) — the fixed default crop for an Event's cover
+      // photo, matching the same portrait format the app expects to
+      // receive uploads in.
+      aspect: [4, 5],
       quality: 0.9,
     });
     if (result.canceled || result.assets.length === 0) return;
