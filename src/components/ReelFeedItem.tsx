@@ -1,8 +1,9 @@
 import { Ionicons } from '@expo/vector-icons';
 import * as Clipboard from 'expo-clipboard';
+import { Image } from 'expo-image';
 import { router, useIsFocused } from 'expo-router';
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { ActivityIndicator, Image, PanResponder, Platform, Pressable, StyleSheet, Text, View } from 'react-native';
+import { ActivityIndicator, PanResponder, Platform, Pressable, StyleSheet, Text, View } from 'react-native';
 import { VideoView, useVideoPlayer } from 'expo-video';
 
 import { AuthorLink } from '@/components/AuthorLink';
@@ -740,7 +741,11 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
     <View style={[styles.page, { height }]} {...swipeResponder.panHandlers}>
       {urlStatus === 'ready' && playbackUrl && !playbackFailed ? (
         isPhoto ? (
-          <Image source={{ uri: playbackUrl }} style={StyleSheet.absoluteFill} resizeMode="cover" />
+          // Perf pass — expo-image, memory+disk cached: a "FOTO" Reel's
+          // own resolved media URL, same reuse-on-revisit win as the
+          // thumbnail overlay below. Video Reels are untouched — this
+          // branch only ever renders for mediaType === 'photo'.
+          <Image source={{ uri: playbackUrl }} style={StyleSheet.absoluteFill} contentFit="cover" cachePolicy="memory-disk" />
         ) : (
           <VideoView
             style={StyleSheet.absoluteFill}
@@ -781,10 +786,16 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
           error (playbackFailed) — that error/Retry UI must stay visible,
           not be hidden behind a static image forever. */}
       {!isPhoto && thumbnailUrl && !thumbnailFailed && !isVideoReady && !playbackFailed ? (
+        // Perf pass — expo-image, memory+disk cached: this exact cover
+        // frame is what gets re-shown every time the viewer scrolls back
+        // to this Reel while its real video is still resolving/buffering
+        // — a cache hit here means it appears with zero flash instead of
+        // waiting on a fresh network fetch each time.
         <Image
           source={{ uri: thumbnailUrl }}
           style={StyleSheet.absoluteFill}
-          resizeMode="cover"
+          contentFit="cover"
+          cachePolicy="memory-disk"
           onError={() => setThumbnailFailed(true)}
         />
       ) : null}

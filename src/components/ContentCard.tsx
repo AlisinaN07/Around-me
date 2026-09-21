@@ -1,6 +1,7 @@
 import { Ionicons } from '@expo/vector-icons';
+import { Image } from 'expo-image';
 import { router } from 'expo-router';
-import { Image, Pressable, StyleSheet, Text, View } from 'react-native';
+import { Pressable, StyleSheet, Text, View } from 'react-native';
 
 import { AuthorLink } from '@/components/AuthorLink';
 import { INTERESTS } from '@/constants/interests';
@@ -101,7 +102,12 @@ export function ContentCard({ item, currentUid, showAuthor = true, showTypeBadge
     >
       {coverPhotoURL ? (
         <>
-          <Image source={{ uri: coverPhotoURL }} style={StyleSheet.absoluteFill} resizeMode="cover" />
+          {/* Perf pass — expo-image, memory+disk cached: the same
+              Event cover renders here every time this card appears in a
+              feed/discovery list, so a real cache avoids re-downloading
+              it on every scroll-past. contentFit="cover" matches the
+              plain <Image>'s own prior resizeMode="cover" exactly. */}
+          <Image source={{ uri: coverPhotoURL }} style={StyleSheet.absoluteFill} contentFit="cover" cachePolicy="memory-disk" />
           <View style={[StyleSheet.absoluteFill, styles.coverOverlay]} pointerEvents="none" />
         </>
       ) : null}

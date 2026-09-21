@@ -1,7 +1,8 @@
 import { Ionicons } from '@expo/vector-icons';
+import { Image } from 'expo-image';
 import { LinearGradient } from 'expo-linear-gradient';
 import type { ReactNode } from 'react';
-import { Image, StyleSheet, Text, View, useWindowDimensions } from 'react-native';
+import { StyleSheet, Text, View, useWindowDimensions } from 'react-native';
 
 import { Avatar } from '@/components/Avatar';
 import { StatItem } from '@/components/StatItem';
@@ -130,7 +131,12 @@ export function ProfileHeader({
         // explicit width, the box's edges ARE the left/right values, so it
         // sizes itself to exactly fill the gap between them.
         <View style={[styles.coverWrap, { left: -coverBleed, right: -coverBleed }, coverEdgeInset > 0 && styles.coverWrapEdgeToEdge]}>
-          <Image source={{ uri: coverPhotoURL }} style={styles.cover} />
+          {/* Perf pass — expo-image, memory+disk cached: the same
+              coverPhotoURL renders here on every visit to this profile
+              (own or someone else's), so a real cache means it's instant
+              after the first load. contentFit="cover" matches the plain
+              <Image>'s own prior default resizeMode exactly. */}
+          <Image source={{ uri: coverPhotoURL }} style={styles.cover} contentFit="cover" cachePolicy="memory-disk" />
           {/* Fades the cover's own bottom edge into the page background
               instead of a hard cutoff — same scrim technique DetailHero
               uses for its hero image. */}
