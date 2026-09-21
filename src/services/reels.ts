@@ -853,6 +853,50 @@ export async function fetchCityReels(scope: BrowseScope, limitCount = DEFAULT_FE
   return snapshot.docs.map((docSnapshot) => normalizeReel(docSnapshot.data() as Reel));
 }
 
+export type ReelScopePage = {
+  items: Reel[];
+  /** Pass back as `cursor` on the next call to keep paging through this SAME scope — `null` once this scope has no more results (a page shorter than requested — the same "no more results" signal getRecentPostsForHashtag below already uses, never an extra read just to check). */
+  cursor: QueryDocumentSnapshot<DocumentData> | null;
+};
+
+/**
+ * Cursor-paginated counterpart to fetchCityReels above, for the Reels
+ * "For You" candidate generator only (candidateGenerator.ts). Identical
+ * WHERE/orderBy shape (same eligible-candidate SET for a given scope,
+ * same composite index) — a real `startAfter` cursor is the only
+ * difference, so "load more" advances through a scope's own Reels
+ * instead of re-running the same bounded top-N query from the start
+ * every page. This changes HOW candidates already eligible for a scope
+ * are fetched, never WHICH ones are eligible (scopeWhereClause is
+ * untouched and shared with fetchCityReels) or how they're later ranked.
+ *
+ * `fetchCityReels` itself is left completely unchanged and still used
+ * as-is by the standalone Reels browser screen (src/app/(app)/reels.tsx)
+ * and by 'cities' (multi-city) scope in candidateGenerator.ts — see that
+ * file's own doc comment for why 'cities' scope doesn't route through
+ * this cursor-paginated path at all.
+ */
+export async function fetchCityReelsPage(
+  scope: BrowseScope,
+  cursor: QueryDocumentSnapshot<DocumentData> | null,
+  limitCount: number
+): Promise<ReelScopePage> {
+  if (!firestore) return { items: [], cursor: null };
+  const snapshot = await getDocs(
+    query(
+      collection(firestore, REELS_COLLECTION),
+      ...scopeWhereClause(scope),
+      where('status', '==', 'published'),
+      orderBy('publishedAt', 'desc'),
+      ...(cursor ? [startAfter(cursor)] : []),
+      limit(limitCount)
+    )
+  );
+  const items = snapshot.docs.map((docSnapshot) => normalizeReel(docSnapshot.data() as Reel));
+  const nextCursor = snapshot.docs.length === limitCount ? snapshot.docs[snapshot.docs.length - 1] : null;
+  return { items, cursor: nextCursor };
+}
+
 function chunkArray<T>(items: T[], size: number): T[][] {
   const chunks: T[][] = [];
   for (let i = 0; i < items.length; i += size) {

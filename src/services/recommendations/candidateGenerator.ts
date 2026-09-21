@@ -38,23 +38,62 @@
  * bounded (max 1-3, per Step 27's own cap) supplemental query here, gated
  * on the SAME `pickSecondaryCity`-style "does a real, confident signal
  * exist" check collaborativeProfile.confidence already provides.
+ *
+ * Perf pass — real cursor pagination (fixes the audit's own "load-more
+ * re-runs the same bounded 180-doc query from the start every page"
+ * finding). STRICT GEOGRAPHY is completely unaffected: `fetchCityReelsPage`
+ * shares the exact same `scopeWhereClause` as `fetchCityReels` (City stays
+ * City, Country stays that one country, World stays unfiltered) — a real
+ * Firestore `startAfter` cursor is the only difference, so this changes
+ * HOW eligible candidates are fetched, never WHICH ones are eligible or
+ * how they're ranked afterward. `ReelCandidateCursor.scopeKey` isolates
+ * pagination state per scope (Karlstad City vs. Sweden Country vs. Global
+ * each get their own, never-shared cursor) — see generateReelCandidates'
+ * own doc comment for exactly how.
  */
+import type { DocumentData, QueryDocumentSnapshot } from 'firebase/firestore';
+
 import type { BrowseScope } from '@/types/browseScope';
+import { browseScopeKey } from '@/types/browseScope';
 import type { Reel } from '@/types/reel';
 
 import { fetchMyBlockedUserIds } from '../blocks';
-import { fetchCityReels, fetchFollowingReels } from '../reels';
+import { fetchCityReels, fetchCityReelsPage, fetchFollowingReels } from '../reels';
 import { CANDIDATE_POOL } from './recommendationConfig';
+
+/**
+ * Opaque pagination state for one scope's own local (City/Country/World)
+ * pool. `scopeKey` (see browseScopeKey) is what keeps Karlstad's own City
+ * cursor from ever being read back as if it were Sweden's Country cursor
+ * or the Global cursor — generateReelCandidates only ever resumes a
+ * `previousCursor` whose `scopeKey` matches the CURRENT scope exactly;
+ * anything else (a genuine scope change) starts that scope fresh from
+ * page one, which is also what naturally happens the first time a scope
+ * is ever viewed. `exhausted` persists across calls so an already-fully-
+ * paged-through scope never re-queries it's own local pool again this
+ * session — only the small Following/blocked-list reads still run.
+ */
+export type ReelCandidateCursor = {
+  scopeKey: string;
+  cityCursor: QueryDocumentSnapshot<DocumentData> | null;
+  exhausted: boolean;
+};
 
 export type ReelCandidatePool = {
   candidates: Reel[];
+  cursor: ReelCandidateCursor;
 };
+
+function freshCursor(scopeKey: string, exhausted = false): ReelCandidateCursor {
+  return { scopeKey, cityCursor: null, exhausted };
+}
 
 /**
  * Fetches the candidate pool for one uid's Reels "For You" feed. Excludes
  * blocked authors and (via `excludeReelIds`, accumulated by the caller
  * across feed pages — see recommendationEngine.ts) anything already shown
- * this session, so a second page never just re-ranks the exact same pool.
+ * this session — this remains a safety-net dedupe layer, not the primary
+ * mechanism preventing repeated reads (that's `previousCursor` below).
  *
  * STRICT GEOGRAPHY, no exceptions: the candidate pool is exactly what the
  * viewer's own explicitly selected `scope` returns — City stays City,
@@ -66,8 +105,16 @@ export type ReelCandidatePool = {
  * must never appear under a different country, no matter how few Reels
  * the selected scope currently has. The ONLY way to see broader content
  * is to explicitly pick a broader scope (Country or World) — which
- * already naturally includes it, via fetchCityReels' own
- * 'country'/'world' query branches, with no widening needed.
+ * already naturally includes it, via fetchCityReels'/fetchCityReelsPage's
+ * own 'country'/'world' query branches, with no widening needed.
+ *
+ * `previousCursor` should be whatever this same function returned on the
+ * last call for this uid's session (`undefined` on the very first page);
+ * it's only honored when its own `scopeKey` matches the CURRENT scope —
+ * a scope change always starts that scope's own pool fresh, from page
+ * one, exactly like viewing it for the first time. `'cities'` (multi-city
+ * drill-down) is deliberately NOT routed through cursor pagination at
+ * all — see the branch below for why.
  *
  * `homeCountryCode`/`normalizedCityAffinity` are accepted for call-site
  * compatibility with recommendationEngine.ts (which still computes the
@@ -81,32 +128,88 @@ export async function generateReelCandidates(
   scope: BrowseScope,
   homeCountryCode: string,
   excludeReelIds: ReadonlySet<string>,
-  normalizedCityAffinity: Record<string, number> = {}
+  normalizedCityAffinity: Record<string, number> = {},
+  previousCursor?: ReelCandidateCursor
 ): Promise<ReelCandidatePool> {
   void homeCountryCode;
   void normalizedCityAffinity;
 
-  const [localPool, followingPool, blockedUids] = await Promise.all([
-    fetchCityReels(scope, CANDIDATE_POOL.localPoolLimit),
+  const scopeKey = browseScopeKey(scope);
+  const isContinuation = previousCursor?.scopeKey === scopeKey;
+
+  const [followingReels, blockedUids] = await Promise.all([
     fetchFollowingReels({ currentUid: uid, scope, limit: CANDIDATE_POOL.followingPoolLimit }).then((result) => result.reels),
     fetchMyBlockedUserIds(uid),
   ]);
-
-  const combined = [...localPool, ...followingPool];
-  const effectivePool = dedupeAndFilter(combined, blockedUids, excludeReelIds);
-
-  return { candidates: effectivePool };
-}
-
-function dedupeAndFilter(reels: Reel[], blockedUids: string[], excludeReelIds: ReadonlySet<string>): Reel[] {
   const blocked = new Set(blockedUids);
-  const seen = new Set<string>();
-  const result: Reel[] = [];
-  for (const reel of reels) {
-    if (seen.has(reel.reelId) || excludeReelIds.has(reel.reelId)) continue;
-    if (blocked.has(reel.authorUid)) continue;
-    seen.add(reel.reelId);
-    result.push(reel);
+  const seen = new Set(excludeReelIds);
+  const collected: Reel[] = [];
+  let duplicatesFiltered = 0;
+
+  const addReels = (reels: Reel[]) => {
+    for (const reel of reels) {
+      if (seen.has(reel.reelId) || blocked.has(reel.authorUid)) {
+        duplicatesFiltered += 1;
+        continue;
+      }
+      seen.add(reel.reelId);
+      collected.push(reel);
+    }
+  };
+
+  // Step: Following is not promotion-gated — merged in unconditionally,
+  // completely independent of the local pool below.
+  addReels(followingReels);
+
+  // 'cities' (multi-city drill-down) — deliberately NOT routed through
+  // cursor pagination: this scope kind already fans into a bounded
+  // `where('cityKey', 'in', [...])` fetch (fetchCityReels' own branch),
+  // and a real per-city-combination cursor scheme was judged not worth
+  // the added complexity for this secondary, less-used scope kind (same
+  // "report the decision, don't force a fit" call this codebase already
+  // made for 'cities' scope elsewhere). Its OLD simple, single-bounded-
+  // fetch behavior is fully preserved.
+  if (scope.kind === 'cities') {
+    addReels(await fetchCityReels(scope, CANDIDATE_POOL.localPoolLimit));
+    return { candidates: collected, cursor: freshCursor(scopeKey, true) };
   }
-  return result;
+
+  const resumed = isContinuation ? previousCursor! : freshCursor(scopeKey);
+
+  let cityCursor = resumed.cityCursor;
+  let exhausted = resumed.exhausted;
+  let pageReturnedCount = 0;
+
+  // Once a scope's own local pool is fully exhausted, never re-query it
+  // again this session — only the small Following/blocked-list reads
+  // above still run on every call. This is the actual fix for the
+  // audit's "load-more re-reads the same ~180 documents" finding: a
+  // continuation call resumes from `cityCursor`, a real Firestore
+  // `startAfter` position, instead of re-running the bounded query from
+  // the very start.
+  if (!exhausted) {
+    const page = await fetchCityReelsPage(scope, cityCursor, CANDIDATE_POOL.localPoolLimit);
+    pageReturnedCount = page.items.length;
+    cityCursor = page.cursor;
+    if (page.cursor === null) exhausted = true;
+    addReels(page.items);
+  }
+
+  if (__DEV__) {
+    // Dev-only pagination observability (Step 2's own explicit ask) —
+    // never runs in production builds, never affects candidate
+    // generation itself.
+    // eslint-disable-next-line no-console
+    console.log('[recommendations] Reel candidate pagination', {
+      scope: scopeKey,
+      mode: isContinuation ? 'continuation' : 'initial',
+      requestedPageSize: CANDIDATE_POOL.localPoolLimit,
+      returnedCount: pageReturnedCount,
+      exhausted,
+      duplicatesFiltered,
+      totalCollected: collected.length,
+    });
+  }
+
+  return { candidates: collected, cursor: { scopeKey, cityCursor, exhausted } };
 }

@@ -25,7 +25,7 @@ import { bucketAndSort, classifyBucket, type BucketableEntry } from './bucketing
 import { deriveSourceTags } from './attribution';
 import { getCachedCollaborativeProfile } from './collaborative';
 import { applyDiversity } from './diversity';
-import { generateReelCandidates } from './candidateGenerator';
+import { generateReelCandidates, type ReelCandidateCursor } from './candidateGenerator';
 import { fetchEngagementStatsBatch } from './engagementStats';
 import { getCachedHashtagInterestMap } from './hashtagInterestCache';
 import { getCachedInterestProfile } from './profileCache';
@@ -109,10 +109,26 @@ export type GetForYouReelsInput = {
   pageSize?: number;
   /** Attaches RankingBreakdown to each result — dev/debug only, see Step 18. Never true in production UI code. */
   debug?: boolean;
+  /**
+   * Perf pass — whatever `cursor` the PREVIOUS getForYouReels call for
+   * this same session returned (`undefined` on the first page). Opaque
+   * to the caller — the UI never needs to understand Firestore cursors,
+   * just hold this in state/a ref and pass it straight back on the next
+   * `loadMore`. Automatically restarted (that scope's own pool begins
+   * fresh, from page one) the moment `scope` no longer matches what the
+   * cursor was generated for — see candidateGenerator.ts's own
+   * generateReelCandidates doc comment — so the caller doesn't need its
+   * own scope-change detection either. `excludeReelIds` remains the
+   * caller's OWN safety-net dedupe on top of this cursor, not a
+   * replacement for it.
+   */
+  cursor?: ReelCandidateCursor;
 };
 
 export type ForYouReelsPage = {
   reels: RankedItem<Reel>[];
+  /** Perf pass — pass this back as `cursor` on the NEXT getForYouReels call for this same session to continue paging through the active scope's own local pool via a real Firestore cursor, instead of re-fetching the same bounded top-N query from the start every page. */
+  cursor: ReelCandidateCursor;
   /** Recommendation Engine — Step 6, Step 21 — coarse phase timings for THIS call, in ms. Cheap (a handful of Date.now() calls, no extra I/O) and always populated — "we need to know if intelligence makes the feed slow" without needing a separate profiling pass. DEVELOPMENT/observability only; never affects ranking (Step 29). */
   latencyMs: { profileAndCollaborativeRead: number; candidateGeneration: number; scoringAndDiversity: number; statsRead: number; total: number };
 };
@@ -143,7 +159,7 @@ export async function getForYouReels(input: GetForYouReelsInput): Promise<ForYou
   // as-is for every candidate scored below; never refetched per page
   // within this cache's TTL, never refetched per candidate at all.
   const [candidatePool, collaborativeProfile, hashtagInterests] = await Promise.all([
-    generateReelCandidates(input.uid, input.scope, input.homeCountryCode, input.excludeReelIds, normalizedCityAffinity),
+    generateReelCandidates(input.uid, input.scope, input.homeCountryCode, input.excludeReelIds, normalizedCityAffinity, input.cursor),
     getCachedCollaborativeProfile(input.uid),
     getCachedHashtagInterestMap(input.uid),
   ]);
@@ -154,6 +170,7 @@ export async function getForYouReels(input: GetForYouReelsInput): Promise<ForYou
   if (eligible.length === 0) {
     return {
       reels: [],
+      cursor: candidatePool.cursor,
       latencyMs: {
         profileAndCollaborativeRead: afterProfileAt - startedAt,
         candidateGeneration: afterCandidatesAt - afterProfileAt,
@@ -268,6 +285,7 @@ export async function getForYouReels(input: GetForYouReelsInput): Promise<ForYou
 
   return {
     reels: page,
+    cursor: candidatePool.cursor,
     latencyMs: {
       profileAndCollaborativeRead: afterProfileAt - startedAt,
       candidateGeneration: afterCandidatesAt - afterProfileAt,

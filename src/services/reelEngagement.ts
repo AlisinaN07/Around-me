@@ -29,6 +29,7 @@ import { NOTIFICATION_PREVIEW_MAX_LENGTH } from '@/types/notification';
 import type { PostLike } from '@/types/postLikes';
 import type { Reel, ReelComment, ReelCommentReaction, ReelCommentReactionType, ReelLike } from '@/types/reel';
 import { REEL_COMMENT_BODY_MAX_LENGTH } from '@/types/reel';
+import { TtlCache } from '@/utils/requestCache';
 
 import { resolveTrustedFields, type EngagementError, type EngagementResult } from './engagement';
 import { firestore } from './firestore';
@@ -67,6 +68,52 @@ const DEFAULT_REEL_COMMENT_LIMIT = 30;
 // technical debt) rather than blocking the delete itself.
 const MAX_REACTIONS_DELETED_WITH_COMMENT = 200;
 const MAX_REPLIES_DELETED_WITH_COMMENT = 200;
+
+// Perf pass — same TtlCache building block as following.ts/saved.ts/
+// publicProfile.ts/stories.ts (see requestCache.ts's own doc comment).
+// Fixes the audit's own "ReelFeedItem remount re-fetches fresh every
+// time" finding for the three engagement reads it makes per mount:
+// isReelLiked, fetchReelLikeCount, fetchReelCommentCount.
+//
+// Two different TTLs, matching the two different kinds of staleness risk:
+//   - reelLikedCache mirrors FOLLOW_CACHE_TTL_MS/SAVED_CACHE_TTL_MS
+//     (45s) exactly — it's the same shape of state (a private, per-
+//     viewer boolean this viewer's own action fully controls).
+//   - the two count caches use a shorter TTL: unlike a follow/save flag,
+//     a like/comment COUNT can also change because of a DIFFERENT
+//     user's action, which this cache has no way to observe — a shorter
+//     TTL keeps that drift small without giving up the "scroll away and
+//     back within a few seconds" win the audit was actually about.
+const REEL_LIKED_CACHE_TTL_MS = 45_000;
+const REEL_COUNT_CACHE_TTL_MS = 20_000;
+
+const reelLikedCache = new TtlCache<boolean>(REEL_LIKED_CACHE_TTL_MS);
+const reelLikeCountCache = new TtlCache<number>(REEL_COUNT_CACHE_TTL_MS);
+const reelCommentCountCache = new TtlCache<number>(REEL_COUNT_CACHE_TTL_MS);
+
+// Same "pair, not just target" reasoning as followCacheKey in
+// following.ts — whether uid liked THIS reel is a (reel, viewer) pair,
+// never shared across different signed-in accounts sharing one session.
+function reelLikedCacheKey(reelId: string, uid: string): string {
+  return `${reelId}:${uid}`;
+}
+
+/**
+ * Bumps a cached count by a known, exact delta (+1 like, -1 unlike, +1
+ * comment, -(1 + replies) comment-thread delete) instead of forcing a
+ * fresh getCountFromServer read after every mutation. Only touches the
+ * cache when a fresh entry already exists — if this count was never
+ * cached (or its TTL already lapsed), there's nothing to bump: the next
+ * real fetchReelLikeCount/fetchReelCommentCount call will read the true
+ * server value directly, which is correct on its own and cheaper than an
+ * extra read here just to warm a cache nobody has asked for yet. Never
+ * lets a count go negative.
+ */
+function bumpCachedCount(cache: TtlCache<number>, key: string, delta: number): void {
+  const current = cache.getFresh(key);
+  if (current === undefined) return;
+  cache.set(key, Math.max(0, current + delta));
+}
 
 function reelLikeRef(reelId: string, uid: string) {
   return doc(firestore!, REELS_COLLECTION, reelId, 'likes', uid);
@@ -111,6 +158,11 @@ export async function likeReel(reelId: string, uid: string): Promise<LikeReelRes
 
   const existing = await getDoc(reelLikeRef(reelId, uid));
   if (existing.exists()) {
+    // Already liked — the redundant call still confirms the real, current
+    // state, so this is a fine place to (re)populate the cache too rather
+    // than leave it to the next isReelLiked() call (same reasoning as
+    // followUser's own "already following" early-return).
+    reelLikedCache.set(reelLikedCacheKey(reelId, uid), true);
     return { ok: true, alreadyLiked: true };
   }
 
@@ -161,6 +213,14 @@ export async function likeReel(reelId: string, uid: string): Promise<LikeReelRes
     return { ok: false, error: 'unknown', message: "Couldn't like this post." };
   }
 
+  // The write above just succeeded, so the new state is already known
+  // with certainty — update, not just invalidate, the same "write the
+  // known new value directly" pattern followUser/unfollowUser already
+  // use, so the very next isReelLiked()/fetchReelLikeCount() call (e.g.
+  // this same item re-rendering right after this resolves) reflects it
+  // immediately, with no extra Firestore read and no stale window.
+  reelLikedCache.set(reelLikedCacheKey(reelId, uid), true);
+  bumpCachedCount(reelLikeCountCache, reelId, 1);
   trackReelSignal(uid, parent.reel, 'like');
   return { ok: true, alreadyLiked: false };
 }
@@ -191,20 +251,36 @@ export async function unlikeReel(reelId: string, uid: string): Promise<{ ok: tru
   } catch {
     return { ok: false, error: 'unknown', message: "Couldn't remove your like." };
   }
+  // Same "update with the now-known value" reasoning as likeReel above.
+  reelLikedCache.set(reelLikedCacheKey(reelId, uid), false);
+  bumpCachedCount(reelLikeCountCache, reelId, -1);
   return { ok: true };
 }
 
 export async function isReelLiked(reelId: string, uid: string): Promise<boolean> {
+  const key = reelLikedCacheKey(reelId, uid);
+  const cached = reelLikedCache.getFresh(key);
+  if (cached !== undefined) return cached;
   if (!firestore) return false;
-  const snapshot = await getDoc(reelLikeRef(reelId, uid));
-  return snapshot.exists();
+  const result = await reelLikedCache.dedupe(key, async () => {
+    const snapshot = await getDoc(reelLikeRef(reelId, uid));
+    return snapshot.exists();
+  });
+  reelLikedCache.set(key, result);
+  return result;
 }
 
 /** Server-side aggregation count — never fetches every like document just to count them. */
 export async function fetchReelLikeCount(reelId: string): Promise<number> {
+  const cached = reelLikeCountCache.getFresh(reelId);
+  if (cached !== undefined) return cached;
   if (!firestore) return 0;
-  const snapshot = await getCountFromServer(collection(firestore, REELS_COLLECTION, reelId, 'likes'));
-  return snapshot.data().count;
+  const result = await reelLikeCountCache.dedupe(reelId, async () => {
+    const snapshot = await getCountFromServer(collection(firestore!, REELS_COLLECTION, reelId, 'likes'));
+    return snapshot.data().count;
+  });
+  reelLikeCountCache.set(reelId, result);
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -282,6 +358,9 @@ export async function addReelComment(
   if (!created.exists()) {
     return { ok: false, error: 'unknown', message: 'Comment was posted but could not be read back.' };
   }
+  // Exactly one comment document was just added — see bumpCachedCount's
+  // own doc comment for why this is a bump, not a forced re-read.
+  bumpCachedCount(reelCommentCountCache, reelId, 1);
   trackReelSignal(uid, parent.reel, 'comment');
   return { ok: true, comment: created.data() as ReelComment };
 }
@@ -325,6 +404,11 @@ export async function deleteReelComment(
       }
     }
     await batch.commit();
+    // The comment itself PLUS every direct reply deleted alongside it —
+    // see bumpCachedCount's own doc comment for why this is a bump, not
+    // a forced re-read. Reaction deletes don't count here: reactions were
+    // never part of this cache.
+    bumpCachedCount(reelCommentCountCache, reelId, -(1 + repliesSnapshot.docs.length));
   } catch {
     return { ok: false, error: 'unknown', message: "Couldn't delete your comment." };
   }
@@ -354,9 +438,15 @@ export async function fetchReelComment(reelId: string, commentId: string): Promi
 
 /** Server-side aggregation count — never fetches every comment just to count them. */
 export async function fetchReelCommentCount(reelId: string): Promise<number> {
+  const cached = reelCommentCountCache.getFresh(reelId);
+  if (cached !== undefined) return cached;
   if (!firestore) return 0;
-  const snapshot = await getCountFromServer(reelCommentsCollectionRef(reelId));
-  return snapshot.data().count;
+  const result = await reelCommentCountCache.dedupe(reelId, async () => {
+    const snapshot = await getCountFromServer(reelCommentsCollectionRef(reelId));
+    return snapshot.data().count;
+  });
+  reelCommentCountCache.set(reelId, result);
+  return result;
 }
 
 // ---------------------------------------------------------------------------

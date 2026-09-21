@@ -12,6 +12,7 @@ import { useAuth } from '@/hooks/useAuth';
 import { useProfile } from '@/hooks/useProfile';
 import { useCity } from '@/providers/CityProvider';
 import { fetchMyBlockedUserIds } from '@/services/blocks';
+import type { ReelCandidateCursor } from '@/services/recommendations/candidateGenerator';
 import { assignExperimentVariant, COLLABORATIVE_WEIGHT_V1_EXPERIMENT } from '@/services/recommendations/experiments';
 import { getForYouReels } from '@/services/recommendations/recommendationEngine';
 import { fetchFollowingReels } from '@/services/reels';
@@ -93,6 +94,17 @@ export default function HomeScreen() {
   // refresh via onReload). A ref, not state — read at call time by
   // loadMoreForYou, never itself needs to trigger a re-render.
   const seenForYouReelIdsRef = useRef<Set<string>>(new Set());
+  // Perf pass — the opaque cursor getForYouReels itself returns (see
+  // candidateGenerator.ts's own doc comment): a real Firestore position
+  // to resume this scope's own local pool from, so loadMoreForYou
+  // actually pages forward instead of re-fetching the same bounded
+  // top-N query every time. Reset alongside seenForYouReelIdsRef
+  // whenever loadForYou (re)starts a fresh session (scope/mode change,
+  // pull-to-refresh, user change) — a fresh session has nothing to
+  // resume, and a stale cursor from a DIFFERENT scope is already safely
+  // ignored by generateReelCandidates' own scopeKey check even if this
+  // reset were somehow skipped.
+  const forYouCursorRef = useRef<ReelCandidateCursor | undefined>(undefined);
 
   const [followingReels, setFollowingReels] = useState<Reel[]>([]);
   const [followsAnyone, setFollowsAnyone] = useState(true);
@@ -111,6 +123,7 @@ export default function HomeScreen() {
     setForYouReels([]);
     setForYouAttribution({});
     seenForYouReelIdsRef.current = new Set();
+    forYouCursorRef.current = undefined;
     try {
       const page = await getForYouReels({
         uid: user.uid,
@@ -123,6 +136,7 @@ export default function HomeScreen() {
       });
       const reels = page.reels.map((ranked) => ranked.item);
       for (const reel of reels) seenForYouReelIdsRef.current.add(reel.reelId);
+      forYouCursorRef.current = page.cursor;
       setForYouReels(reels);
       setForYouAttribution(attributionMapFor(page.reels, experimentVariant));
       setForYouStatus('loaded');
@@ -154,7 +168,9 @@ export default function HomeScreen() {
         excludeReelIds: seenForYouReelIdsRef.current,
         onboardingInterestIds: profile?.interests,
         sessionSeed: feedSessionId,
+        cursor: forYouCursorRef.current,
       });
+      forYouCursorRef.current = page.cursor;
       const newReels = page.reels.map((ranked) => ranked.item);
       if (newReels.length > 0) {
         for (const reel of newReels) seenForYouReelIdsRef.current.add(reel.reelId);
