@@ -108,6 +108,14 @@ check('eventCoverKey matches the existing eventCovers/{uid}/{draftId}/photo conv
   assert.equal(eventCoverKey('uid1', 'draft1'), 'eventCovers/uid1/draft1/photo');
 });
 
+check('eventCoverKey differs for a different uid at the same draftId — one user can never write into another\'s eventCovers/ namespace', () => {
+  assert.notEqual(eventCoverKey('uid-a', 'draft1'), eventCoverKey('uid-b', 'draft1'));
+});
+
+check('eventCoverKey differs for a different draftId at the same uid — a fresh draft never collides with an earlier one', () => {
+  assert.notEqual(eventCoverKey('uid1', 'draft1'), eventCoverKey('uid1', 'draft2'));
+});
+
 check('soundOriginKey matches the existing soundOrigins/{hash}/audio convention', () => {
   assert.equal(soundOriginKey('abcdef0123456789'), 'soundOrigins/abcdef0123456789/audio');
 });
@@ -127,6 +135,10 @@ check('reelSourceKey throws on a path-traversal reelId rather than building an e
 
 check('eventCoverKey throws on a slash-containing draftId', () => {
   assert.throws(() => eventCoverKey('uid1', 'a/b'));
+});
+
+check('eventCoverKey throws on a path-traversal draftId', () => {
+  assert.throws(() => eventCoverKey('uid1', '../other-uid'));
 });
 
 console.log('\n=== functions/ media object-key logic test results ===');

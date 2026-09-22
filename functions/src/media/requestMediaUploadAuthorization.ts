@@ -5,11 +5,16 @@
  * r2Config.ts's own doc comment on why those never leave this backend).
  *
  * Deliberately narrow: supports ONLY `mediaKind: 'profilePhoto'` (Step
- * 5A) and `'profileCover'` (Step 5C) for the CALLING user's own uid — no
- * client-supplied uid, no client-supplied path, no other media kind.
- * Extending this to Reels/Stories/Events is explicit future work, not
- * something this file's own shape should be stretched to cover
- * prematurely.
+ * 5A), `'profileCover'` (Step 5C), and `'eventCover'` (Step 5D) for the
+ * CALLING user's own uid — no client-supplied uid, no other media kind.
+ * Extending this to Reels/Stories is explicit future work, not something
+ * this file's own shape should be stretched to cover prematurely.
+ *
+ * `eventCover` is the one media kind that DOES accept a client-supplied
+ * identifier (`draftId`) — see RequestMediaUploadAuthorizationInput's own
+ * doc comment on that field for exactly why, and mediaUploadValidation.ts
+ * for how it's validated as a safe path segment before ever reaching
+ * objectKey.ts's eventCoverKey.
  *
  * Unlike r2Storage.ts/r2Config.ts (deliberately NOT exported from
  * functions/src/index.ts — see r2Storage.ts's own doc comment), THIS
@@ -30,7 +35,7 @@ import { HttpsError, onCall, type CallableRequest } from 'firebase-functions/v2/
 
 import { MediaUploadValidationError, validateMediaUploadInput, type AllowedMediaKind } from './mediaUploadValidation';
 import { buildMediaUrl } from './mediaUrl';
-import { profileCoverKey, profilePhotoKey } from './objectKey';
+import { eventCoverKey, profileCoverKey, profilePhotoKey } from './objectKey';
 import { getR2Config } from './r2Config';
 import { createPresignedUploadUrl } from './r2Storage';
 
@@ -55,6 +60,24 @@ type RequestMediaUploadAuthorizationInput = {
   contentType: string;
   /** The exact byte length the client intends to upload — bound into the presigned URL's own signature (see r2Storage.ts's createPresignedUploadUrl), so the actual PUT must match this exactly or R2 itself rejects it. Required, not optional, precisely so that binding is always applied. */
   fileSizeBytes: number;
+  /**
+   * Required for, and used ONLY by, `mediaKind: 'eventCover'`. Unlike
+   * profile photo/cover — always exactly one deterministic object per
+   * uid, needing no client input at all to identify — an Event's cover
+   * is uploaded to a client-generated `draftId` slot (content.ts's
+   * existing `generateEventDraftId()`) BEFORE the real Event document
+   * exists, so there is nothing in Firestore yet to derive an identifier
+   * from. This exactly preserves the current Firebase behavior: the
+   * client already picks this identifier today (see
+   * storage.rules' own `eventCovers/{authorUid}/{draftId}/photo` — the
+   * SAME "any string, as long as it's under your own uid" trust model),
+   * so accepting it here is not a NEW or weaker trust boundary, just the
+   * same one carried over to R2. Validated as one safe path SEGMENT
+   * (never a full path) in mediaUploadValidation.ts before ever reaching
+   * objectKey.ts's eventCoverKey — a malformed value is rejected, not
+   * silently accepted.
+   */
+  draftId?: string;
 };
 
 /** Safe, minimal client-facing result — see src/services/media/types.ts's MediaUploadAuthorization, which this shape matches. Never includes an access key, secret key, or any other R2 credential. */
@@ -124,13 +147,28 @@ export async function handleRequest(request: CallableRequest<unknown>): Promise<
     throw error;
   }
 
-  // Server-derived, deterministic, and bound to the CALLER's own uid —
-  // exactly src/services/userProfile.ts's existing
-  // `profilePhotos/{uid}/photo` / `profileCovers/{uid}/photo` Firebase
-  // Storage conventions (see objectKey.ts's own doc comment), so a
-  // future read/delivery step can map straight back to the same logical
-  // object identity regardless of which backend actually holds it.
-  const path = input.mediaKind === 'profileCover' ? profileCoverKey(request.auth.uid) : profilePhotoKey(request.auth.uid);
+  // Server-derived and always bound to the CALLER's own uid — exactly
+  // the existing Firebase Storage conventions in userProfile.ts/
+  // content.ts (see objectKey.ts's own doc comment), so a future read/
+  // delivery step can map straight back to the same logical object
+  // identity regardless of which backend actually holds it. `eventCover`
+  // is the one case that also incorporates a (separately validated)
+  // client-supplied draftId — see this file's own doc comment on that
+  // input field for why; the uid segment itself is still never anything
+  // but `request.auth.uid`, so a caller can never write into another
+  // user's eventCovers/ namespace no matter what draftId they pass.
+  let path: string;
+  if (input.mediaKind === 'eventCover') {
+    // validateMediaUploadInput already guarantees `draftId` is present
+    // and a safe path segment whenever mediaKind is 'eventCover' — this
+    // non-null assertion reflects that already-checked invariant, not an
+    // unchecked assumption.
+    path = eventCoverKey(request.auth.uid, input.draftId!);
+  } else if (input.mediaKind === 'profileCover') {
+    path = profileCoverKey(request.auth.uid);
+  } else {
+    path = profilePhotoKey(request.auth.uid);
+  }
 
   try {
     const { uploadUrl, expiresAt } = await createPresignedUploadUrl(path, input.contentType, input.fileSizeBytes);

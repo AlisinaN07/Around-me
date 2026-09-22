@@ -36,16 +36,17 @@ type MediaUploadAuthorizationResponse = {
 async function requestUploadAuthorization(
   mediaKind: MediaKind,
   contentType: string,
-  fileSizeBytes: number
+  fileSizeBytes: number,
+  draftId?: string
 ): Promise<MediaUploadAuthorizationResponse> {
   if (!functions) {
     throw new Error('This feature is not available right now.');
   }
-  const callable = httpsCallable<{ mediaKind: string; contentType: string; fileSizeBytes: number }, MediaUploadAuthorizationResponse>(
-    functions,
-    'requestMediaUploadAuthorization'
-  );
-  const result = await callable({ mediaKind, contentType, fileSizeBytes });
+  const callable = httpsCallable<
+    { mediaKind: string; contentType: string; fileSizeBytes: number; draftId?: string },
+    MediaUploadAuthorizationResponse
+  >(functions, 'requestMediaUploadAuthorization');
+  const result = await callable({ mediaKind, contentType, fileSizeBytes, ...(draftId ? { draftId } : {}) });
   return result.data;
 }
 
@@ -64,7 +65,8 @@ async function performDirectUpload(
   mediaKind: MediaKind,
   localUri: string,
   contentType: string,
-  onProgress: MediaUploadProgressCallback
+  onProgress: MediaUploadProgressCallback,
+  draftId?: string
 ): Promise<DirectUploadOutcome> {
   let blob: Blob;
   try {
@@ -83,7 +85,7 @@ async function performDirectUpload(
 
   let authorization: MediaUploadAuthorizationResponse;
   try {
-    authorization = await requestUploadAuthorization(mediaKind, resolvedContentType, blob.size);
+    authorization = await requestUploadAuthorization(mediaKind, resolvedContentType, blob.size, draftId);
   } catch {
     return { ok: false, message: "Couldn't prepare this upload." };
   }
@@ -189,9 +191,10 @@ async function uploadDisplayableMediaToR2(
   mediaKind: MediaKind,
   localUri: string,
   onProgress: MediaUploadProgressCallback,
-  notConfiguredMessage: string
+  notConfiguredMessage: string,
+  draftId?: string
 ): Promise<DisplayableUploadResult> {
-  const outcome = await performDirectUpload(mediaKind, localUri, 'image/jpeg', onProgress);
+  const outcome = await performDirectUpload(mediaKind, localUri, 'image/jpeg', onProgress, draftId);
   if (!outcome.ok) return outcome;
 
   if (!outcome.authorization.mediaUrl) {
@@ -217,5 +220,32 @@ export async function uploadProfileCoverToR2(localUri: string, onProgress: Media
     localUri,
     onProgress,
     'Uploaded to R2, but no public media domain is configured yet — this cover photo is not displayable.'
+  );
+}
+
+/**
+ * The real, production-wired Event-cover upload path — see
+ * uploadDisplayableMediaToR2's own doc comment for the shared upload
+ * behavior. `draftId` is REQUIRED here (unlike profile photo/cover,
+ * which need no client-supplied identifier at all) — see
+ * requestMediaUploadAuthorization.ts's own doc comment on why an Event
+ * cover, uploaded before the real Event document exists, needs one;
+ * this must be the exact same draftId content.ts's existing
+ * generateEventDraftId() already produces for the Create Event screen's
+ * own lifetime, so a later createEvent call's own object identity stays
+ * consistent within one creation session — exactly mirroring the
+ * existing Firebase `eventCovers/{uid}/{draftId}/photo` behavior.
+ */
+export async function uploadEventCoverToR2(
+  draftId: string,
+  localUri: string,
+  onProgress: MediaUploadProgressCallback
+): Promise<ProfilePhotoUploadResult> {
+  return uploadDisplayableMediaToR2(
+    'eventCover',
+    localUri,
+    onProgress,
+    'Uploaded to R2, but no public media domain is configured yet — this cover photo is not displayable.',
+    draftId
   );
 }

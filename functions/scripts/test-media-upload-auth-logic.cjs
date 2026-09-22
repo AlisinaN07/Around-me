@@ -1,5 +1,5 @@
 /**
- * Step 5A/5C — plain-Node tests for the pure request-validation logic
+ * Step 5A/5C/5D — plain-Node tests for the pure request-validation logic
  * behind requestMediaUploadAuthorization: functions/src/media/
  * mediaUploadValidation.ts's validateMediaUploadInput. Runs against the
  * COMPILED lib/ output — `npm run build` first (see the `test` script in
@@ -32,8 +32,9 @@ const {
   ALLOWED_CONTENT_TYPES,
   PROFILE_PHOTO_MAX_SIZE_BYTES,
   PROFILE_COVER_PHOTO_MAX_SIZE_BYTES,
+  EVENT_COVER_PHOTO_MAX_SIZE_BYTES,
 } = require('../lib/media/mediaUploadValidation.js');
-const { profileCoverKey, profilePhotoKey } = require('../lib/media/objectKey.js');
+const { eventCoverKey, profileCoverKey, profilePhotoKey } = require('../lib/media/objectKey.js');
 
 const results = [];
 function check(name, fn) {
@@ -319,6 +320,141 @@ check('profileCoverKey matches the exact existing Firebase convention', () => {
 
 check('profilePhotoKey and profileCoverKey never collide for the same uid', () => {
   assert.notEqual(profilePhotoKey('uid-a'), profileCoverKey('uid-a'));
+});
+
+// ---------------------------------------------------------------------------
+// Step 5D — 'eventCover' media kind. Same validation shape as
+// 'profileCover' (identical 8 MB cap, identical MIME allowlist), PLUS a
+// required `draftId` — the one media kind that needs a client-supplied
+// identifier at all (see mediaUploadValidation.ts's own doc comment on
+// ValidatedMediaUploadInput.draftId for exactly why: an Event cover is
+// uploaded before the real Event document exists, so there is nothing
+// server-side yet to derive an identifier from).
+// ---------------------------------------------------------------------------
+
+check('accepts mediaKind "eventCover" with a valid draftId and supported image type', () => {
+  const result = validateMediaUploadInput({ mediaKind: 'eventCover', contentType: 'image/jpeg', fileSizeBytes: 1000, draftId: 'draft-abc123' });
+  assert.equal(result.mediaKind, 'eventCover');
+  assert.equal(result.draftId, 'draft-abc123');
+});
+
+check('rejects mediaKind "eventCover" with no draftId at all', () => {
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'eventCover', contentType: 'image/jpeg', fileSizeBytes: 1000 }),
+    MediaUploadValidationError
+  );
+});
+
+check('rejects mediaKind "eventCover" with an empty-string draftId', () => {
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'eventCover', contentType: 'image/jpeg', fileSizeBytes: 1000, draftId: '' }),
+    MediaUploadValidationError
+  );
+});
+
+check('rejects mediaKind "eventCover" with a non-string draftId', () => {
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'eventCover', contentType: 'image/jpeg', fileSizeBytes: 1000, draftId: 12345 }),
+    MediaUploadValidationError
+  );
+});
+
+check('rejects a malformed draftId containing a slash (path-fragment injection)', () => {
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'eventCover', contentType: 'image/jpeg', fileSizeBytes: 1000, draftId: 'a/b' }),
+    MediaUploadValidationError
+  );
+});
+
+check('rejects a malformed draftId attempting parent-directory traversal', () => {
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'eventCover', contentType: 'image/jpeg', fileSizeBytes: 1000, draftId: '../other-uid' }),
+    MediaUploadValidationError
+  );
+});
+
+check('rejects a malformed draftId containing whitespace', () => {
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'eventCover', contentType: 'image/jpeg', fileSizeBytes: 1000, draftId: 'draft with spaces' }),
+    MediaUploadValidationError
+  );
+});
+
+check('rejects an unsupported image type for eventCover (image/gif)', () => {
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'eventCover', contentType: 'image/gif', fileSizeBytes: 1000, draftId: 'draft1' }),
+    MediaUploadValidationError
+  );
+});
+
+check('rejects a video/* content type for eventCover', () => {
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'eventCover', contentType: 'video/mp4', fileSizeBytes: 1000, draftId: 'draft1' }),
+    MediaUploadValidationError
+  );
+});
+
+check('EVENT_COVER_PHOTO_MAX_SIZE_BYTES is 8 MB — mirrors src/types/content.ts exactly', () => {
+  assert.equal(EVENT_COVER_PHOTO_MAX_SIZE_BYTES, 8 * 1024 * 1024);
+});
+
+check('eventCover accepts a file exactly at its own maximum size', () => {
+  assert.doesNotThrow(() =>
+    validateMediaUploadInput({
+      mediaKind: 'eventCover',
+      contentType: 'image/jpeg',
+      fileSizeBytes: EVENT_COVER_PHOTO_MAX_SIZE_BYTES,
+      draftId: 'draft1',
+    })
+  );
+});
+
+check('eventCover rejects a file one byte over its own maximum size', () => {
+  assert.throws(
+    () =>
+      validateMediaUploadInput({
+        mediaKind: 'eventCover',
+        contentType: 'image/jpeg',
+        fileSizeBytes: EVENT_COVER_PHOTO_MAX_SIZE_BYTES + 1,
+        draftId: 'draft1',
+      }),
+    MediaUploadValidationError
+  );
+});
+
+check('eventCover rejects a zero or negative file size', () => {
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'eventCover', contentType: 'image/jpeg', fileSizeBytes: 0, draftId: 'draft1' }),
+    MediaUploadValidationError
+  );
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'eventCover', contentType: 'image/jpeg', fileSizeBytes: -1, draftId: 'draft1' }),
+    MediaUploadValidationError
+  );
+});
+
+check('ignores an extra uid field in an eventCover payload — the caller\'s own uid is never read from request data', () => {
+  const result = validateMediaUploadInput({
+    mediaKind: 'eventCover',
+    contentType: 'image/jpeg',
+    fileSizeBytes: 1000,
+    draftId: 'draft1',
+    uid: 'some-other-uid',
+  });
+  assert.equal('uid' in result, false);
+  assert.deepEqual(Object.keys(result).sort(), ['contentType', 'draftId', 'fileSizeBytes', 'mediaKind']);
+});
+
+check('eventCoverKey is deterministic for the same uid+draftId', () => {
+  assert.equal(eventCoverKey('uid-a', 'draft1'), eventCoverKey('uid-a', 'draft1'));
+});
+
+check('eventCoverKey differs for a different uid at the same draftId — one user\'s draft can never target another user\'s namespace', () => {
+  assert.notEqual(eventCoverKey('uid-a', 'draft1'), eventCoverKey('uid-b', 'draft1'));
+});
+
+check('eventCoverKey matches the exact existing Firebase convention', () => {
+  assert.equal(eventCoverKey('uid-a', 'draft1'), 'eventCovers/uid-a/draft1/photo');
 });
 
 console.log('\n=== functions/ media upload authorization logic test results ===');

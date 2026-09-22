@@ -39,6 +39,8 @@ import { getTodayOrTonightWindow, getUpcomingWindow } from '@/utils/dateWindows'
 import { fetchFollowingUids } from './following';
 import { firestore } from './firestore';
 import { functions } from './functions';
+import { getMediaStorageProvider } from './media';
+import { uploadEventCoverToR2 } from './media/r2Provider';
 import { storage } from './storage';
 import { fetchUserProfile } from './userProfile';
 
@@ -372,6 +374,15 @@ export type UploadEventCoverPhotoHandle = { cancel: () => void };
  * coverPhotoURL once onComplete reports success, same division of
  * responsibility as uploadProfileCoverPhoto/updateMyProfileCoverPhoto in
  * src/services/userProfile.ts.
+ *
+ * Step 5D — dispatches on getMediaStorageProvider() (see
+ * src/services/media/config.ts), same pattern as userProfile.ts's own
+ * uploadProfilePhoto/uploadProfileCoverPhoto. This function's own
+ * behavior for the default, production value ('firebase') is completely
+ * untouched below — the exact same code that existed before Step 5D. The
+ * 'r2' branch (uploadEventCoverViaR2, right below) is a SEPARATE
+ * function, reached only when a developer explicitly sets
+ * EXPO_PUBLIC_MEDIA_STORAGE_PROVIDER=r2 for controlled testing.
  */
 export function uploadEventCoverPhoto(
   uid: string,
@@ -380,6 +391,10 @@ export function uploadEventCoverPhoto(
   onProgress: (percent: number) => void,
   onComplete: (result: { ok: true; coverPhotoURL: string } | { ok: false; message: string }) => void
 ): UploadEventCoverPhotoHandle {
+  if (getMediaStorageProvider() === 'r2') {
+    return uploadEventCoverViaR2(draftId, localUri, onProgress, onComplete);
+  }
+
   let cancelled = false;
   let task: UploadTask | null = null;
 
@@ -435,6 +450,47 @@ export function uploadEventCoverPhoto(
     cancel: () => {
       cancelled = true;
       task?.cancel();
+    },
+  };
+}
+
+/**
+ * Step 5D's real, end-to-end R2 upload+display path for Event covers —
+ * reached ONLY when getMediaStorageProvider() returns 'r2' (never in a
+ * default build; see uploadEventCoverPhoto's own doc comment). Delegates
+ * to uploadEventCoverToR2 (src/services/media/r2Provider.ts), the exact
+ * same proven authorize-then-PUT mechanics as
+ * uploadProfilePhotoViaR2/uploadProfileCoverViaR2, just for the
+ * `eventCover` media kind and its own `eventCovers/{uid}/{draftId}/photo`
+ * object key — `draftId` is passed straight through, unchanged, to the
+ * authorization request (see requestMediaUploadAuthorization.ts's own
+ * doc comment on why this one media kind needs it). Returns the SAME
+ * shape uploadEventCoverPhoto's own Firebase branch above already
+ * returns, so the Create Event screen's own upload handler needs no
+ * changes at all.
+ */
+function uploadEventCoverViaR2(
+  draftId: string,
+  localUri: string,
+  onProgress: (percent: number) => void,
+  onComplete: (result: { ok: true; coverPhotoURL: string } | { ok: false; message: string }) => void
+): UploadEventCoverPhotoHandle {
+  let cancelled = false;
+
+  (async () => {
+    const result = await uploadEventCoverToR2(draftId, localUri, onProgress);
+    if (cancelled) return;
+
+    if (__DEV__) {
+      // eslint-disable-next-line no-console
+      console.log('[content] R2 Event cover upload for draft', draftId, '->', result);
+    }
+    onComplete(result.ok ? { ok: true, coverPhotoURL: result.photoURL } : result);
+  })();
+
+  return {
+    cancel: () => {
+      cancelled = true;
     },
   };
 }
