@@ -15,7 +15,7 @@ import { fetchMyBlockedUserIds } from '@/services/blocks';
 import type { ReelCandidateCursor } from '@/services/recommendations/candidateGenerator';
 import { assignExperimentVariant, COLLABORATIVE_WEIGHT_V1_EXPERIMENT } from '@/services/recommendations/experiments';
 import { getForYouReels } from '@/services/recommendations/recommendationEngine';
-import { fetchFollowingReels } from '@/services/reels';
+import { fetchFollowingReels, getReelFeedDirtyVersion } from '@/services/reels';
 import { browseScopeKey } from '@/types/browseScope';
 import type { Reel } from '@/types/reel';
 import type { RankedItem, RankingAttribution } from '@/types/recommendation';
@@ -230,16 +230,40 @@ export default function HomeScreen() {
   const loadedForYouKeyRef = useRef<string | null>(null);
   const loadedFollowingKeyRef = useRef<string | null>(null);
 
+  // UX fix — publishing a Reel changes none of feedLoadKey's own three
+  // ingredients (account, Active Scope, Home City), so on its own the
+  // check above would treat "just came back from publishing" exactly like
+  // any other same-scope refocus and skip reloading — the newly published
+  // Reel then simply wasn't in forYouReels/followingReels until something
+  // ELSE (an actual scope change) forced a real reload anyway. These refs
+  // track the LAST getReelFeedDirtyVersion() value each mode was loaded
+  // at; a fresh read that differs means "a publish happened since," which
+  // is deliberately checked ALONGSIDE feedLoadKey below, not folded into
+  // it — feedLoadKey is derived at render time, but Home stays mounted
+  // (just unfocused) under the create-Reel flow, so nothing re-renders it
+  // in between; reading getReelFeedDirtyVersion() fresh inside the focus
+  // callback body itself is what actually observes a publish that
+  // happened while this screen was unfocused. Initialized eagerly so a
+  // publish that somehow raced this component's very first mount doesn't
+  // retroactively count as "since we last loaded."
+  const forYouDirtyVersionRef = useRef<number>(getReelFeedDirtyVersion());
+  const followingDirtyVersionRef = useRef<number>(getReelFeedDirtyVersion());
+
   useFocusEffect(
     useCallback(() => {
       if (!isCityReady) return;
+      const dirtyVersion = getReelFeedDirtyVersion();
       if (mode === 'forYou') {
-        if (loadedForYouKeyRef.current === feedLoadKey) return;
+        const isDirty = dirtyVersion !== forYouDirtyVersionRef.current;
+        if (loadedForYouKeyRef.current === feedLoadKey && !isDirty) return;
         loadedForYouKeyRef.current = feedLoadKey;
+        forYouDirtyVersionRef.current = dirtyVersion;
         loadForYou();
       } else {
-        if (loadedFollowingKeyRef.current === feedLoadKey) return;
+        const isDirty = dirtyVersion !== followingDirtyVersionRef.current;
+        if (loadedFollowingKeyRef.current === feedLoadKey && !isDirty) return;
         loadedFollowingKeyRef.current = feedLoadKey;
+        followingDirtyVersionRef.current = dirtyVersion;
         loadFollowing();
       }
       // eslint-disable-next-line react-hooks/exhaustive-deps

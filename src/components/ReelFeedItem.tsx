@@ -18,7 +18,7 @@ import { followUser, isFollowing } from '@/services/following';
 import { fetchPublicProfile } from '@/services/publicProfile';
 import { fetchReelCommentCount, fetchReelLikeCount, isReelLiked, likeReel, unlikeReel } from '@/services/reelEngagement';
 import { trackContentInteraction, trackReelWatchSummary, trackVideoStarted } from '@/services/recommendations/interactions';
-import { resolveReelPlaybackUrl } from '@/services/reels';
+import { resolveReelPlaybackUrl, resolveReelThumbnailUrl } from '@/services/reels';
 import { isPostSaved, savePost, unsavePost } from '@/services/saved';
 import { fetchActiveStoriesForAuthor, hasViewedStory } from '@/services/stories';
 import type { Reel } from '@/types/reel';
@@ -202,7 +202,11 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
       setThumbnailFailed(false);
       return;
     }
-    resolveReelPlaybackUrl(reel.thumbnailStoragePath).then((url) => {
+    // Step 5E — branches on this Reel's OWN persisted
+    // thumbnailStorageProvider (Firebase, resolved lazily via the same
+    // resolveReelPlaybackUrl cache as before; or R2, already resolved at
+    // upload time) — see resolveReelThumbnailUrl's own doc comment.
+    resolveReelThumbnailUrl(reel).then((url) => {
       if (cancelled) return;
       setThumbnailUrl(url);
       if (url) prefetchImageOnce(url);
@@ -210,7 +214,7 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
     return () => {
       cancelled = true;
     };
-  }, [reel.thumbnailStoragePath, shouldPrepare, isPhoto]);
+  }, [reel.thumbnailStoragePath, reel.thumbnailStorageProvider, reel.thumbnailUrl, shouldPrepare, isPhoto]);
 
   useEffect(() => {
     let cancelled = false;

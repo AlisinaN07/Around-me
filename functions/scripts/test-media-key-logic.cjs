@@ -88,6 +88,14 @@ check('reelThumbnailKey matches the existing reels/{uid}/{reelId}/thumbnail conv
   assert.equal(reelThumbnailKey('uid1', 'reel1'), 'reels/uid1/reel1/thumbnail');
 });
 
+check('reelThumbnailKey differs for a different uid at the same reelId — one user can never write into another\'s reels/ namespace', () => {
+  assert.notEqual(reelThumbnailKey('uid-a', 'reel1'), reelThumbnailKey('uid-b', 'reel1'));
+});
+
+check('reelThumbnailKey differs for a different reelId at the same uid — a fresh Reel never collides with an earlier one', () => {
+  assert.notEqual(reelThumbnailKey('uid1', 'reel1'), reelThumbnailKey('uid1', 'reel2'));
+});
+
 check('reelMusicKey matches the existing reels/{uid}/{reelId}/music convention', () => {
   assert.equal(reelMusicKey('uid1', 'reel1'), 'reels/uid1/reel1/music');
 });
@@ -139,6 +147,14 @@ check('eventCoverKey throws on a slash-containing draftId', () => {
 
 check('eventCoverKey throws on a path-traversal draftId', () => {
   assert.throws(() => eventCoverKey('uid1', '../other-uid'));
+});
+
+check('reelThumbnailKey throws on a slash-containing reelId', () => {
+  assert.throws(() => reelThumbnailKey('uid1', 'a/b'));
+});
+
+check('reelThumbnailKey throws on a path-traversal reelId', () => {
+  assert.throws(() => reelThumbnailKey('uid1', '../other-uid'));
 });
 
 console.log('\n=== functions/ media object-key logic test results ===');

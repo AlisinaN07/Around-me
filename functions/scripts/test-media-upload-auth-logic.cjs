@@ -33,8 +33,9 @@ const {
   PROFILE_PHOTO_MAX_SIZE_BYTES,
   PROFILE_COVER_PHOTO_MAX_SIZE_BYTES,
   EVENT_COVER_PHOTO_MAX_SIZE_BYTES,
+  REEL_THUMBNAIL_MAX_SIZE_BYTES,
 } = require('../lib/media/mediaUploadValidation.js');
-const { eventCoverKey, profileCoverKey, profilePhotoKey } = require('../lib/media/objectKey.js');
+const { eventCoverKey, profileCoverKey, profilePhotoKey, reelThumbnailKey } = require('../lib/media/objectKey.js');
 
 const results = [];
 function check(name, fn) {
@@ -455,6 +456,159 @@ check('eventCoverKey differs for a different uid at the same draftId — one use
 
 check('eventCoverKey matches the exact existing Firebase convention', () => {
   assert.equal(eventCoverKey('uid-a', 'draft1'), 'eventCovers/uid-a/draft1/photo');
+});
+
+// ---------------------------------------------------------------------------
+// Step 5E — 'reelThumbnail' media kind. Same shape-validation reasoning as
+// 'eventCover' above (a required, isSafePathSegment-checked identifier —
+// here `reelId` instead of `draftId`), same 5 MB cap as profilePhoto. This
+// file only covers the PURE shape validation this module can check —
+// verifyReelThumbnailOwnership's own real Firestore ownership/status/
+// mediaType checks (in requestMediaUploadAuthorization.ts, which
+// transitively imports firebase-admin and so can't run under this plain-
+// Node test runner — see this file's own top doc comment) are verified by
+// direct code review instead, same convention as this callable's
+// auth-required/secret-shape/expiry behavior already is.
+// ---------------------------------------------------------------------------
+
+check('accepts mediaKind "reelThumbnail" with a valid reelId and supported image type', () => {
+  const result = validateMediaUploadInput({ mediaKind: 'reelThumbnail', contentType: 'image/jpeg', fileSizeBytes: 1000, reelId: 'reel-abc123' });
+  assert.equal(result.mediaKind, 'reelThumbnail');
+  assert.equal(result.reelId, 'reel-abc123');
+});
+
+check('rejects mediaKind "reelThumbnail" with no reelId at all', () => {
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'reelThumbnail', contentType: 'image/jpeg', fileSizeBytes: 1000 }),
+    MediaUploadValidationError
+  );
+});
+
+check('rejects mediaKind "reelThumbnail" with an empty-string reelId', () => {
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'reelThumbnail', contentType: 'image/jpeg', fileSizeBytes: 1000, reelId: '' }),
+    MediaUploadValidationError
+  );
+});
+
+check('rejects mediaKind "reelThumbnail" with a non-string reelId', () => {
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'reelThumbnail', contentType: 'image/jpeg', fileSizeBytes: 1000, reelId: 12345 }),
+    MediaUploadValidationError
+  );
+});
+
+check('rejects a malformed reelId containing a slash (path-fragment injection)', () => {
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'reelThumbnail', contentType: 'image/jpeg', fileSizeBytes: 1000, reelId: 'a/b' }),
+    MediaUploadValidationError
+  );
+});
+
+check('rejects a malformed reelId attempting parent-directory traversal', () => {
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'reelThumbnail', contentType: 'image/jpeg', fileSizeBytes: 1000, reelId: '../other-uid' }),
+    MediaUploadValidationError
+  );
+});
+
+check('rejects a malformed reelId containing whitespace', () => {
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'reelThumbnail', contentType: 'image/jpeg', fileSizeBytes: 1000, reelId: 'reel with spaces' }),
+    MediaUploadValidationError
+  );
+});
+
+check('rejects an unsupported image type for reelThumbnail (image/gif)', () => {
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'reelThumbnail', contentType: 'image/gif', fileSizeBytes: 1000, reelId: 'reel1' }),
+    MediaUploadValidationError
+  );
+});
+
+check('rejects a video/* content type for reelThumbnail', () => {
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'reelThumbnail', contentType: 'video/mp4', fileSizeBytes: 1000, reelId: 'reel1' }),
+    MediaUploadValidationError
+  );
+});
+
+check('REEL_THUMBNAIL_MAX_SIZE_BYTES is 5 MB — mirrors firestore.rules\' isValidReelThumbnail and src/types/reel.ts exactly', () => {
+  assert.equal(REEL_THUMBNAIL_MAX_SIZE_BYTES, 5 * 1024 * 1024);
+});
+
+check('reelThumbnail accepts a file exactly at its own maximum size', () => {
+  assert.doesNotThrow(() =>
+    validateMediaUploadInput({
+      mediaKind: 'reelThumbnail',
+      contentType: 'image/jpeg',
+      fileSizeBytes: REEL_THUMBNAIL_MAX_SIZE_BYTES,
+      reelId: 'reel1',
+    })
+  );
+});
+
+check('reelThumbnail rejects a file one byte over its own maximum size', () => {
+  assert.throws(
+    () =>
+      validateMediaUploadInput({
+        mediaKind: 'reelThumbnail',
+        contentType: 'image/jpeg',
+        fileSizeBytes: REEL_THUMBNAIL_MAX_SIZE_BYTES + 1,
+        reelId: 'reel1',
+      }),
+    MediaUploadValidationError
+  );
+});
+
+check('reelThumbnail rejects a file within profilePhoto\'s smaller cap\'s excess but over its own only if it truly exceeds 5 MB — sanity-checks the cap is genuinely REEL_THUMBNAIL_MAX_SIZE_BYTES, not the profileCover/eventCover 8 MB one', () => {
+  assert.throws(
+    () =>
+      validateMediaUploadInput({
+        mediaKind: 'reelThumbnail',
+        contentType: 'image/jpeg',
+        fileSizeBytes: 6 * 1024 * 1024,
+        reelId: 'reel1',
+      }),
+    MediaUploadValidationError
+  );
+});
+
+check('reelThumbnail rejects a zero or negative file size', () => {
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'reelThumbnail', contentType: 'image/jpeg', fileSizeBytes: 0, reelId: 'reel1' }),
+    MediaUploadValidationError
+  );
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'reelThumbnail', contentType: 'image/jpeg', fileSizeBytes: -1, reelId: 'reel1' }),
+    MediaUploadValidationError
+  );
+});
+
+check('ignores an extra uid/authorUid field in a reelThumbnail payload — ownership is verified server-side against Firestore, never trusted from request data', () => {
+  const result = validateMediaUploadInput({
+    mediaKind: 'reelThumbnail',
+    contentType: 'image/jpeg',
+    fileSizeBytes: 1000,
+    reelId: 'reel1',
+    uid: 'some-other-uid',
+    authorUid: 'some-other-uid',
+  });
+  assert.equal('uid' in result, false);
+  assert.equal('authorUid' in result, false);
+  assert.deepEqual(Object.keys(result).sort(), ['contentType', 'fileSizeBytes', 'mediaKind', 'reelId']);
+});
+
+check('reelThumbnailKey is deterministic for the same uid+reelId', () => {
+  assert.equal(reelThumbnailKey('uid-a', 'reel1'), reelThumbnailKey('uid-a', 'reel1'));
+});
+
+check('reelThumbnailKey differs for a different uid at the same reelId — one user\'s Reel can never target another user\'s namespace', () => {
+  assert.notEqual(reelThumbnailKey('uid-a', 'reel1'), reelThumbnailKey('uid-b', 'reel1'));
+});
+
+check('reelThumbnailKey matches the exact existing Firebase convention', () => {
+  assert.equal(reelThumbnailKey('uid-a', 'reel1'), 'reels/uid-a/reel1/thumbnail');
 });
 
 console.log('\n=== functions/ media upload authorization logic test results ===');

@@ -58,6 +58,8 @@ import { fetchFollowingUids } from './following';
 import { firestore } from './firestore';
 import { functions } from './functions';
 import { extractHashtags, incrementHashtagCounts } from './hashtags';
+import { getMediaStorageProvider } from './media';
+import { uploadReelThumbnailToR2 } from './media/r2Provider';
 import { fetchEngagementStatsBatch } from './recommendations/engagementStats';
 import { scoreContentQuality } from './recommendations/ranking';
 import { storage } from './storage';
@@ -117,6 +119,11 @@ export function normalizeReel(data: Reel): Reel {
     musicHash: data.musicHash ?? '',
     soundOriginAuthorUid: data.soundOriginAuthorUid ?? '',
     soundOriginReelId: data.soundOriginReelId ?? '',
+    // Step 5E — a Reel published before this field existed has its
+    // thumbnail on Firebase, same defaulting convention as musicHash
+    // above. See ReelThumbnailStorageProvider's own doc comment.
+    thumbnailStorageProvider: data.thumbnailStorageProvider ?? 'firebase',
+    thumbnailUrl: data.thumbnailUrl ?? '',
   };
 }
 
@@ -146,6 +153,42 @@ export function setReelFeedHandoff(reels: Reel[]): void {
 export function peekReelFeedHandoff(): Reel[] | undefined {
   if (!reelFeedHandoff || Date.now() - reelFeedHandoff.fetchedAt >= REEL_FEED_HANDOFF_TTL_MS) return undefined;
   return reelFeedHandoff.reels;
+}
+
+// ---------------------------------------------------------------------------
+// Feed invalidation signal — a plain, session-local (never persisted)
+// version counter, bumped exactly once whenever THIS device's own
+// publishReel call below actually succeeds. This exists for Home's own
+// stale-while-revalidate memoization (src/app/(app)/(tabs)/index.tsx),
+// which otherwise only reloads the active feed when its own load key
+// (account + Active Scope + Home City) changes — a mere tab refocus is
+// deliberately a no-op there, to avoid a real Firestore read on every
+// ordinary tab switch. Publishing a Reel changes none of those three
+// things, so without this signal, returning to Home right after
+// publishing looked identical to "nothing happened" and the newly
+// published Reel simply wasn't there until an unrelated scope change
+// forced a real reload anyway.
+//
+// Deliberately a plain read at the CALL SITE's own focus-time, not
+// something folded into a React state value or into feedLoadKey itself:
+// Home stays mounted (just unfocused) while the create-Reel flow runs on
+// top of it, so nothing here needs to re-render Home while it's not even
+// visible — the version only needs to be read fresh at the moment Home
+// actually regains focus, which is exactly when a focus-effect callback
+// body (not a render) runs. See getReelFeedDirtyVersion's own callers in
+// index.tsx.
+//
+// Deliberately NOT scoped to a specific reelId/city/scope — a freshly
+// published Reel could legitimately become visible in more than just its
+// own home scope (e.g. it's also eligible under Global), so this simply
+// says "something new might exist, worth one fresh check," regardless of
+// which scope/mode the viewer happens to be looking at when they return.
+// ---------------------------------------------------------------------------
+let reelFeedDirtyVersion = 0;
+
+/** Current value of the feed-invalidation counter — see its own doc comment above. Callers should capture this at the time they last (re)loaded a feed and compare against a fresh read of this function at focus time, never store it in React state (that would just reintroduce the "does this force a render" problem this exists to avoid). */
+export function getReelFeedDirtyVersion(): number {
+  return reelFeedDirtyVersion;
 }
 
 export async function fetchReel(reelId: string): Promise<Reel | null> {
@@ -382,6 +425,14 @@ export async function createReelDraft(input: CreateReelDraftInput): Promise<Crea
     thumbnailFileSizeBytes: thumbnail.fileSizeBytes,
     thumbnailWidth: thumbnail.width,
     thumbnailHeight: thumbnail.height,
+    // Step 5E — every draft is created with its thumbnail still on
+    // Firebase, same "required field, fixed default at create" pattern as
+    // musicHash etc. above. Only a trusted, one-time server-authorized
+    // update (see confirmReelThumbnailProvider below) can ever flip this
+    // to 'r2' — enforced server-side by firestore.rules'
+    // isValidReelThumbnailProviderUpdate, not just by this client code.
+    thumbnailStorageProvider: 'firebase',
+    thumbnailUrl: '',
     createdAt: serverTimestamp(),
     updatedAt: serverTimestamp(),
     publishedAt: null,
@@ -540,13 +591,32 @@ export function uploadReelMusicAudio(
   };
 }
 
-/** Same shape/pattern as uploadReelVideo/uploadReelMusicAudio, for the cover-frame image at `reel.thumbnailStoragePath` — always uploaded, unlike music. */
+/**
+ * Same shape/pattern as uploadReelVideo/uploadReelMusicAudio, for the
+ * cover-frame image at `reel.thumbnailStoragePath` — always uploaded,
+ * unlike music.
+ *
+ * Step 5E — dispatches to uploadReelThumbnailViaR2 (below) ONLY when
+ * BOTH getMediaStorageProvider() is 'r2' AND `reel.mediaType === 'video'`
+ * — a 'photo' Reel's thumbnail IS its own primary storagePath (see
+ * Reel.thumbnailStoragePath's own doc comment in src/types/reel.ts), so
+ * there is no separate thumbnail object to ever migrate for one; it
+ * always takes this exact same, unmodified Firebase path below,
+ * regardless of the configured provider. This function's own default,
+ * production behavior (Firebase, or an R2 build's own photo Reels) is
+ * otherwise completely untouched — the exact same code that existed
+ * before Step 5E.
+ */
 export function uploadReelThumbnail(
   reel: Reel,
   localUri: string,
   onProgress: (percent: number) => void,
   onComplete: (result: { ok: true } | { ok: false; message: string }) => void
 ): UploadReelVideoHandle {
+  if (getMediaStorageProvider() === 'r2' && reel.mediaType === 'video') {
+    return uploadReelThumbnailViaR2(reel, localUri, onProgress, onComplete);
+  }
+
   let cancelled = false;
   let task: UploadTask | null = null;
 
@@ -594,6 +664,124 @@ export function uploadReelThumbnail(
       task?.cancel();
     },
   };
+}
+
+/**
+ * Step 5E — the one-time, server-authorized Firestore write that flips a
+ * still-"uploading" video Reel's thumbnail from Firebase to R2, once (and
+ * only once) the direct client PUT to R2 has actually succeeded — see
+ * firestore.rules' own isValidReelThumbnailProviderUpdate for the exact
+ * narrow shape this write must take (every field besides
+ * thumbnailStorageProvider/thumbnailUrl/updatedAt must stay
+ * byte-identical, and this can never fire a second time against the same
+ * Reel). The ONLY caller is uploadReelThumbnailViaR2 below — this is not
+ * a general-purpose Reel-editing function.
+ *
+ * `thumbnailUrl` must be the exact, already-resolved, cache-busted R2
+ * delivery URL returned by uploadReelThumbnailToR2 — never fabricated or
+ * reconstructed here (same "server is the one source of truth for this
+ * URL" principle as every other R2-backed media kind — see
+ * r2Provider.ts's own doc comments).
+ */
+async function confirmReelThumbnailProvider(reelId: string, thumbnailUrl: string): Promise<{ ok: true } | { ok: false; message: string }> {
+  if (!firestore) {
+    return { ok: false, message: 'Firestore is not available.' };
+  }
+  try {
+    await updateDoc(reelRef(reelId), {
+      thumbnailStorageProvider: 'r2',
+      thumbnailUrl,
+      updatedAt: serverTimestamp(),
+    });
+  } catch {
+    return { ok: false, message: "Couldn't finish saving this post's cover image." };
+  }
+  return { ok: true };
+}
+
+/**
+ * Step 5E's real, end-to-end R2 upload path for a video Reel's
+ * thumbnail — reached ONLY from uploadReelThumbnail above, when both
+ * getMediaStorageProvider() is 'r2' and `reel.mediaType === 'video'`
+ * (never for a 'photo' Reel — see uploadReelThumbnail's own doc
+ * comment). Unlike profile photo/cover/event cover — whose own callers
+ * persist the returned URL themselves — this function ALSO performs the
+ * follow-up confirmReelThumbnailProvider write itself, since
+ * uploadReelThumbnail's existing `{ok:true}|{ok:false}` contract exposes
+ * no URL to ITS OWN caller at all (unlike edit.tsx's profile-photo flow,
+ * which receives `photoURL` directly). A failure at EITHER step — the R2
+ * PUT itself, or the follow-up Firestore write — surfaces as
+ * `onComplete({ok:false,...})`, preserving the existing guarantee that
+ * the caller (camera.tsx's publish flow) never proceeds to publish a
+ * Reel whose thumbnail isn't genuinely ready.
+ *
+ * A note on the resulting orphan risk: if the R2 PUT succeeds but the
+ * follow-up Firestore write then fails, the R2 object itself is left
+ * behind with nothing in Firestore ever pointing at it — same
+ * "documented, not fixed" gap as discardReelDraft's own lack of an R2
+ * equivalent (see that function's own doc comment) — a real user retry
+ * simply re-PUTs to the exact same deterministic key, overwriting it in
+ * place, so this never accumulates unbounded orphans, just an occasional
+ * harmless overwrite.
+ */
+function uploadReelThumbnailViaR2(
+  reel: Reel,
+  localUri: string,
+  onProgress: (percent: number) => void,
+  onComplete: (result: { ok: true } | { ok: false; message: string }) => void
+): UploadReelVideoHandle {
+  let cancelled = false;
+
+  (async () => {
+    const uploadResult = await uploadReelThumbnailToR2(reel.reelId, localUri, onProgress);
+    if (cancelled) return;
+
+    if (!uploadResult.ok) {
+      onComplete(uploadResult);
+      return;
+    }
+
+    const confirmResult = await confirmReelThumbnailProvider(reel.reelId, uploadResult.photoURL);
+    if (cancelled) return;
+
+    if (__DEV__) {
+      // eslint-disable-next-line no-console
+      console.log('[reels] R2 thumbnail upload for', reel.reelId, '->', uploadResult, confirmResult);
+    }
+    onComplete(confirmResult);
+  })();
+
+  return {
+    cancel: () => {
+      cancelled = true;
+    },
+  };
+}
+
+/**
+ * Resolves the URL a video Reel's thumbnail should actually render from
+ * — the ONE call site (ReelFeedItem.tsx) that needs to know which of the
+ * two provider paths a given Reel's thumbnail lives behind. Branches on
+ * the Reel's OWN persisted `thumbnailStorageProvider` (never on
+ * getMediaStorageProvider() — the CURRENT app config has nothing to do
+ * with where an EXISTING Reel's thumbnail actually was uploaded), so a
+ * mixed feed of some Firebase-thumbnail and some R2-thumbnail Reels
+ * resolves each one correctly regardless of the currently-configured
+ * provider — see src/types/reel.ts's ReelThumbnailStorageProvider doc
+ * comment for the full model.
+ *
+ * 'r2': `thumbnailUrl` was already resolved once, at upload time, and
+ * persisted — returned directly, no network round-trip needed.
+ * 'firebase' (including every legacy Reel missing the field entirely,
+ * already defaulted by normalizeReel): unchanged, existing behavior —
+ * lazily resolved from `thumbnailStoragePath` via resolveReelPlaybackUrl,
+ * same as before Step 5E.
+ */
+export async function resolveReelThumbnailUrl(reel: Reel): Promise<string | null> {
+  if (reel.thumbnailStorageProvider === 'r2') {
+    return reel.thumbnailUrl || null;
+  }
+  return resolveReelPlaybackUrl(reel.thumbnailStoragePath);
 }
 
 // ---------------------------------------------------------------------------
@@ -701,6 +889,11 @@ export async function publishReel(reelId: string): Promise<PublishReelResult> {
   } catch {
     return { ok: false, error: 'unknown', message: "Couldn't publish this post." };
   }
+  // The Reel is genuinely published in Firestore from this point on, even
+  // if the read-back or hashtag-count step below somehow fails — so the
+  // feed-invalidation signal fires here, not after either of those. See
+  // getReelFeedDirtyVersion's own doc comment above for the full reasoning.
+  reelFeedDirtyVersion += 1;
   const published = await fetchReel(reelId);
   if (!published) {
     return { ok: false, error: 'unknown', message: 'Post was published but could not be read back.' };

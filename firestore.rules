@@ -1189,15 +1189,18 @@ service cloud.firestore {
 
       allow create: if isSignedIn() && isValidReelCreate(reelId, request.resource.data);
 
-      // The ONLY allowed transition: uploading -> published. Every other
-      // field is immutable — no caption editing, no city changing, no
-      // storage path changing, no author changing, and once published,
-      // this rule can never fire again (oldData.status == 'uploading' is
-      // required, so a second update attempt against a published Reel is
-      // always denied here).
+      // Two allowed updates, and only these: uploading -> published (the
+      // original, still overwhelmingly common case), and Step 5E's
+      // narrow, one-time "thumbnail moved to R2" flip while still
+      // "uploading" — see isValidReelPublish/isValidReelThumbnailProviderUpdate's
+      // own doc comments for the full "every other field is immutable"
+      // reasoning each one separately enforces.
       allow update: if isSignedIn()
         && resource.data.authorUid == request.auth.uid
-        && isValidReelPublish(request.resource.data, resource.data);
+        && (
+          isValidReelPublish(request.resource.data, resource.data)
+          || isValidReelThumbnailProviderUpdate(request.resource.data, resource.data)
+        );
 
       // Only a still-uploading draft may be deleted, by its own author —
       // for failed/cancelled-upload cleanup (see discardReelDraft). A
@@ -1389,6 +1392,7 @@ service cloud.firestore {
         'musicHash', 'soundOriginAuthorUid', 'soundOriginReelId',
         'thumbnailStoragePath', 'thumbnailStorageContentType',
         'thumbnailFileSizeBytes', 'thumbnailWidth', 'thumbnailHeight',
+        'thumbnailStorageProvider', 'thumbnailUrl',
         'createdAt', 'updatedAt', 'publishedAt'
       ];
     }
@@ -1552,6 +1556,14 @@ service cloud.firestore {
         && data.musicHash == ''
         && data.soundOriginAuthorUid == ''
         && data.soundOriginReelId == ''
+        // Step 5E — a draft is always created with its thumbnail still on
+        // Firebase, same "required field, fixed default at create" pattern
+        // as musicHash/soundOriginAuthorUid/soundOriginReelId above. Only a
+        // trusted, one-time server-authorized update (see
+        // isValidReelThumbnailProviderUpdate below) can ever flip this to
+        // 'r2' — a client can never create a draft already claiming R2.
+        && data.thumbnailStorageProvider == 'firebase'
+        && data.thumbnailUrl == ''
         && isValidReelMusic(reelId, request.auth.uid, data)
         && isValidReelThumbnail(reelId, request.auth.uid, data)
         && isServerTimestamp(data.createdAt)
@@ -1613,7 +1625,78 @@ service cloud.firestore {
         && newData.thumbnailFileSizeBytes == oldData.thumbnailFileSizeBytes
         && newData.thumbnailWidth == oldData.thumbnailWidth
         && newData.thumbnailHeight == oldData.thumbnailHeight
+        && newData.thumbnailStorageProvider == oldData.thumbnailStorageProvider
+        && newData.thumbnailUrl == oldData.thumbnailUrl
         && newData.createdAt == oldData.createdAt
+        && newData.keys().hasOnly(reelBaseKeys());
+    }
+
+    // Step 5E — the ONE other allowed update besides publish: a still-
+    // "uploading" video Reel's thumbnail moving from Firebase to R2, once
+    // (and only once) a direct client upload to R2 has actually succeeded
+    // (see functions/src/media/requestMediaUploadAuthorization.ts's own
+    // verifyReelThumbnailOwnership for the server-side authorization that
+    // must happen BEFORE that upload, and src/services/reels.ts's
+    // confirmReelThumbnailProvider, the only client-side caller of this
+    // path). `oldData.thumbnailStorageProvider == 'firebase'` is what
+    // makes this fire at most once ever per Reel — a second attempt to
+    // call this against a Reel that's already 'r2' is always denied here,
+    // exactly mirroring isValidReelPublish's own
+    // `oldData.status == 'uploading'` one-shot guard above. Every field
+    // besides thumbnailStorageProvider/thumbnailUrl/updatedAt must stay
+    // byte-identical — same "no sneaking an unrelated change through this
+    // narrow door" reasoning as isValidReelPublish.
+    function isValidReelThumbnailProviderUpdate(newData, oldData) {
+      return oldData.status == 'uploading'
+        && newData.status == 'uploading'
+        // Only a real video Reel has a separate thumbnail object to begin
+        // with — a 'photo' Reel's thumbnail IS its own storagePath (see
+        // isValidReelThumbnail above) and must never reach this path (also
+        // independently enforced server-side, before any R2 upload is
+        // even authorized — see verifyReelThumbnailOwnership).
+        && oldData.mediaType == 'video'
+        && newData.mediaType == 'video'
+        && oldData.thumbnailStorageProvider == 'firebase'
+        && newData.thumbnailStorageProvider == 'r2'
+        && newData.thumbnailUrl is string
+        && newData.thumbnailUrl.size() > 0
+        && newData.thumbnailUrl.size() <= 2048
+        && newData.thumbnailUrl.matches('https://.*')
+        && isServerTimestamp(newData.updatedAt)
+        && newData.reelId == oldData.reelId
+        && newData.authorUid == oldData.authorUid
+        && newData.authorDisplayName == oldData.authorDisplayName
+        && newData.authorUsername == oldData.authorUsername
+        && newData.cityName == oldData.cityName
+        && newData.countryCode == oldData.countryCode
+        && newData.cityKey == oldData.cityKey
+        && newData.categoryId == oldData.categoryId
+        && newData.caption == oldData.caption
+        && newData.hashtags == oldData.hashtags
+        && newData.needsPhotoVideoRender == oldData.needsPhotoVideoRender
+        && newData.storagePath == oldData.storagePath
+        && newData.storageContentType == oldData.storageContentType
+        && newData.fileSizeBytes == oldData.fileSizeBytes
+        && newData.durationMs == oldData.durationMs
+        && newData.width == oldData.width
+        && newData.height == oldData.height
+        && newData.visibility == oldData.visibility
+        && newData.musicSourceType == oldData.musicSourceType
+        && newData.musicTitle == oldData.musicTitle
+        && newData.musicStorageAudioPath == oldData.musicStorageAudioPath
+        && newData.musicStorageContentType == oldData.musicStorageContentType
+        && newData.musicFileSizeBytes == oldData.musicFileSizeBytes
+        && newData.musicDurationMs == oldData.musicDurationMs
+        && newData.musicHash == oldData.musicHash
+        && newData.soundOriginAuthorUid == oldData.soundOriginAuthorUid
+        && newData.soundOriginReelId == oldData.soundOriginReelId
+        && newData.thumbnailStoragePath == oldData.thumbnailStoragePath
+        && newData.thumbnailStorageContentType == oldData.thumbnailStorageContentType
+        && newData.thumbnailFileSizeBytes == oldData.thumbnailFileSizeBytes
+        && newData.thumbnailWidth == oldData.thumbnailWidth
+        && newData.thumbnailHeight == oldData.thumbnailHeight
+        && newData.createdAt == oldData.createdAt
+        && newData.publishedAt == oldData.publishedAt
         && newData.keys().hasOnly(reelBaseKeys());
     }
 

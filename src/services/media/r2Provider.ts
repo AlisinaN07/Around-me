@@ -37,16 +37,23 @@ async function requestUploadAuthorization(
   mediaKind: MediaKind,
   contentType: string,
   fileSizeBytes: number,
-  draftId?: string
+  draftId?: string,
+  reelId?: string
 ): Promise<MediaUploadAuthorizationResponse> {
   if (!functions) {
     throw new Error('This feature is not available right now.');
   }
   const callable = httpsCallable<
-    { mediaKind: string; contentType: string; fileSizeBytes: number; draftId?: string },
+    { mediaKind: string; contentType: string; fileSizeBytes: number; draftId?: string; reelId?: string },
     MediaUploadAuthorizationResponse
   >(functions, 'requestMediaUploadAuthorization');
-  const result = await callable({ mediaKind, contentType, fileSizeBytes, ...(draftId ? { draftId } : {}) });
+  const result = await callable({
+    mediaKind,
+    contentType,
+    fileSizeBytes,
+    ...(draftId ? { draftId } : {}),
+    ...(reelId ? { reelId } : {}),
+  });
   return result.data;
 }
 
@@ -66,7 +73,8 @@ async function performDirectUpload(
   localUri: string,
   contentType: string,
   onProgress: MediaUploadProgressCallback,
-  draftId?: string
+  draftId?: string,
+  reelId?: string
 ): Promise<DirectUploadOutcome> {
   let blob: Blob;
   try {
@@ -85,7 +93,7 @@ async function performDirectUpload(
 
   let authorization: MediaUploadAuthorizationResponse;
   try {
-    authorization = await requestUploadAuthorization(mediaKind, resolvedContentType, blob.size, draftId);
+    authorization = await requestUploadAuthorization(mediaKind, resolvedContentType, blob.size, draftId, reelId);
   } catch {
     return { ok: false, message: "Couldn't prepare this upload." };
   }
@@ -192,9 +200,10 @@ async function uploadDisplayableMediaToR2(
   localUri: string,
   onProgress: MediaUploadProgressCallback,
   notConfiguredMessage: string,
-  draftId?: string
+  draftId?: string,
+  reelId?: string
 ): Promise<DisplayableUploadResult> {
-  const outcome = await performDirectUpload(mediaKind, localUri, 'image/jpeg', onProgress, draftId);
+  const outcome = await performDirectUpload(mediaKind, localUri, 'image/jpeg', onProgress, draftId, reelId);
   if (!outcome.ok) return outcome;
 
   if (!outcome.authorization.mediaUrl) {
@@ -247,5 +256,39 @@ export async function uploadEventCoverToR2(
     onProgress,
     'Uploaded to R2, but no public media domain is configured yet — this cover photo is not displayable.',
     draftId
+  );
+}
+
+/**
+ * The real, production-wired Reel-thumbnail upload path — see
+ * uploadDisplayableMediaToR2's own doc comment for the shared upload
+ * behavior. `reelId` is REQUIRED (unlike profile photo/cover) — see
+ * requestMediaUploadAuthorization.ts's own verifyReelThumbnailOwnership
+ * for why: the server loads this exact Reel and verifies the caller
+ * owns it and it's still awaiting its thumbnail BEFORE ever creating a
+ * presigned URL, so a made-up/foreign reelId is rejected server-side
+ * regardless of what this client-side function passes along.
+ *
+ * Unlike profile photo/cover/event cover — whose callers persist the
+ * returned `photoURL` themselves — this function's own caller
+ * (reels.ts's uploadReelThumbnail) is responsible for ALSO writing the
+ * returned URL into the Reel's own `thumbnailUrl`/
+ * `thumbnailStorageProvider` fields via confirmReelThumbnailProvider,
+ * since uploadReelThumbnail's existing contract exposes no URL to ITS
+ * own caller at all (unlike edit.tsx's profile-photo flow) — see
+ * reels.ts's own doc comment on that function for the full reasoning.
+ */
+export async function uploadReelThumbnailToR2(
+  reelId: string,
+  localUri: string,
+  onProgress: MediaUploadProgressCallback
+): Promise<ProfilePhotoUploadResult> {
+  return uploadDisplayableMediaToR2(
+    'reelThumbnail',
+    localUri,
+    onProgress,
+    'Uploaded to R2, but no public media domain is configured yet — this thumbnail is not displayable.',
+    undefined,
+    reelId
   );
 }

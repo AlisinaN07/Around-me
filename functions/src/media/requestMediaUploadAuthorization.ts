@@ -5,16 +5,22 @@
  * r2Config.ts's own doc comment on why those never leave this backend).
  *
  * Deliberately narrow: supports ONLY `mediaKind: 'profilePhoto'` (Step
- * 5A), `'profileCover'` (Step 5C), and `'eventCover'` (Step 5D) for the
- * CALLING user's own uid — no client-supplied uid, no other media kind.
- * Extending this to Reels/Stories is explicit future work, not something
- * this file's own shape should be stretched to cover prematurely.
+ * 5A), `'profileCover'` (Step 5C), `'eventCover'` (Step 5D), and
+ * `'reelThumbnail'` (Step 5E) for the CALLING user's own uid — no
+ * client-supplied uid, no other media kind. In particular this never
+ * authorizes a Reel's own video/audio, or any Story — extending this
+ * further is explicit future work, not something this file's own shape
+ * should be stretched to cover prematurely.
  *
- * `eventCover` is the one media kind that DOES accept a client-supplied
- * identifier (`draftId`) — see RequestMediaUploadAuthorizationInput's own
- * doc comment on that field for exactly why, and mediaUploadValidation.ts
- * for how it's validated as a safe path segment before ever reaching
- * objectKey.ts's eventCoverKey.
+ * `eventCover` is the one media kind that accepts a client-supplied,
+ * NOT independently ownership-checked identifier (`draftId`) — see
+ * RequestMediaUploadAuthorizationInput's own doc comment on that field
+ * for exactly why, and mediaUploadValidation.ts for how it's validated
+ * as a safe path segment before ever reaching objectKey.ts's
+ * eventCoverKey. `reelThumbnail`'s `reelId` looks similar on the
+ * surface but is different in kind: it identifies a REAL, pre-existing
+ * Firestore document, so this file additionally verifies real ownership
+ * of it server-side — see verifyReelThumbnailOwnership below.
  *
  * Unlike r2Storage.ts/r2Config.ts (deliberately NOT exported from
  * functions/src/index.ts — see r2Storage.ts's own doc comment), THIS
@@ -30,12 +36,13 @@
  * this file's own firebase-functions import chain isn't safely
  * `require()`-able under this project's plain-Node test runner).
  */
+import { getFirestore } from 'firebase-admin/firestore';
 import { defineSecret } from 'firebase-functions/params';
 import { HttpsError, onCall, type CallableRequest } from 'firebase-functions/v2/https';
 
 import { MediaUploadValidationError, validateMediaUploadInput, type AllowedMediaKind } from './mediaUploadValidation';
 import { buildMediaUrl } from './mediaUrl';
-import { eventCoverKey, profileCoverKey, profilePhotoKey } from './objectKey';
+import { eventCoverKey, profileCoverKey, profilePhotoKey, reelThumbnailKey } from './objectKey';
 import { getR2Config } from './r2Config';
 import { createPresignedUploadUrl } from './r2Storage';
 
@@ -78,6 +85,18 @@ type RequestMediaUploadAuthorizationInput = {
    * silently accepted.
    */
   draftId?: string;
+  /**
+   * Required for, and used ONLY by, `mediaKind: 'reelThumbnail'`. Unlike
+   * `draftId` above, this identifies a REAL, already-existing Firestore
+   * `reels/{reelId}` document (src/services/reels.ts's createReelDraft
+   * always runs before a thumbnail upload is ever attempted) — so unlike
+   * eventCover, this callable does NOT just trust a client-supplied
+   * segment at face value. See verifyReelThumbnailOwnership below: this
+   * value is used to load that exact Reel server-side and confirm the
+   * caller actually owns it and it's still awaiting its thumbnail,
+   * BEFORE any presigned URL is ever created.
+   */
+  reelId?: string;
 };
 
 /** Safe, minimal client-facing result — see src/services/media/types.ts's MediaUploadAuthorization, which this shape matches. Never includes an access key, secret key, or any other R2 credential. */
@@ -111,6 +130,49 @@ type RequestMediaUploadAuthorizationResult = {
    */
   mediaUrl: string | null;
 };
+
+/**
+ * Reel thumbnails are the first media kind this callable authorizes for
+ * an object that already has a REAL Firestore document behind it — so
+ * unlike eventCover's bare "any string under your own uid" trust model,
+ * this does an actual Firestore Admin SDK read to verify:
+ *  1. The Reel document exists at all (a made-up/foreign reelId is
+ *     rejected, not silently authorized against a path that happens to
+ *     parse).
+ *  2. `authorUid === request.auth.uid` — never authorize a thumbnail
+ *     upload into another user's Reel, no matter what reelId is passed.
+ *  3. `status === 'uploading'` — mirrors the one narrow window
+ *     firestore.rules' own isValidReelThumbnailProviderUpdate will also
+ *     require for the follow-up confirm-write (see reels.ts's
+ *     confirmReelThumbnailProvider): a published or already-discarded
+ *     Reel can never have its thumbnail re-authorized for upload.
+ *  4. `mediaType === 'video'` — a photo Reel has no separate thumbnail
+ *     object at all (its thumbnailStoragePath IS its own storagePath —
+ *     see reels.ts's createReelDraft), so authorizing an R2 thumbnail
+ *     upload for one would silently create an orphaned object nothing
+ *     ever references, not migrate anything real.
+ *
+ * Throws a distinct HttpsError code per failure so legitimate client
+ * bugs are debuggable, while still never leaking WHY a given reelId was
+ * rejected beyond that top-level code (no Reel content/other fields are
+ * ever included in an error message).
+ */
+async function verifyReelThumbnailOwnership(reelId: string, uid: string): Promise<void> {
+  const snapshot = await getFirestore().collection('reels').doc(reelId).get();
+  if (!snapshot.exists) {
+    throw new HttpsError('not-found', 'This Reel could not be found.');
+  }
+  const reel = snapshot.data() as Record<string, unknown>;
+  if (reel.authorUid !== uid) {
+    throw new HttpsError('permission-denied', 'You do not own this Reel.');
+  }
+  if (reel.status !== 'uploading') {
+    throw new HttpsError('failed-precondition', 'This Reel is not awaiting a thumbnail upload.');
+  }
+  if (reel.mediaType !== 'video') {
+    throw new HttpsError('failed-precondition', 'This Reel does not use a separate thumbnail.');
+  }
+}
 
 /**
  * The actual handler, exported separately from the `onCall(...)`-wrapped
@@ -164,6 +226,15 @@ export async function handleRequest(request: CallableRequest<unknown>): Promise<
     // non-null assertion reflects that already-checked invariant, not an
     // unchecked assumption.
     path = eventCoverKey(request.auth.uid, input.draftId!);
+  } else if (input.mediaKind === 'reelThumbnail') {
+    // validateMediaUploadInput already guarantees `reelId` is present and
+    // a safe path segment — but that's only shape validation. The real
+    // security property (this Reel belongs to the caller and is still
+    // awaiting its thumbnail) is verified here, against Firestore, before
+    // any presigned URL is ever created — see verifyReelThumbnailOwnership's
+    // own doc comment above.
+    await verifyReelThumbnailOwnership(input.reelId!, request.auth.uid);
+    path = reelThumbnailKey(request.auth.uid, input.reelId!);
   } else if (input.mediaKind === 'profileCover') {
     path = profileCoverKey(request.auth.uid);
   } else {

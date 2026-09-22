@@ -120,6 +120,23 @@ export type ReelMusicSourceType = 'none' | 'device';
  */
 export type ReelMediaType = 'video' | 'photo';
 
+/**
+ * Which backend a video Reel's `thumbnailStoragePath`/`thumbnailUrl`
+ * actually live in — Step 5E's hybrid-media step. 'firebase' is every
+ * Reel published before this field existed (see normalizeReel in
+ * src/services/reels.ts) and every Reel published while
+ * EXPO_PUBLIC_MEDIA_STORAGE_PROVIDER stays unset/'firebase' — for these,
+ * `thumbnailUrl` is '' and the thumbnail is resolved the existing way,
+ * lazily from `thumbnailStoragePath` via resolveReelPlaybackUrl. 'r2' is
+ * set exactly once, by a trusted server write (see firestore.rules'
+ * isValidReelThumbnailProviderUpdate and functions/src/media/
+ * requestMediaUploadAuthorization.ts), the moment an R2 thumbnail upload
+ * succeeds — never client-writable directly. Meaningless for a 'photo'
+ * mediaType Reel (whose thumbnail IS its own primary storagePath, never
+ * migrated by Step 5E) — see resolveReelThumbnailUrl in reels.ts.
+ */
+export type ReelThumbnailStorageProvider = 'firebase' | 'r2';
+
 export type Reel = {
   reelId: string;
   authorUid: string;
@@ -256,6 +273,28 @@ export type Reel = {
   thumbnailFileSizeBytes: number;
   thumbnailWidth: number;
   thumbnailHeight: number;
+  /**
+   * Step 5E — which backend this Reel's thumbnail actually lives in. See
+   * ReelThumbnailStorageProvider's own doc comment for the full model.
+   * Always `'firebase'` on a legacy Reel missing this key — see
+   * normalizeReel, same "required-field-with-default" convention as
+   * `musicHash` etc. above. Never client-writable to `'r2'` directly —
+   * only a trusted server write can flip it (see firestore.rules'
+   * isValidReelThumbnailProviderUpdate).
+   */
+  thumbnailStorageProvider: ReelThumbnailStorageProvider;
+  /**
+   * Step 5E — the resolved, cache-busted R2 delivery URL for this Reel's
+   * thumbnail, persisted at upload time (never derived from
+   * `thumbnailStoragePath` the way a Firebase-backed thumbnail's URL is
+   * resolved lazily at render time — see resolveReelThumbnailUrl in
+   * reels.ts). `''` whenever `thumbnailStorageProvider` is `'firebase'`
+   * (including every legacy Reel) — meaningful ONLY when
+   * `thumbnailStorageProvider === 'r2'`. Set exactly once by a trusted
+   * server write, never client-writable directly (same rule as
+   * `thumbnailStorageProvider` above).
+   */
+  thumbnailUrl: string;
   createdAt: Timestamp;
   updatedAt: Timestamp;
   publishedAt: Timestamp | null;
