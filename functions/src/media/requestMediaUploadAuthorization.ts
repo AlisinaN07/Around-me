@@ -4,12 +4,12 @@
  * scoped presigned R2 upload URL — never R2 credentials themselves (see
  * r2Config.ts's own doc comment on why those never leave this backend).
  *
- * Deliberately narrow: Step 5A supports ONLY `mediaKind: 'profilePhoto'`
- * for the CALLING user's own uid — no client-supplied uid, no
- * client-supplied path, no other media kind. Extending this to Reels/
- * Stories/Events/profile covers is explicit future work (see the Step 5A
- * report's own "Exact recommendation for Step 5B"), not something this
- * file's own shape should be stretched to cover prematurely.
+ * Deliberately narrow: supports ONLY `mediaKind: 'profilePhoto'` (Step
+ * 5A) and `'profileCover'` (Step 5C) for the CALLING user's own uid — no
+ * client-supplied uid, no client-supplied path, no other media kind.
+ * Extending this to Reels/Stories/Events is explicit future work, not
+ * something this file's own shape should be stretched to cover
+ * prematurely.
  *
  * Unlike r2Storage.ts/r2Config.ts (deliberately NOT exported from
  * functions/src/index.ts — see r2Storage.ts's own doc comment), THIS
@@ -29,8 +29,8 @@ import { defineSecret } from 'firebase-functions/params';
 import { HttpsError, onCall, type CallableRequest } from 'firebase-functions/v2/https';
 
 import { MediaUploadValidationError, validateMediaUploadInput, type AllowedMediaKind } from './mediaUploadValidation';
-import { buildProfilePhotoMediaUrl } from './mediaUrl';
-import { profilePhotoKey } from './objectKey';
+import { buildMediaUrl } from './mediaUrl';
+import { profileCoverKey, profilePhotoKey } from './objectKey';
 import { getR2Config } from './r2Config';
 import { createPresignedUploadUrl } from './r2Storage';
 
@@ -80,10 +80,11 @@ type RequestMediaUploadAuthorizationResult = {
    *
    * Deliberately returned at AUTHORIZATION time, before the upload has
    * actually happened — safe because the object's path is already fully
-   * deterministic (profilePhotoKey(uid)) and the version token below is
-   * generated fresh for this exact request, so the URL this response
-   * predicts is exactly the URL the object will be reachable at the
-   * moment the client's own PUT succeeds.
+   * deterministic (profilePhotoKey(uid) or profileCoverKey(uid),
+   * depending on mediaKind) and the version token below is generated
+   * fresh for this exact request, so the URL this response predicts is
+   * exactly the URL the object will be reachable at the moment the
+   * client's own PUT succeeds.
    */
   mediaUrl: string | null;
 };
@@ -125,22 +126,22 @@ export async function handleRequest(request: CallableRequest<unknown>): Promise<
 
   // Server-derived, deterministic, and bound to the CALLER's own uid —
   // exactly src/services/userProfile.ts's existing
-  // `profilePhotos/{uid}/photo` Firebase Storage convention (see
-  // objectKey.ts's own doc comment), so a future read/delivery step can
-  // map straight back to the same logical object identity regardless of
-  // which backend actually holds it.
-  const path = profilePhotoKey(request.auth.uid);
+  // `profilePhotos/{uid}/photo` / `profileCovers/{uid}/photo` Firebase
+  // Storage conventions (see objectKey.ts's own doc comment), so a
+  // future read/delivery step can map straight back to the same logical
+  // object identity regardless of which backend actually holds it.
+  const path = input.mediaKind === 'profileCover' ? profileCoverKey(request.auth.uid) : profilePhotoKey(request.auth.uid);
 
   try {
     const { uploadUrl, expiresAt } = await createPresignedUploadUrl(path, input.contentType, input.fileSizeBytes);
 
-    // Step 5B — cache-busting: a fresh version token per authorization
-    // request, folded into the delivery URL's own query string (see
-    // mediaUrl.ts's own doc comment for the full reasoning). The
-    // underlying R2 object key is untouched — still the exact same
-    // `profilePhotos/{uid}/photo` every time, overwritten in place.
+    // Cache-busting: a fresh version token per authorization request,
+    // folded into the delivery URL's own query string (see mediaUrl.ts's
+    // own doc comment for the full reasoning). The underlying R2 object
+    // key is untouched — still the exact same deterministic path every
+    // time, overwritten in place.
     const publicMediaBaseUrl = getR2Config()?.publicMediaBaseUrl ?? null;
-    const mediaUrl = publicMediaBaseUrl ? buildProfilePhotoMediaUrl(publicMediaBaseUrl, path, Date.now()) : null;
+    const mediaUrl = publicMediaBaseUrl ? buildMediaUrl(publicMediaBaseUrl, path, Date.now()) : null;
 
     return { provider: 'r2', path, uploadUrl, contentType: input.contentType, expiresAt, mediaUrl };
   } catch {

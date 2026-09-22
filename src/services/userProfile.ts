@@ -23,7 +23,7 @@ import { normalizeUsername } from '@/utils/username';
 
 import { firestore } from './firestore';
 import { getMediaStorageProvider } from './media';
-import { uploadProfilePhotoToR2 } from './media/r2Provider';
+import { uploadProfileCoverToR2, uploadProfilePhotoToR2 } from './media/r2Provider';
 import { invalidatePublicProfile } from './publicProfile';
 import { storage } from './storage';
 
@@ -679,6 +679,15 @@ export type UploadProfileCoverPhotoHandle = { cancel: () => void };
  * uploading to profileCovers/{uid}/photo instead (see storage.rules, same
  * create-or-update-in-place path), just with the larger
  * PROFILE_COVER_PHOTO_MAX_SIZE_BYTES cap.
+ *
+ * Step 5C — dispatches on getMediaStorageProvider() (see
+ * src/services/media/config.ts), same pattern as uploadProfilePhoto
+ * above. This function's own behavior for the default, production value
+ * ('firebase') is completely untouched below — the exact same code that
+ * existed before Step 5C. The 'r2' branch (uploadProfileCoverViaR2,
+ * right below) is a SEPARATE function, reached only when a developer
+ * explicitly sets EXPO_PUBLIC_MEDIA_STORAGE_PROVIDER=r2 for controlled
+ * testing.
  */
 export function uploadProfileCoverPhoto(
   uid: string,
@@ -686,6 +695,10 @@ export function uploadProfileCoverPhoto(
   onProgress: (percent: number) => void,
   onComplete: (result: { ok: true; coverPhotoURL: string } | { ok: false; message: string }) => void
 ): UploadProfileCoverPhotoHandle {
+  if (getMediaStorageProvider() === 'r2') {
+    return uploadProfileCoverViaR2(uid, localUri, onProgress, onComplete);
+  }
+
   let cancelled = false;
   let task: UploadTask | null = null;
 
@@ -741,6 +754,43 @@ export function uploadProfileCoverPhoto(
     cancel: () => {
       cancelled = true;
       task?.cancel();
+    },
+  };
+}
+
+/**
+ * Step 5C's real, end-to-end R2 upload+display path for profile covers —
+ * reached ONLY when getMediaStorageProvider() returns 'r2' (never in a
+ * default build; see uploadProfileCoverPhoto's own doc comment).
+ * Delegates to uploadProfileCoverToR2 (src/services/media/r2Provider.ts),
+ * the exact same proven authorize-then-PUT mechanics as
+ * uploadProfilePhotoViaR2, just for the `profileCover` media kind and
+ * its own `profileCovers/{uid}/photo` object key. Returns the SAME shape
+ * uploadProfileCoverPhoto's own Firebase branch above already returns,
+ * so edit.tsx's handleChangeCoverPhoto needs no changes at all.
+ */
+function uploadProfileCoverViaR2(
+  uid: string,
+  localUri: string,
+  onProgress: (percent: number) => void,
+  onComplete: (result: { ok: true; coverPhotoURL: string } | { ok: false; message: string }) => void
+): UploadProfileCoverPhotoHandle {
+  let cancelled = false;
+
+  (async () => {
+    const result = await uploadProfileCoverToR2(localUri, onProgress);
+    if (cancelled) return;
+
+    if (__DEV__) {
+      // eslint-disable-next-line no-console
+      console.log('[userProfile] R2 profile cover upload for', uid, '->', result);
+    }
+    onComplete(result.ok ? { ok: true, coverPhotoURL: result.photoURL } : result);
+  })();
+
+  return {
+    cancel: () => {
+      cancelled = true;
     },
   };
 }

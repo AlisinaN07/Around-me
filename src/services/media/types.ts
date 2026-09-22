@@ -16,14 +16,15 @@ export type MediaProvider = 'firebase' | 'r2';
 
 /**
  * Every kind of media Around Me's storage-provider abstraction knows how
- * to upload. 'profilePhoto' is the only kind Step 5A actually wires up
- * end-to-end (see functions/src/media/requestMediaUploadAuthorization.ts
- * and provider.ts's own MediaStorageProvider) — profile cover, Reel,
- * Story, and Event media all still upload through their own existing,
- * untouched Firebase-direct code in userProfile.ts/reels.ts/stories.ts/
- * content.ts, not through this abstraction at all yet.
+ * to upload. 'profilePhoto' (Step 5A) and 'profileCover' (Step 5C) are
+ * the only kinds wired up end-to-end (see
+ * functions/src/media/requestMediaUploadAuthorization.ts and provider.ts's
+ * own MediaStorageProvider) — Reel, Story, and Event media all still
+ * upload through their own existing, untouched Firebase-direct code in
+ * reels.ts/stories.ts/content.ts, not through this abstraction at all
+ * yet.
  */
-export type MediaKind = 'profilePhoto';
+export type MediaKind = 'profilePhoto' | 'profileCover';
 
 /**
  * A storage-neutral pointer to one media object — the shape a Firestore

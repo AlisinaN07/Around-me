@@ -1,6 +1,6 @@
 /**
- * Step 5A — plain-Node tests for the pure request-validation logic behind
- * requestMediaUploadAuthorization: functions/src/media/
+ * Step 5A/5C — plain-Node tests for the pure request-validation logic
+ * behind requestMediaUploadAuthorization: functions/src/media/
  * mediaUploadValidation.ts's validateMediaUploadInput. Runs against the
  * COMPILED lib/ output — `npm run build` first (see the `test` script in
  * package.json).
@@ -31,8 +31,9 @@ const {
   MediaUploadValidationError,
   ALLOWED_CONTENT_TYPES,
   PROFILE_PHOTO_MAX_SIZE_BYTES,
+  PROFILE_COVER_PHOTO_MAX_SIZE_BYTES,
 } = require('../lib/media/mediaUploadValidation.js');
-const { profilePhotoKey } = require('../lib/media/objectKey.js');
+const { profileCoverKey, profilePhotoKey } = require('../lib/media/objectKey.js');
 
 const results = [];
 function check(name, fn) {
@@ -222,6 +223,102 @@ check('profilePhotoKey differs for a different uid — one user can never target
 
 check('profilePhotoKey matches the exact existing Firebase convention', () => {
   assert.equal(profilePhotoKey('uid-a'), 'profilePhotos/uid-a/photo');
+});
+
+// ---------------------------------------------------------------------------
+// Step 5C — 'profileCover' media kind. Same validation shape as
+// 'profilePhoto', with its own larger size cap (mirrors the existing
+// Firebase-upload PROFILE_COVER_PHOTO_MAX_SIZE_BYTES exactly).
+// ---------------------------------------------------------------------------
+
+check('accepts mediaKind "profileCover" with a supported image type', () => {
+  const result = validateMediaUploadInput({ mediaKind: 'profileCover', contentType: 'image/jpeg', fileSizeBytes: 1000 });
+  assert.equal(result.mediaKind, 'profileCover');
+});
+
+check('accepts image/png and image/webp for profileCover too', () => {
+  assert.doesNotThrow(() => validateMediaUploadInput({ mediaKind: 'profileCover', contentType: 'image/png', fileSizeBytes: 1000 }));
+  assert.doesNotThrow(() => validateMediaUploadInput({ mediaKind: 'profileCover', contentType: 'image/webp', fileSizeBytes: 1000 }));
+});
+
+check('rejects an unsupported image type for profileCover (image/gif)', () => {
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'profileCover', contentType: 'image/gif', fileSizeBytes: 1000 }),
+    MediaUploadValidationError
+  );
+});
+
+check('rejects a video/* content type for profileCover', () => {
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'profileCover', contentType: 'video/mp4', fileSizeBytes: 1000 }),
+    MediaUploadValidationError
+  );
+});
+
+check('PROFILE_COVER_PHOTO_MAX_SIZE_BYTES is 8 MB — mirrors src/types/user.ts exactly', () => {
+  assert.equal(PROFILE_COVER_PHOTO_MAX_SIZE_BYTES, 8 * 1024 * 1024);
+});
+
+check('profileCover accepts a file exactly at its own (larger) maximum size', () => {
+  assert.doesNotThrow(() =>
+    validateMediaUploadInput({ mediaKind: 'profileCover', contentType: 'image/jpeg', fileSizeBytes: PROFILE_COVER_PHOTO_MAX_SIZE_BYTES })
+  );
+});
+
+check('profileCover rejects a file one byte over its own maximum size', () => {
+  assert.throws(
+    () =>
+      validateMediaUploadInput({ mediaKind: 'profileCover', contentType: 'image/jpeg', fileSizeBytes: PROFILE_COVER_PHOTO_MAX_SIZE_BYTES + 1 }),
+    MediaUploadValidationError
+  );
+});
+
+check('profileCover rejects a file within profilePhoto\'s smaller cap\'s excess but over its own — proves the two limits are genuinely independent', () => {
+  // A size between the photo cap (5 MB) and the cover cap (8 MB) is
+  // valid for profileCover but would have been rejected for
+  // profilePhoto — this is the actual proof the two mediaKinds don't
+  // silently share one limit.
+  const midSize = PROFILE_PHOTO_MAX_SIZE_BYTES + 1024;
+  assert.doesNotThrow(() => validateMediaUploadInput({ mediaKind: 'profileCover', contentType: 'image/jpeg', fileSizeBytes: midSize }));
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'profilePhoto', contentType: 'image/jpeg', fileSizeBytes: midSize }),
+    MediaUploadValidationError
+  );
+});
+
+check('profileCover rejects a zero or negative file size', () => {
+  assert.throws(() => validateMediaUploadInput({ mediaKind: 'profileCover', contentType: 'image/jpeg', fileSizeBytes: 0 }), MediaUploadValidationError);
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'profileCover', contentType: 'image/jpeg', fileSizeBytes: -1 }),
+    MediaUploadValidationError
+  );
+});
+
+check('ignores an extra uid/path field in a profileCover payload too', () => {
+  const result = validateMediaUploadInput({
+    mediaKind: 'profileCover',
+    contentType: 'image/jpeg',
+    fileSizeBytes: 1000,
+    uid: 'some-other-uid',
+    path: 'profileCovers/some-other-uid/photo',
+  });
+  assert.deepEqual(Object.keys(result).sort(), ['contentType', 'fileSizeBytes', 'mediaKind']);
+});
+
+check('profileCoverKey is deterministic for the same uid', () => {
+  assert.equal(profileCoverKey('uid-a'), profileCoverKey('uid-a'));
+});
+
+check('profileCoverKey differs for a different uid — one user can never target another\'s cover object', () => {
+  assert.notEqual(profileCoverKey('uid-a'), profileCoverKey('uid-b'));
+});
+
+check('profileCoverKey matches the exact existing Firebase convention', () => {
+  assert.equal(profileCoverKey('uid-a'), 'profileCovers/uid-a/photo');
+});
+
+check('profilePhotoKey and profileCoverKey never collide for the same uid', () => {
+  assert.notEqual(profilePhotoKey('uid-a'), profileCoverKey('uid-a'));
 });
 
 console.log('\n=== functions/ media upload authorization logic test results ===');

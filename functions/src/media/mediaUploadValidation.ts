@@ -17,14 +17,22 @@
  * throw an HttpsError directly.
  */
 
-/** The only media kind Step 5A supports. */
-export type AllowedMediaKind = 'profilePhoto';
+/** The only media kinds this callable supports — Step 5A added 'profilePhoto', Step 5C adds 'profileCover'. Any other value (Reels, Stories, Events, audio, thumbnails, or a made-up future kind) is rejected. */
+export type AllowedMediaKind = 'profilePhoto' | 'profileCover';
 
-/** Narrowly restricted to formats the app's existing profile-photo picker flow actually produces — no video/*, no application/*, no arbitrary MIME type. */
+/** Narrowly restricted to formats the app's existing profile-photo/cover picker flows actually produce — no video/*, no application/*, no arbitrary MIME type. Same set for both media kinds — the existing Firebase cover-photo flow (userProfile.ts's uploadProfileCoverPhoto) uses the exact same `blob.type || 'image/jpeg'` fallback and no separate content-type restriction of its own, so there's no reason to diverge here. */
 export const ALLOWED_CONTENT_TYPES: ReadonlySet<string> = new Set(['image/jpeg', 'image/png', 'image/webp']);
 
 /** Mirrors src/types/user.ts's own PROFILE_PHOTO_MAX_SIZE_BYTES exactly — functions/ and the app are separate TypeScript compilation roots (this codebase's own established, pre-existing convention — see e.g. REGION being duplicated across every functions/src/*.ts file rather than imported), so this is a deliberate, documented duplication to keep in sync, not an oversight. */
 export const PROFILE_PHOTO_MAX_SIZE_BYTES = 5 * 1024 * 1024;
+
+/** Mirrors src/types/user.ts's own PROFILE_COVER_PHOTO_MAX_SIZE_BYTES exactly (8 MB — the existing Firebase cover-upload flow's own limit, larger than the profile-photo limit since a cover banner is a wider image) — same duplication reasoning as PROFILE_PHOTO_MAX_SIZE_BYTES above. */
+export const PROFILE_COVER_PHOTO_MAX_SIZE_BYTES = 8 * 1024 * 1024;
+
+/** The exact per-mediaKind maximum — inspected from, and must be kept in sync with, the existing Firebase upload limits in userProfile.ts (5 MB for profilePhoto, 8 MB for profileCover). */
+function maxSizeForMediaKind(mediaKind: AllowedMediaKind): number {
+  return mediaKind === 'profileCover' ? PROFILE_COVER_PHOTO_MAX_SIZE_BYTES : PROFILE_PHOTO_MAX_SIZE_BYTES;
+}
 
 export type ValidatedMediaUploadInput = {
   mediaKind: AllowedMediaKind;
@@ -57,12 +65,13 @@ export function validateMediaUploadInput(data: unknown): ValidatedMediaUploadInp
 
   const { mediaKind, contentType, fileSizeBytes } = data as Record<string, unknown>;
 
-  // Step 5A's own explicit scope: profile photo only. Any other value —
-  // including a real future media kind name typed too early — is
-  // rejected here, not silently accepted.
-  if (mediaKind !== 'profilePhoto') throw invalid();
+  // Only 'profilePhoto'/'profileCover' — any other value (including a
+  // real future media kind name typed too early) is rejected here, not
+  // silently accepted.
+  if (mediaKind !== 'profilePhoto' && mediaKind !== 'profileCover') throw invalid();
   if (typeof contentType !== 'string' || !ALLOWED_CONTENT_TYPES.has(contentType)) throw invalid();
-  if (typeof fileSizeBytes !== 'number' || !Number.isFinite(fileSizeBytes) || fileSizeBytes <= 0 || fileSizeBytes > PROFILE_PHOTO_MAX_SIZE_BYTES) {
+  const maxSizeBytes = maxSizeForMediaKind(mediaKind);
+  if (typeof fileSizeBytes !== 'number' || !Number.isFinite(fileSizeBytes) || fileSizeBytes <= 0 || fileSizeBytes > maxSizeBytes) {
     throw invalid();
   }
 

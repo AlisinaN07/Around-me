@@ -5,15 +5,16 @@ import type { MediaStorageProvider, MediaUploadRequest, MediaUploadResult } from
 import type { MediaKind } from './types';
 
 /**
- * Mirrors the deterministic path convention already used inline in
- * userProfile.ts (`profilePhotos/${uid}/photo`) — the ONLY media kind
- * this provider actually implements today (Step 5A's own narrow scope;
- * see provider.ts's own doc comment). Extending this to other media
- * kinds is future work, not something to speculatively stub out now.
+ * Mirrors the deterministic path conventions already used inline in
+ * userProfile.ts (`profilePhotos/${uid}/photo`, `profileCovers/${uid}/photo`)
+ * — the only media kinds this provider actually implements today (see
+ * provider.ts's own doc comment). Extending this to other media kinds is
+ * future work, not something to speculatively stub out now.
  */
 function pathForMediaKind(mediaKind: MediaKind, uid: string): string {
+  if (mediaKind === 'profileCover') return `profileCovers/${uid}/photo`;
   if (mediaKind === 'profilePhoto') return `profilePhotos/${uid}/photo`;
-  // Exhaustive — MediaKind only has one member today (see types.ts).
+  // Exhaustive — MediaKind only has these two members today (see types.ts).
   throw new Error(`Unsupported media kind: ${mediaKind}`);
 }
 
