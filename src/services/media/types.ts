@@ -15,6 +15,17 @@
 export type MediaProvider = 'firebase' | 'r2';
 
 /**
+ * Every kind of media Around Me's storage-provider abstraction knows how
+ * to upload. 'profilePhoto' is the only kind Step 5A actually wires up
+ * end-to-end (see functions/src/media/requestMediaUploadAuthorization.ts
+ * and provider.ts's own MediaStorageProvider) — profile cover, Reel,
+ * Story, and Event media all still upload through their own existing,
+ * untouched Firebase-direct code in userProfile.ts/reels.ts/stories.ts/
+ * content.ts, not through this abstraction at all yet.
+ */
+export type MediaKind = 'profilePhoto';
+
+/**
  * A storage-neutral pointer to one media object — the shape a Firestore
  * document could eventually store instead of (or alongside) a bare
  * `storagePath` string, so a client reading it back can tell whether to

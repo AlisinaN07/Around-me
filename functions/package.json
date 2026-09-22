@@ -9,7 +9,7 @@
     "build": "tsc",
     "build:watch": "tsc --watch",
     "lint": "tsc --noEmit",
-    "test": "npm run build && node scripts/test-stats-logic.cjs && node scripts/test-collaborative-logic.cjs && node scripts/test-metrics-logic.cjs && node scripts/test-media-key-logic.cjs"
+    "test": "npm run build && node scripts/test-stats-logic.cjs && node scripts/test-collaborative-logic.cjs && node scripts/test-metrics-logic.cjs && node scripts/test-media-key-logic.cjs && node scripts/test-media-upload-auth-logic.cjs && node scripts/test-media-url-logic.cjs"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1137.0",

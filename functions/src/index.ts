@@ -1941,3 +1941,13 @@ export * from './metrics';
 // reason as engagementStats.ts.
 // ---------------------------------------------------------------------------
 export * from './hashtagTrends';
+
+// ---------------------------------------------------------------------------
+// Step 5A — Cloudflare R2 media foundation. requestMediaUploadAuthorization
+// is the ONE deliberate, narrow, secret-bound production entry point this
+// step adds (profile-photo upload only — see its own file's top doc
+// comment); the lower-level R2 client/config modules it's built on
+// (functions/src/media/r2Storage.ts, r2Config.ts) remain intentionally
+// UNEXPORTED here, same as Step 4 left them.
+// ---------------------------------------------------------------------------
+export * from './media/requestMediaUploadAuthorization';

@@ -36,7 +36,7 @@ import { getR2Config } from './r2Config';
  * a real device to start a large video upload without racing the clock,
  * short enough that a leaked/logged URL stops being useful quickly.
  */
-const PRESIGNED_UPLOAD_TTL_SECONDS = 5 * 60;
+export const PRESIGNED_UPLOAD_TTL_SECONDS = 5 * 60;
 
 let cachedClient: S3Client | null = null;
 let cachedClientAccountId: string | null = null;
@@ -61,13 +61,27 @@ function requireR2Client(): { client: S3Client; bucketName: string } {
 }
 
 /**
- * A short-lived presigned PUT URL scoped to exactly ONE object key and
- * ONE Content-Type — the eventual client-facing upload primitive (see
+ * A short-lived presigned PUT URL scoped to exactly ONE object key, ONE
+ * Content-Type, and (when `contentLengthBytes` is given) exactly ONE
+ * byte length — the eventual client-facing upload primitive (see
  * src/services/media/types.ts's MediaUploadAuthorization). The client
- * can upload directly to R2 with this URL, so large video bytes never
- * pass through a Cloud Function, but it can never choose a different key
- * or content type than what was authorized here, and the URL stops
- * working after PRESIGNED_UPLOAD_TTL_SECONDS.
+ * can upload directly to R2 with this URL, so large media bytes never
+ * pass through a Cloud Function, but it can never choose a different
+ * key, content type, or (when bound) body size than what was authorized
+ * here — SigV4 presigning covers every parameter passed into the command
+ * below, so R2 itself rejects a PUT whose actual Content-Type or
+ * Content-Length doesn't match what was signed, with no extra
+ * server-side check needed. The URL stops working after
+ * PRESIGNED_UPLOAD_TTL_SECONDS regardless.
+ *
+ * `contentLengthBytes`, when passed, is a REAL enforced upper/exact
+ * bound (unlike a caller-declared size the server merely trusted) — the
+ * request fails at R2 if the actual upload body isn't exactly that many
+ * bytes. Callers should still validate the declared size against a
+ * sensible maximum BEFORE calling this (see
+ * requestMediaUploadAuthorization.ts's own PROFILE_PHOTO_MAX_SIZE_BYTES
+ * check) — this only makes the signed value binding, it doesn't pick
+ * what that value should be.
  *
  * Never call this with a client-supplied key directly — always build the
  * key server-side via objectKey.ts's own helpers from TRUSTED
@@ -78,9 +92,18 @@ function requireR2Client(): { client: S3Client; bucketName: string } {
  * separate and pure/dependency-free so it's unit-testable without an R2
  * client.
  */
-export async function createPresignedUploadUrl(key: string, contentType: string): Promise<{ uploadUrl: string; expiresAt: number }> {
+export async function createPresignedUploadUrl(
+  key: string,
+  contentType: string,
+  contentLengthBytes?: number
+): Promise<{ uploadUrl: string; expiresAt: number }> {
   const { client, bucketName } = requireR2Client();
-  const command = new PutObjectCommand({ Bucket: bucketName, Key: key, ContentType: contentType });
+  const command = new PutObjectCommand({
+    Bucket: bucketName,
+    Key: key,
+    ContentType: contentType,
+    ...(contentLengthBytes !== undefined ? { ContentLength: contentLengthBytes } : {}),
+  });
   const uploadUrl = await getSignedUrl(client, command, { expiresIn: PRESIGNED_UPLOAD_TTL_SECONDS });
   return { uploadUrl, expiresAt: Date.now() + PRESIGNED_UPLOAD_TTL_SECONDS * 1000 };
 }

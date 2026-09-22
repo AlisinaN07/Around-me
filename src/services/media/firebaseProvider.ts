@@ -1,7 +1,21 @@
 import { deleteObject, getDownloadURL, ref, uploadBytesResumable } from 'firebase/storage';
 
 import { storage } from '../storage';
-import type { MediaStorageProvider, MediaUploadProgressCallback, MediaUploadResult } from './provider';
+import type { MediaStorageProvider, MediaUploadRequest, MediaUploadResult } from './provider';
+import type { MediaKind } from './types';
+
+/**
+ * Mirrors the deterministic path convention already used inline in
+ * userProfile.ts (`profilePhotos/${uid}/photo`) — the ONLY media kind
+ * this provider actually implements today (Step 5A's own narrow scope;
+ * see provider.ts's own doc comment). Extending this to other media
+ * kinds is future work, not something to speculatively stub out now.
+ */
+function pathForMediaKind(mediaKind: MediaKind, uid: string): string {
+  if (mediaKind === 'profilePhoto') return `profilePhotos/${uid}/photo`;
+  // Exhaustive — MediaKind only has one member today (see types.ts).
+  throw new Error(`Unsupported media kind: ${mediaKind}`);
+}
 
 /**
  * The Firebase Storage implementation of MediaStorageProvider — a thin,
@@ -10,18 +24,22 @@ import type { MediaStorageProvider, MediaUploadProgressCallback, MediaUploadResu
  * directly today (fetch the local URI into a Blob, `uploadBytesResumable`,
  * resolve via `getDownloadURL`, remove via `deleteObject`).
  *
- * NOT yet used by any of those files — Step 4's own "prefer foundation
- * over a large refactor" instruction means they keep their own, already-
- * shipped, already-tested upload code untouched. This exists so a FUTURE
- * step can migrate one call site at a time onto this shared abstraction
- * with zero behavior change, since the underlying calls are identical to
- * what each call site already does inline.
+ * NOT yet used by userProfile.ts's own real uploadProfilePhoto — Step
+ * 5A's own "if provider = firebase, current behavior remains EXACTLY
+ * unchanged" requirement is met more simply by leaving that function's
+ * own already-shipped code untouched, rather than routing it through
+ * this wrapper only to reproduce the identical calls. This exists so a
+ * FUTURE step can migrate that call site onto this shared abstraction
+ * with zero behavior change, since the underlying calls here are
+ * identical to what it already does inline.
  */
 export const firebaseMediaProvider: MediaStorageProvider = {
   provider: 'firebase',
 
-  async upload(path: string, localUri: string, contentType: string, onProgress: MediaUploadProgressCallback): Promise<MediaUploadResult> {
+  async upload({ mediaKind, uid, localUri, contentType, onProgress }: MediaUploadRequest): Promise<MediaUploadResult> {
     if (!storage) return { ok: false, message: 'Storage is not available.' };
+
+    const path = pathForMediaKind(mediaKind, uid);
 
     let blob: Blob;
     try {
@@ -32,7 +50,7 @@ export const firebaseMediaProvider: MediaStorageProvider = {
     }
 
     return new Promise<MediaUploadResult>((resolve) => {
-      const task = uploadBytesResumable(ref(storage!, path), blob, { contentType });
+      const task = uploadBytesResumable(ref(storage!, path), blob, { contentType: blob.type || contentType });
       task.on(
         'state_changed',
         (snapshot) => {
@@ -40,7 +58,7 @@ export const firebaseMediaProvider: MediaStorageProvider = {
           onProgress(percent);
         },
         () => resolve({ ok: false, message: "Couldn't upload this file." }),
-        () => resolve({ ok: true })
+        () => resolve({ ok: true, reference: { provider: 'firebase', path } })
       );
     });
   },
