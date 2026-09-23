@@ -15,7 +15,7 @@ import { Colors, Radius, Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
 import { blockUser } from '@/services/blocks';
 import { trackContentInteraction } from '@/services/recommendations/interactions';
-import { deleteMyReel, resolveReelPlaybackUrl } from '@/services/reels';
+import { deleteMyReel, resolveReelThumbnailUrl } from '@/services/reels';
 import { isPostReposted, repostPost, undoRepost } from '@/services/reposts';
 import { prefetchImageOnce } from '@/utils/imagePrefetch';
 import { buildReelShareUrl } from '@/utils/reelShare';
@@ -160,8 +160,9 @@ export function ReelFeed({
   // side — this only needs to reach ONE step further, the item at
   // activeIndex + 2, which is never "prepared" and so never resolves its
   // own thumbnail otherwise. Deliberately NOT activeIndex/activeIndex + 1
-  // too: resolveReelPlaybackUrl's own cache (reels.ts) only dedupes AFTER
-  // a call resolves, not concurrent in-flight calls for the same key —
+  // too: resolveReelThumbnailUrl's own underlying Firebase-branch cache
+  // (resolveReelPlaybackUrl in reels.ts) only dedupes AFTER a call
+  // resolves, not concurrent in-flight calls for the same key —
   // calling it here for those already-covered indices raced with
   // ReelFeedItem's own call for the SAME storagePath and produced two
   // real Storage getDownloadURL requests instead of one (confirmed live
@@ -176,7 +177,11 @@ export function ReelFeed({
   useEffect(() => {
     const reel = reels[activeIndex + 2];
     if (!reel || reel.mediaType === 'photo') return;
-    resolveReelPlaybackUrl(reel.thumbnailStoragePath).then((url) => {
+    // Step 9A cleanup — this was still calling resolveReelPlaybackUrl
+    // directly against thumbnailStoragePath (a Step 5E gap this file was
+    // missed for) — resolveReelThumbnailUrl is the provider-aware
+    // version every other thumbnail call site already uses.
+    resolveReelThumbnailUrl(reel).then((url) => {
       if (url) prefetchImageOnce(url);
     });
   }, [reels, activeIndex]);

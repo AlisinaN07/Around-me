@@ -1,6 +1,8 @@
+import { File, UploadType } from 'expo-file-system';
 import { httpsCallable } from 'firebase/functions';
 
 import { functions } from '../functions';
+import { performReelVideoUpload } from './reelVideoUploadCore';
 import type { MediaStorageProvider, MediaUploadProgressCallback, MediaUploadRequest, MediaUploadResult } from './provider';
 import type { MediaKind } from './types';
 
@@ -290,5 +292,108 @@ export async function uploadReelThumbnailToR2(
     'Uploaded to R2, but no public media domain is configured yet — this thumbnail is not displayable.',
     undefined,
     reelId
+  );
+}
+
+type ReelVideoUploadResult = { ok: true; sourceUrl: string } | { ok: false; message: string };
+
+/**
+ * Step 9A — the real, production-wired Reel-VIDEO upload path. Unlike
+ * every other R2 upload above (all built on performDirectUpload's own
+ * `fetch(localUri) -> Blob -> fetch(presignedUrl, PUT)` mechanics), this
+ * deliberately does NOT reuse that helper — see the "Large file handling"
+ * section of the Step 9A report for the full investigation this
+ * divergence is based on. In short:
+ *
+ *  - React Native's own `Response.blob()` (what performDirectUpload's
+ *    `fetch(localUri)` step relies on) is documented as "may be slow for
+ *    large responses" — acceptable for a 5-8 MB image, not for a video up
+ *    to REEL_VIDEO_MAX_SIZE_BYTES (50 MB): it would fully buffer the
+ *    entire file into a JS-visible Blob before the PUT even starts, and
+ *    plain `fetch(uploadUrl, { body: blob })` gives no real upload
+ *    progress at all (the existing image paths simply accept a fake
+ *    0 -> 100 jump for this reason — not acceptable for a multi-second
+ *    video upload).
+ *  - expo-file-system's `File.createUploadTask` (already used elsewhere
+ *    in this app — see camera.tsx/music.tsx's own `new File(uri).size`
+ *    usage) performs a NATIVE-level upload straight from the local file
+ *    on disk, supports `httpMethod: 'PUT'` and
+ *    `uploadType: UploadType.BINARY_CONTENT` (a raw-body PUT, exactly
+ *    what a presigned R2 URL expects — no multipart framing), and
+ *    reports REAL `onProgress({ bytesSent, totalBytes })` events from
+ *    the native layer — without ever pulling the whole file through JS
+ *    as a Blob or base64 string.
+ *
+ * No new dependency was added — expo-file-system is already a direct
+ * dependency of this project for unrelated reasons (see above).
+ *
+ * `onUploadTaskReady`, if provided, is called synchronously with a real
+ * `cancel()` function the moment the native upload task exists — this is
+ * what lets reels.ts's own uploadReelVideoViaR2 wire up GENUINE upload
+ * cancellation (unlike uploadReelThumbnailViaR2's own thumbnail-upload
+ * cancel, which only ever ignores a still-in-flight small image request
+ * rather than actually aborting it — acceptable for a few-hundred-KB
+ * image, not for tens of MB of video the user might reasonably want to
+ * stop mid-transfer).
+ *
+ * DELIBERATELY THIN: every byte of actual decision logic (read file size
+ * -> authorize -> PUT -> gate success on a real 2xx status AND a real
+ * `mediaUrl` -> report progress) lives in the pure, dependency-free
+ * performReelVideoUpload (reelVideoUploadCore.ts), which has no
+ * expo-file-system import and so IS directly unit-testable under plain
+ * Node — see that file's own top doc comment for why this split exists.
+ * This function's only remaining job is to satisfy that file's own
+ * `UploadAdapter` contract with the real native calls — `httpMethod:
+ * 'PUT'`, `uploadType: UploadType.BINARY_CONTENT` (a raw-body PUT with no
+ * multipart framing, exactly what a presigned R2 URL expects), and a
+ * real file-size read via `new File(localUri).size` — which is
+ * EXECUTION-UNVERIFIED in this repo's own test suite (expo-file-system's
+ * native module registry only exists inside a real Expo/RN runtime) and
+ * is instead verified by direct static source review — see the Step 9A
+ * verification report's own "Upload-adapter contract" section for
+ * exactly what was checked.
+ */
+export async function uploadReelVideoToR2(
+  reelId: string,
+  localUri: string,
+  contentType: string,
+  onProgress: MediaUploadProgressCallback,
+  onUploadTaskReady?: (cancel: () => void) => void
+): Promise<ReelVideoUploadResult> {
+  return performReelVideoUpload(
+    () => {
+      const file = new File(localUri);
+      // Captured here, populated inside `start` — `cancel` needs the SAME
+      // task instance `start` creates, and performReelVideoUpload may call
+      // `onUploadTaskReady` (which wires up `cancel`) before `start` ever
+      // runs, so `cancel` must tolerate being called before `task` exists
+      // (a no-op — nothing to cancel yet, matching every other upload
+      // handle's own "safe to call even before transferring starts"
+      // contract in this codebase, e.g. UploadReelVideoHandle's own doc
+      // comment in reels.ts).
+      let task: ReturnType<File['createUploadTask']> | null = null;
+      return {
+        getFileSize: () => file.size,
+        start: (url, headers, onAdapterProgress) => {
+          task = file.createUploadTask(url, {
+            httpMethod: 'PUT',
+            uploadType: UploadType.BINARY_CONTENT,
+            headers,
+            onProgress: ({ bytesSent, totalBytes }) => onAdapterProgress(bytesSent, totalBytes),
+          });
+          return task.uploadAsync();
+        },
+        cancel: () => task?.cancel(),
+      };
+    },
+    (contentType, fileSizeBytes, reelId) => requestUploadAuthorization('reelVideo', contentType, fileSizeBytes, undefined, reelId).then((authorization) => ({
+      uploadUrl: authorization.uploadUrl,
+      contentType: authorization.contentType,
+      mediaUrl: authorization.mediaUrl,
+    })),
+    reelId,
+    contentType,
+    onProgress,
+    onUploadTaskReady
   );
 }

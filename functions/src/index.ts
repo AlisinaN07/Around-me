@@ -47,6 +47,7 @@ import {
 } from 'firebase-admin/firestore';
 import { initializeApp } from 'firebase-admin/app';
 import { getStorage } from 'firebase-admin/storage';
+import { defineSecret } from 'firebase-functions/params';
 import { HttpsError, onCall, type CallableRequest } from 'firebase-functions/v2/https';
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -56,7 +57,27 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 import ffmpegPath from 'ffmpeg-static';
 
+import { copyReelSourceToFirebaseStoryObject, deleteReelSourceMedia, downloadReelSourceToLocalFile } from './media/reelSourceStorage';
+
 initializeApp();
+
+// Step 9A — bound only onto the specific callables below that actually
+// need to delete an R2 object as part of Reel-source cleanup
+// (deleteMyReel, deleteMyAccountData, removeReportedReel) — see
+// r2Storage.ts's own doc comment on why binding a secret per-callable,
+// not just having it exist in Secret Manager, is what actually populates
+// `process.env.R2_ACCESS_KEY_ID`/`R2_SECRET_ACCESS_KEY` for a given
+// function's execution environment. Every OTHER callable in this file
+// that reads/writes a Reel's `storagePath` (muxReelMusic,
+// renderPhotoToVideo, resolveOwnSoundOrigin, addReelToMyStory) never
+// needs an R2 credential at all: the two mux/render functions are
+// scoped away from ever seeing an R2-backed Reel in the first place
+// (see requestMediaUploadAuthorization.ts's own verifyReelVideoOwnership
+// for why), and resolveOwnSoundOrigin/addReelToMyStory only ever need to
+// GET the Reel's own already-PUBLIC `sourceUrl` — an ordinary HTTPS
+// fetch, not an authenticated R2 API call.
+const r2AccessKeyIdSecret = defineSecret('R2_ACCESS_KEY_ID');
+const r2SecretAccessKeySecret = defineSecret('R2_SECRET_ACCESS_KEY');
 
 // europe-north1 (Finland) — see Step 34.1: the closest Cloud Functions
 // 2nd-gen-supported region to this project's Firestore location,
@@ -398,11 +419,17 @@ async function decrementHashtagCounts(db: Firestore, hashtags: string[]): Promis
   }
 }
 
+// deleteReelSourceMedia now lives in functions/src/media/reelSourceStorage.ts
+// (imported above) — extracted there specifically so its Firebase/R2
+// branching is directly unit-testable with a fake bucket and a delete spy,
+// instead of only reachable via a real deployed callable.
+
 async function deleteReelDocumentAndSubcollections(
   db: Firestore,
   bucket: ReturnType<ReturnType<typeof getStorage>['bucket']>,
   reelId: string,
   storagePath: string | undefined,
+  storageProvider: string | undefined,
   receivedPostLikesPolicy: ReceivedPostLikesPolicy,
   // Only ever the Reel's own `hashtags` (or [] for one that was never
   // published — see this parameter's callers) — a draft that never
@@ -431,13 +458,7 @@ async function deleteReelDocumentAndSubcollections(
     await decrementHashtagCounts(db, hashtagsToDecrement);
   }
 
-  let storageDeleted = false;
-  if (storagePath) {
-    const file = bucket.file(storagePath);
-    const [existedBefore] = await file.exists();
-    await file.delete({ ignoreNotFound: true });
-    storageDeleted = existedBefore;
-  }
+  const storageDeleted = storagePath ? await deleteReelSourceMedia(bucket, storagePath, storageProvider) : false;
 
   await db.doc(`reels/${reelId}`).delete();
   return { storageDeleted };
@@ -458,13 +479,14 @@ async function deleteOwnReels(
     for (const docSnap of snap.docs) {
       const reelData = docSnap.data();
       const storagePath = reelData?.storagePath as string | undefined;
+      const storageProvider = reelData?.storageProvider as string | undefined;
       // Only a published Reel ever incremented these — see
       // deleteReelDocumentAndSubcollections' own `hashtagsToDecrement`
       // doc comment.
       const hashtagsToDecrement = reelData?.status === 'published' ? ((reelData?.hashtags as string[] | undefined) ?? []) : [];
       // Step 41.2H.2.1 — same reasoning as deleteOwnContent's own call
       // site: the author's account is going away entirely.
-      const result = await deleteReelDocumentAndSubcollections(db, bucket, docSnap.id, storagePath, 'remove', hashtagsToDecrement);
+      const result = await deleteReelDocumentAndSubcollections(db, bucket, docSnap.id, storagePath, storageProvider, 'remove', hashtagsToDecrement);
       if (storagePath) {
         if (result.storageDeleted) storageDeleted += 1;
         else storageAlreadyMissing += 1;
@@ -536,7 +558,7 @@ async function deleteProfileDocuments(db: Firestore, uid: string) {
 // The callable itself.
 // ---------------------------------------------------------------------------
 
-export const deleteMyAccountData = onCall({ region: REGION, timeoutSeconds: 300, memory: '256MiB' }, async (request) => {
+export const deleteMyAccountData = onCall({ region: REGION, timeoutSeconds: 300, memory: '256MiB', secrets: [r2AccessKeyIdSecret, r2SecretAccessKeySecret] }, async (request) => {
   if (!request.auth) {
     throw new HttpsError('unauthenticated', 'Sign in required.');
   }
@@ -985,7 +1007,7 @@ export const removeReportedContent = onCall({ region: REGION, timeoutSeconds: 30
  * (src/services/reels.ts). This is what makes a Storage-only retry safe
  * without trusting anything from the request itself.
  */
-export const removeReportedReel = onCall({ region: REGION, timeoutSeconds: 300, memory: '256MiB' }, async (request) => {
+export const removeReportedReel = onCall({ region: REGION, timeoutSeconds: 300, memory: '256MiB', secrets: [r2AccessKeyIdSecret, r2SecretAccessKeySecret] }, async (request) => {
   requireAdmin(request);
   const reportId = parseReportId(request);
   const adminUid = request.auth!.uid;
@@ -1024,14 +1046,22 @@ export const removeReportedReel = onCall({ region: REGION, timeoutSeconds: 300, 
   if (reelSnap.exists) {
     const reelData = reelSnap.data();
     const storagePath = reelData?.storagePath as string | undefined;
+    const storageProvider = reelData?.storageProvider as string | undefined;
     // Only a published Reel ever incremented these — see
     // deleteReelDocumentAndSubcollections' own `hashtagsToDecrement` doc
     // comment.
     const hashtagsToDecrement = reelData?.status === 'published' ? ((reelData?.hashtags as string[] | undefined) ?? []) : [];
     // Step 41.2H.2.1 — moderation removal never earned legitimate
     // reputation credit to begin with.
-    await deleteReelDocumentAndSubcollections(db, bucket, reelId, storagePath, 'remove', hashtagsToDecrement);
+    await deleteReelDocumentAndSubcollections(db, bucket, reelId, storagePath, storageProvider, 'remove', hashtagsToDecrement);
   } else {
+    // The Reel's own Firestore document is already gone by the time a
+    // report gets here — a rare race, not the normal path. Only a
+    // best-effort Firebase-path guess is possible (no storageProvider
+    // left to consult), same limitation this branch already had before
+    // Step 9A: if that Reel's source had actually moved to R2, this
+    // guess simply finds nothing and deletes nothing, exactly as
+    // `ignoreNotFound` already tolerates for the Firebase case.
     const inferredStoragePath = `reels/${reportedAuthorUid}/${reelId}/source`;
     await bucket.file(inferredStoragePath).delete({ ignoreNotFound: true });
   }
@@ -1318,7 +1348,7 @@ export const deleteMyContent = onCall({ region: REGION, timeoutSeconds: 300, mem
  * regardless of status, reusing the same per-document primitive
  * moderation already relies on).
  */
-export const deleteMyReel = onCall({ region: REGION, timeoutSeconds: 300, memory: '256MiB' }, async (request) => {
+export const deleteMyReel = onCall({ region: REGION, timeoutSeconds: 300, memory: '256MiB', secrets: [r2AccessKeyIdSecret, r2SecretAccessKeySecret] }, async (request) => {
   if (!request.auth) {
     throw new HttpsError('unauthenticated', 'Sign in required.');
   }
@@ -1337,6 +1367,7 @@ export const deleteMyReel = onCall({ region: REGION, timeoutSeconds: 300, memory
 
   const bucket = getStorage().bucket();
   const storagePath = reel.storagePath as string | undefined;
+  const storageProvider = reel.storageProvider as string | undefined;
   // Only a published Reel ever incremented these — see
   // deleteReelDocumentAndSubcollections' own `hashtagsToDecrement` doc
   // comment.
@@ -1345,7 +1376,7 @@ export const deleteMyReel = onCall({ region: REGION, timeoutSeconds: 300, memory
   await drainNotificationsByField(db, 'reelId', reelId);
   // Step 41.2H.2.1 — voluntary author self-delete: same reasoning as
   // deleteMyContent above — received postLikes survive.
-  await deleteReelDocumentAndSubcollections(db, bucket, reelId, storagePath, 'preserve', hashtagsToDecrement);
+  await deleteReelDocumentAndSubcollections(db, bucket, reelId, storagePath, storageProvider, 'preserve', hashtagsToDecrement);
 
   return { reelId, deleted: true as const };
 });
@@ -1387,6 +1418,34 @@ export const deleteMyReel = onCall({ region: REGION, timeoutSeconds: 300, memory
 // ---------------------------------------------------------------------------
 
 const execFileAsync = promisify(execFile);
+
+// ---------------------------------------------------------------------------
+// Step 9A — provider-aware Reel-SOURCE read. muxReelMusic and
+// renderPhotoToVideo below are deliberately NOT made provider-aware (see
+// requestMediaUploadAuthorization.ts's own verifyReelVideoOwnership doc
+// comment — a Reel eligible for either of those two functions is, by
+// construction, NEVER authorized for an R2 source upload in the first
+// place, so they can safely go on assuming Firebase Storage exactly as
+// before). resolveOwnSoundOrigin and addReelToMyStory are different: both
+// operate on an already-PUBLISHED plain video Reel (no music, no pending
+// photo-render) — exactly the one variant Step 9A DOES allow onto R2 — so
+// both need to read that Reel's source bytes regardless of which backend
+// actually holds them.
+//
+// For 'r2', `reel.sourceUrl` is already a resolved, PUBLIC delivery URL
+// (see requestMediaUploadAuthorization.ts's own mediaUrl computation) —
+// an ordinary HTTPS GET, no R2 credential of any kind needed, which is
+// exactly why neither of those two callables needs an R2 secret bound
+// (see this file's own top doc comment on r2AccessKeyIdSecret). Buffering
+// the whole response in memory before writing it is safe specifically
+// because REEL_VIDEO_MAX_SIZE_BYTES already caps a Reel source at 50 MB —
+// both callables already run at 1GiB memory for their own ffmpeg step,
+// so a single 50 MB buffer is a rounding error next to that.
+// See functions/src/media/reelSourceStorage.ts's own doc comment for the
+// full implementation — extracted there specifically so its Firebase/R2
+// branching is directly unit-testable with a fake bucket and a local HTTP
+// test server, instead of only reachable via a real deployed callable.
+// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Sound attribution — see Reel.musicHash's own doc comment in
@@ -1764,8 +1823,11 @@ export const addReelToMyStory = onCall({ region: REGION, timeoutSeconds: 120, me
   const storyId = storyDocRef.id;
   const storagePath = `stories/${uid}/${storyId}/source`;
 
+  // Step 9A — provider-aware copy of the SOURCE Reel (see
+  // copyReelSourceToFirebaseStoryObject's own doc comment in
+  // functions/src/media/reelSourceStorage.ts).
   try {
-    await bucket.file(reel.storagePath as string).copy(bucket.file(storagePath));
+    await copyReelSourceToFirebaseStoryObject(bucket, reel, storagePath);
   } catch {
     throw new HttpsError('internal', "Couldn't share this post to your Story.");
   }
@@ -1858,18 +1920,20 @@ export const resolveOwnSoundOrigin = onCall({ region: REGION, timeoutSeconds: 18
   }
 
   const bucket = getStorage().bucket();
-  const videoFile = bucket.file(reel.storagePath as string);
-  const [videoExists] = await videoFile.exists();
-  if (!videoExists) {
-    throw new HttpsError('failed-precondition', "This post's video isn't available.");
-  }
 
   const workDir = await mkdtemp(join(tmpdir(), `reel-own-sound-${reelId}-`));
   const localVideoPath = join(workDir, 'input-video');
   const localAudioPath = join(workDir, 'output-audio.m4a');
 
   try {
-    await videoFile.download({ destination: localVideoPath });
+    // Step 9A — provider-aware: this Reel's source may be on Firebase or
+    // R2 (see downloadReelSourceToLocalFile's own doc comment above) —
+    // either way, the check happens INSIDE the try so its own temp
+    // workDir is still cleaned up in `finally` on failure.
+    const downloaded = await downloadReelSourceToLocalFile(bucket, reel, localVideoPath);
+    if (!downloaded) {
+      throw new HttpsError('failed-precondition', "This post's video isn't available.");
+    }
 
     // "-vn" drops the video stream entirely, keeping only audio, re-encoded
     // to a consistent AAC stream regardless of whatever codec the source
@@ -1945,9 +2009,17 @@ export * from './hashtagTrends';
 // ---------------------------------------------------------------------------
 // Step 5A — Cloudflare R2 media foundation. requestMediaUploadAuthorization
 // is the ONE deliberate, narrow, secret-bound production entry point this
-// step adds (profile-photo upload only — see its own file's top doc
-// comment); the lower-level R2 client/config modules it's built on
+// step adds (profilePhoto/profileCover/eventCover/reelThumbnail/reelVideo
+// upload authorization — see its own file's top doc comment). Step 9A adds
+// a second, equally narrow entry point, discardReelSource (see its own
+// file's top doc comment) — a trusted server-authorized delete for the R2
+// objects a still-uploading Reel draft may hold, since (unlike Firebase
+// Storage) a client has no direct delete path of its own onto an R2
+// object. The lower-level R2 client/config modules both are built on
 // (functions/src/media/r2Storage.ts, r2Config.ts) remain intentionally
-// UNEXPORTED here, same as Step 4 left them.
+// UNEXPORTED here, same as Step 4 left them — every exported function in
+// r2Storage.ts is now reached, but only ever through one of these two
+// narrow, validated, secret-bound callables, never directly.
 // ---------------------------------------------------------------------------
 export * from './media/requestMediaUploadAuthorization';
+export * from './media/discardReelSource';

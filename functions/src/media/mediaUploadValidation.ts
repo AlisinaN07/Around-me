@@ -14,32 +14,61 @@
  * requestMediaUploadAuthorization.ts imports this and wraps
  * MediaUploadValidationError into a real HttpsError('invalid-argument',
  * ...) — this file itself never touches firebase-functions, so it can't
- * throw an HttpsError directly. Reel-ownership/draft-status verification
- * for 'reelThumbnail' (a real Firestore read) can't live here either —
- * that stays in requestMediaUploadAuthorization.ts's own handleRequest,
- * right after this pure shape validation passes.
+ * throw an HttpsError directly. Real ownership/draft-status verification
+ * for 'reelThumbnail'/'reelVideo' (a real Firestore read) can't live here
+ * either — that stays in requestMediaUploadAuthorization.ts's own
+ * handleRequest, right after this pure shape validation passes.
  */
 import { isSafePathSegment } from './objectKey';
 
-/** The only media kinds this callable supports — Step 5A added 'profilePhoto', Step 5C added 'profileCover', Step 5D added 'eventCover', Step 5E adds 'reelThumbnail'. Any other value (the Reel video/audio itself, Stories, or a made-up future kind) is rejected. */
-export type AllowedMediaKind = 'profilePhoto' | 'profileCover' | 'eventCover' | 'reelThumbnail';
+/** The only media kinds this callable supports — Step 5A added 'profilePhoto', Step 5C added 'profileCover', Step 5D added 'eventCover', Step 5E added 'reelThumbnail', Step 9A adds 'reelVideo'. Any other value (a Reel's own audio, Stories, or a made-up future kind) is rejected. */
+export type AllowedMediaKind = 'profilePhoto' | 'profileCover' | 'eventCover' | 'reelThumbnail' | 'reelVideo';
 
-/** Narrowly restricted to formats the app's existing image-upload flows actually produce — no video/*, no application/*, no arbitrary MIME type. Same set for every media kind, including reelThumbnail: every real thumbnail-generation code path observed (src/utils/reelThumbnailCandidates.ts's expo-video-thumbnails output, and camera.tsx's own SaveFormat.JPEG render for a "FOTO" cover) only ever produces JPEG, but this allowlist is kept at the same 3-format set used elsewhere rather than narrowed to jpeg-only, since narrowing further without being certain every code path is JPEG-only would risk silently breaking a legitimate upload. */
+/** Narrowly restricted to formats the app's existing image-upload flows actually produce — no video/*, no application/*, no arbitrary MIME type. Same set for every IMAGE media kind, including reelThumbnail: every real thumbnail-generation code path observed (src/utils/reelThumbnailCandidates.ts's expo-video-thumbnails output, and camera.tsx's own SaveFormat.JPEG render for a "FOTO" cover) only ever produces JPEG, but this allowlist is kept at the same 3-format set used elsewhere rather than narrowed to jpeg-only, since narrowing further without being certain every code path is JPEG-only would risk silently breaking a legitimate upload. Never used for 'reelVideo' — see ALLOWED_VIDEO_CONTENT_TYPES below for that kind's own, separate allowlist. */
 export const ALLOWED_CONTENT_TYPES: ReadonlySet<string> = new Set(['image/jpeg', 'image/png', 'image/webp']);
 
-/** Mirrors src/types/user.ts's own PROFILE_PHOTO_MAX_SIZE_BYTES exactly — functions/ and the app are separate TypeScript compilation roots (this codebase's own established, pre-existing convention — see e.g. REGION being duplicated across every functions/src/*.ts file rather than imported), so this is a deliberate, documented duplication to keep in sync, not an oversight. */
+/**
+ * Step 9A — 'reelVideo' only. Built by directly inspecting this app's OWN
+ * video-producing code paths rather than accepting a generic `video/*`
+ * wildcard (the same wildcard storage.rules' own existing Reel-source
+ * rule already uses — this callable is deliberately narrower):
+ *
+ *  - src/app/(app)/create/reel/camera.tsx's own KNOWN_VIDEO_EXTENSIONS
+ *    map is the authoritative "what this app's camera capture actually
+ *    produces" declaration — it already REJECTS (via
+ *    inferMimeTypeFromUri returning null, caught by
+ *    validateSelectedReelVideo) any extension outside exactly these
+ *    four: mp4, mov (quicktime), m4v (x-m4v), webm.
+ *  - The library-picker path (expo-image-picker) reports whatever
+ *    `asset.mimeType` the OS itself declares for a picked video — live
+ *    testing has confirmed `video/quicktime` (iOS .mov) alongside
+ *    `video/mp4`, matching this same four-value set; nothing in this
+ *    app's own code has ever been observed to produce a fifth kind.
+ *
+ * A rare/exotic library-picked video outside this set is rejected here
+ * rather than silently widened to `video/*` — consistent with this
+ * file's own "narrow, observed-behavior allowlist, not a broad wildcard"
+ * approach for images above.
+ */
+export const ALLOWED_VIDEO_CONTENT_TYPES: ReadonlySet<string> = new Set(['video/mp4', 'video/quicktime', 'video/x-m4v', 'video/webm']);
+
 export const PROFILE_PHOTO_MAX_SIZE_BYTES = 5 * 1024 * 1024;
-
-/** Mirrors src/types/user.ts's own PROFILE_COVER_PHOTO_MAX_SIZE_BYTES exactly (8 MB — the existing Firebase cover-upload flow's own limit, larger than the profile-photo limit since a cover banner is a wider image) — same duplication reasoning as PROFILE_PHOTO_MAX_SIZE_BYTES above. */
 export const PROFILE_COVER_PHOTO_MAX_SIZE_BYTES = 8 * 1024 * 1024;
-
-/** Mirrors src/types/content.ts's own EVENT_COVER_PHOTO_MAX_SIZE_BYTES exactly (8 MB — inspected directly from content.ts's existing uploadEventCoverPhoto, same limit as profile cover) — same duplication reasoning as above. */
 export const EVENT_COVER_PHOTO_MAX_SIZE_BYTES = 8 * 1024 * 1024;
-
-/** Mirrors src/types/reel.ts's own REEL_THUMBNAIL_MAX_FILE_SIZE_BYTES exactly (5 MB — inspected directly from firestore.rules' own isValidReelThumbnail, which already caps a video Reel's real cover-image object at exactly this value) — same duplication reasoning as above. */
 export const REEL_THUMBNAIL_MAX_SIZE_BYTES = 5 * 1024 * 1024;
 
-/** The exact per-mediaKind maximum — inspected from, and must be kept in sync with, the existing Firebase upload limits (5 MB for profilePhoto/reelThumbnail, 8 MB for profileCover/eventCover). */
+/**
+ * Step 9A — mirrors src/types/reel.ts's own REEL_MAX_FILE_SIZE_BYTES and
+ * storage.rules' own existing `request.resource.size <= 50 * 1024 * 1024`
+ * cap for a video-mediaType Reel source exactly (inspected directly, not
+ * guessed) — this is the app's own EXISTING limit (informed by
+ * REEL_MAX_DURATION_MS's 60-second cap and typical mobile capture
+ * bitrates), preserved as-is rather than introduced fresh. Same
+ * duplication reasoning as every other size constant in this file.
+ */
+export const REEL_VIDEO_MAX_SIZE_BYTES = 50 * 1024 * 1024;
+
+/** The exact per-mediaKind maximum for an IMAGE upload — inspected from, and must be kept in sync with, the existing Firebase upload limits (5 MB for profilePhoto/reelThumbnail, 8 MB for profileCover/eventCover). Never consulted for 'reelVideo' — see REEL_VIDEO_MAX_SIZE_BYTES above, checked directly in validateMediaUploadInput's own 'reelVideo' branch instead. */
 function maxSizeForMediaKind(mediaKind: AllowedMediaKind): number {
   if (mediaKind === 'profileCover' || mediaKind === 'eventCover') return PROFILE_COVER_PHOTO_MAX_SIZE_BYTES;
   if (mediaKind === 'reelThumbnail') return REEL_THUMBNAIL_MAX_SIZE_BYTES;
@@ -64,15 +93,17 @@ export type ValidatedMediaUploadInput = {
    */
   draftId?: string;
   /**
-   * Present only for `mediaKind === 'reelThumbnail'` — unlike Event
-   * covers, a Reel draft DOES already exist in Firestore by the time its
-   * thumbnail uploads (see src/services/reels.ts's createReelDraft,
-   * which always runs first), so `reelId` identifies an EXISTING,
-   * ownership-checkable document rather than a bare client-chosen slot.
-   * Validated here only as a safe path segment (defense in depth,
-   * mirroring draftId above) — the REAL security property (this Reel
-   * belongs to the caller and is still awaiting its thumbnail) is a
-   * Firestore read that can only happen in
+   * Present only for `mediaKind === 'reelThumbnail'` or `'reelVideo'` —
+   * unlike Event covers, a Reel draft DOES already exist in Firestore by
+   * the time either of these uploads happens (see src/services/reels.ts's
+   * createReelDraft, which always runs first), so `reelId` identifies an
+   * EXISTING, ownership-checkable document rather than a bare
+   * client-chosen slot. Validated here only as a safe path segment
+   * (defense in depth, mirroring draftId above) — the REAL security
+   * property (this Reel belongs to the caller, is still awaiting this
+   * exact media, and — for 'reelVideo' specifically — has no server-side
+   * source transformation pending that would make an R2-backed source
+   * unsafe) is a Firestore read that can only happen in
    * requestMediaUploadAuthorization.ts's own handleRequest, never in
    * this pure, Firestore-free file.
    */
@@ -109,12 +140,32 @@ export function validateMediaUploadInput(data: unknown): ValidatedMediaUploadInp
 
   const { mediaKind, contentType, fileSizeBytes, draftId, reelId } = data as Record<string, unknown>;
 
-  // Only these four exact kinds — any other value (including a real
-  // future media kind name typed too early, or the Reel's own video/
-  // audio) is rejected here, not silently accepted.
-  if (mediaKind !== 'profilePhoto' && mediaKind !== 'profileCover' && mediaKind !== 'eventCover' && mediaKind !== 'reelThumbnail') {
+  // Only these five exact kinds — any other value (including a real
+  // future media kind name typed too early, or the Reel's own audio) is
+  // rejected here, not silently accepted.
+  if (
+    mediaKind !== 'profilePhoto' &&
+    mediaKind !== 'profileCover' &&
+    mediaKind !== 'eventCover' &&
+    mediaKind !== 'reelThumbnail' &&
+    mediaKind !== 'reelVideo'
+  ) {
     throw invalid();
   }
+
+  // 'reelVideo' uses its own, separate content-type allowlist and size
+  // cap (see ALLOWED_VIDEO_CONTENT_TYPES/REEL_VIDEO_MAX_SIZE_BYTES's own
+  // doc comments) — every other kind is an image, sharing the one
+  // ALLOWED_CONTENT_TYPES set and its own per-kind size cap below.
+  if (mediaKind === 'reelVideo') {
+    if (typeof contentType !== 'string' || !ALLOWED_VIDEO_CONTENT_TYPES.has(contentType)) throw invalid();
+    if (typeof fileSizeBytes !== 'number' || !Number.isFinite(fileSizeBytes) || fileSizeBytes <= 0 || fileSizeBytes > REEL_VIDEO_MAX_SIZE_BYTES) {
+      throw invalid();
+    }
+    if (typeof reelId !== 'string' || !isSafePathSegment(reelId)) throw invalid();
+    return { mediaKind, contentType, fileSizeBytes, reelId };
+  }
+
   if (typeof contentType !== 'string' || !ALLOWED_CONTENT_TYPES.has(contentType)) throw invalid();
   const maxSizeBytes = maxSizeForMediaKind(mediaKind);
   if (typeof fileSizeBytes !== 'number' || !Number.isFinite(fileSizeBytes) || fileSizeBytes <= 0 || fileSizeBytes > maxSizeBytes) {

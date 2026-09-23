@@ -1,0 +1,171 @@
+/**
+ * Step 9A — provider-aware Reel-source storage operations (delete + read),
+ * extracted from functions/src/index.ts into their own file specifically
+ * so their actual branching logic (Firebase vs. R2) is directly
+ * unit-testable with plain fakes, without needing a real Firebase Admin
+ * Storage bucket, a real R2 client, or real network access.
+ *
+ * Both functions below take their real dependencies (a bucket-like
+ * object, the R2 delete primitive, `fetch`, a file-write function) as
+ * parameters with real defaults — production call sites
+ * (functions/src/index.ts) pass nothing extra and get the exact same
+ * behavior as before this file existed; a test passes a fake bucket, a
+ * spy delete function, or a `fetchImpl` pointed at a local HTTP test
+ * server instead.
+ *
+ * `BucketFileLike`/`BucketLike` are deliberately the SMALLEST possible
+ * structural shape this code actually calls — `@google-cloud/storage`'s
+ * real `Bucket`/`File` classes already satisfy them, so
+ * `getStorage().bucket()` can be passed directly at every real call site
+ * with no adapter/wrapper needed.
+ */
+import { deleteR2Object } from './r2Storage';
+
+export type RawReelData = Record<string, unknown>;
+
+export interface BucketFileLike {
+  exists(): Promise<[boolean]>;
+  delete(options?: { ignoreNotFound?: boolean }): Promise<unknown>;
+  download(options: { destination: string }): Promise<unknown>;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- the real
+  // @google-cloud/storage File.copy() accepts (string | Bucket | File,
+  // options?) with several overloads; typing the destination as `any` here
+  // is what lets both the real File (whose own .copy signature is far
+  // wider than this minimal structural interface) and a test fake satisfy
+  // BucketFileLike at once. Only ever called here with another
+  // BucketFileLike/File in practice.
+  copy(destination: any): Promise<unknown>;
+  save(data: Buffer, options?: { contentType?: string }): Promise<unknown>;
+}
+
+export interface BucketLike {
+  file(path: string): BucketFileLike;
+}
+
+/**
+ * Step 9A — deletes a Reel's own source media, on whichever backend it
+ * actually lives (see the Reel's own `storageProvider` field —
+ * src/types/reel.ts's ReelStorageProvider). Never throws: a delete
+ * failure on either backend is logged and treated as "not deleted" here,
+ * matching this function's own existing pre-Step-9A behavior for
+ * Firebase (`{ ignoreNotFound: true }`) — a media-cleanup hiccup must
+ * never block the rest of a real, already-decided Reel deletion (likes/
+ * comments/reposts/hashtag counts/the Firestore doc itself all still
+ * proceed regardless).
+ */
+export async function deleteReelSourceMedia(
+  bucket: BucketLike,
+  storagePath: string,
+  storageProvider: string | undefined,
+  deleteObject: (key: string) => Promise<void> = deleteR2Object
+): Promise<boolean> {
+  if (storageProvider === 'r2') {
+    try {
+      await deleteObject(storagePath);
+      return true;
+    } catch (error) {
+      console.warn(`[deleteReelSourceMedia] Could not delete R2 video source at "${storagePath}":`, error);
+      return false;
+    }
+  }
+  const file = bucket.file(storagePath);
+  const [existedBefore] = await file.exists();
+  await file.delete({ ignoreNotFound: true });
+  return existedBefore;
+}
+
+export interface DownloadDeps {
+  /** Defaults to the global `fetch` — overridden in tests to point at a local HTTP test server instead of a real R2 domain. */
+  fetchImpl?: typeof fetch;
+  /** Defaults to `node:fs/promises`' own `writeFile` — overridden in tests to capture what was "written" without touching a real temp file, or to point at a scratch directory. */
+  writeFileImpl?: (path: string, data: Buffer) => Promise<void>;
+}
+
+/**
+ * Step 9A — provider-aware Reel-SOURCE read, shared by resolveOwnSoundOrigin
+ * and addReelToMyStory (functions/src/index.ts) — both operate on an
+ * already-PUBLISHED plain video Reel (no music, no pending photo-render),
+ * exactly the one variant Step 9A allows onto R2, so both need to read
+ * that Reel's source bytes regardless of which backend actually holds
+ * them.
+ *
+ * For 'r2', `reel.sourceUrl` is already a resolved, PUBLIC delivery URL
+ * (see requestMediaUploadAuthorization.ts's own mediaUrl computation) —
+ * an ordinary HTTPS GET, no R2 credential of any kind needed, which is
+ * exactly why neither of those two callables needs an R2 secret bound.
+ * Buffering the whole response in memory before writing it is safe
+ * specifically because REEL_VIDEO_MAX_SIZE_BYTES already caps a Reel
+ * source at 50 MB — both callables already run at 1GiB memory for their
+ * own ffmpeg step, so a single 50 MB buffer is a rounding error next to
+ * that.
+ *
+ * Returns `false` (never throws) for: no `sourceUrl` recorded, a
+ * non-2xx HTTP response, or a missing Firebase object — the caller is
+ * responsible for turning that into whatever HttpsError fits its own
+ * context (both current callers do: "video isn't available").
+ */
+export async function downloadReelSourceToLocalFile(
+  bucket: BucketLike,
+  reel: RawReelData,
+  destination: string,
+  deps: DownloadDeps = {}
+): Promise<boolean> {
+  const fetchImpl = deps.fetchImpl ?? fetch;
+  if (reel.storageProvider === 'r2') {
+    const sourceUrl = reel.sourceUrl as string | undefined;
+    if (!sourceUrl) return false;
+    try {
+      const response = await fetchImpl(sourceUrl);
+      if (!response.ok) return false;
+      const buffer = Buffer.from(await response.arrayBuffer());
+      if (deps.writeFileImpl) {
+        await deps.writeFileImpl(destination, buffer);
+      } else {
+        const { writeFile } = await import('node:fs/promises');
+        await writeFile(destination, buffer);
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  const file = bucket.file(reel.storagePath as string);
+  const [exists] = await file.exists();
+  if (!exists) return false;
+  await file.download({ destination });
+  return true;
+}
+
+/**
+ * Step 9A — provider-aware counterpart of downloadReelSourceToLocalFile,
+ * for addReelToMyStory (functions/src/index.ts): copies a PUBLISHED
+ * Reel's own source into a brand-new Story object. The new Story object
+ * is ALWAYS written to Firebase Storage regardless of the source Reel's
+ * own provider — Stories are explicitly out of scope for this migration
+ * — so a Firebase-backed Reel still takes the fast native `.copy()` path
+ * (no bytes ever leave Google's own infrastructure), and only an
+ * R2-backed Reel's bytes are actually fetched over HTTPS and re-uploaded.
+ *
+ * Throws (never returns false) on failure — matching addReelToMyStory's
+ * own existing try/catch-and-wrap-as-HttpsError('internal', ...) shape,
+ * unlike the two `boolean`-returning functions above, which have their
+ * own distinct "not available" callers.
+ */
+export async function copyReelSourceToFirebaseStoryObject(
+  bucket: BucketLike,
+  reel: RawReelData,
+  destinationPath: string,
+  deps: DownloadDeps = {}
+): Promise<void> {
+  const fetchImpl = deps.fetchImpl ?? fetch;
+  if (reel.storageProvider === 'r2') {
+    const sourceUrl = reel.sourceUrl as string | undefined;
+    if (!sourceUrl) throw new Error('Missing R2 source URL.');
+    const response = await fetchImpl(sourceUrl);
+    if (!response.ok) throw new Error(`R2 fetch failed with status ${response.status}.`);
+    const buffer = Buffer.from(await response.arrayBuffer());
+    await bucket.file(destinationPath).save(buffer, { contentType: reel.storageContentType as string });
+    return;
+  }
+  await bucket.file(reel.storagePath as string).copy(bucket.file(destinationPath));
+}

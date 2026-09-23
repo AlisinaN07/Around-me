@@ -30,12 +30,14 @@ const {
   validateMediaUploadInput,
   MediaUploadValidationError,
   ALLOWED_CONTENT_TYPES,
+  ALLOWED_VIDEO_CONTENT_TYPES,
   PROFILE_PHOTO_MAX_SIZE_BYTES,
   PROFILE_COVER_PHOTO_MAX_SIZE_BYTES,
   EVENT_COVER_PHOTO_MAX_SIZE_BYTES,
   REEL_THUMBNAIL_MAX_SIZE_BYTES,
+  REEL_VIDEO_MAX_SIZE_BYTES,
 } = require('../lib/media/mediaUploadValidation.js');
-const { eventCoverKey, profileCoverKey, profilePhotoKey, reelThumbnailKey } = require('../lib/media/objectKey.js');
+const { eventCoverKey, profileCoverKey, profilePhotoKey, reelSourceKey, reelThumbnailKey } = require('../lib/media/objectKey.js');
 
 const results = [];
 function check(name, fn) {
@@ -609,6 +611,165 @@ check('reelThumbnailKey differs for a different uid at the same reelId — one u
 
 check('reelThumbnailKey matches the exact existing Firebase convention', () => {
   assert.equal(reelThumbnailKey('uid-a', 'reel1'), 'reels/uid-a/reel1/thumbnail');
+});
+
+// ---------------------------------------------------------------------------
+// Step 9A — 'reelVideo' media kind. Same required-reelId shape-validation
+// reasoning as 'reelThumbnail' above, but with its OWN, separate content-type
+// allowlist (ALLOWED_VIDEO_CONTENT_TYPES, not ALLOWED_CONTENT_TYPES) and its
+// OWN, much larger size cap (REEL_VIDEO_MAX_SIZE_BYTES). This file only
+// covers the PURE shape validation this module can check —
+// verifyReelVideoOwnership's own real Firestore ownership/status/mediaType/
+// musicSourceType/needsPhotoVideoRender checks (in
+// requestMediaUploadAuthorization.ts, which transitively imports
+// firebase-admin and so can't run under this plain-Node test runner — see
+// this file's own top doc comment) are verified by direct code review
+// instead, same convention as every other callable-level check in this
+// file.
+// ---------------------------------------------------------------------------
+
+check('accepts mediaKind "reelVideo" with a valid reelId and video/mp4', () => {
+  const result = validateMediaUploadInput({ mediaKind: 'reelVideo', contentType: 'video/mp4', fileSizeBytes: 1000, reelId: 'reel-abc123' });
+  assert.equal(result.mediaKind, 'reelVideo');
+  assert.equal(result.reelId, 'reel-abc123');
+});
+
+check('accepts mediaKind "reelVideo" with video/quicktime — live testing has confirmed real iOS .mov uploads use this exact type', () => {
+  assert.doesNotThrow(() =>
+    validateMediaUploadInput({ mediaKind: 'reelVideo', contentType: 'video/quicktime', fileSizeBytes: 1000, reelId: 'reel1' })
+  );
+});
+
+check('accepts mediaKind "reelVideo" with video/x-m4v and video/webm — the other two extensions camera.tsx\'s own KNOWN_VIDEO_EXTENSIONS map declares supported', () => {
+  assert.doesNotThrow(() => validateMediaUploadInput({ mediaKind: 'reelVideo', contentType: 'video/x-m4v', fileSizeBytes: 1000, reelId: 'reel1' }));
+  assert.doesNotThrow(() => validateMediaUploadInput({ mediaKind: 'reelVideo', contentType: 'video/webm', fileSizeBytes: 1000, reelId: 'reel1' }));
+});
+
+check('rejects mediaKind "reelVideo" with no reelId at all', () => {
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'reelVideo', contentType: 'video/mp4', fileSizeBytes: 1000 }),
+    MediaUploadValidationError
+  );
+});
+
+check('rejects mediaKind "reelVideo" with an empty-string reelId', () => {
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'reelVideo', contentType: 'video/mp4', fileSizeBytes: 1000, reelId: '' }),
+    MediaUploadValidationError
+  );
+});
+
+check('rejects mediaKind "reelVideo" with a non-string reelId', () => {
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'reelVideo', contentType: 'video/mp4', fileSizeBytes: 1000, reelId: 12345 }),
+    MediaUploadValidationError
+  );
+});
+
+check('rejects a malformed reelId containing a slash (path-fragment injection) for reelVideo', () => {
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'reelVideo', contentType: 'video/mp4', fileSizeBytes: 1000, reelId: 'a/b' }),
+    MediaUploadValidationError
+  );
+});
+
+check('rejects a malformed reelId attempting parent-directory traversal for reelVideo', () => {
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'reelVideo', contentType: 'video/mp4', fileSizeBytes: 1000, reelId: '../other-uid' }),
+    MediaUploadValidationError
+  );
+});
+
+check('rejects an image/* content type for reelVideo — image/jpeg is valid for every OTHER kind but not this one', () => {
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'reelVideo', contentType: 'image/jpeg', fileSizeBytes: 1000, reelId: 'reel1' }),
+    MediaUploadValidationError
+  );
+});
+
+check('rejects an audio/* content type for reelVideo', () => {
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'reelVideo', contentType: 'audio/mp4', fileSizeBytes: 1000, reelId: 'reel1' }),
+    MediaUploadValidationError
+  );
+});
+
+check('rejects application/octet-stream for reelVideo', () => {
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'reelVideo', contentType: 'application/octet-stream', fileSizeBytes: 1000, reelId: 'reel1' }),
+    MediaUploadValidationError
+  );
+});
+
+check('rejects an arbitrary/unrecognized video-shaped MIME type for reelVideo — a narrow allowlist, not a video/* wildcard', () => {
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'reelVideo', contentType: 'video/3gpp', fileSizeBytes: 1000, reelId: 'reel1' }),
+    MediaUploadValidationError
+  );
+});
+
+check('REEL_VIDEO_MAX_SIZE_BYTES is 50 MB — mirrors src/types/reel.ts\'s REEL_MAX_FILE_SIZE_BYTES and storage.rules\' own existing Reel-source cap exactly', () => {
+  assert.equal(REEL_VIDEO_MAX_SIZE_BYTES, 50 * 1024 * 1024);
+});
+
+check('reelVideo accepts a file exactly at its own maximum size', () => {
+  assert.doesNotThrow(() =>
+    validateMediaUploadInput({ mediaKind: 'reelVideo', contentType: 'video/mp4', fileSizeBytes: REEL_VIDEO_MAX_SIZE_BYTES, reelId: 'reel1' })
+  );
+});
+
+check('reelVideo rejects a file one byte over its own maximum size', () => {
+  assert.throws(
+    () =>
+      validateMediaUploadInput({
+        mediaKind: 'reelVideo',
+        contentType: 'video/mp4',
+        fileSizeBytes: REEL_VIDEO_MAX_SIZE_BYTES + 1,
+        reelId: 'reel1',
+      }),
+    MediaUploadValidationError
+  );
+});
+
+check('reelVideo rejects a zero or negative file size', () => {
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'reelVideo', contentType: 'video/mp4', fileSizeBytes: 0, reelId: 'reel1' }),
+    MediaUploadValidationError
+  );
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'reelVideo', contentType: 'video/mp4', fileSizeBytes: -1, reelId: 'reel1' }),
+    MediaUploadValidationError
+  );
+});
+
+check('ALLOWED_VIDEO_CONTENT_TYPES is exactly the four-format set this app\'s own camera.tsx KNOWN_VIDEO_EXTENSIONS map declares — not a broader video/* wildcard', () => {
+  assert.deepEqual([...ALLOWED_VIDEO_CONTENT_TYPES].sort(), ['video/mp4', 'video/quicktime', 'video/webm', 'video/x-m4v'].sort());
+});
+
+check('ignores an extra uid/authorUid field in a reelVideo payload — ownership is verified server-side against Firestore, never trusted from request data', () => {
+  const result = validateMediaUploadInput({
+    mediaKind: 'reelVideo',
+    contentType: 'video/mp4',
+    fileSizeBytes: 1000,
+    reelId: 'reel1',
+    uid: 'some-other-uid',
+    authorUid: 'some-other-uid',
+  });
+  assert.equal('uid' in result, false);
+  assert.equal('authorUid' in result, false);
+  assert.deepEqual(Object.keys(result).sort(), ['contentType', 'fileSizeBytes', 'mediaKind', 'reelId']);
+});
+
+check('reelSourceKey is deterministic for the same uid+reelId', () => {
+  assert.equal(reelSourceKey('uid-a', 'reel1'), reelSourceKey('uid-a', 'reel1'));
+});
+
+check('reelSourceKey differs for a different uid at the same reelId — one user\'s Reel can never target another user\'s namespace', () => {
+  assert.notEqual(reelSourceKey('uid-a', 'reel1'), reelSourceKey('uid-b', 'reel1'));
+});
+
+check('reelSourceKey matches the exact existing Firebase convention', () => {
+  assert.equal(reelSourceKey('uid-a', 'reel1'), 'reels/uid-a/reel1/source');
 });
 
 console.log('\n=== functions/ media upload authorization logic test results ===');

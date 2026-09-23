@@ -301,7 +301,18 @@ export default function CreateReelScreen() {
       // musicStorageAudioPath is '' when no music was attached — see
       // ReelMusicSourceType's doc comment; discardReelDraft treats an
       // empty/falsy path as "nothing to delete," not an error.
-      await discardReelDraft(draft.reelId, draft.storagePath, draft.thumbnailStoragePath, draft.musicStorageAudioPath || undefined);
+      // storageProvider/thumbnailStorageProvider (Step 9A) are always
+      // 'firebase' at this point unless a real R2 upload for either one
+      // already confirmed — discardReelDraft only asks the server to
+      // clean up R2 when at least one of them says so.
+      await discardReelDraft(
+        draft.reelId,
+        draft.storagePath,
+        draft.thumbnailStoragePath,
+        draft.musicStorageAudioPath || undefined,
+        draft.storageProvider,
+        draft.thumbnailStorageProvider
+      );
     }
     setError(message);
     setUploadFailed(keepFailureBanner);

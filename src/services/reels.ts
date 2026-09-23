@@ -52,6 +52,8 @@ import {
   REEL_THUMBNAIL_MAX_FILE_SIZE_BYTES,
   type Reel,
   type ReelMediaType,
+  type ReelStorageProvider,
+  type ReelThumbnailStorageProvider,
 } from '@/types/reel';
 
 import { fetchFollowingUids } from './following';
@@ -59,7 +61,9 @@ import { firestore } from './firestore';
 import { functions } from './functions';
 import { extractHashtags, incrementHashtagCounts } from './hashtags';
 import { getMediaStorageProvider } from './media';
-import { uploadReelThumbnailToR2 } from './media/r2Provider';
+import { pickProviderUrl } from './media/providerAwareUrl';
+import { isReelEligibleForR2VideoUpload } from './media/reelVideoEligibility';
+import { uploadReelThumbnailToR2, uploadReelVideoToR2 } from './media/r2Provider';
 import { fetchEngagementStatsBatch } from './recommendations/engagementStats';
 import { scoreContentQuality } from './recommendations/ranking';
 import { storage } from './storage';
@@ -124,6 +128,10 @@ export function normalizeReel(data: Reel): Reel {
     // above. See ReelThumbnailStorageProvider's own doc comment.
     thumbnailStorageProvider: data.thumbnailStorageProvider ?? 'firebase',
     thumbnailUrl: data.thumbnailUrl ?? '',
+    // Step 9A — same defaulting convention, for the Reel's own video
+    // source this time. See ReelStorageProvider's own doc comment.
+    storageProvider: data.storageProvider ?? 'firebase',
+    sourceUrl: data.sourceUrl ?? '',
   };
 }
 
@@ -398,6 +406,14 @@ export async function createReelDraft(input: CreateReelDraftInput): Promise<Crea
     storagePath: reelStoragePath(profile.uid, draftRef.id),
     storageContentType: input.storageContentType,
     fileSizeBytes: input.fileSizeBytes,
+    // Step 9A — every draft is created with its video source still on
+    // Firebase, same "required field, fixed default at create" pattern as
+    // thumbnailStorageProvider below. Only a trusted, one-time
+    // server-authorized update (see confirmReelVideoProvider below) can
+    // ever flip this to 'r2' — enforced server-side by firestore.rules'
+    // isValidReelSourceProviderUpdate, not just by this client code.
+    storageProvider: 'firebase',
+    sourceUrl: '',
     durationMs: isPhoto ? 0 : isPhotoPendingRender ? REEL_PHOTO_DURATION_MS : input.durationMs,
     width: input.width,
     height: input.height,
@@ -472,6 +488,20 @@ export type UploadReelVideoHandle = {
  * this project does not use) — so the local file URI from the picker is
  * first read into a Blob via `fetch()`, which works uniformly across iOS,
  * Android, and web with the Firebase JS SDK.
+ *
+ * Step 9A — dispatches to uploadReelVideoViaR2 (below) ONLY when ALL of:
+ * getMediaStorageProvider() is 'r2', `reel.mediaType === 'video'`,
+ * `reel.musicSourceType === 'none'`, and `reel.needsPhotoVideoRender ===
+ * false`. Despite its name this function is also the plain-photo upload
+ * path (`mediaType === 'photo'`, no separate thumbnail step — see
+ * createReelDraft's own doc comment) — a photo Reel, a music-attached
+ * video Reel, and a "FOTO"-with-music render-pending Reel all still take
+ * this exact same, unmodified Firebase path below, regardless of the
+ * configured provider — see verifyReelVideoOwnership's own doc comment
+ * in functions/src/media/requestMediaUploadAuthorization.ts for exactly
+ * why those variants are excluded from R2 in this step. This function's
+ * own default, production behavior is otherwise completely untouched —
+ * the exact same code that existed before Step 9A.
  */
 export function uploadReelVideo(
   reel: Reel,
@@ -479,6 +509,10 @@ export function uploadReelVideo(
   onProgress: (percent: number) => void,
   onComplete: (result: { ok: true } | { ok: false; message: string }) => void
 ): UploadReelVideoHandle {
+  if (getMediaStorageProvider() === 'r2' && isReelEligibleForR2VideoUpload(reel)) {
+    return uploadReelVideoViaR2(reel, localUri, onProgress, onComplete);
+  }
+
   let cancelled = false;
   let task: UploadTask | null = null;
 
@@ -526,6 +560,135 @@ export function uploadReelVideo(
       task?.cancel();
     },
   };
+}
+
+/**
+ * Step 9A — the one-time, server-authorized Firestore write that flips a
+ * still-"uploading" plain video Reel's source from Firebase to R2, once
+ * (and only once) the direct client PUT to R2 has actually succeeded —
+ * see firestore.rules' own isValidReelSourceProviderUpdate for the exact
+ * narrow shape this write must take (every field besides
+ * storageProvider/sourceUrl/updatedAt must stay byte-identical, and this
+ * can never fire a second time against the same Reel). The ONLY caller
+ * is uploadReelVideoViaR2 below — this is not a general-purpose
+ * Reel-editing function. Exact structural mirror of
+ * confirmReelThumbnailProvider above, for the video source instead of
+ * the thumbnail — the two are deliberately independent writes (a Reel's
+ * video and thumbnail providers never change together in one call), same
+ * "do not couple them" reasoning as ReelStorageProvider's own doc
+ * comment in src/types/reel.ts.
+ */
+async function confirmReelVideoProvider(reelId: string, sourceUrl: string): Promise<{ ok: true } | { ok: false; message: string }> {
+  if (!firestore) {
+    return { ok: false, message: 'Firestore is not available.' };
+  }
+  try {
+    await updateDoc(reelRef(reelId), {
+      storageProvider: 'r2',
+      sourceUrl,
+      updatedAt: serverTimestamp(),
+    });
+  } catch {
+    return { ok: false, message: "Couldn't finish saving this post's video." };
+  }
+  return { ok: true };
+}
+
+/**
+ * Step 9A's real, end-to-end R2 upload path for a plain video Reel's own
+ * source — reached ONLY from uploadReelVideo above, when the provider is
+ * 'r2' and this exact Reel is eligible (see that function's own doc
+ * comment). Mirrors uploadReelThumbnailViaR2's own "upload, then confirm,
+ * both must succeed" structure — uploadReelVideo's existing
+ * `{ok:true}|{ok:false}` contract exposes no URL to its own caller
+ * either, so this function performs the follow-up
+ * confirmReelVideoProvider write itself before ever reporting success.
+ *
+ * Unlike uploadReelThumbnailViaR2, this wires up REAL cancellation: video
+ * uploads can run for a meaningful amount of time (up to
+ * REEL_VIDEO_MAX_SIZE_BYTES), so a user backing out mid-upload should
+ * actually stop the transfer, not just have this function ignore its
+ * eventual result — see uploadReelVideoToR2's own `onUploadTaskReady`
+ * parameter in r2Provider.ts.
+ *
+ * Same orphan-risk note as uploadReelThumbnailViaR2: if the R2 PUT
+ * succeeds but the follow-up Firestore write then fails, the R2 object
+ * is left behind with nothing in Firestore pointing at it yet — a real
+ * user retry re-PUTs to the exact same deterministic key, overwriting it
+ * in place, so this never accumulates unbounded orphans. A genuinely
+ * abandoned draft (the user discards instead of retrying) is cleaned up
+ * server-side by discardReelDraft's own call to the discardReelSource
+ * callable below.
+ */
+function uploadReelVideoViaR2(
+  reel: Reel,
+  localUri: string,
+  onProgress: (percent: number) => void,
+  onComplete: (result: { ok: true } | { ok: false; message: string }) => void
+): UploadReelVideoHandle {
+  let cancelled = false;
+  let cancelUpload: (() => void) | null = null;
+
+  (async () => {
+    const uploadResult = await uploadReelVideoToR2(
+      reel.reelId,
+      localUri,
+      reel.storageContentType,
+      onProgress,
+      (cancel) => {
+        cancelUpload = cancel;
+      }
+    );
+    if (cancelled) return;
+
+    if (!uploadResult.ok) {
+      onComplete(uploadResult);
+      return;
+    }
+
+    const confirmResult = await confirmReelVideoProvider(reel.reelId, uploadResult.sourceUrl);
+    if (cancelled) return;
+
+    if (__DEV__) {
+      // eslint-disable-next-line no-console
+      console.log('[reels] R2 video upload for', reel.reelId, '->', uploadResult, confirmResult);
+    }
+    onComplete(confirmResult);
+  })();
+
+  return {
+    cancel: () => {
+      cancelled = true;
+      cancelUpload?.();
+    },
+  };
+}
+
+/**
+ * Resolves the URL a Reel's own video should actually play from — the
+ * provider-aware counterpart to resolveReelThumbnailUrl above, for the
+ * main source instead of the cover image. Branches on the Reel's OWN
+ * persisted `storageProvider` (never on getMediaStorageProvider() — the
+ * CURRENT app config has nothing to do with where an EXISTING Reel's
+ * source actually was uploaded), so a mixed feed of some Firebase-source
+ * and some R2-source Reels resolves each one correctly regardless of the
+ * currently-configured provider.
+ *
+ * 'r2': `sourceUrl` was already resolved once, at upload-confirm time,
+ * and persisted — returned directly, no network round-trip needed, and
+ * (unlike the Firebase branch) never cached in playbackUrlCache below —
+ * there is nothing to cache a second time for a value that's already a
+ * plain field read.
+ * 'firebase' (including every legacy Reel missing the field entirely,
+ * already defaulted by normalizeReel): unchanged, existing behavior —
+ * lazily resolved from `storagePath` via resolveReelPlaybackUrl, same as
+ * before Step 9A.
+ */
+export async function resolveReelVideoPlaybackUrl(reel: Reel): Promise<string | null> {
+  const resolution = pickProviderUrl(reel.storageProvider, reel.sourceUrl);
+  if (resolution.mode === 'r2') return resolution.url;
+  if (resolution.mode === 'r2-malformed') return null;
+  return resolveReelPlaybackUrl(reel.storagePath);
 }
 
 /**
@@ -778,9 +941,9 @@ function uploadReelThumbnailViaR2(
  * same as before Step 5E.
  */
 export async function resolveReelThumbnailUrl(reel: Reel): Promise<string | null> {
-  if (reel.thumbnailStorageProvider === 'r2') {
-    return reel.thumbnailUrl || null;
-  }
+  const resolution = pickProviderUrl(reel.thumbnailStorageProvider, reel.thumbnailUrl);
+  if (resolution.mode === 'r2') return resolution.url;
+  if (resolution.mode === 'r2-malformed') return null;
   return resolveReelPlaybackUrl(reel.thumbnailStoragePath);
 }
 
@@ -931,7 +1094,16 @@ export async function discardReelDraft(
   reelId: string,
   storagePath: string,
   thumbnailStoragePath: string,
-  musicStoragePath?: string
+  musicStoragePath?: string,
+  // Step 9A — optional, and only ever 'r2' for a Reel whose video source
+  // and/or thumbnail actually moved there (see uploadReelVideoViaR2/
+  // uploadReelThumbnailViaR2 above) — undefined/'firebase' means "nothing
+  // to clean up beyond the Firebase attempts above," matching every
+  // pre-Step-9A draft's own real behavior exactly. Passed by the one
+  // caller (create/reel/index.tsx's handleDiscard) straight from the
+  // draft Reel's own `storageProvider`/`thumbnailStorageProvider` fields.
+  storageProvider?: ReelStorageProvider,
+  thumbnailStorageProvider?: ReelThumbnailStorageProvider
 ): Promise<void> {
   if (storage) {
     try {
@@ -974,6 +1146,26 @@ export async function discardReelDraft(
             error
           );
         }
+      }
+    }
+  }
+  // Step 9A — a Firebase Storage object this draft never actually held
+  // (because its video/thumbnail went to R2 instead) has no equivalent
+  // client-reachable delete path — R2 credentials never leave the
+  // backend (see r2Config.ts's own doc comment) — so this asks the
+  // trusted discardReelSource callable to clean up whichever of the two
+  // objects actually exist there. Best-effort, same reasoning as every
+  // Firebase delete attempt above: a cleanup failure here must never
+  // block the draft's own Firestore deletion just below.
+  if ((storageProvider === 'r2' || thumbnailStorageProvider === 'r2') && functions) {
+    try {
+      await httpsCallable(functions, 'discardReelSource')({ reelId });
+    } catch (error) {
+      if (__DEV__) {
+        console.warn(
+          `[reels] Could not clean up R2 media while discarding Reel "${reelId}" — it may be left orphaned and require cleanup via trusted CLI tooling. Error:`,
+          error
+        );
       }
     }
   }

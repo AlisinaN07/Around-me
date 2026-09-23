@@ -52,9 +52,10 @@
     "ios": "expo start --ios",
     "web": "expo start --web",
     "lint": "expo lint",
-    "test:rules": "npx firebase-tools emulators:exec --only firestore \"node tests/firestore.rules.test.mjs\"",
+    "test:rules": "JAVA_TOOL_OPTIONS=-Djava.net.preferIPv4Stack=true npx firebase-tools emulators:exec --only firestore \"node tests/firestore.rules.test.mjs\"",
     "test:cities": "tsx tests/cities.test.ts",
     "test:recommendations": "tsx tests/recommendations.test.ts",
+    "test:reel-video-r2": "tsx tests/reel-video-r2.test.ts",
     "cleanup:test-data": "node scripts/delete-test-documents.cjs"
   },
   "private": true

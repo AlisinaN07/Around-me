@@ -1,13 +1,17 @@
 /**
  * SERVER-SIDE-ONLY R2 client — Cloud Functions code, never imported by
- * anything under src/ (the mobile app). Deliberately NOT re-exported from
- * functions/src/index.ts — Cloud Functions deploys every trigger/callable
- * that file exports, so keeping this module out of that barrel is what
- * guarantees ZERO production/deployment footprint from it today, exactly
- * per Step 4's "do NOT hook it into current production media flow"
- * instruction. Nothing calls any function in this file anywhere in this
- * repository right now.
+ * anything under src/ (the mobile app). Deliberately NOT re-exported
+ * ITSELF from functions/src/index.ts — Cloud Functions deploys every
+ * trigger/callable that file exports, so keeping this module out of that
+ * barrel directly is what guarantees it has no deployment footprint of
+ * its own beyond the few narrow, validated, secret-bound callables that
+ * DO import from it (requestMediaUploadAuthorization.ts since Step 5A,
+ * discardReelSource.ts since Step 9A, and functions/src/index.ts's own
+ * deleteMyReel/deleteMyAccountData/removeReportedReel since Step 9A, for
+ * R2-aware Reel-source cleanup — see their own doc comments). No OTHER
+ * code path in this repository reaches any function here.
  *
+
  * Every exported function here throws a clear, actionable error if
  * getR2Config() returns null, rather than silently no-op'ing or trying to
  * reach a real bucket with missing credentials — importing this module is

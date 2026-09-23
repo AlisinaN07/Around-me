@@ -17,18 +17,22 @@ export type MediaProvider = 'firebase' | 'r2';
 /**
  * Every kind of media Around Me's storage-provider abstraction knows how
  * to upload. 'profilePhoto' (Step 5A), 'profileCover' (Step 5C),
- * 'eventCover' (Step 5D), and 'reelThumbnail' (Step 5E) are the only
- * kinds wired up end-to-end (see
+ * 'eventCover' (Step 5D), 'reelThumbnail' (Step 5E), and 'reelVideo'
+ * (Step 9A) are the only kinds wired up end-to-end (see
  * functions/src/media/requestMediaUploadAuthorization.ts and provider.ts's
- * own MediaStorageProvider) — a Reel's own video/audio and all Story
- * media still upload through their own existing, untouched
- * Firebase-direct code in reels.ts/stories.ts, not through this
- * abstraction at all. 'reelThumbnail' is deliberately scoped to ONLY the
- * thumbnail object of a video Reel — see reels.ts's own
- * uploadReelThumbnail/resolveReelThumbnailUrl for why a photo Reel (whose
- * thumbnail IS its own source object) never reaches this path.
+ * own MediaStorageProvider) — a Reel's own audio and all Story media
+ * still upload through their own existing, untouched Firebase-direct
+ * code in reels.ts/stories.ts, not through this abstraction at all.
+ * 'reelThumbnail' is deliberately scoped to ONLY the thumbnail object of
+ * a video Reel — see reels.ts's own uploadReelThumbnail/
+ * resolveReelThumbnailUrl for why a photo Reel (whose thumbnail IS its
+ * own source object) never reaches this path. 'reelVideo' is equally
+ * narrow: ONLY a plain video Reel with no music and no pending
+ * photo-to-video render — see reels.ts's own uploadReelVideo dispatch
+ * guard and functions/src/media/requestMediaUploadAuthorization.ts's own
+ * verifyReelVideoOwnership for exactly why those variants are excluded.
  */
-export type MediaKind = 'profilePhoto' | 'profileCover' | 'eventCover' | 'reelThumbnail';
+export type MediaKind = 'profilePhoto' | 'profileCover' | 'eventCover' | 'reelThumbnail' | 'reelVideo';
 
 /**
  * A storage-neutral pointer to one media object — the shape a Firestore

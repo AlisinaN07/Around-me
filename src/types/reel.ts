@@ -137,6 +137,30 @@ export type ReelMediaType = 'video' | 'photo';
  */
 export type ReelThumbnailStorageProvider = 'firebase' | 'r2';
 
+/**
+ * Which backend a video Reel's own `storagePath`/`sourceUrl` (its main
+ * source media, not its thumbnail — see ReelThumbnailStorageProvider
+ * above, an entirely independent, never-coupled field) actually lives
+ * in — Step 9A. 'firebase' is every Reel published before this field
+ * existed and every Reel published while
+ * EXPO_PUBLIC_MEDIA_STORAGE_PROVIDER stays unset/'firebase' — for these,
+ * `sourceUrl` is '' and playback is resolved the existing way, lazily
+ * from `storagePath` via resolveReelPlaybackUrl. 'r2' is set exactly
+ * once, by a trusted server write (see firestore.rules'
+ * isValidReelSourceProviderUpdate and functions/src/media/
+ * requestMediaUploadAuthorization.ts's own verifyReelVideoOwnership),
+ * the moment an R2 video upload succeeds — never client-writable
+ * directly. Only ever 'r2' for a PLAIN video Reel with no music and no
+ * pending photo-to-video render (musicSourceType === 'none' &&
+ * needsPhotoVideoRender === false) — a Reel with picked music or a
+ * pending photo render still needs a trusted server-side rewrite of its
+ * own source (muxReelMusic/renderPhotoToVideo in functions/src/index.ts,
+ * both Firebase-Storage-only) before publish, so those variants stay on
+ * Firebase in this step — see resolveReelVideoPlaybackUrl and
+ * uploadReelVideo's own dispatch guard in reels.ts.
+ */
+export type ReelStorageProvider = 'firebase' | 'r2';
+
 export type Reel = {
   reelId: string;
   authorUid: string;
@@ -189,6 +213,33 @@ export type Reel = {
   storagePath: string;
   storageContentType: string;
   fileSizeBytes: number;
+  /**
+   * Step 9A — which backend this Reel's own video source actually lives
+   * in. See ReelStorageProvider's own doc comment for the full model.
+   * Always `'firebase'` on a legacy Reel missing this key — see
+   * normalizeReel, same "required-field-with-default" convention as
+   * `musicHash`/`thumbnailStorageProvider` above. Never client-writable
+   * to `'r2'` directly — only a trusted server write can flip it (see
+   * firestore.rules' isValidReelSourceProviderUpdate).
+   */
+  storageProvider: ReelStorageProvider;
+  /**
+   * Step 9A — the resolved R2 delivery URL for this Reel's own video
+   * source, persisted at upload-confirm time (never derived from
+   * `storagePath` the way a Firebase-backed Reel's playback URL is
+   * resolved lazily at render time — see resolveReelVideoPlaybackUrl in
+   * reels.ts). `''` whenever `storageProvider` is `'firebase'` (including
+   * every legacy Reel) — meaningful ONLY when `storageProvider ===
+   * 'r2'`. Deliberately carries NO cache-busting query string (unlike
+   * thumbnailUrl/profile-photo URLs) — an R2-eligible Reel's source is
+   * never rewritten server-side after upload (that's the whole point of
+   * this provider only being reachable for a plain, no-music,
+   * no-pending-render video — see ReelStorageProvider's own doc
+   * comment), so there is nothing here for a version token to ever bust.
+   * Set exactly once by a trusted server write, never client-writable
+   * directly (same rule as `storageProvider` above).
+   */
+  sourceUrl: string;
   /**
    * Declared duration in milliseconds, taken from the picked asset's own
    * metadata. This is a CLIENT-DECLARED value, re-validated by Firestore

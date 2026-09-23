@@ -5,12 +5,14 @@
  * r2Config.ts's own doc comment on why those never leave this backend).
  *
  * Deliberately narrow: supports ONLY `mediaKind: 'profilePhoto'` (Step
- * 5A), `'profileCover'` (Step 5C), `'eventCover'` (Step 5D), and
- * `'reelThumbnail'` (Step 5E) for the CALLING user's own uid — no
- * client-supplied uid, no other media kind. In particular this never
- * authorizes a Reel's own video/audio, or any Story — extending this
- * further is explicit future work, not something this file's own shape
- * should be stretched to cover prematurely.
+ * 5A), `'profileCover'` (Step 5C), `'eventCover'` (Step 5D),
+ * `'reelThumbnail'` (Step 5E), and `'reelVideo'` (Step 9A — a plain video
+ * Reel's own source, ONLY when it has no music and no pending
+ * photo-to-video render, see verifyReelVideoOwnership below) for the
+ * CALLING user's own uid — no client-supplied uid, no other media kind.
+ * In particular this never authorizes a Reel's own audio/music, or any
+ * Story — extending this further is explicit future work, not something
+ * this file's own shape should be stretched to cover prematurely.
  *
  * `eventCover` is the one media kind that accepts a client-supplied,
  * NOT independently ownership-checked identifier (`draftId`) — see
@@ -42,8 +44,9 @@ import { HttpsError, onCall, type CallableRequest } from 'firebase-functions/v2/
 
 import { MediaUploadValidationError, validateMediaUploadInput, type AllowedMediaKind } from './mediaUploadValidation';
 import { buildMediaUrl } from './mediaUrl';
-import { eventCoverKey, profileCoverKey, profilePhotoKey, reelThumbnailKey } from './objectKey';
+import { eventCoverKey, profileCoverKey, profilePhotoKey, reelSourceKey, reelThumbnailKey } from './objectKey';
 import { getR2Config } from './r2Config';
+import { checkReelThumbnailEligibility, checkReelVideoEligibility, type RawReelData } from './reelEligibility';
 import { createPresignedUploadUrl } from './r2Storage';
 
 const REGION = 'europe-north1';
@@ -95,6 +98,12 @@ type RequestMediaUploadAuthorizationInput = {
    * value is used to load that exact Reel server-side and confirm the
    * caller actually owns it and it's still awaiting its thumbnail,
    * BEFORE any presigned URL is ever created.
+   *
+   * Step 9A also reuses this exact same field for `mediaKind:
+   * 'reelVideo'` — see verifyReelVideoOwnership below for that kind's
+   * own, stricter verification (also requires `musicSourceType ===
+   * 'none'` and `needsPhotoVideoRender === false`, on top of everything
+   * verifyReelThumbnailOwnership already checks).
    */
   reelId?: string;
 };
@@ -156,21 +165,67 @@ type RequestMediaUploadAuthorizationResult = {
  * bugs are debuggable, while still never leaking WHY a given reelId was
  * rejected beyond that top-level code (no Reel content/other fields are
  * ever included in an error message).
+ *
+ * The actual eligibility DECISION (given a Reel's data and the caller's
+ * uid, is this allowed?) lives in the pure, directly-unit-tested
+ * checkReelThumbnailEligibility (reelEligibility.ts) — this function's
+ * own job is just the impure part: the real Firestore read, and
+ * translating that pure result into a real HttpsError.
  */
 async function verifyReelThumbnailOwnership(reelId: string, uid: string): Promise<void> {
   const snapshot = await getFirestore().collection('reels').doc(reelId).get();
-  if (!snapshot.exists) {
-    throw new HttpsError('not-found', 'This Reel could not be found.');
+  const reel = snapshot.exists ? (snapshot.data() as RawReelData) : null;
+  const result = checkReelThumbnailEligibility(reel, uid);
+  if (!result.ok) {
+    throw new HttpsError(result.code, result.message);
   }
-  const reel = snapshot.data() as Record<string, unknown>;
-  if (reel.authorUid !== uid) {
-    throw new HttpsError('permission-denied', 'You do not own this Reel.');
-  }
-  if (reel.status !== 'uploading') {
-    throw new HttpsError('failed-precondition', 'This Reel is not awaiting a thumbnail upload.');
-  }
-  if (reel.mediaType !== 'video') {
-    throw new HttpsError('failed-precondition', 'This Reel does not use a separate thumbnail.');
+}
+
+/**
+ * Step 9A — the STRICTEST ownership/eligibility check this callable
+ * performs, for exactly the reason Step 9A's own migration-scope
+ * decision exists: a Reel's video source can be rewritten IN PLACE,
+ * server-side, by two other trusted Cloud Functions —
+ * muxReelMusic (merges picked device music into the video) and
+ * renderPhotoToVideo (renders a "FOTO"-with-music photo into a real
+ * video) — both of which download `reel.storagePath` directly from
+ * Firebase Storage via the Admin SDK and know nothing about R2. If either
+ * of those could ever run against an R2-backed source, they would
+ * silently fail (the object simply isn't in the Firebase bucket) or,
+ * worse, leave the Reel in a broken half-migrated state. So this
+ * verification EXCLUDES exactly the Reel variants those two functions
+ * still own:
+ *
+ *  1. Reel exists, `authorUid === request.auth.uid`, `status ===
+ *     'uploading'`, `mediaType === 'video'` — same four checks as
+ *     verifyReelThumbnailOwnership above, same reasoning.
+ *  2. `musicSourceType === 'none'` — a Reel with picked device music
+ *     always goes through muxReelMusic before publish; authorizing an R2
+ *     source upload for one would let that function try to
+ *     `bucket.file(...).download()` an object that was never written to
+ *     Firebase at all. Music-attached Reels stay on Firebase for their
+ *     video source in this step (see this file's own top doc comment).
+ *  3. `needsPhotoVideoRender !== true` — a "FOTO"-with-music draft's
+ *     `storagePath` still holds the ORIGINAL PHOTO until
+ *     renderPhotoToVideo overwrites it with a real rendered video; same
+ *     reasoning as (2) — that function also only knows Firebase Storage.
+ *
+ * A plain video Reel with no music (`musicSourceType === 'none'` and
+ * `needsPhotoVideoRender === false`) has NO server-side source
+ * transformation scheduled before publish at all — nothing else in this
+ * codebase ever touches its `storagePath` object between this upload and
+ * playback, which is exactly what makes it safe to move to R2.
+ *
+ * Same "pure decision, impure read" split as verifyReelThumbnailOwnership
+ * above — see checkReelVideoEligibility (reelEligibility.ts) for the
+ * actual, directly-unit-tested decision logic.
+ */
+async function verifyReelVideoOwnership(reelId: string, uid: string): Promise<void> {
+  const snapshot = await getFirestore().collection('reels').doc(reelId).get();
+  const reel = snapshot.exists ? (snapshot.data() as RawReelData) : null;
+  const result = checkReelVideoEligibility(reel, uid);
+  if (!result.ok) {
+    throw new HttpsError(result.code, result.message);
   }
 }
 
@@ -235,6 +290,12 @@ export async function handleRequest(request: CallableRequest<unknown>): Promise<
     // own doc comment above.
     await verifyReelThumbnailOwnership(input.reelId!, request.auth.uid);
     path = reelThumbnailKey(request.auth.uid, input.reelId!);
+  } else if (input.mediaKind === 'reelVideo') {
+    // Same reasoning as the reelThumbnail branch above, plus the extra
+    // eligibility checks verifyReelVideoOwnership's own doc comment
+    // explains in full.
+    await verifyReelVideoOwnership(input.reelId!, request.auth.uid);
+    path = reelSourceKey(request.auth.uid, input.reelId!);
   } else if (input.mediaKind === 'profileCover') {
     path = profileCoverKey(request.auth.uid);
   } else {
@@ -249,8 +310,23 @@ export async function handleRequest(request: CallableRequest<unknown>): Promise<
     // own doc comment for the full reasoning). The underlying R2 object
     // key is untouched — still the exact same deterministic path every
     // time, overwritten in place.
+    //
+    // Step 9A — 'reelVideo' deliberately uses a FIXED version (1) instead
+    // of a fresh Date.now() every time: by the time verifyReelVideoOwnership
+    // above has passed, this exact object is guaranteed to have no
+    // server-side rewrite scheduled after upload (that's the whole point
+    // of the eligibility check it performs) — the video becomes immutable
+    // the moment it's confirmed, and the client only ever authorizes ONE
+    // real upload per Reel (a retry after a failed PUT/confirm re-uses
+    // the exact same never-yet-confirmed object, not a new "version" of
+    // published content). A real per-request version here would just mean
+    // the same one true video getting a different, meaningless URL on
+    // every retry, for zero cache-correctness benefit — see this file's
+    // own Step 9A report for the fuller reasoning this was weighed
+    // against.
     const publicMediaBaseUrl = getR2Config()?.publicMediaBaseUrl ?? null;
-    const mediaUrl = publicMediaBaseUrl ? buildMediaUrl(publicMediaBaseUrl, path, Date.now()) : null;
+    const version = input.mediaKind === 'reelVideo' ? 1 : Date.now();
+    const mediaUrl = publicMediaBaseUrl ? buildMediaUrl(publicMediaBaseUrl, path, version) : null;
 
     return { provider: 'r2', path, uploadUrl, contentType: input.contentType, expiresAt, mediaUrl };
   } catch {

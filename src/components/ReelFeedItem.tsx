@@ -18,7 +18,7 @@ import { followUser, isFollowing } from '@/services/following';
 import { fetchPublicProfile } from '@/services/publicProfile';
 import { fetchReelCommentCount, fetchReelLikeCount, isReelLiked, likeReel, unlikeReel } from '@/services/reelEngagement';
 import { trackContentInteraction, trackReelWatchSummary, trackVideoStarted } from '@/services/recommendations/interactions';
-import { resolveReelPlaybackUrl, resolveReelThumbnailUrl } from '@/services/reels';
+import { resolveReelThumbnailUrl, resolveReelVideoPlaybackUrl } from '@/services/reels';
 import { isPostSaved, savePost, unsavePost } from '@/services/saved';
 import { fetchActiveStoriesForAuthor, hasViewedStory } from '@/services/stories';
 import type { Reel } from '@/types/reel';
@@ -167,7 +167,11 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
     // used in ReportModal.
     setUrlStatus('loading');
     setIsVideoReady(false);
-    resolveReelPlaybackUrl(reel.storagePath).then((url) => {
+    // Step 9A — branches on this Reel's OWN persisted storageProvider
+    // (Firebase, resolved lazily via the same resolveReelPlaybackUrl
+    // cache as before; or R2, already resolved at upload-confirm time) —
+    // see resolveReelVideoPlaybackUrl's own doc comment.
+    resolveReelVideoPlaybackUrl(reel).then((url) => {
       if (cancelled) return;
       if (url) {
         setPlaybackUrl(url);
@@ -179,7 +183,7 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
     return () => {
       cancelled = true;
     };
-  }, [reel.storagePath, shouldPrepare]);
+  }, [reel.storagePath, reel.storageProvider, reel.sourceUrl, shouldPrepare]);
 
   // Phase 3 perf pass — see thumbnailUrl's own doc comment above. Gated
   // on the exact same shouldPrepare window as playbackUrl (never resolved
@@ -612,7 +616,7 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
     setPlaybackFailed(false);
     setUrlStatus('loading');
     setIsVideoReady(false);
-    resolveReelPlaybackUrl(reel.storagePath).then((url) => {
+    resolveReelVideoPlaybackUrl(reel).then((url) => {
       if (url) {
         setPlaybackUrl(url);
         setUrlStatus('ready');
