@@ -6,10 +6,12 @@
  *
  * Deliberately narrow: supports ONLY `mediaKind: 'profilePhoto'` (Step
  * 5A), `'profileCover'` (Step 5C), `'eventCover'` (Step 5D),
- * `'reelThumbnail'` (Step 5E), and `'reelVideo'` (Step 9A — a plain video
- * Reel's own source, ONLY when it has no music and no pending
- * photo-to-video render, see verifyReelVideoOwnership below) for the
- * CALLING user's own uid — no client-supplied uid, no other media kind.
+ * `'reelThumbnail'` (Step 5E), and `'reelVideo'` (Step 9A — a video
+ * Reel's own source; Step 9B extended this to include a video Reel with
+ * device-picked music, since muxReelMusic became provider-aware — a
+ * pending photo-to-video render is still always excluded, see
+ * verifyReelVideoOwnership below) for the CALLING user's own uid — no
+ * client-supplied uid, no other media kind.
  * In particular this never authorizes a Reel's own audio/music, or any
  * Story — extending this further is explicit future work, not something
  * this file's own shape should be stretched to cover prematurely.
@@ -182,43 +184,23 @@ async function verifyReelThumbnailOwnership(reelId: string, uid: string): Promis
 }
 
 /**
- * Step 9A — the STRICTEST ownership/eligibility check this callable
- * performs, for exactly the reason Step 9A's own migration-scope
- * decision exists: a Reel's video source can be rewritten IN PLACE,
- * server-side, by two other trusted Cloud Functions —
- * muxReelMusic (merges picked device music into the video) and
- * renderPhotoToVideo (renders a "FOTO"-with-music photo into a real
- * video) — both of which download `reel.storagePath` directly from
- * Firebase Storage via the Admin SDK and know nothing about R2. If either
- * of those could ever run against an R2-backed source, they would
- * silently fail (the object simply isn't in the Firebase bucket) or,
- * worse, leave the Reel in a broken half-migrated state. So this
- * verification EXCLUDES exactly the Reel variants those two functions
- * still own:
+ * Step 9A/9B — the STRICTEST ownership/eligibility check this callable
+ * performs. A Reel's video source can be rewritten IN PLACE, server-side,
+ * by two other trusted Cloud Functions — muxReelMusic (merges picked
+ * device music into the video) and renderPhotoToVideo (renders a
+ * "FOTO"-with-music photo into a real video). renderPhotoToVideo is
+ * STILL entirely Firebase-Storage-only in Step 9B (deliberately out of
+ * scope) — a Reel it would ever touch (`needsPhotoVideoRender === true`)
+ * is still excluded here. muxReelMusic became PROVIDER-AWARE in Step 9B
+ * (see reelMuxOrchestration.ts) — it can now read/replace a Reel's
+ * source on either backend, so a Reel with picked device music
+ * (`musicSourceType === 'device'`) is no longer excluded purely because
+ * mux will touch it.
  *
- *  1. Reel exists, `authorUid === request.auth.uid`, `status ===
- *     'uploading'`, `mediaType === 'video'` — same four checks as
- *     verifyReelThumbnailOwnership above, same reasoning.
- *  2. `musicSourceType === 'none'` — a Reel with picked device music
- *     always goes through muxReelMusic before publish; authorizing an R2
- *     source upload for one would let that function try to
- *     `bucket.file(...).download()` an object that was never written to
- *     Firebase at all. Music-attached Reels stay on Firebase for their
- *     video source in this step (see this file's own top doc comment).
- *  3. `needsPhotoVideoRender !== true` — a "FOTO"-with-music draft's
- *     `storagePath` still holds the ORIGINAL PHOTO until
- *     renderPhotoToVideo overwrites it with a real rendered video; same
- *     reasoning as (2) — that function also only knows Firebase Storage.
- *
- * A plain video Reel with no music (`musicSourceType === 'none'` and
- * `needsPhotoVideoRender === false`) has NO server-side source
- * transformation scheduled before publish at all — nothing else in this
- * codebase ever touches its `storagePath` object between this upload and
- * playback, which is exactly what makes it safe to move to R2.
- *
- * Same "pure decision, impure read" split as verifyReelThumbnailOwnership
- * above — see checkReelVideoEligibility (reelEligibility.ts) for the
- * actual, directly-unit-tested decision logic.
+ * See checkReelVideoEligibility's own doc comment (reelEligibility.ts)
+ * for the exact, directly-unit-tested decision logic this delegates to —
+ * this function's own job is only the impure Firestore read and
+ * translating a `{ok:false}` result into a real HttpsError.
  */
 async function verifyReelVideoOwnership(reelId: string, uid: string): Promise<void> {
   const snapshot = await getFirestore().collection('reels').doc(reelId).get();
@@ -311,19 +293,24 @@ export async function handleRequest(request: CallableRequest<unknown>): Promise<
     // key is untouched — still the exact same deterministic path every
     // time, overwritten in place.
     //
-    // Step 9A — 'reelVideo' deliberately uses a FIXED version (1) instead
-    // of a fresh Date.now() every time: by the time verifyReelVideoOwnership
-    // above has passed, this exact object is guaranteed to have no
-    // server-side rewrite scheduled after upload (that's the whole point
-    // of the eligibility check it performs) — the video becomes immutable
-    // the moment it's confirmed, and the client only ever authorizes ONE
-    // real upload per Reel (a retry after a failed PUT/confirm re-uses
-    // the exact same never-yet-confirmed object, not a new "version" of
-    // published content). A real per-request version here would just mean
-    // the same one true video getting a different, meaningless URL on
-    // every retry, for zero cache-correctness benefit — see this file's
-    // own Step 9A report for the fuller reasoning this was weighed
-    // against.
+    // Step 9A — 'reelVideo' deliberately uses a FIXED version (1) here,
+    // rather than a fresh Date.now() every time — this is the version for
+    // the ORIGINAL upload's own confirm, not necessarily the LAST word on
+    // this object's URL. For a plain, no-music Reel, this object is
+    // guaranteed immutable from this point on (verifyReelVideoOwnership
+    // above already excludes anything mux/render would still touch), so
+    // version 1 IS the final version, forever. For a Step 9B music Reel,
+    // this same object WILL be rewritten once more by muxReelMusic before
+    // publish — but that's fine specifically because this version-1 URL
+    // is never exposed to anyone before mux runs (the Reel stays
+    // 'uploading', author-only, and the app's own upload flow never
+    // fetches this URL back) — muxReelMusic's own Firestore update
+    // (reelMuxOrchestration.ts) computes and persists a FRESH version
+    // once it actually replaces the bytes, which is the URL that's
+    // actually true by the time this Reel can ever publish. A real
+    // per-request version here would just mean the same not-yet-final
+    // video getting a different, meaningless URL on every authorization
+    // retry, for zero cache-correctness benefit.
     const publicMediaBaseUrl = getR2Config()?.publicMediaBaseUrl ?? null;
     const version = input.mediaKind === 'reelVideo' ? 1 : Date.now();
     const mediaUrl = publicMediaBaseUrl ? buildMediaUrl(publicMediaBaseUrl, path, version) : null;

@@ -72,7 +72,10 @@ function isServerTimestampSentinel(value) {
  * Mirrors isValidReelSourceProviderUpdate (firestore.rules, line
  * ~1751-1806) field-for-field, including its exhaustive
  * "every other field must stay byte-identical" equality list and the
- * defense-in-depth musicSourceType/needsPhotoVideoRender checks.
+ * defense-in-depth musicSourceType/needsPhotoVideoRender checks. Step
+ * 9B relaxed the musicSourceType constraint from `'none'`-only to
+ * `'none' or 'device'` (kept UNCHANGED across the transition either
+ * way) — mirrored here exactly.
  */
 function isValidReelSourceProviderUpdate(newData, oldData) {
   return (
@@ -80,8 +83,8 @@ function isValidReelSourceProviderUpdate(newData, oldData) {
     newData.status === 'uploading' &&
     oldData.mediaType === 'video' &&
     newData.mediaType === 'video' &&
-    oldData.musicSourceType === 'none' &&
-    newData.musicSourceType === 'none' &&
+    (oldData.musicSourceType === 'none' || oldData.musicSourceType === 'device') &&
+    newData.musicSourceType === oldData.musicSourceType &&
     oldData.needsPhotoVideoRender === false &&
     newData.needsPhotoVideoRender === false &&
     oldData.storageProvider === 'firebase' &&
@@ -332,6 +335,34 @@ check('source transition: firebase -> r2 with a valid https sourceUrl and only p
 });
 
 // ---------------------------------------------------------------------------
+// Step 9B — the SAME transition, now for a Reel with device-picked music —
+// the newly-relaxed case.
+// ---------------------------------------------------------------------------
+check('Step 9B — source transition: firebase -> r2 for a Reel WITH device-picked music is now ACCEPTED', () => {
+  const oldData = baseReelDoc({ musicSourceType: 'device', musicTitle: 'Song.mp3', musicStorageAudioPath: 'reels/uid1/reel1/music' });
+  const newData = { ...oldData, storageProvider: 'r2', sourceUrl: 'https://media.example.com/reels/uid1/reel1/source', updatedAt: 'SERVER_TIMESTAMP' };
+  assert.equal(isValidReelUpdate(newData, oldData, 'uid1'), true);
+});
+check('Step 9B — source transition: an unsupported/unrecognized musicSourceType value is still REJECTED — an allowlist, not a blocklist', () => {
+  const oldData = baseReelDoc({ musicSourceType: 'catalog' });
+  const newData = { ...oldData, storageProvider: 'r2', sourceUrl: 'https://media.example.com/x', updatedAt: 'SERVER_TIMESTAMP' };
+  assert.equal(isValidReelSourceProviderUpdate(newData, oldData), false);
+});
+check('Step 9B — source transition: sneaking a musicSourceType CHANGE into the same write (e.g. "device" -> "none") is REJECTED — music state itself must stay unchanged during this transition', () => {
+  const oldData = baseReelDoc({ musicSourceType: 'device', musicTitle: 'Song.mp3', musicStorageAudioPath: 'reels/uid1/reel1/music' });
+  const newData = {
+    ...oldData,
+    storageProvider: 'r2',
+    sourceUrl: 'https://media.example.com/x',
+    updatedAt: 'SERVER_TIMESTAMP',
+    musicSourceType: 'none',
+    musicTitle: '',
+    musicStorageAudioPath: '',
+  };
+  assert.equal(isValidReelUpdate(newData, oldData, 'uid1'), false);
+});
+
+// ---------------------------------------------------------------------------
 // 3. reject r2 -> firebase (reverse transition never allowed)
 // ---------------------------------------------------------------------------
 check('source transition: r2 -> firebase is REJECTED — the one-shot guard only ever fires firebase -> r2, never the reverse', () => {
@@ -406,13 +437,12 @@ check('source transition: a photo Reel (mediaType "photo") is REJECTED regardles
 });
 
 // ---------------------------------------------------------------------------
-// 9. reject music Reel
+// 9. music Reel — Step 9A rejected this outright; Step 9B relaxed it
+// (already covered above, right after the plain firebase->r2 case). This
+// section keeps ONLY the genuinely-still-rejected variant: an
+// unsupported music state (covered above too) — nothing further to add
+// here beyond what Step 9B's own dedicated block already tests.
 // ---------------------------------------------------------------------------
-check('source transition: a Reel with musicSourceType "device" is REJECTED — defense in depth alongside verifyReelVideoOwnership', () => {
-  const oldData = baseReelDoc({ musicSourceType: 'device', musicTitle: 'Song.mp3' });
-  const newData = { ...oldData, storageProvider: 'r2', sourceUrl: 'https://media.example.com/x', updatedAt: 'SERVER_TIMESTAMP' };
-  assert.equal(isValidReelSourceProviderUpdate(newData, oldData), false);
-});
 
 // ---------------------------------------------------------------------------
 // 10. reject pending photo-render Reel
@@ -440,6 +470,20 @@ check('publish: sneaking a storageProvider change INTO the publish write itself 
   const oldData = baseReelDoc();
   const newData = { ...oldData, status: 'published', publishedAt: 'SERVER_TIMESTAMP', updatedAt: 'SERVER_TIMESTAMP', storageProvider: 'r2', sourceUrl: 'https://media.example.com/x' };
   assert.equal(isValidReelUpdate(newData, oldData, 'uid1'), false);
+});
+check('Step 9B — publish: a MUSIC Reel already confirmed as storageProvider "r2" AND already carrying a trusted post-mux musicHash (both set by a prior, separate Admin SDK write — muxReelMusic bypasses these Rules entirely, exactly like musicHash always has) can still publish', () => {
+  const oldData = baseReelDoc({
+    musicSourceType: 'device',
+    musicTitle: 'Song.mp3',
+    musicStorageAudioPath: 'reels/uid1/reel1/music',
+    storageProvider: 'r2',
+    sourceUrl: 'https://media.example.com/reels/uid1/reel1/source?v=999',
+    musicHash: 'abc123',
+    soundOriginAuthorUid: 'uid1',
+    soundOriginReelId: 'reel1',
+  });
+  const newData = { ...oldData, status: 'published', publishedAt: 'SERVER_TIMESTAMP', updatedAt: 'SERVER_TIMESTAMP' };
+  assert.equal(isValidReelUpdate(newData, oldData, 'uid1'), true);
 });
 
 // ---------------------------------------------------------------------------

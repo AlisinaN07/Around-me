@@ -25,11 +25,14 @@
  * officially-supported way to talk to R2 (its object API is
  * S3-compatible) — never the legacy monolithic `aws-sdk` v2 package,
  * which would pull in every AWS service's client for no reason. These
- * two packages alone cover everything Step 4/5 need: put (via a
- * presigned URL, so large video bytes never pass through a Cloud
- * Function), delete, and existence checks.
+ * two packages cover: put (via a presigned URL, so large video bytes
+ * normally never pass through a Cloud Function), delete, existence
+ * checks (Step 4/5), and — Step 9B — an authenticated direct get/put
+ * pair used ONLY by muxReelMusic's own server-internal video
+ * read-mux-replace workflow, where bytes DO need to pass through the
+ * Cloud Function itself (there is no other way to run ffmpeg on them).
  */
-import { DeleteObjectCommand, HeadObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
+import { DeleteObjectCommand, GetObjectCommand, HeadObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 
 import { getR2Config } from './r2Config';
@@ -127,4 +130,70 @@ export async function r2ObjectExists(key: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+/**
+ * Step 9B — an AUTHENTICATED read of an R2 object's full body, via the S3
+ * API directly (GetObjectCommand) rather than the object's own public
+ * delivery URL. Used ONLY by muxReelMusic's own server-internal video
+ * read (see reelSourceStorage.ts's downloadReelSourceForMux) — every
+ * other R2 read in this codebase (resolveOwnSoundOrigin, addReelToMyStory)
+ * deliberately stays on the public-URL `fetch()` path from Step 9A, since
+ * those are fine depending on whatever Cloudflare's edge cache currently
+ * holds. Muxing is different: it must operate on the OBJECT'S OWN, exactly
+ * current bytes, never a possibly-stale CDN-cached copy, and it must not
+ * depend on `R2_PUBLIC_MEDIA_BASE_URL` being configured at all (a
+ * server-internal operation has no reason to depend on the same public
+ * delivery config a client needs) — see the Step 9B report's own "R2
+ * server read behavior" section for the full evaluation.
+ *
+ * Buffers the entire object in memory before returning — safe because
+ * REEL_VIDEO_MAX_SIZE_BYTES already caps a Reel source at 50 MB, and
+ * muxReelMusic already runs at 1GiB memory for its own ffmpeg step.
+ */
+export async function downloadR2ObjectBuffer(key: string): Promise<Buffer> {
+  const { client, bucketName } = requireR2Client();
+  const response = await client.send(new GetObjectCommand({ Bucket: bucketName, Key: key }));
+  const body = response.Body;
+  if (!body) {
+    throw new Error(`R2 object "${key}" has no readable body.`);
+  }
+  // The AWS SDK v3 client's own Node runtime returns a real Node Readable
+  // for `Body` — `transformToByteArray()` is its own documented,
+  // cross-runtime-safe way to fully buffer a response body, avoiding a
+  // hand-rolled stream-to-buffer loop.
+  const bytes = await body.transformToByteArray();
+  return Buffer.from(bytes);
+}
+
+/**
+ * Step 9B — an AUTHENTICATED write of a REPLACEMENT object's full body,
+ * via the S3 API directly (PutObjectCommand) — the server-internal
+ * counterpart to createPresignedUploadUrl's own client-facing presigned
+ * PUT. Used ONLY by muxReelMusic's own server-internal video write (see
+ * reelSourceStorage.ts's uploadMuxedReelSourceToProvider): the client
+ * never receives R2 credentials of any kind for this — this function's
+ * caller (a trusted Cloud Function) does the actual write.
+ *
+ * `cacheControl`, when given, is set on the object itself — used
+ * specifically for the muxed Reel-source replacement, whose delivery URL
+ * is re-versioned (`?v=<version>`) every time this runs (see mediaUrl.ts
+ * and the Step 9B report's own "Cache/version strategy"): once an object
+ * is reachable ONLY via a version-stamped URL, marking the underlying
+ * response long-lived+immutable is safe and correct — a content change
+ * always gets a NEW url, never the same one serving different bytes.
+ * Every other R2 write in this codebase (createPresignedUploadUrl) sets
+ * no Cache-Control at all, unaffected by this new optional parameter.
+ */
+export async function putR2Object(key: string, data: Buffer, contentType: string, cacheControl?: string): Promise<void> {
+  const { client, bucketName } = requireR2Client();
+  await client.send(
+    new PutObjectCommand({
+      Bucket: bucketName,
+      Key: key,
+      Body: data,
+      ContentType: contentType,
+      ...(cacheControl ? { CacheControl: cacheControl } : {}),
+    })
+  );
 }

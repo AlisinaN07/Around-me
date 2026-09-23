@@ -1726,10 +1726,10 @@ service cloud.firestore {
         && newData.keys().hasOnly(reelBaseKeys());
     }
 
-    // Step 9A — the video-source counterpart to
-    // isValidReelThumbnailProviderUpdate above: a still-"uploading" PLAIN
-    // video Reel's own source moving from Firebase to R2, once (and only
-    // once) a direct client upload to R2 has actually succeeded (see
+    // Step 9A/9B — the video-source counterpart to
+    // isValidReelThumbnailProviderUpdate above: a still-"uploading" video
+    // Reel's own source moving from Firebase to R2, once (and only once)
+    // a direct client upload to R2 has actually succeeded (see
     // functions/src/media/requestMediaUploadAuthorization.ts's own
     // verifyReelVideoOwnership for the server-side authorization that
     // must happen BEFORE that upload, and src/services/reels.ts's
@@ -1738,23 +1738,31 @@ service cloud.firestore {
     // fire at most once ever per Reel, exactly mirroring
     // isValidReelThumbnailProviderUpdate's own one-shot guard.
     //
-    // `oldData.musicSourceType == 'none' && oldData.needsPhotoVideoRender
-    // == false` (both also required to stay unchanged, alongside every
-    // other field, since only mediaType/status/storageProvider/sourceUrl
-    // are permitted to differ at all) is DEFENSE IN DEPTH mirroring
-    // verifyReelVideoOwnership's own eligibility check — even though the
-    // authorization callable already refuses to hand out a presigned URL
-    // for a music-attached or render-pending Reel, this rule
-    // independently refuses to ever confirm one as 'r2' either, so a
-    // confirm-write alone (without ever having passed authorization)
-    // could never move an ineligible Reel's source off Firebase.
+    // `oldData.musicSourceType == newData.musicSourceType` (unchanged
+    // during THIS transition either way — music state itself never
+    // changes here, only confirmed to already be an allowed value) plus
+    // `oldData.needsPhotoVideoRender == false` (also required to stay
+    // unchanged, alongside every other field, since only
+    // mediaType/status/storageProvider/sourceUrl are permitted to differ
+    // at all) is DEFENSE IN DEPTH mirroring verifyReelVideoOwnership's own
+    // eligibility check — even though the authorization callable already
+    // refuses to hand out a presigned URL for a render-pending or
+    // unsupported-music Reel, this rule independently refuses to ever
+    // confirm one as 'r2' either, so a confirm-write alone (without ever
+    // having passed authorization) could never move an ineligible Reel's
+    // source off Firebase. Step 9B relaxed the ALLOWED music values from
+    // `'none'`-only to `'none' or 'device'` — muxReelMusic now knows how
+    // to read/replace this exact object on either backend before publish
+    // (see reelMuxOrchestration.ts) — but a Reel with any OTHER music
+    // state is still rejected here, same allowlist-not-blocklist posture
+    // as the server-side eligibility check it mirrors.
     function isValidReelSourceProviderUpdate(newData, oldData) {
       return oldData.status == 'uploading'
         && newData.status == 'uploading'
         && oldData.mediaType == 'video'
         && newData.mediaType == 'video'
-        && oldData.musicSourceType == 'none'
-        && newData.musicSourceType == 'none'
+        && (oldData.musicSourceType == 'none' || oldData.musicSourceType == 'device')
+        && newData.musicSourceType == oldData.musicSourceType
         && oldData.needsPhotoVideoRender == false
         && newData.needsPhotoVideoRender == false
         && oldData.storageProvider == 'firebase'

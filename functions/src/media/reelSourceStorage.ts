@@ -19,7 +19,8 @@
  * `getStorage().bucket()` can be passed directly at every real call site
  * with no adapter/wrapper needed.
  */
-import { deleteR2Object } from './r2Storage';
+import { reelSourceKey } from './objectKey';
+import { deleteR2Object, downloadR2ObjectBuffer, putR2Object } from './r2Storage';
 
 export type RawReelData = Record<string, unknown>;
 
@@ -40,6 +41,8 @@ export interface BucketFileLike {
 
 export interface BucketLike {
   file(path: string): BucketFileLike;
+  /** Uploads a LOCAL file to `options.destination` — the real `@google-cloud/storage` Bucket.upload's own shape, used only by uploadMuxedReelSourceToProvider's Firebase branch (an unchanged carry-over of muxReelMusic's own pre-Step-9B behavior). */
+  upload(localPath: string, options: { destination: string; metadata?: { contentType?: string } }): Promise<unknown>;
 }
 
 /**
@@ -168,4 +171,102 @@ export async function copyReelSourceToFirebaseStoryObject(
     return;
   }
   await bucket.file(reel.storagePath as string).copy(bucket.file(destinationPath));
+}
+
+export interface R2ObjectDeps {
+  /** Defaults to the real, authenticated downloadR2ObjectBuffer — overridden in tests with a fake in-memory object store. */
+  getObject?: (key: string) => Promise<Buffer>;
+  /** Defaults to the real, authenticated putR2Object — overridden in tests the same way. */
+  putObject?: (key: string, data: Buffer, contentType: string, cacheControl?: string) => Promise<void>;
+  /** Defaults to `node:fs/promises`' own `writeFile` — see DownloadDeps' own doc comment on why this is overridable. */
+  writeFileImpl?: (path: string, data: Buffer) => Promise<void>;
+  /** Defaults to `node:fs/promises`' own `readFile`. */
+  readFileImpl?: (path: string) => Promise<Buffer>;
+}
+
+/**
+ * Step 9B — provider-aware Reel-SOURCE read for muxReelMusic specifically
+ * (reelMuxOrchestration.ts's own performReelMux), deliberately SEPARATE
+ * from downloadReelSourceToLocalFile above rather than a third branch
+ * bolted onto it: that function's R2 read goes through the object's own
+ * PUBLIC delivery URL (fine for resolveOwnSoundOrigin/addReelToMyStory,
+ * whose own correctness doesn't depend on bypassing whatever Cloudflare's
+ * edge cache currently holds); mux is different — it needs the OBJECT'S
+ * OWN, exactly-current bytes, so this uses an AUTHENTICATED R2 read
+ * (downloadR2ObjectBuffer, GetObjectCommand) instead, and derives the R2
+ * key itself via reelSourceKey(uid, reelId) — the same trusted,
+ * server-computed derivation every other R2 primitive in this codebase
+ * uses — rather than trusting the Reel document's own `storagePath`/
+ * `sourceUrl` string fields as if they were themselves authorization.
+ *
+ * Returns `false` (never throws) exactly like downloadReelSourceToLocalFile
+ * — the caller (performReelMux) turns that into a specific mux-failure
+ * reason.
+ */
+export async function downloadReelSourceForMux(
+  bucket: BucketLike,
+  reel: RawReelData,
+  uid: string,
+  reelId: string,
+  destination: string,
+  deps: R2ObjectDeps = {}
+): Promise<boolean> {
+  if (reel.storageProvider === 'r2') {
+    const getObject = deps.getObject ?? downloadR2ObjectBuffer;
+    try {
+      const buffer = await getObject(reelSourceKey(uid, reelId));
+      if (deps.writeFileImpl) {
+        await deps.writeFileImpl(destination, buffer);
+      } else {
+        const { writeFile } = await import('node:fs/promises');
+        await writeFile(destination, buffer);
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  const file = bucket.file(reel.storagePath as string);
+  const [exists] = await file.exists();
+  if (!exists) return false;
+  await file.download({ destination });
+  return true;
+}
+
+/**
+ * Step 9B — provider-aware REPLACEMENT write for muxReelMusic: uploads
+ * the freshly-muxed local video file back to the SAME deterministic
+ * source object the original video occupied — `reels/{uid}/{reelId}/source`
+ * either way, on whichever backend that Reel actually uses. Never creates
+ * a new/different object; this is always an overwrite-in-place, matching
+ * muxReelMusic's own pre-existing Firebase behavior exactly (unchanged by
+ * this function for the Firebase branch).
+ *
+ * `cacheControl` is only ever meaningful for the R2 branch — see
+ * putR2Object's own doc comment — and is ignored for Firebase (Firebase
+ * Storage's own metadata/caching is unrelated to this step's scope).
+ */
+export async function uploadMuxedReelSourceToProvider(
+  bucket: BucketLike,
+  reel: RawReelData,
+  uid: string,
+  reelId: string,
+  localFilePath: string,
+  contentType: string,
+  cacheControl: string | undefined,
+  deps: R2ObjectDeps = {}
+): Promise<void> {
+  if (reel.storageProvider === 'r2') {
+    const putObject = deps.putObject ?? putR2Object;
+    const readFileImpl =
+      deps.readFileImpl ??
+      (async (path: string) => {
+        const { readFile } = await import('node:fs/promises');
+        return readFile(path);
+      });
+    const data = await readFileImpl(localFilePath);
+    await putObject(reelSourceKey(uid, reelId), data, contentType, cacheControl);
+    return;
+  }
+  await bucket.upload(localFilePath, { destination: reel.storagePath as string, metadata: { contentType } });
 }

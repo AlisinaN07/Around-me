@@ -54,24 +54,31 @@ async function check(name: string, fn: () => void | Promise<void>) {
 }
 
 // ---------------------------------------------------------------------------
-// isReelEligibleForR2VideoUpload — Part 4/16's client-side dispatch guard
+// isReelEligibleForR2VideoUpload — Step 9A's original matrix plus Step 9B's
+// relaxation (Part 7/15's own "Eligibility" list).
 // ---------------------------------------------------------------------------
 
 async function runEligibilityTests() {
-  await check('eligible: plain video, no music, no pending render', () => {
+  await check('eligible: plain video, no music, no pending render (Step 9A, unaffected by Step 9B)', () => {
     assert.equal(isReelEligibleForR2VideoUpload({ mediaType: 'video', musicSourceType: 'none', needsPhotoVideoRender: false }), true);
   });
   await check('ineligible: photo mediaType', () => {
     assert.equal(isReelEligibleForR2VideoUpload({ mediaType: 'photo', musicSourceType: 'none', needsPhotoVideoRender: false }), false);
   });
-  await check('ineligible: musicSourceType "device"', () => {
-    assert.equal(isReelEligibleForR2VideoUpload({ mediaType: 'video', musicSourceType: 'device', needsPhotoVideoRender: false }), false);
+  await check('Step 9B — eligible: video + supported music (musicSourceType "device"), no pending render', () => {
+    assert.equal(isReelEligibleForR2VideoUpload({ mediaType: 'video', musicSourceType: 'device', needsPhotoVideoRender: false }), true);
   });
-  await check('ineligible: needsPhotoVideoRender true, even with mediaType already "video"', () => {
+  await check('ineligible: needsPhotoVideoRender true, even with mediaType already "video" and no music', () => {
     assert.equal(isReelEligibleForR2VideoUpload({ mediaType: 'video', musicSourceType: 'none', needsPhotoVideoRender: true }), false);
   });
-  await check('ineligible: needsPhotoVideoRender true AND musicSourceType device (the real "FOTO"-with-music shape)', () => {
+  await check('ineligible: needsPhotoVideoRender true AND musicSourceType device (the real "FOTO"-with-music shape) — Part 14, photo-render paths remain excluded even after Step 9B', () => {
     assert.equal(isReelEligibleForR2VideoUpload({ mediaType: 'video', musicSourceType: 'device', needsPhotoVideoRender: true }), false);
+  });
+  await check('ineligible: an unrecognized/future musicSourceType value — an allowlist, not a blocklist', () => {
+    assert.equal(isReelEligibleForR2VideoUpload({ mediaType: 'video', musicSourceType: 'catalog', needsPhotoVideoRender: false }), false);
+  });
+  await check('ineligible: a photo Reel is never eligible regardless of its (meaningless for photo) musicSourceType value', () => {
+    assert.equal(isReelEligibleForR2VideoUpload({ mediaType: 'photo', musicSourceType: 'device', needsPhotoVideoRender: false }), false);
   });
 }
 

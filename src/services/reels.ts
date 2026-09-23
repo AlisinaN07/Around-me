@@ -489,19 +489,21 @@ export type UploadReelVideoHandle = {
  * first read into a Blob via `fetch()`, which works uniformly across iOS,
  * Android, and web with the Firebase JS SDK.
  *
- * Step 9A — dispatches to uploadReelVideoViaR2 (below) ONLY when ALL of:
- * getMediaStorageProvider() is 'r2', `reel.mediaType === 'video'`,
- * `reel.musicSourceType === 'none'`, and `reel.needsPhotoVideoRender ===
- * false`. Despite its name this function is also the plain-photo upload
- * path (`mediaType === 'photo'`, no separate thumbnail step — see
- * createReelDraft's own doc comment) — a photo Reel, a music-attached
- * video Reel, and a "FOTO"-with-music render-pending Reel all still take
+ * Step 9A/9B — dispatches to uploadReelVideoViaR2 (below) ONLY when
+ * getMediaStorageProvider() is 'r2' AND isReelEligibleForR2VideoUpload(reel)
+ * (see that function's own doc comment in reelVideoEligibility.ts): a
+ * video Reel with no pending photo-to-video render, and with either no
+ * music (Step 9A) or device-picked music (Step 9B — muxReelMusic is now
+ * provider-aware, see reelMuxOrchestration.ts). Despite its name this
+ * function is also the plain-photo upload path (`mediaType === 'photo'`,
+ * no separate thumbnail step — see createReelDraft's own doc comment) —
+ * a photo Reel and a "FOTO"-with-music render-pending Reel still take
  * this exact same, unmodified Firebase path below, regardless of the
- * configured provider — see verifyReelVideoOwnership's own doc comment
- * in functions/src/media/requestMediaUploadAuthorization.ts for exactly
- * why those variants are excluded from R2 in this step. This function's
- * own default, production behavior is otherwise completely untouched —
- * the exact same code that existed before Step 9A.
+ * configured provider — see checkReelVideoEligibility's own doc comment
+ * in functions/src/media/reelEligibility.ts for exactly why those two
+ * variants stay excluded from R2. This function's own default,
+ * production behavior is otherwise completely untouched — the exact same
+ * code that existed before Step 9A.
  */
 export function uploadReelVideo(
   reel: Reel,
@@ -674,11 +676,18 @@ function uploadReelVideoViaR2(
  * and some R2-source Reels resolves each one correctly regardless of the
  * currently-configured provider.
  *
- * 'r2': `sourceUrl` was already resolved once, at upload-confirm time,
- * and persisted — returned directly, no network round-trip needed, and
- * (unlike the Firebase branch) never cached in playbackUrlCache below —
- * there is nothing to cache a second time for a value that's already a
- * plain field read.
+ * 'r2': `sourceUrl` was already resolved and persisted — returned
+ * directly, no network round-trip needed, and (unlike the Firebase
+ * branch) never cached in playbackUrlCache below — there is nothing to
+ * cache a second time for a value that's already a plain field read.
+ * Step 9B — for a music Reel specifically, this is NOT necessarily the
+ * same URL the original (pre-mux) upload confirmed: muxReelMusic
+ * persists a FRESH, re-versioned URL once it actually replaces the
+ * bytes (see reelMuxOrchestration.ts's own `buildVersionedSourceUrl`),
+ * and this Reel can never publish before that happens — so by the time
+ * any consumer ever calls this function for a published Reel, `sourceUrl`
+ * already reflects the muxed bytes' own final URL, never the transient
+ * un-muxed one.
  * 'firebase' (including every legacy Reel missing the field entirely,
  * already defaulted by normalizeReel): unchanged, existing behavior —
  * lazily resolved from `storagePath` via resolveReelPlaybackUrl, same as

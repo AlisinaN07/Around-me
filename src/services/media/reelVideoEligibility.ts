@@ -1,8 +1,9 @@
 /**
- * Step 9A — the pure, client-side mirror of the SAME eligibility decision
- * functions/src/media/reelEligibility.ts's checkReelVideoEligibility makes
- * server-side: given a Reel's mediaType/musicSourceType/
- * needsPhotoVideoRender, is its video source allowed to move to R2?
+ * Step 9A/9B — the pure, client-side mirror of the SAME eligibility
+ * decision functions/src/media/reelEligibility.ts's
+ * checkReelVideoEligibility makes server-side: given a Reel's
+ * mediaType/musicSourceType/needsPhotoVideoRender, is its video source
+ * allowed to move to R2?
  *
  * Deliberately its own tiny, dependency-free file (no import from
  * reels.ts, no Firebase import) so reels.ts's own uploadReelVideo
@@ -28,13 +29,26 @@ export type ReelEligibilityShape = {
 };
 
 /**
- * True ONLY for a plain video Reel with no music and no pending
- * photo-to-video render — the ONE variant Step 9A allows onto R2 (see
- * requestMediaUploadAuthorization.ts's own verifyReelVideoOwnership for
- * the full reasoning: a music-attached or render-pending Reel still
- * needs a trusted server-side rewrite of its own source, via
- * muxReelMusic/renderPhotoToVideo, both Firebase-Storage-only).
+ * True for a video Reel with no pending photo-to-video render, and with
+ * a music state this codebase actually knows how to bring to R2 — Step
+ * 9A's original `'none'` (nothing to mux, immutable after upload), or
+ * Step 9B's new `'device'` (device-picked music — muxReelMusic now runs
+ * provider-aware, on either backend, before publish). A render-pending
+ * Reel is excluded regardless of music state — renderPhotoToVideo stays
+ * entirely Firebase-only in Step 9B (deliberately out of scope; see
+ * checkReelVideoEligibility's own doc comment in
+ * functions/src/media/reelEligibility.ts for the full reasoning both
+ * sides of this predicate share).
+ *
+ * Deliberately an ALLOWLIST on `musicSourceType`, not a blocklist — a
+ * hypothetical future music source type this app doesn't support yet is
+ * rejected by default here too, matching the server's own same defensive
+ * posture, rather than silently accepted just because it isn't `'device'`.
  */
 export function isReelEligibleForR2VideoUpload(reel: ReelEligibilityShape): boolean {
-  return reel.mediaType === 'video' && reel.musicSourceType === 'none' && !reel.needsPhotoVideoRender;
+  return (
+    reel.mediaType === 'video' &&
+    !reel.needsPhotoVideoRender &&
+    (reel.musicSourceType === 'none' || reel.musicSourceType === 'device')
+  );
 }
