@@ -221,6 +221,63 @@ async function main() {
     assert.deepEqual(second, { ok: true });
   });
 
+  // ---------------------------------------------------------------------------
+  // Step 9C — the `extraConfirmFields` parameter, added specifically so
+  // renderPhotoToVideo (functions/src/index.ts) can reuse this ENTIRE
+  // orchestration unchanged otherwise, merging its own
+  // `{ needsPhotoVideoRender: false }` into the exact same atomic
+  // confirm-write.
+  // ---------------------------------------------------------------------------
+
+  await check('extraConfirmFields defaults to {} — omitting the third argument entirely (muxReelMusic\'s own call shape) changes nothing about the confirm-write', async () => {
+    const { deps, calls } = makeDeps();
+    const outcome = await performReelMux(PATHS, deps);
+    assert.deepEqual(outcome, { ok: true });
+    const updateCall = calls.find((c) => c[0] === 'updateReelDocument');
+    assert.deepEqual(updateCall[1], {
+      storageContentType: 'video/mp4',
+      fileSizeBytes: 12345,
+      musicHash: 'fake-music-hash',
+      soundOriginAuthorUid: 'uid1',
+      soundOriginReelId: 'reel1',
+    });
+  });
+
+  await check('extraConfirmFields (Step 9C — renderPhotoToVideo\'s own usage): needsPhotoVideoRender:false is merged into the SAME atomic confirm-write, alongside every field this function already writes', async () => {
+    const { deps, calls } = makeDeps();
+    const outcome = await performReelMux(PATHS, deps, { needsPhotoVideoRender: false });
+    assert.deepEqual(outcome, { ok: true });
+    const updateCall = calls.find((c) => c[0] === 'updateReelDocument');
+    assert.deepEqual(updateCall[1], {
+      needsPhotoVideoRender: false,
+      storageContentType: 'video/mp4',
+      fileSizeBytes: 12345,
+      musicHash: 'fake-music-hash',
+      soundOriginAuthorUid: 'uid1',
+      soundOriginReelId: 'reel1',
+    });
+  });
+
+  await check('extraConfirmFields + a versioned sourceUrl (R2 photo-render case) both land in the same write', async () => {
+    const { deps, calls } = makeDeps({ buildVersionedSourceUrl: () => 'https://media.example.com/reels/uid1/reel1/source?v=999' });
+    const outcome = await performReelMux(PATHS, deps, { needsPhotoVideoRender: false });
+    assert.deepEqual(outcome, { ok: true });
+    const updateCall = calls.find((c) => c[0] === 'updateReelDocument');
+    assert.equal(updateCall[1].needsPhotoVideoRender, false);
+    assert.equal(updateCall[1].sourceUrl, 'https://media.example.com/reels/uid1/reel1/source?v=999');
+  });
+
+  await check('extraConfirmFields is NEVER written when the confirm-write itself never runs (e.g. ffmpeg-failed) — no partial/stray state', async () => {
+    const { deps, calls } = makeDeps({
+      runFfmpegMux: async () => {
+        throw new Error('ffmpeg exited with code 1');
+      },
+    });
+    const outcome = await performReelMux(PATHS, deps, { needsPhotoVideoRender: false });
+    assert.deepEqual(outcome, { ok: false, reason: 'ffmpeg-failed' });
+    assert.equal(calls.some((c) => c[0] === 'updateReelDocument'), false);
+  });
+
   console.log('\n=== functions/ Reel mux orchestration logic test results ===');
   let failures = 0;
   for (const result of results) {

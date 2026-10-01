@@ -597,6 +597,46 @@ async function confirmReelVideoProvider(reelId: string, sourceUrl: string): Prom
 }
 
 /**
+ * Step 9C — the lockstep counterpart of confirmReelVideoProvider/
+ * confirmReelThumbnailProvider above, ONLY for a plain PHOTO Reel
+ * (`mediaType === 'photo'`). A photo Reel has no separate thumbnail
+ * object at all — `thumbnailStoragePath === storagePath` from
+ * createReelDraft onward (see that function's own doc comment) — but
+ * `storageProvider`/`sourceUrl` and `thumbnailStorageProvider`/
+ * `thumbnailUrl` are still tracked as two INDEPENDENT field pairs (kept
+ * decoupled on purpose for video Reels, whose source and thumbnail
+ * really are two different objects — see ReelStorageProvider's own doc
+ * comment in src/types/reel.ts). Left as two independent writes for a
+ * photo Reel, a plain R2 upload would confirm `storageProvider: 'r2'`
+ * while `thumbnailStorageProvider` stayed stuck at its default
+ * `'firebase'` forever — ReelPreviewCard.tsx's own thumbnail resolver
+ * would then try to fetch a Firebase Storage object that was never
+ * written, since the real bytes went straight to R2 (see this file's own
+ * resolveReelThumbnailUrl above). This function fixes that by writing
+ * BOTH pairs together, to the SAME url, in ONE atomic update — see
+ * firestore.rules' own new isValidReelPhotoSourceProviderUpdate, which
+ * is the only Rule that permits this exact dual-field transition (and
+ * only for `mediaType == 'photo'` on both sides of the write).
+ */
+async function confirmReelPhotoSourceProvider(reelId: string, url: string): Promise<{ ok: true } | { ok: false; message: string }> {
+  if (!firestore) {
+    return { ok: false, message: 'Firestore is not available.' };
+  }
+  try {
+    await updateDoc(reelRef(reelId), {
+      storageProvider: 'r2',
+      sourceUrl: url,
+      thumbnailStorageProvider: 'r2',
+      thumbnailUrl: url,
+      updatedAt: serverTimestamp(),
+    });
+  } catch {
+    return { ok: false, message: "Couldn't finish saving this post's photo." };
+  }
+  return { ok: true };
+}
+
+/**
  * Step 9A's real, end-to-end R2 upload path for a plain video Reel's own
  * source — reached ONLY from uploadReelVideo above, when the provider is
  * 'r2' and this exact Reel is eligible (see that function's own doc
@@ -648,7 +688,15 @@ function uploadReelVideoViaR2(
       return;
     }
 
-    const confirmResult = await confirmReelVideoProvider(reel.reelId, uploadResult.sourceUrl);
+    // Step 9C — a plain photo Reel's source and thumbnail are the SAME
+    // object (see confirmReelPhotoSourceProvider's own doc comment) and
+    // must be confirmed together, in one write; every other Reel
+    // variant this function ever reaches (plain video, video+music) uses
+    // the original, independent-fields confirm.
+    const confirmResult =
+      reel.mediaType === 'photo'
+        ? await confirmReelPhotoSourceProvider(reel.reelId, uploadResult.sourceUrl)
+        : await confirmReelVideoProvider(reel.reelId, uploadResult.sourceUrl);
     if (cancelled) return;
 
     if (__DEV__) {

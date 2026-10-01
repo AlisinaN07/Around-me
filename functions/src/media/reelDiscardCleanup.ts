@@ -38,6 +38,23 @@ export type RawReelData = Record<string, unknown>;
  * anything off the `reel` object itself (e.g. a hostile/foreign
  * `authorUid` field) — so a client can never influence which R2 object
  * gets targeted beyond the exact Reel it already proved ownership of.
+ *
+ * Step 9C — a plain photo Reel's discard reaches this SAME, unmodified
+ * function: after src/services/reels.ts's own lockstep
+ * confirmReelPhotoSourceProvider, BOTH `storageProvider` and
+ * `thumbnailStorageProvider` read `'r2'`, so this function attempts a
+ * delete at BOTH `reelSourceKey`/`reelThumbnailKey` — even though a photo
+ * Reel only ever had ONE real R2 object written, at the source key (see
+ * confirmReelPhotoSourceProvider's own doc comment: there is no separate
+ * client thumbnail-upload step for a photo Reel at all). The
+ * `reelThumbnailKey` delete for such a Reel is a harmless no-op — an S3/R2
+ * DeleteObjectCommand for a key that was never written succeeds
+ * idempotently rather than throwing — so this never creates an orphan or
+ * a real error; it costs one redundant API call. Deliberately NOT special-
+ * cased away: doing so would mean this function needs to know about
+ * `mediaType` at all, which it currently doesn't, and the cost of leaving
+ * it as-is is zero (see test-discard-reel-source-logic.cjs's own Step 9C
+ * test).
  */
 export async function performReelSourceDiscardCleanup(
   reel: RawReelData,

@@ -90,6 +90,23 @@ export type ReelMuxDeps = {
 };
 
 /**
+ * Step 9C — merged verbatim into the same `fields` object this file
+ * already builds for its own confirm-write, letting a second caller
+ * (renderPhotoToVideo) reuse this ENTIRE orchestration function
+ * unchanged otherwise. muxReelMusic itself never passes this (defaults
+ * to `{}`, a no-op merge); renderPhotoToVideo passes
+ * `{ needsPhotoVideoRender: false }` — the one extra field its own
+ * workflow needs recorded atomically in the SAME write that confirms the
+ * rendered video is now the Reel's real source, so no reader can ever
+ * observe `needsPhotoVideoRender: true` alongside an already-rendered
+ * video. Deliberately a plain optional bag rather than a named
+ * "photo-render mode" boolean — this file's own job is running steps in
+ * the right order and mapping failures, not knowing which caller it is;
+ * see this file's own top doc comment.
+ */
+export type ReelMuxExtraConfirmFields = Record<string, unknown>;
+
+/**
  * Runs the full mux workflow against injected dependencies. Every
  * distinct failure mode from the Step 9B spec's own Part 10 maps to a
  * distinct `reason` — the caller (index.ts's own muxReelMusic) is
@@ -103,7 +120,11 @@ export type ReelMuxDeps = {
  * called, which only happens after a real, non-empty ffmpeg output
  * exists.
  */
-export async function performReelMux(paths: ReelMuxPaths, deps: ReelMuxDeps): Promise<ReelMuxOutcome> {
+export async function performReelMux(
+  paths: ReelMuxPaths,
+  deps: ReelMuxDeps,
+  extraConfirmFields: ReelMuxExtraConfirmFields = {}
+): Promise<ReelMuxOutcome> {
   const videoReady = await deps.downloadVideo(paths.localVideoPath);
   if (!videoReady) return { ok: false, reason: 'video-unavailable' };
 
@@ -143,6 +164,7 @@ export async function performReelMux(paths: ReelMuxPaths, deps: ReelMuxDeps): Pr
 
   const versionedSourceUrl = deps.buildVersionedSourceUrl();
   const fields: Record<string, unknown> = {
+    ...extraConfirmFields,
     storageContentType: 'video/mp4',
     fileSizeBytes: outputSize,
     musicHash,

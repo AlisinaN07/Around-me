@@ -59,7 +59,7 @@ import ffmpegPath from 'ffmpeg-static';
 
 import { buildMediaUrl } from './media/mediaUrl';
 import { reelSourceKey } from './media/objectKey';
-import { checkReelMuxEligibility } from './media/reelEligibility';
+import { checkReelMuxEligibility, checkReelPhotoRenderEligibility } from './media/reelEligibility';
 import { performReelMux, type ReelMuxFailureReason } from './media/reelMuxOrchestration';
 import {
   copyReelSourceToFirebaseStoryObject,
@@ -1431,17 +1431,15 @@ export const deleteMyReel = onCall({ region: REGION, timeoutSeconds: 300, memory
 const execFileAsync = promisify(execFile);
 
 // ---------------------------------------------------------------------------
-// Step 9A — provider-aware Reel-SOURCE read. muxReelMusic and
-// renderPhotoToVideo below are deliberately NOT made provider-aware (see
-// requestMediaUploadAuthorization.ts's own verifyReelVideoOwnership doc
-// comment — a Reel eligible for either of those two functions is, by
-// construction, NEVER authorized for an R2 source upload in the first
-// place, so they can safely go on assuming Firebase Storage exactly as
-// before). resolveOwnSoundOrigin and addReelToMyStory are different: both
-// operate on an already-PUBLISHED plain video Reel (no music, no pending
-// photo-render) — exactly the one variant Step 9A DOES allow onto R2 — so
-// both need to read that Reel's source bytes regardless of which backend
-// actually holds them.
+// Step 9A/9B/9C — provider-aware Reel-SOURCE read. muxReelMusic (Step 9B)
+// and renderPhotoToVideo (Step 9C) below are BOTH now provider-aware —
+// see downloadReelSourceForMux/uploadMuxedReelSourceToProvider's own doc
+// comments in reelSourceStorage.ts, reused unchanged by both callables:
+// neither cares whether the "primary object" they read/replace is a
+// video or a still photo, only its bytes/contentType/cache-control,
+// keyed by this Reel's own deterministic reelSourceKey(uid, reelId).
+// resolveOwnSoundOrigin and addReelToMyStory read the same way, for an
+// already-PUBLISHED plain video Reel (no server-side rewrite pending).
 //
 // For 'r2', `reel.sourceUrl` is already a resolved, PUBLIC delivery URL
 // (see requestMediaUploadAuthorization.ts's own mediaUrl computation) —
@@ -1541,6 +1539,24 @@ function muxFailureMessage(reason: ReelMuxFailureReason): string {
       return 'Both the video and music must finish uploading before merging.';
     default:
       return "Couldn't process this post's music.";
+  }
+}
+
+/**
+ * Step 9C — renderPhotoToVideo's own equivalent of muxFailureMessage
+ * above, mapping the SAME performReelMux failure `reason`s to this
+ * callable's own pre-existing error wording (this function's
+ * `downloadVideo` slot is actually downloading the ORIGINAL PHOTO — see
+ * performReelMux's own generic "video" naming, unchanged since it has no
+ * reason to know which media kind it's really moving).
+ */
+function photoRenderFailureMessage(reason: ReelMuxFailureReason): string {
+  switch (reason) {
+    case 'video-unavailable':
+    case 'music-unavailable':
+      return 'Both the photo and music must finish uploading before rendering.';
+    default:
+      return "Couldn't process this post's photo.";
   }
 }
 
@@ -1652,33 +1668,42 @@ export const muxReelMusic = onCall(
 );
 
 // ---------------------------------------------------------------------------
-// Step — "FOTO" mode photo taken WITH music, rendered into a real video.
+// Step 9C — "FOTO" mode photo taken WITH music, rendered into a real
+// video. Now PROVIDER-AWARE for both its input (the original photo) and
+// its output (the rendered video), reusing performReelMux — the exact
+// same orchestration muxReelMusic already runs — via its new
+// `extraConfirmFields` parameter, rather than a second, duplicated
+// download->ffmpeg->upload->confirm->cleanup implementation.
 //
-// Different operation from muxReelMusic above: that one merges an audio
-// track into an EXISTING video. This one generates the video itself — the
-// client only ever has a still photo plus a separate music file, and
-// nothing in this project's managed Expo toolchain can turn "one image +
-// one audio file" into a real video on-device (same reasoning as
-// muxReelMusic's own file-header comment for why this has to be a trusted
-// backend callable running real ffmpeg).
+// Different SOURCE operation from muxReelMusic above: that one merges an
+// audio track into an EXISTING video. This one generates the video
+// itself — the client only ever has a still photo plus a separate music
+// file, and nothing in this project's managed Expo toolchain can turn
+// "one image + one audio file" into a real video on-device (same
+// reasoning as muxReelMusic's own file-header comment for why this has
+// to be a trusted backend callable running real ffmpeg). Everything
+// AFTER ffmpeg — provider-aware upload, sound attribution, confirm-write
+// ordering, best-effort music cleanup — is identical, which is exactly
+// what makes sharing performReelMux correct rather than coincidental.
 //
 // Only ever called for a draft created with mediaType: 'video' AND
 // needsPhotoVideoRender: true (see CreateReelDraftInput.photoRenderPending
 // and Reel.needsPhotoVideoRender's own doc comments in
 // src/services/reels.ts / src/types/reel.ts) — at that point
-// reel.storagePath actually still holds the ORIGINAL PHOTO (an image
-// upload was allowed there specifically because needsPhotoVideoRender was
-// true at create time — see storage.rules), and reel.musicStorageAudioPath
-// holds the chosen track. This downloads both, uses ffmpeg to hold the
-// still image for exactly REEL_PHOTO_DURATION_MS with the music (looped,
-// then cut to that same fixed length) as its audio track, and overwrites
-// reel.storagePath with the result — the same "overwrite in place, update
-// storageContentType/fileSizeBytes" pattern muxReelMusic already uses,
-// plus flipping needsPhotoVideoRender back to false so
-// firestore.rules' isValidReelPublish will actually allow publishing it.
-// The now-redundant standalone music object is deleted afterward, exactly
-// like muxReelMusic does — the rendered video is the only copy of the
-// sound from this point on.
+// reel.storagePath/reel.sourceUrl actually still hold the ORIGINAL PHOTO
+// (an image upload was allowed there specifically because
+// needsPhotoVideoRender was true at create time/authorization — see
+// checkReelVideoEligibility's own doc comment), on EITHER backend. This
+// downloads both the photo and the music, uses ffmpeg to hold the still
+// image for exactly REEL_PHOTO_RENDER_DURATION_SECONDS with the music
+// (looped, then cut to that same fixed length) as its audio track, and
+// overwrites the Reel's own source object with the result — on whichever
+// backend that Reel actually uses — via performReelMux's own confirm-write,
+// which ALSO flips `needsPhotoVideoRender` back to `false` in the exact
+// same atomic write that records the render succeeded (via
+// `extraConfirmFields`) — never a state where a reader could observe
+// `needsPhotoVideoRender: false` while the object is still the
+// un-rendered photo, or vice versa.
 //
 // "-loop 1" makes the still image an infinite-length video input;
 // "-stream_loop -1" does the same for the audio (reproducing exactly what
@@ -1686,132 +1711,131 @@ export const muxReelMusic = onCall(
 // as long as needed); with BOTH inputs already infinite, "-t" (not
 // "-shortest", which only means anything when at least one input has a
 // real finite length) is what actually bounds the output to exactly
-// REEL_PHOTO_DURATION_MS. The scale filter forces even width/height —
-// libx264 requires it, and a photo's native dimensions aren't guaranteed
-// to already be even.
+// REEL_PHOTO_RENDER_DURATION_SECONDS. The scale filter forces even
+// width/height — libx264 requires it, and a photo's native dimensions
+// aren't guaranteed to already be even.
 // ---------------------------------------------------------------------------
 
 const REEL_PHOTO_RENDER_DURATION_SECONDS = 15;
 
-export const renderPhotoToVideo = onCall({ region: REGION, timeoutSeconds: 300, memory: '1GiB' }, async (request) => {
-  if (!request.auth) {
-    throw new HttpsError('unauthenticated', 'Sign in required.');
-  }
-  const reelId = parseReelIdParam(request);
-  const uid = request.auth.uid;
+export const renderPhotoToVideo = onCall(
+  { region: REGION, timeoutSeconds: 300, memory: '1GiB', secrets: [r2AccessKeyIdSecret, r2SecretAccessKeySecret] },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError('unauthenticated', 'Sign in required.');
+    }
+    const reelId = parseReelIdParam(request);
+    const uid = request.auth.uid;
 
-  const db = getFirestore();
-  const reelDocRef = db.doc(`reels/${reelId}`);
-  const reelSnap = await reelDocRef.get();
-  if (!reelSnap.exists) {
-    throw new HttpsError('not-found', 'No Reel with that ID exists.');
-  }
-  const reel = reelSnap.data()!;
-  if (reel.authorUid !== uid) {
-    throw new HttpsError('permission-denied', 'You can only process your own post.');
-  }
-  if (reel.status !== 'uploading') {
-    throw new HttpsError('failed-precondition', 'This post is not awaiting photo processing.');
-  }
-  if (reel.mediaType !== 'video' || reel.needsPhotoVideoRender !== true) {
-    throw new HttpsError('failed-precondition', 'This post does not need photo-to-video rendering.');
-  }
-  if (reel.musicSourceType !== 'device') {
-    throw new HttpsError('failed-precondition', 'This post has no music to render with.');
-  }
-  if (!ffmpegPath) {
-    // Genuinely unexpected (ffmpeg-static failed to resolve a binary for
-    // this runtime) — never silently skip rendering and publish the raw
-    // photo as if it were a real video.
-    throw new HttpsError('internal', "Couldn't process this post's photo.");
-  }
+    const db = getFirestore();
+    const reelDocRef = db.doc(`reels/${reelId}`);
+    const reelSnap = await reelDocRef.get();
+    const reel = reelSnap.exists ? (reelSnap.data() as Record<string, unknown>) : null;
+    const eligibility = checkReelPhotoRenderEligibility(reel, uid);
+    if (!eligibility.ok) {
+      throw new HttpsError(eligibility.code, eligibility.message);
+    }
+    // eligibility.ok guarantees `reel` is non-null.
+    const reelData = reel as Record<string, unknown>;
 
-  const bucket = getStorage().bucket();
-  const photoStoragePath = reel.storagePath as string;
-  const musicStoragePath = reel.musicStorageAudioPath as string;
-  const photoFile = bucket.file(photoStoragePath);
-  const musicFile = bucket.file(musicStoragePath);
-
-  const [[photoExists], [musicExists]] = await Promise.all([photoFile.exists(), musicFile.exists()]);
-  if (!photoExists || !musicExists) {
-    throw new HttpsError('failed-precondition', 'Both the photo and music must finish uploading before rendering.');
-  }
-
-  const workDir = await mkdtemp(join(tmpdir(), `reel-photo-render-${reelId}-`));
-  const localPhotoPath = join(workDir, 'input-photo');
-  const localMusicPath = join(workDir, 'input-music');
-  const localOutputPath = join(workDir, 'output.mp4');
-
-  try {
-    await Promise.all([photoFile.download({ destination: localPhotoPath }), musicFile.download({ destination: localMusicPath })]);
-
-    // Same sound-attribution step as muxReelMusic — see this file's own
-    // "Sound attribution" section header above.
-    const musicHash = await computeSha256Hex(localMusicPath);
-    const soundOrigin = await resolveSoundOrigin(db, musicHash, reel.authorUid as string, reelId);
-
-    await execFileAsync(
-      ffmpegPath,
-      [
-        '-y',
-        '-loop', '1',
-        '-i', localPhotoPath,
-        '-stream_loop', '-1',
-        '-i', localMusicPath,
-        '-map', '0:v:0',
-        '-map', '1:a:0',
-        '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
-        '-c:v', 'libx264',
-        '-tune', 'stillimage',
-        '-pix_fmt', 'yuv420p',
-        '-c:a', 'aac',
-        '-b:a', '192k',
-        '-t', String(REEL_PHOTO_RENDER_DURATION_SECONDS),
-        localOutputPath,
-      ],
-      { timeout: 240_000 }
-    );
-
-    const outputStat = await stat(localOutputPath);
-    if (outputStat.size <= 0) {
+    if (!ffmpegPath) {
+      // Genuinely unexpected (ffmpeg-static failed to resolve a binary for
+      // this runtime) — never silently skip rendering and publish the raw
+      // photo as if it were a real video.
       throw new HttpsError('internal', "Couldn't process this post's photo.");
     }
 
-    await bucket.upload(localOutputPath, { destination: photoStoragePath, metadata: { contentType: 'video/mp4' } });
+    const bucket = getStorage().bucket();
+    const musicStoragePath = reelData.musicStorageAudioPath as string;
+    const musicFile = bucket.file(musicStoragePath);
+    // Provider-aware, same convention as muxReelMusic above: `undefined`
+    // (a legacy Reel predating storageProvider) defaults to 'firebase'.
+    const photoProvider = (reelData.storageProvider as string | undefined) ?? 'firebase';
 
-    // Same one-time permanent-copy step as muxReelMusic — see
-    // soundOriginAudioStoragePath's own doc comment.
-    if (soundOrigin.isNewOrigin) {
-      await bucket.upload(localMusicPath, {
-        destination: soundOriginAudioStoragePath(musicHash),
-        metadata: { contentType: reel.musicStorageContentType as string },
-      });
+    const workDir = await mkdtemp(join(tmpdir(), `reel-photo-render-${reelId}-`));
+    const paths = {
+      localVideoPath: join(workDir, 'input-photo'),
+      localMusicPath: join(workDir, 'input-music'),
+      localOutputPath: join(workDir, 'output.mp4'),
+    };
+
+    try {
+      const outcome = await performReelMux(
+        paths,
+        {
+          // performReelMux's own `downloadVideo` slot — here downloading
+          // the ORIGINAL PHOTO, provider-aware exactly like muxReelMusic's
+          // own video download (see reelSourceStorage.ts: this helper
+          // only cares about bytes/key, never the media kind).
+          downloadVideo: (destination) => downloadReelSourceForMux(bucket, reelData, uid, reelId, destination),
+          downloadMusic: async (destination) => {
+            const [exists] = await musicFile.exists();
+            if (!exists) return false;
+            await musicFile.download({ destination });
+            return true;
+          },
+          runFfmpegMux: (localPhotoPath, localMusicPath, localOutputPath) =>
+            execFileAsync(
+              ffmpegPath!,
+              [
+                '-y',
+                '-loop', '1',
+                '-i', localPhotoPath,
+                '-stream_loop', '-1',
+                '-i', localMusicPath,
+                '-map', '0:v:0',
+                '-map', '1:a:0',
+                '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
+                '-c:v', 'libx264',
+                '-tune', 'stillimage',
+                '-pix_fmt', 'yuv420p',
+                '-c:a', 'aac',
+                '-b:a', '192k',
+                '-t', String(REEL_PHOTO_RENDER_DURATION_SECONDS),
+                localOutputPath,
+              ],
+              { timeout: 240_000 }
+            ).then(() => undefined),
+          statFileSize: async (path) => (await stat(path)).size,
+          computeSha256: computeSha256Hex,
+          resolveSoundOrigin: (musicHash) => resolveSoundOrigin(db, musicHash, reelData.authorUid as string, reelId),
+          uploadMuxedVideo: (localOutputPath) =>
+            uploadMuxedReelSourceToProvider(bucket, reelData, uid, reelId, localOutputPath, 'video/mp4', muxedVideoCacheControl(photoProvider)),
+          uploadSoundOriginCopy: (localMusicPath, musicHash) =>
+            bucket
+              .upload(localMusicPath, {
+                destination: soundOriginAudioStoragePath(musicHash),
+                metadata: { contentType: reelData.musicStorageContentType as string },
+              })
+              .then(() => undefined),
+          deleteStandaloneMusic: () => musicFile.delete({ ignoreNotFound: true }).then(() => undefined),
+          updateReelDocument: (fields) => reelDocRef.update({ ...fields, updatedAt: FieldValue.serverTimestamp() }).then(() => undefined),
+          buildVersionedSourceUrl: () => {
+            if (photoProvider !== 'r2') return null;
+            const publicMediaBaseUrl = getR2Config()?.publicMediaBaseUrl ?? null;
+            if (!publicMediaBaseUrl) return null;
+            return buildMediaUrl(publicMediaBaseUrl, reelSourceKey(uid, reelId), Date.now());
+          },
+        },
+        // The one extra field this workflow needs, atomically, in the
+        // SAME confirm-write that records the render succeeded — see
+        // this function's own top doc comment.
+        { needsPhotoVideoRender: false }
+      );
+
+      if (!outcome.ok) {
+        throw new HttpsError(outcome.reason === 'video-unavailable' || outcome.reason === 'music-unavailable' ? 'failed-precondition' : 'internal', photoRenderFailureMessage(outcome.reason));
+      }
+    } catch (error) {
+      if (error instanceof HttpsError) throw error;
+      throw new HttpsError('internal', "Couldn't process this post's photo.");
+    } finally {
+      await rm(workDir, { recursive: true, force: true });
     }
 
-    await reelDocRef.update({
-      storageContentType: 'video/mp4',
-      fileSizeBytes: outputStat.size,
-      needsPhotoVideoRender: false,
-      musicHash,
-      soundOriginAuthorUid: soundOrigin.originAuthorUid,
-      soundOriginReelId: soundOrigin.originReelId,
-      updatedAt: FieldValue.serverTimestamp(),
-    });
-
-    // The standalone music object is now redundant — the rendered video is
-    // the only copy of the sound from here on. Best-effort: a failure here
-    // leaves an orphaned object, never a broken post (same reasoning as
-    // discardReelDraft's own Storage cleanup on the client).
-    await musicFile.delete({ ignoreNotFound: true }).catch(() => undefined);
-  } catch (error) {
-    if (error instanceof HttpsError) throw error;
-    throw new HttpsError('internal', "Couldn't process this post's photo.");
-  } finally {
-    await rm(workDir, { recursive: true, force: true });
+    return { reelId, rendered: true as const };
   }
-
-  return { reelId, rendered: true as const };
-});
+);
 
 // ---------------------------------------------------------------------------
 // Step — "Add to Story": reshares an existing published Reel as the

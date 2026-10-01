@@ -184,28 +184,31 @@ async function verifyReelThumbnailOwnership(reelId: string, uid: string): Promis
 }
 
 /**
- * Step 9A/9B — the STRICTEST ownership/eligibility check this callable
- * performs. A Reel's video source can be rewritten IN PLACE, server-side,
- * by two other trusted Cloud Functions — muxReelMusic (merges picked
- * device music into the video) and renderPhotoToVideo (renders a
- * "FOTO"-with-music photo into a real video). renderPhotoToVideo is
- * STILL entirely Firebase-Storage-only in Step 9B (deliberately out of
- * scope) — a Reel it would ever touch (`needsPhotoVideoRender === true`)
- * is still excluded here. muxReelMusic became PROVIDER-AWARE in Step 9B
- * (see reelMuxOrchestration.ts) — it can now read/replace a Reel's
- * source on either backend, so a Reel with picked device music
- * (`musicSourceType === 'device'`) is no longer excluded purely because
- * mux will touch it.
+ * Step 9A/9B/9C — the STRICTEST ownership/eligibility check this
+ * callable performs. A Reel's source can be rewritten IN PLACE,
+ * server-side, by two other trusted Cloud Functions — muxReelMusic
+ * (merges picked device music into a video) and renderPhotoToVideo
+ * (renders a photo + music into a real video). BOTH are PROVIDER-AWARE
+ * as of Step 9C (see reelMuxOrchestration.ts) — a Reel either one will
+ * touch is no longer excluded purely because a server-side rewrite is
+ * still scheduled; see checkReelVideoEligibility's own doc comment.
+ *
+ * `contentType` — Step 9C's own addition — is `input.contentType` as
+ * already validated (shape-only) by mediaUploadValidation.ts; passed
+ * through here so the REAL, Firestore-aware check can confirm it's not
+ * just SOME allowed shape but the RIGHT one for this exact Reel's
+ * current state (a plain video Reel can't upload an image here, and a
+ * photo/render-pending Reel can't upload a video here).
  *
  * See checkReelVideoEligibility's own doc comment (reelEligibility.ts)
  * for the exact, directly-unit-tested decision logic this delegates to —
  * this function's own job is only the impure Firestore read and
  * translating a `{ok:false}` result into a real HttpsError.
  */
-async function verifyReelVideoOwnership(reelId: string, uid: string): Promise<void> {
+async function verifyReelVideoOwnership(reelId: string, uid: string, contentType: string): Promise<void> {
   const snapshot = await getFirestore().collection('reels').doc(reelId).get();
   const reel = snapshot.exists ? (snapshot.data() as RawReelData) : null;
-  const result = checkReelVideoEligibility(reel, uid);
+  const result = checkReelVideoEligibility(reel, uid, contentType);
   if (!result.ok) {
     throw new HttpsError(result.code, result.message);
   }
@@ -276,7 +279,7 @@ export async function handleRequest(request: CallableRequest<unknown>): Promise<
     // Same reasoning as the reelThumbnail branch above, plus the extra
     // eligibility checks verifyReelVideoOwnership's own doc comment
     // explains in full.
-    await verifyReelVideoOwnership(input.reelId!, request.auth.uid);
+    await verifyReelVideoOwnership(input.reelId!, request.auth.uid, input.contentType);
     path = reelSourceKey(request.auth.uid, input.reelId!);
   } else if (input.mediaKind === 'profileCover') {
     path = profileCoverKey(request.auth.uid);

@@ -133,6 +133,24 @@ async function main() {
     );
   });
 
+  await check('Step 9C — a plain photo Reel post-lockstep-confirm (both providers "r2") attempts BOTH deletes, even though only the source object was ever real — the thumbnail delete is a harmless no-op, never an orphan', async () => {
+    const deleteObject = spy();
+    // Exactly the state a photo Reel is in after
+    // src/services/reels.ts's own confirmReelPhotoSourceProvider —
+    // storageProvider and thumbnailStorageProvider both 'r2', same as
+    // the pre-existing "both r2" test above; this test's own point is
+    // documenting WHY that's still correct for a photo Reel specifically
+    // (see reelDiscardCleanup.ts's own doc comment).
+    const result = await performReelSourceDiscardCleanup(
+      { mediaType: 'photo', storageProvider: 'r2', thumbnailStorageProvider: 'r2' },
+      'uid1',
+      'reel1',
+      deleteObject
+    );
+    assert.deepEqual(result, { videoAttempted: true, thumbnailAttempted: true });
+    assert.deepEqual(deleteObject.calls.sort(), ['reels/uid1/reel1/source', 'reels/uid1/reel1/thumbnail'].sort());
+  });
+
   await check('different uid/reelId produce different, non-colliding keys — one user\'s discard can never target another\'s namespace', async () => {
     const callsA = [];
     const callsB = [];

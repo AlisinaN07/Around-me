@@ -52,6 +52,42 @@ export const ALLOWED_CONTENT_TYPES: ReadonlySet<string> = new Set(['image/jpeg',
  */
 export const ALLOWED_VIDEO_CONTENT_TYPES: ReadonlySet<string> = new Set(['video/mp4', 'video/quicktime', 'video/x-m4v', 'video/webm']);
 
+/**
+ * Step 9C — 'reelVideo' ONLY, for the "this upload is actually an image"
+ * sub-case (a plain photo Reel, or a photo-pending-render Reel whose
+ * `storagePath` still holds the ORIGINAL PHOTO — see
+ * ValidatedMediaUploadInput's own doc comment). Deliberately a SEPARATE,
+ * WIDER set than ALLOWED_CONTENT_TYPES above (jpeg/png/webp only): this
+ * is the one Reel-media path where the app can upload a user's ORIGINAL,
+ * unprocessed library photo as the Reel's own primary source, not a
+ * locally-re-encoded derivative —
+ * src/app/(app)/create/reel/camera.tsx's own library-picker branch for a
+ * plain photo (`asset.type === 'image'`) reports whatever `asset.mimeType`
+ * iOS/Android itself declares (`ImagePicker.launchImageLibraryAsync`'s
+ * own `preferredAssetRepresentationMode` stays at its `Automatic`
+ * default — inspected directly in the installed expo-image-picker types,
+ * not assumed — which does NOT force a JPEG/HEIC conversion), and only
+ * validates `startsWith('image/')` before upload — never narrowing
+ * further or normalizing HEIC client-side. Camera-CAPTURED photos are
+ * always `image/jpeg` or `image/png` (expo-camera's own
+ * `takePictureAsync()` format, mapped directly) — HEIC/HEIF are
+ * exclusively a LIBRARY-pick possibility, added here rather than assumed
+ * away, matching the app's own actual, unnormalized behavior rather than
+ * a narrower guess. `image/webp` is included for the same
+ * already-established reason ALLOWED_CONTENT_TYPES includes it elsewhere
+ * in this file — a real, if less common, library-image format this
+ * app's own `startsWith('image/')` client check already permits through
+ * today's existing Firebase path (storage.rules' own Reel-source rule
+ * uses a plain `image/.*` wildcard, never narrower than this set).
+ */
+export const ALLOWED_REEL_PHOTO_CONTENT_TYPES: ReadonlySet<string> = new Set([
+  'image/jpeg',
+  'image/png',
+  'image/webp',
+  'image/heic',
+  'image/heif',
+]);
+
 export const PROFILE_PHOTO_MAX_SIZE_BYTES = 5 * 1024 * 1024;
 export const PROFILE_COVER_PHOTO_MAX_SIZE_BYTES = 8 * 1024 * 1024;
 export const EVENT_COVER_PHOTO_MAX_SIZE_BYTES = 8 * 1024 * 1024;
@@ -67,6 +103,18 @@ export const REEL_THUMBNAIL_MAX_SIZE_BYTES = 5 * 1024 * 1024;
  * duplication reasoning as every other size constant in this file.
  */
 export const REEL_VIDEO_MAX_SIZE_BYTES = 50 * 1024 * 1024;
+
+/**
+ * Step 9C — mirrors src/types/reel.ts's own REEL_PHOTO_MAX_FILE_SIZE_BYTES
+ * and firestore.rules' own existing `data.fileSizeBytes <= 10485760` cap
+ * for BOTH a plain photo Reel and a photo-pending-render Reel's own
+ * original-photo upload (inspected directly in isValidReelCreate — the
+ * same 10 MB bound applies to both variants already, today, on Firebase).
+ * Deliberately larger than REEL_THUMBNAIL_MAX_SIZE_BYTES (5 MB): this is
+ * the Reel's own full-resolution primary source, not a small derived
+ * cover crop.
+ */
+export const REEL_PHOTO_SOURCE_MAX_SIZE_BYTES = 10 * 1024 * 1024;
 
 /** The exact per-mediaKind maximum for an IMAGE upload — inspected from, and must be kept in sync with, the existing Firebase upload limits (5 MB for profilePhoto/reelThumbnail, 8 MB for profileCover/eventCover). Never consulted for 'reelVideo' — see REEL_VIDEO_MAX_SIZE_BYTES above, checked directly in validateMediaUploadInput's own 'reelVideo' branch instead. */
 function maxSizeForMediaKind(mediaKind: AllowedMediaKind): number {
@@ -153,17 +201,39 @@ export function validateMediaUploadInput(data: unknown): ValidatedMediaUploadInp
     throw invalid();
   }
 
-  // 'reelVideo' uses its own, separate content-type allowlist and size
-  // cap (see ALLOWED_VIDEO_CONTENT_TYPES/REEL_VIDEO_MAX_SIZE_BYTES's own
-  // doc comments) — every other kind is an image, sharing the one
+  // 'reelVideo' uses its own, separate content-type allowlists and size
+  // caps (see ALLOWED_VIDEO_CONTENT_TYPES/ALLOWED_REEL_PHOTO_CONTENT_TYPES's
+  // own doc comments) — every other kind is an image, sharing the one
   // ALLOWED_CONTENT_TYPES set and its own per-kind size cap below.
+  //
+  // Step 9C — 'reelVideo' now accepts EITHER shape here (a real video, OR
+  // an image — covering a plain photo Reel's own source, and a
+  // photo-pending-render Reel's still-a-photo original upload): this
+  // pure layer has no access to the Reel's own `mediaType`/
+  // `needsPhotoVideoRender`, so it can only validate that SOME allowed
+  // shape was sent, not that it's the RIGHT shape for THIS exact Reel.
+  // That cross-check (does this content type actually match what this
+  // Reel is currently expecting?) is checkReelVideoEligibility's own job
+  // (reelEligibility.ts) — it has the real Firestore document this file
+  // deliberately never reads.
   if (mediaKind === 'reelVideo') {
-    if (typeof contentType !== 'string' || !ALLOWED_VIDEO_CONTENT_TYPES.has(contentType)) throw invalid();
-    if (typeof fileSizeBytes !== 'number' || !Number.isFinite(fileSizeBytes) || fileSizeBytes <= 0 || fileSizeBytes > REEL_VIDEO_MAX_SIZE_BYTES) {
-      throw invalid();
-    }
+    const isValidVideoShape =
+      typeof contentType === 'string' &&
+      ALLOWED_VIDEO_CONTENT_TYPES.has(contentType) &&
+      typeof fileSizeBytes === 'number' &&
+      Number.isFinite(fileSizeBytes) &&
+      fileSizeBytes > 0 &&
+      fileSizeBytes <= REEL_VIDEO_MAX_SIZE_BYTES;
+    const isValidPhotoShape =
+      typeof contentType === 'string' &&
+      ALLOWED_REEL_PHOTO_CONTENT_TYPES.has(contentType) &&
+      typeof fileSizeBytes === 'number' &&
+      Number.isFinite(fileSizeBytes) &&
+      fileSizeBytes > 0 &&
+      fileSizeBytes <= REEL_PHOTO_SOURCE_MAX_SIZE_BYTES;
+    if (!isValidVideoShape && !isValidPhotoShape) throw invalid();
     if (typeof reelId !== 'string' || !isSafePathSegment(reelId)) throw invalid();
-    return { mediaKind, contentType, fileSizeBytes, reelId };
+    return { mediaKind, contentType: contentType as string, fileSizeBytes: fileSizeBytes as number, reelId };
   }
 
   if (typeof contentType !== 'string' || !ALLOWED_CONTENT_TYPES.has(contentType)) throw invalid();

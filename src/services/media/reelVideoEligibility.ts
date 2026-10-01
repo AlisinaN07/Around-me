@@ -1,9 +1,9 @@
 /**
- * Step 9A/9B — the pure, client-side mirror of the SAME eligibility
+ * Step 9A/9B/9C — the pure, client-side mirror of the SAME eligibility
  * decision functions/src/media/reelEligibility.ts's
  * checkReelVideoEligibility makes server-side: given a Reel's
- * mediaType/musicSourceType/needsPhotoVideoRender, is its video source
- * allowed to move to R2?
+ * mediaType/musicSourceType/needsPhotoVideoRender, is its source allowed
+ * to move to R2?
  *
  * Deliberately its own tiny, dependency-free file (no import from
  * reels.ts, no Firebase import) so reels.ts's own uploadReelVideo
@@ -29,26 +29,30 @@ export type ReelEligibilityShape = {
 };
 
 /**
- * True for a video Reel with no pending photo-to-video render, and with
- * a music state this codebase actually knows how to bring to R2 — Step
- * 9A's original `'none'` (nothing to mux, immutable after upload), or
- * Step 9B's new `'device'` (device-picked music — muxReelMusic now runs
- * provider-aware, on either backend, before publish). A render-pending
- * Reel is excluded regardless of music state — renderPhotoToVideo stays
- * entirely Firebase-only in Step 9B (deliberately out of scope; see
- * checkReelVideoEligibility's own doc comment in
- * functions/src/media/reelEligibility.ts for the full reasoning both
- * sides of this predicate share).
+ * True for:
+ *  - a plain `'photo'` Reel — always eligible; a photo Reel never has a
+ *    pending render (see ReelMediaType's own doc comment in
+ *    src/types/reel.ts) and this predicate doesn't otherwise care about
+ *    music state for a photo (checkReelVideoEligibility's own
+ *    server-side twin doesn't gate `musicSourceType` for photos either —
+ *    see that function's doc comment).
+ *  - a `'video'` Reel with a music state this codebase actually knows
+ *    how to bring to R2 — Step 9A's original `'none'` (nothing to mux,
+ *    immutable after upload), or Step 9B's `'device'` (device-picked
+ *    music — muxReelMusic runs provider-aware, on either backend, before
+ *    publish). `needsPhotoVideoRender` no longer excludes a video Reel
+ *    as of Step 9C — renderPhotoToVideo is now provider-aware too (see
+ *    checkReelVideoEligibility's own doc comment in
+ *    functions/src/media/reelEligibility.ts for the full reasoning both
+ *    sides of this predicate share).
  *
- * Deliberately an ALLOWLIST on `musicSourceType`, not a blocklist — a
- * hypothetical future music source type this app doesn't support yet is
- * rejected by default here too, matching the server's own same defensive
- * posture, rather than silently accepted just because it isn't `'device'`.
+ * Deliberately an ALLOWLIST on `musicSourceType` for the video case, not
+ * a blocklist — a hypothetical future music source type this app doesn't
+ * support yet is rejected by default here too, matching the server's own
+ * same defensive posture, rather than silently accepted just because it
+ * isn't `'device'`.
  */
 export function isReelEligibleForR2VideoUpload(reel: ReelEligibilityShape): boolean {
-  return (
-    reel.mediaType === 'video' &&
-    !reel.needsPhotoVideoRender &&
-    (reel.musicSourceType === 'none' || reel.musicSourceType === 'device')
-  );
+  if (reel.mediaType === 'photo') return true;
+  return reel.mediaType === 'video' && (reel.musicSourceType === 'none' || reel.musicSourceType === 'device');
 }

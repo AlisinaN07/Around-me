@@ -1,10 +1,11 @@
 /**
- * Step 9A — DETERMINISTIC MIRROR of firestore.rules' own Reel
+ * Step 9A/9B/9C — DETERMINISTIC MIRROR of firestore.rules' own Reel
  * source/thumbnail-provider transition predicates
  * (isValidReelSourceProviderUpdate, isValidReelThumbnailProviderUpdate,
- * isValidReelPublish, isValidReelCreate's storageProvider/sourceUrl
- * defaults, and the plain `allow read` condition), reimplemented here as
- * plain JS functions and tested against fixtures.
+ * isValidReelPhotoSourceProviderUpdate (Step 9C), isValidReelPublish,
+ * isValidReelCreate's storageProvider/sourceUrl defaults, and the plain
+ * `allow read` condition), reimplemented here as plain JS functions and
+ * tested against fixtures.
  *
  * WHY THIS FILE EXISTS: `npm run test:rules` (the real Firestore emulator
  * suite) cannot currently execute in this sandbox — every attempt
@@ -70,12 +71,15 @@ function isServerTimestampSentinel(value) {
 
 /**
  * Mirrors isValidReelSourceProviderUpdate (firestore.rules, line
- * ~1751-1806) field-for-field, including its exhaustive
+ * ~1759-1814) field-for-field, including its exhaustive
  * "every other field must stay byte-identical" equality list and the
  * defense-in-depth musicSourceType/needsPhotoVideoRender checks. Step
  * 9B relaxed the musicSourceType constraint from `'none'`-only to
  * `'none' or 'device'` (kept UNCHANGED across the transition either
- * way) — mirrored here exactly.
+ * way). Step 9C relaxed `needsPhotoVideoRender` from a fixed `false` on
+ * both sides to "stays whatever it already was" — `true` is now also
+ * allowed (renderPhotoToVideo is provider-aware too) — mirrored here
+ * exactly.
  */
 function isValidReelSourceProviderUpdate(newData, oldData) {
   return (
@@ -85,8 +89,7 @@ function isValidReelSourceProviderUpdate(newData, oldData) {
     newData.mediaType === 'video' &&
     (oldData.musicSourceType === 'none' || oldData.musicSourceType === 'device') &&
     newData.musicSourceType === oldData.musicSourceType &&
-    oldData.needsPhotoVideoRender === false &&
-    newData.needsPhotoVideoRender === false &&
+    newData.needsPhotoVideoRender === oldData.needsPhotoVideoRender &&
     oldData.storageProvider === 'firebase' &&
     newData.storageProvider === 'r2' &&
     typeof newData.sourceUrl === 'string' &&
@@ -186,6 +189,67 @@ function isValidReelThumbnailProviderUpdate(newData, oldData) {
   );
 }
 
+/**
+ * Step 9C — mirrors isValidReelPhotoSourceProviderUpdate (firestore.rules,
+ * added right after isValidReelSourceProviderUpdate). The LOCKSTEP
+ * transition for a plain photo Reel — mediaType == 'photo' on both
+ * sides, storageProvider/sourceUrl AND thumbnailStorageProvider/
+ * thumbnailUrl move together in one write, to the exact same url.
+ */
+function isValidReelPhotoSourceProviderUpdate(newData, oldData) {
+  return (
+    oldData.status === 'uploading' &&
+    newData.status === 'uploading' &&
+    oldData.mediaType === 'photo' &&
+    newData.mediaType === 'photo' &&
+    oldData.storageProvider === 'firebase' &&
+    newData.storageProvider === 'r2' &&
+    oldData.thumbnailStorageProvider === 'firebase' &&
+    newData.thumbnailStorageProvider === 'r2' &&
+    typeof newData.sourceUrl === 'string' &&
+    newData.sourceUrl.length > 0 &&
+    newData.sourceUrl.length <= 2048 &&
+    /^https:\/\//.test(newData.sourceUrl) &&
+    newData.thumbnailUrl === newData.sourceUrl &&
+    isServerTimestampSentinel(newData.updatedAt) &&
+    newData.reelId === oldData.reelId &&
+    newData.authorUid === oldData.authorUid &&
+    newData.authorDisplayName === oldData.authorDisplayName &&
+    newData.authorUsername === oldData.authorUsername &&
+    newData.cityName === oldData.cityName &&
+    newData.countryCode === oldData.countryCode &&
+    newData.cityKey === oldData.cityKey &&
+    newData.categoryId === oldData.categoryId &&
+    newData.caption === oldData.caption &&
+    JSON.stringify(newData.hashtags) === JSON.stringify(oldData.hashtags) &&
+    newData.needsPhotoVideoRender === oldData.needsPhotoVideoRender &&
+    newData.storagePath === oldData.storagePath &&
+    newData.storageContentType === oldData.storageContentType &&
+    newData.fileSizeBytes === oldData.fileSizeBytes &&
+    newData.durationMs === oldData.durationMs &&
+    newData.width === oldData.width &&
+    newData.height === oldData.height &&
+    newData.visibility === oldData.visibility &&
+    newData.musicSourceType === oldData.musicSourceType &&
+    newData.musicTitle === oldData.musicTitle &&
+    newData.musicStorageAudioPath === oldData.musicStorageAudioPath &&
+    newData.musicStorageContentType === oldData.musicStorageContentType &&
+    newData.musicFileSizeBytes === oldData.musicFileSizeBytes &&
+    newData.musicDurationMs === oldData.musicDurationMs &&
+    newData.musicHash === oldData.musicHash &&
+    newData.soundOriginAuthorUid === oldData.soundOriginAuthorUid &&
+    newData.soundOriginReelId === oldData.soundOriginReelId &&
+    newData.thumbnailStoragePath === oldData.thumbnailStoragePath &&
+    newData.thumbnailStorageContentType === oldData.thumbnailStorageContentType &&
+    newData.thumbnailFileSizeBytes === oldData.thumbnailFileSizeBytes &&
+    newData.thumbnailWidth === oldData.thumbnailWidth &&
+    newData.thumbnailHeight === oldData.thumbnailHeight &&
+    newData.createdAt === oldData.createdAt &&
+    newData.publishedAt === oldData.publishedAt &&
+    hasOnlyKeys(newData, REEL_BASE_KEYS)
+  );
+}
+
 /** Mirrors isValidReelPublish (firestore.rules, line ~1595-1649). */
 function isValidReelPublish(newData, oldData) {
   return (
@@ -237,10 +301,15 @@ function isValidReelPublish(newData, oldData) {
   );
 }
 
-/** The actual `allow update` clause (firestore.rules line ~1203-1209): author-only, then any ONE of the three transitions. */
+/** The actual `allow update` clause (firestore.rules line ~1203-1211): author-only, then any ONE of the FOUR transitions (Step 9C added the fourth). */
 function isValidReelUpdate(newData, oldData, requestAuthUid) {
   if (oldData.authorUid !== requestAuthUid) return false;
-  return isValidReelPublish(newData, oldData) || isValidReelThumbnailProviderUpdate(newData, oldData) || isValidReelSourceProviderUpdate(newData, oldData);
+  return (
+    isValidReelPublish(newData, oldData) ||
+    isValidReelThumbnailProviderUpdate(newData, oldData) ||
+    isValidReelSourceProviderUpdate(newData, oldData) ||
+    isValidReelPhotoSourceProviderUpdate(newData, oldData)
+  );
 }
 
 /** Mirrors isValidReelCreate's storageProvider/sourceUrl-relevant subset (firestore.rules line ~1469-1587) — NOT the full image/video size-branch logic, which predates Step 9A and is unrelated to the provider fields this step introduced. */
@@ -445,12 +514,137 @@ check('source transition: a photo Reel (mediaType "photo") is REJECTED regardles
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// 10. reject pending photo-render Reel
+// 10. Step 9C — a pending photo-render Reel's source transition, now ACCEPTED
+// (renderPhotoToVideo is provider-aware as of Step 9C, so a render-pending
+// Reel is no longer excluded from moving to R2 pre-render).
 // ---------------------------------------------------------------------------
-check('source transition: a Reel with needsPhotoVideoRender true is REJECTED even though mediaType is already "video"', () => {
-  const oldData = baseReelDoc({ needsPhotoVideoRender: true, musicSourceType: 'device' });
-  const newData = { ...oldData, storageProvider: 'r2', sourceUrl: 'https://media.example.com/x', needsPhotoVideoRender: true, updatedAt: 'SERVER_TIMESTAMP' };
-  assert.equal(isValidReelSourceProviderUpdate(newData, oldData), false);
+check('Step 9C — source transition: a Reel with needsPhotoVideoRender true, with valid device music, is now ACCEPTED — renderPhotoToVideo can read/replace it on either backend', () => {
+  const oldData = baseReelDoc({ needsPhotoVideoRender: true, musicSourceType: 'device', musicTitle: 'Song.mp3', musicStorageAudioPath: 'reels/uid1/reel1/music' });
+  const newData = { ...oldData, storageProvider: 'r2', sourceUrl: 'https://media.example.com/x', updatedAt: 'SERVER_TIMESTAMP' };
+  assert.equal(isValidReelUpdate(newData, oldData, 'uid1'), true);
+});
+check('Step 9C — source transition: sneaking a needsPhotoVideoRender CHANGE into the same write (true -> false) is REJECTED — that flip is renderPhotoToVideo\'s own confirm-write\'s job (an Admin SDK write bypassing these Rules), never a client-driven provider confirmation', () => {
+  const oldData = baseReelDoc({ needsPhotoVideoRender: true, musicSourceType: 'device', musicTitle: 'Song.mp3', musicStorageAudioPath: 'reels/uid1/reel1/music' });
+  const newData = { ...oldData, storageProvider: 'r2', sourceUrl: 'https://media.example.com/x', needsPhotoVideoRender: false, updatedAt: 'SERVER_TIMESTAMP' };
+  assert.equal(isValidReelUpdate(newData, oldData, 'uid1'), false);
+});
+
+// ---------------------------------------------------------------------------
+// Step 9C — the LOCKSTEP photo-source transition (isValidReelPhotoSourceProviderUpdate).
+// ---------------------------------------------------------------------------
+/** A fully-populated plain PHOTO Reel — source and thumbnail are the SAME storagePath, matching createReelDraft's own real behavior for mediaType 'photo'. */
+function basePhotoReelDoc(overrides = {}) {
+  return baseReelDoc({
+    mediaType: 'photo',
+    storagePath: 'reels/uid1/reel1/source',
+    thumbnailStoragePath: 'reels/uid1/reel1/source',
+    ...overrides,
+  });
+}
+
+check('Step 9C — photo lockstep transition: firebase -> r2 for BOTH storageProvider and thumbnailStorageProvider, to the SAME url, is ACCEPTED', () => {
+  const oldData = basePhotoReelDoc();
+  const newData = {
+    ...oldData,
+    storageProvider: 'r2',
+    sourceUrl: 'https://media.example.com/reels/uid1/reel1/source',
+    thumbnailStorageProvider: 'r2',
+    thumbnailUrl: 'https://media.example.com/reels/uid1/reel1/source',
+    updatedAt: 'SERVER_TIMESTAMP',
+  };
+  assert.equal(isValidReelUpdate(newData, oldData, 'uid1'), true);
+});
+
+check('Step 9C — photo lockstep transition: thumbnailUrl DIFFERENT from sourceUrl is REJECTED — they must be the exact same object\'s URL', () => {
+  const oldData = basePhotoReelDoc();
+  const newData = {
+    ...oldData,
+    storageProvider: 'r2',
+    sourceUrl: 'https://media.example.com/reels/uid1/reel1/source',
+    thumbnailStorageProvider: 'r2',
+    thumbnailUrl: 'https://media.example.com/reels/uid1/reel1/DIFFERENT',
+    updatedAt: 'SERVER_TIMESTAMP',
+  };
+  assert.equal(isValidReelPhotoSourceProviderUpdate(newData, oldData), false);
+});
+
+check('Step 9C — photo lockstep transition: moving ONLY storageProvider (leaving thumbnailStorageProvider at "firebase") is REJECTED — the two must move together', () => {
+  const oldData = basePhotoReelDoc();
+  const newData = {
+    ...oldData,
+    storageProvider: 'r2',
+    sourceUrl: 'https://media.example.com/reels/uid1/reel1/source',
+    updatedAt: 'SERVER_TIMESTAMP',
+  };
+  assert.equal(isValidReelUpdate(newData, oldData, 'uid1'), false);
+});
+
+check('Step 9C — photo lockstep transition: moving ONLY thumbnailStorageProvider (leaving storageProvider at "firebase") is REJECTED', () => {
+  const oldData = basePhotoReelDoc();
+  const newData = {
+    ...oldData,
+    thumbnailStorageProvider: 'r2',
+    thumbnailUrl: 'https://media.example.com/reels/uid1/reel1/source',
+    updatedAt: 'SERVER_TIMESTAMP',
+  };
+  assert.equal(isValidReelUpdate(newData, oldData, 'uid1'), false);
+});
+
+check('Step 9C — photo lockstep transition: a VIDEO Reel (mediaType "video") can never use this photo-only path, even with matching urls', () => {
+  const oldData = baseReelDoc(); // mediaType: 'video'
+  const newData = {
+    ...oldData,
+    storageProvider: 'r2',
+    sourceUrl: 'https://media.example.com/x',
+    thumbnailStorageProvider: 'r2',
+    thumbnailUrl: 'https://media.example.com/x',
+    updatedAt: 'SERVER_TIMESTAMP',
+  };
+  assert.equal(isValidReelPhotoSourceProviderUpdate(newData, oldData), false);
+});
+
+check('Step 9C — photo lockstep transition: reverse r2 -> firebase is REJECTED — one-shot guard, same as the video-source transition', () => {
+  const oldData = basePhotoReelDoc({ storageProvider: 'r2', sourceUrl: 'https://media.example.com/x', thumbnailStorageProvider: 'r2', thumbnailUrl: 'https://media.example.com/x' });
+  const newData = { ...oldData, storageProvider: 'firebase', sourceUrl: '', thumbnailStorageProvider: 'firebase', thumbnailUrl: '' };
+  assert.equal(isValidReelUpdate(newData, oldData, 'uid1'), false);
+});
+
+check('Step 9C — photo lockstep transition: sneaking a caption change into the same write is REJECTED', () => {
+  const oldData = basePhotoReelDoc();
+  const newData = {
+    ...oldData,
+    storageProvider: 'r2',
+    sourceUrl: 'https://media.example.com/x',
+    thumbnailStorageProvider: 'r2',
+    thumbnailUrl: 'https://media.example.com/x',
+    caption: 'sneaky edit',
+    updatedAt: 'SERVER_TIMESTAMP',
+  };
+  assert.equal(isValidReelUpdate(newData, oldData, 'uid1'), false);
+});
+
+check('Step 9C — photo lockstep transition: attempted by a non-author is REJECTED at the ownership gate', () => {
+  const oldData = basePhotoReelDoc();
+  const newData = {
+    ...oldData,
+    storageProvider: 'r2',
+    sourceUrl: 'https://media.example.com/x',
+    thumbnailStorageProvider: 'r2',
+    thumbnailUrl: 'https://media.example.com/x',
+    updatedAt: 'SERVER_TIMESTAMP',
+  };
+  assert.equal(isValidReelUpdate(newData, oldData, 'attacker-uid'), false);
+});
+
+check('Step 9C — a plain photo Reel is publishable after the lockstep confirmation', () => {
+  const oldData = basePhotoReelDoc({
+    storageProvider: 'r2',
+    sourceUrl: 'https://media.example.com/x',
+    thumbnailStorageProvider: 'r2',
+    thumbnailUrl: 'https://media.example.com/x',
+  });
+  const newData = { ...oldData, status: 'published', publishedAt: 'SERVER_TIMESTAMP', updatedAt: 'SERVER_TIMESTAMP' };
+  assert.equal(isValidReelUpdate(newData, oldData, 'uid1'), true);
 });
 
 // ---------------------------------------------------------------------------

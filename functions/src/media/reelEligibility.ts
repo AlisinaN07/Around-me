@@ -16,7 +16,14 @@
  * `{ok:false}` result into a real `HttpsError` with the matching `code`.
  * This mirrors mediaUploadValidation.ts's MediaUploadValidationError
  * pattern: keep the pure logic free of any HttpsError dependency.
+ *
+ * Imports mediaUploadValidation.ts's own content-type SETS (not the
+ * reverse) — this file stays the one place that knows "is this content
+ * type consistent with THIS Reel's own current shape," since only this
+ * file ever has both the real Reel document and (as of Step 9C) the
+ * requested content type in hand at once.
  */
+import { ALLOWED_REEL_PHOTO_CONTENT_TYPES, ALLOWED_VIDEO_CONTENT_TYPES } from './mediaUploadValidation';
 
 /** Mirrors the subset of `firebase-functions/v2/https`'s HttpsError codes these checks ever produce — kept as a plain string union here so this file needs no import from that package. */
 export type ReelEligibilityErrorCode = 'not-found' | 'permission-denied' | 'failed-precondition';
@@ -71,64 +78,75 @@ export function checkReelThumbnailEligibility(reel: RawReelData | null, uid: str
 }
 
 /**
- * Step 9A/9B — the STRICTEST eligibility check in this file, for exactly
- * the reason Step 9A's own migration-scope decision exists: a Reel's
- * video source can be rewritten IN PLACE, server-side, by two other
- * trusted Cloud Functions — muxReelMusic (merges picked device music into
- * the video) and renderPhotoToVideo (renders a "FOTO"-with-music photo
- * into a real video). renderPhotoToVideo is STILL entirely
- * Firebase-Storage-only (out of scope for Step 9B, deliberately) — a
- * Reel it would ever touch must still be excluded here. muxReelMusic,
- * however, became provider-aware in Step 9B (see
- * reelMuxOrchestration.ts) — it can now read/replace a Reel's source on
- * EITHER backend, so a Reel with picked device music no longer needs to
- * be excluded from R2 purely because mux will touch it; it only needs to
- * be excluded from PUBLISHING before mux actually runs (a separate
- * concern, unaffected by this check — see isValidReelPublish in
- * firestore.rules, which independently still requires `musicHash` etc.
- * to already be their trusted post-mux values by publish time, exactly
- * as before this step).
+ * Step 9A/9B/9C — the STRICTEST eligibility check in this file, for
+ * exactly the reason Step 9A's own migration-scope decision exists: a
+ * Reel's source can be rewritten IN PLACE, server-side, by two other
+ * trusted Cloud Functions — muxReelMusic (merges picked device music
+ * into an existing video) and renderPhotoToVideo (renders a photo +
+ * music into a real video). BOTH became provider-aware (Step 9B and
+ * 9C respectively, see reelMuxOrchestration.ts) — a Reel either one will
+ * touch no longer needs to be excluded from R2 purely because a
+ * server-side rewrite is still scheduled; it only needs to be excluded
+ * from PUBLISHING before that rewrite actually runs (a separate concern,
+ * unaffected by this check — see isValidReelPublish in firestore.rules,
+ * which independently still requires `musicHash`/`needsPhotoVideoRender`
+ * etc. to already be their trusted post-render values by publish time).
  *
- *  1. Same four checks as checkReelThumbnailEligibility above (exists,
- *     owned, uploading, mediaType video).
- *  2. `musicSourceType` must be a value this codebase actually knows how
- *     to bring to R2 — currently `'none'` (nothing to mux, immutable
- *     after upload) or `'device'` (Step 9B's own new case — mux runs
- *     server-side, provider-aware, before publish). Any OTHER value
- *     (there is none today, but this is deliberately an allowlist, not a
- *     blocklist, so a hypothetical future music source type is rejected
- *     by default rather than silently accepted) is rejected.
- *  3. For `musicSourceType === 'device'` specifically, also require a
- *     real, non-empty `musicStorageAudioPath` — defense-in-depth against
- *     an inconsistent document (createReelDraft's own Firestore Rules
- *     already guarantee this can't happen from a legitimate client
- *     write, but this check costs nothing and never trusts that
- *     invariant blindly).
- *  4. `needsPhotoVideoRender !== true` — a "FOTO"-with-music draft's
- *     `storagePath` still holds the ORIGINAL PHOTO until
- *     renderPhotoToVideo overwrites it with a real rendered video, and
- *     that function stays Firebase-only in Step 9B — this Reel variant
- *     is excluded regardless of `musicSourceType`.
+ *  1. Reel exists, `authorUid === uid`, `status === 'uploading'` — same
+ *     as every other check in this file.
+ *  2. `mediaType` must be `'video'` or `'photo'` — the only two real
+ *     Reel media kinds; anything else is rejected outright.
+ *  3. For `mediaType === 'video'`: `musicSourceType` must be a value
+ *     this codebase actually knows how to bring to R2 — `'none'`
+ *     (nothing to mux) or `'device'` (Step 9B — mux runs provider-aware
+ *     before publish), with a required, non-empty `musicStorageAudioPath`
+ *     for the latter (defense-in-depth against an inconsistent
+ *     document). An allowlist, not a blocklist — a hypothetical future
+ *     music source type is rejected by default.
+ *  4. For `mediaType === 'photo'`: no music/render constraint applies at
+ *     all — a plain photo Reel is never render-pending by definition
+ *     (see ReelMediaType's own doc comment in src/types/reel.ts).
+ *  5. `contentType` — Step 9C's own new parameter — must match what
+ *     THIS Reel is actually expecting RIGHT NOW: an image type
+ *     (ALLOWED_REEL_PHOTO_CONTENT_TYPES) whenever the upload about to
+ *     happen is still a photo (`mediaType === 'photo'`, OR
+ *     `mediaType === 'video' && needsPhotoVideoRender === true` — a
+ *     photo-pending-render Reel's `storagePath` still holds the
+ *     ORIGINAL PHOTO until renderPhotoToVideo overwrites it — see that
+ *     function's own doc comment in functions/src/index.ts), or a video
+ *     type (ALLOWED_VIDEO_CONTENT_TYPES) otherwise. This is the ONE
+ *     check in this file that reads BOTH the Reel's own state AND the
+ *     request's own declared content type together — mediaUploadValidation.ts's
+ *     own pure shape check (run earlier, with no Firestore access) can
+ *     only confirm SOME allowed shape was sent, never that it's the
+ *     RIGHT one for this exact Reel.
  *
- * A plain video Reel with no music, and a video Reel with device-picked
- * music (Step 9B), both have their source's only scheduled server-side
- * transformation (if any) fully accounted for by muxReelMusic, which now
- * knows how to operate on either backend — that's what makes both safe
- * to move to R2. A render-pending Reel does not.
+ * Every Reel variant this function now accepts has its source's only
+ * scheduled server-side transformation (if any) fully accounted for by a
+ * provider-aware trusted function (muxReelMusic or renderPhotoToVideo) —
+ * that's what makes moving all of them to R2 safe.
  */
-export function checkReelVideoEligibility(reel: RawReelData | null, uid: string): EligibilityResult {
+export function checkReelVideoEligibility(reel: RawReelData | null, uid: string, contentType: string): EligibilityResult {
   if (!reel) return notFound();
   if (reel.authorUid !== uid) return permissionDenied('You do not own this Reel.');
   if (reel.status !== 'uploading') return failedPrecondition('This Reel is not awaiting a video upload.');
-  if (reel.mediaType !== 'video') return failedPrecondition('This Reel does not have a separate video source.');
-  if (reel.musicSourceType !== 'none' && reel.musicSourceType !== 'device') {
-    return failedPrecondition('This Reel has an unsupported music state.');
+  if (reel.mediaType !== 'video' && reel.mediaType !== 'photo') {
+    return failedPrecondition('This Reel does not have a separate video source.');
   }
-  if (reel.musicSourceType === 'device' && (typeof reel.musicStorageAudioPath !== 'string' || reel.musicStorageAudioPath.length === 0)) {
-    return failedPrecondition('This Reel has an unsupported music state.');
+  if (reel.mediaType === 'video') {
+    if (reel.musicSourceType !== 'none' && reel.musicSourceType !== 'device') {
+      return failedPrecondition('This Reel has an unsupported music state.');
+    }
+    if (reel.musicSourceType === 'device' && (typeof reel.musicStorageAudioPath !== 'string' || reel.musicStorageAudioPath.length === 0)) {
+      return failedPrecondition('This Reel has an unsupported music state.');
+    }
   }
-  if (reel.needsPhotoVideoRender === true) {
-    return failedPrecondition('This Reel still needs server-side photo rendering before its source can move.');
+  const isImageUploadExpected = reel.mediaType === 'photo' || reel.needsPhotoVideoRender === true;
+  const contentTypeMatches = isImageUploadExpected
+    ? ALLOWED_REEL_PHOTO_CONTENT_TYPES.has(contentType)
+    : ALLOWED_VIDEO_CONTENT_TYPES.has(contentType);
+  if (!contentTypeMatches) {
+    return failedPrecondition('This file type does not match what this post is expecting.');
   }
   return OK;
 }
@@ -154,6 +172,46 @@ export function checkReelMuxEligibility(reel: RawReelData | null, uid: string): 
   if (reel.authorUid !== uid) return permissionDenied('You can only merge music into your own post.');
   if (reel.status !== 'uploading') return failedPrecondition('This post is not awaiting a music merge.');
   if (reel.musicSourceType !== 'device') return failedPrecondition('This post has no music to merge.');
+  if (typeof reel.musicStorageAudioPath !== 'string' || reel.musicStorageAudioPath.length === 0) {
+    return failedPrecondition('This post is missing its music file.');
+  }
+  return OK;
+}
+
+/**
+ * Step 9C — renderPhotoToVideo's own eligibility check, extracted from
+ * that function's pre-existing inline checks the same way Step 9B
+ * extracted checkReelMuxEligibility from muxReelMusic's — same shape,
+ * different trigger condition:
+ *  1. Reel exists, `authorUid === uid`, `status === 'uploading'` — same
+ *     as every other check in this file.
+ *  2. `mediaType === 'video' && needsPhotoVideoRender === true` — the
+ *     ONE Reel variant this function is ever meant to touch (a plain
+ *     photo Reel, `mediaType === 'photo'`, is NEVER render-pending — see
+ *     checkReelVideoEligibility's own doc comment above).
+ *  3. `musicSourceType === 'device'` with a real, non-empty
+ *     `musicStorageAudioPath` — a render-pending Reel always has device
+ *     music by construction (see CreateReelDraftInput.photoRenderPending's
+ *     own doc comment in src/services/reels.ts: this render mode only
+ *     ever exists BECAUSE the user picked device music for a photo), but
+ *     this check costs nothing and never trusts that invariant blindly,
+ *     same reasoning as checkReelMuxEligibility's own third check.
+ *
+ * Deliberately does NOT gate on `reel.storageProvider` at all — same
+ * reasoning as checkReelMuxEligibility: the provider only decides WHICH
+ * download/upload path performReelMux takes, never whether rendering is
+ * allowed to run.
+ */
+export function checkReelPhotoRenderEligibility(reel: RawReelData | null, uid: string): EligibilityResult {
+  if (!reel) return notFound();
+  if (reel.authorUid !== uid) return permissionDenied('You can only process your own post.');
+  if (reel.status !== 'uploading') return failedPrecondition('This post is not awaiting photo processing.');
+  if (reel.mediaType !== 'video' || reel.needsPhotoVideoRender !== true) {
+    return failedPrecondition('This post does not need photo-to-video rendering.');
+  }
+  if (reel.musicSourceType !== 'device') {
+    return failedPrecondition('This post has no music to render with.');
+  }
   if (typeof reel.musicStorageAudioPath !== 'string' || reel.musicStorageAudioPath.length === 0) {
     return failedPrecondition('This post is missing its music file.');
   }

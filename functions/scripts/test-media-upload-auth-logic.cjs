@@ -31,11 +31,13 @@ const {
   MediaUploadValidationError,
   ALLOWED_CONTENT_TYPES,
   ALLOWED_VIDEO_CONTENT_TYPES,
+  ALLOWED_REEL_PHOTO_CONTENT_TYPES,
   PROFILE_PHOTO_MAX_SIZE_BYTES,
   PROFILE_COVER_PHOTO_MAX_SIZE_BYTES,
   EVENT_COVER_PHOTO_MAX_SIZE_BYTES,
   REEL_THUMBNAIL_MAX_SIZE_BYTES,
   REEL_VIDEO_MAX_SIZE_BYTES,
+  REEL_PHOTO_SOURCE_MAX_SIZE_BYTES,
 } = require('../lib/media/mediaUploadValidation.js');
 const { eventCoverKey, profileCoverKey, profilePhotoKey, reelSourceKey, reelThumbnailKey } = require('../lib/media/objectKey.js');
 
@@ -680,10 +682,9 @@ check('rejects a malformed reelId attempting parent-directory traversal for reel
   );
 });
 
-check('rejects an image/* content type for reelVideo — image/jpeg is valid for every OTHER kind but not this one', () => {
-  assert.throws(
-    () => validateMediaUploadInput({ mediaKind: 'reelVideo', contentType: 'image/jpeg', fileSizeBytes: 1000, reelId: 'reel1' }),
-    MediaUploadValidationError
+check('Step 9C — accepts an image/jpeg content type for reelVideo (a photo Reel/render-pending Reel\'s own original-photo upload), at a photo-sized fileSizeBytes', () => {
+  assert.doesNotThrow(() =>
+    validateMediaUploadInput({ mediaKind: 'reelVideo', contentType: 'image/jpeg', fileSizeBytes: 1000, reelId: 'reel1' })
   );
 });
 
@@ -705,6 +706,77 @@ check('rejects an arbitrary/unrecognized video-shaped MIME type for reelVideo �
   assert.throws(
     () => validateMediaUploadInput({ mediaKind: 'reelVideo', contentType: 'video/3gpp', fileSizeBytes: 1000, reelId: 'reel1' }),
     MediaUploadValidationError
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Step 9C — 'reelVideo' now also accepts a PHOTO shape (a plain photo
+// Reel's own source, or a photo-pending-render Reel's still-a-photo
+// original upload). This pure layer only validates SOME allowed shape was
+// sent (see ALLOWED_REEL_PHOTO_CONTENT_TYPES/REEL_PHOTO_SOURCE_MAX_SIZE_BYTES's
+// own doc comments in mediaUploadValidation.ts) — the cross-check that
+// it's the RIGHT shape for a given Reel's own current state is
+// checkReelVideoEligibility's own job (see test-reel-eligibility-logic.cjs).
+// ---------------------------------------------------------------------------
+
+check('Step 9C — accepts image/png and image/webp for reelVideo, the same photo-shape allowlist as image/jpeg', () => {
+  assert.doesNotThrow(() => validateMediaUploadInput({ mediaKind: 'reelVideo', contentType: 'image/png', fileSizeBytes: 1000, reelId: 'reel1' }));
+  assert.doesNotThrow(() => validateMediaUploadInput({ mediaKind: 'reelVideo', contentType: 'image/webp', fileSizeBytes: 1000, reelId: 'reel1' }));
+});
+
+check('Step 9C — accepts image/heic and image/heif for reelVideo — genuinely unnormalized library-picked photos, not a guessed-away possibility', () => {
+  assert.doesNotThrow(() => validateMediaUploadInput({ mediaKind: 'reelVideo', contentType: 'image/heic', fileSizeBytes: 1000, reelId: 'reel1' }));
+  assert.doesNotThrow(() => validateMediaUploadInput({ mediaKind: 'reelVideo', contentType: 'image/heif', fileSizeBytes: 1000, reelId: 'reel1' }));
+});
+
+check('Step 9C — rejects image/gif for reelVideo — not in the photo-shape allowlist, same narrow-allowlist posture as the video shape', () => {
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'reelVideo', contentType: 'image/gif', fileSizeBytes: 1000, reelId: 'reel1' }),
+    MediaUploadValidationError
+  );
+});
+
+check('REEL_PHOTO_SOURCE_MAX_SIZE_BYTES is 10 MB — mirrors src/types/reel.ts\'s REEL_PHOTO_MAX_FILE_SIZE_BYTES and firestore.rules\' own existing 10485760 cap exactly', () => {
+  assert.equal(REEL_PHOTO_SOURCE_MAX_SIZE_BYTES, 10 * 1024 * 1024);
+});
+
+check('Step 9C — reelVideo photo shape accepts a file exactly at its own (photo) maximum size', () => {
+  assert.doesNotThrow(() =>
+    validateMediaUploadInput({ mediaKind: 'reelVideo', contentType: 'image/jpeg', fileSizeBytes: REEL_PHOTO_SOURCE_MAX_SIZE_BYTES, reelId: 'reel1' })
+  );
+});
+
+check('Step 9C — reelVideo photo shape rejects a file one byte over its own (photo) maximum size — the SMALLER photo cap, not the video cap', () => {
+  assert.throws(
+    () =>
+      validateMediaUploadInput({
+        mediaKind: 'reelVideo',
+        contentType: 'image/jpeg',
+        fileSizeBytes: REEL_PHOTO_SOURCE_MAX_SIZE_BYTES + 1,
+        reelId: 'reel1',
+      }),
+    MediaUploadValidationError
+  );
+});
+
+check('Step 9C — a photo-shaped upload beyond the photo cap but still under the (larger) video cap is still REJECTED — the two caps are not interchangeable', () => {
+  assert.ok(REEL_PHOTO_SOURCE_MAX_SIZE_BYTES < REEL_VIDEO_MAX_SIZE_BYTES);
+  assert.throws(
+    () =>
+      validateMediaUploadInput({
+        mediaKind: 'reelVideo',
+        contentType: 'image/jpeg',
+        fileSizeBytes: REEL_PHOTO_SOURCE_MAX_SIZE_BYTES + 1,
+        reelId: 'reel1',
+      }),
+    MediaUploadValidationError
+  );
+});
+
+check('ALLOWED_REEL_PHOTO_CONTENT_TYPES is exactly the five-format set this app\'s own photo Reel/render-pending upload paths actually produce', () => {
+  assert.deepEqual(
+    [...ALLOWED_REEL_PHOTO_CONTENT_TYPES].sort(),
+    ['image/heic', 'image/heif', 'image/jpeg', 'image/png', 'image/webp'].sort()
   );
 });
 

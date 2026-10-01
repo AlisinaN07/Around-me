@@ -1,20 +1,24 @@
 /**
- * Step 9A/9B — plain-Node tests for the pure Reel-media eligibility checks
- * in functions/src/media/reelEligibility.ts: checkReelThumbnailEligibility,
- * checkReelVideoEligibility, checkReelDiscardEligibility, and (Step 9B)
- * checkReelMuxEligibility. These are the DECISION logic behind
- * requestMediaUploadAuthorization.ts's verifyReelThumbnailOwnership/
+ * Step 9A/9B/9C — plain-Node tests for the pure Reel-media eligibility
+ * checks in functions/src/media/reelEligibility.ts:
+ * checkReelThumbnailEligibility, checkReelVideoEligibility,
+ * checkReelDiscardEligibility, checkReelMuxEligibility (Step 9B), and
+ * checkReelPhotoRenderEligibility (Step 9C). These are the DECISION logic
+ * behind requestMediaUploadAuthorization.ts's verifyReelThumbnailOwnership/
  * verifyReelVideoOwnership, discardReelSource.ts's own ownership check,
- * and index.ts's own muxReelMusic — extracted into their own
- * dependency-free file specifically so this logic is directly testable
- * without a live Firestore/Admin SDK (see reelEligibility.ts's own doc
- * comment). Runs against the COMPILED lib/ output — `npm run build` first.
+ * index.ts's own muxReelMusic, and (Step 9C) index.ts's own
+ * renderPhotoToVideo — extracted into their own dependency-free file
+ * specifically so this logic is directly testable without a live
+ * Firestore/Admin SDK (see reelEligibility.ts's own doc comment). Runs
+ * against the COMPILED lib/ output — `npm run build` first.
  *
  * This is the authoritative coverage for Part 5/7's authorization-security
  * matrix (unauthenticated is checked one level up, in handleRequest,
  * before either eligibility function is ever reached — not re-tested
  * here), Step 9B's own eligibility-relaxation matrix (Part 15's
- * "Eligibility" list), and discardReelSource's/muxReelMusic's own
+ * "Eligibility" list), Step 9C's own eligibility relaxation (photo/
+ * render-pending Reels, plus the new contentType cross-check), and
+ * discardReelSource's/muxReelMusic's/renderPhotoToVideo's own
  * ownership+status checks.
  */
 const assert = require('node:assert/strict');
@@ -23,7 +27,11 @@ const {
   checkReelVideoEligibility,
   checkReelDiscardEligibility,
   checkReelMuxEligibility,
+  checkReelPhotoRenderEligibility,
 } = require('../lib/media/reelEligibility.js');
+
+const VIDEO_CONTENT_TYPE = 'video/mp4';
+const PHOTO_CONTENT_TYPE = 'image/jpeg';
 
 const results = [];
 function check(name, fn) {
@@ -57,6 +65,25 @@ function baseEligibleMusicVideoReel(overrides = {}) {
     musicStorageAudioPath: `reels/${UID}/reel1/music`,
     musicStorageContentType: 'audio/mp4',
     musicTitle: 'Song.mp3',
+    ...overrides,
+  });
+}
+
+/** Step 9C — a plain photo Reel: never render-pending, no music constraint at all. */
+function baseEligiblePhotoReel(overrides = {}) {
+  return {
+    authorUid: UID,
+    status: 'uploading',
+    mediaType: 'photo',
+    needsPhotoVideoRender: false,
+    ...overrides,
+  };
+}
+
+/** Step 9C — a "FOTO"-with-music render-pending Reel: mediaType stays 'video', needsPhotoVideoRender true, always device music with a real musicStorageAudioPath (see CreateReelDraftInput.photoRenderPending's own doc comment in src/services/reels.ts). */
+function baseEligibleRenderPendingReel(overrides = {}) {
+  return baseEligibleMusicVideoReel({
+    needsPhotoVideoRender: true,
     ...overrides,
   });
 }
@@ -104,47 +131,48 @@ check('thumbnail: correct owner + uploading + video is eligible', () => {
 });
 
 // ---------------------------------------------------------------------------
-// checkReelVideoEligibility — Step 9A's original matrix plus Step 9B's
-// relaxation (plain video AND device-music video are now both eligible;
-// photo and render-pending remain excluded either way).
+// checkReelVideoEligibility — Step 9A's original matrix, Step 9B's
+// relaxation (device-music video also eligible), and Step 9C's own
+// relaxation (photo AND render-pending are now eligible too, plus the new
+// contentType cross-check).
 // ---------------------------------------------------------------------------
 
 check('video: nonexistent Reel (null) is not-found', () => {
-  const result = checkReelVideoEligibility(null, UID);
+  const result = checkReelVideoEligibility(null, UID, VIDEO_CONTENT_TYPE);
   assert.equal(result.ok, false);
   assert.equal(result.code, 'not-found');
 });
 
 check('video: wrong owner is permission-denied', () => {
-  const result = checkReelVideoEligibility(baseEligibleVideoReel(), OTHER_UID);
+  const result = checkReelVideoEligibility(baseEligibleVideoReel(), OTHER_UID, VIDEO_CONTENT_TYPE);
   assert.equal(result.ok, false);
   assert.equal(result.code, 'permission-denied');
 });
 
 check('video: status published is failed-precondition', () => {
-  const result = checkReelVideoEligibility(baseEligibleVideoReel({ status: 'published' }), UID);
+  const result = checkReelVideoEligibility(baseEligibleVideoReel({ status: 'published' }), UID, VIDEO_CONTENT_TYPE);
   assert.equal(result.ok, false);
   assert.equal(result.code, 'failed-precondition');
 });
 
-check('video: photo Reel is REJECTED — Part 14/16, photo Reels never reach the reelVideo R2 path', () => {
-  const result = checkReelVideoEligibility(baseEligibleVideoReel({ mediaType: 'photo' }), UID);
+check('video: an unrecognized mediaType is REJECTED — only "video"/"photo" are real Reel media kinds', () => {
+  const result = checkReelVideoEligibility(baseEligibleVideoReel({ mediaType: 'story' }), UID, VIDEO_CONTENT_TYPE);
   assert.equal(result.ok, false);
   assert.equal(result.code, 'failed-precondition');
 });
 
-check('video: plain video, no music, no pending render — the Step 9A eligible shape, unaffected by Step 9B', () => {
-  const result = checkReelVideoEligibility(baseEligibleVideoReel(), UID);
+check('video: plain video, no music, no pending render — the Step 9A eligible shape, unaffected by Step 9B/9C', () => {
+  const result = checkReelVideoEligibility(baseEligibleVideoReel(), UID, VIDEO_CONTENT_TYPE);
   assert.equal(result.ok, true);
 });
 
-check('video: Step 9B — a video Reel WITH device-picked music, and a real musicStorageAudioPath, is now ELIGIBLE', () => {
-  const result = checkReelVideoEligibility(baseEligibleMusicVideoReel(), UID);
+check('video: Step 9B — a video Reel WITH device-picked music, and a real musicStorageAudioPath, is ELIGIBLE', () => {
+  const result = checkReelVideoEligibility(baseEligibleMusicVideoReel(), UID, VIDEO_CONTENT_TYPE);
   assert.equal(result.ok, true);
 });
 
 check('video: Step 9B — a music Reel missing musicStorageAudioPath (inconsistent state) is REJECTED, not silently accepted', () => {
-  const result = checkReelVideoEligibility(baseEligibleMusicVideoReel({ musicStorageAudioPath: '' }), UID);
+  const result = checkReelVideoEligibility(baseEligibleMusicVideoReel({ musicStorageAudioPath: '' }), UID, VIDEO_CONTENT_TYPE);
   assert.equal(result.ok, false);
   assert.equal(result.code, 'failed-precondition');
 });
@@ -152,31 +180,63 @@ check('video: Step 9B — a music Reel missing musicStorageAudioPath (inconsiste
 check('video: Step 9B — a music Reel with musicStorageAudioPath missing entirely (not even an empty string) is REJECTED', () => {
   const reel = baseEligibleMusicVideoReel();
   delete reel.musicStorageAudioPath;
-  const result = checkReelVideoEligibility(reel, UID);
+  const result = checkReelVideoEligibility(reel, UID, VIDEO_CONTENT_TYPE);
   assert.equal(result.ok, false);
   assert.equal(result.code, 'failed-precondition');
 });
 
 check('video: an unrecognized/future musicSourceType value is REJECTED — an allowlist, not a blocklist', () => {
-  const result = checkReelVideoEligibility(baseEligibleVideoReel({ musicSourceType: 'catalog' }), UID);
+  const result = checkReelVideoEligibility(baseEligibleVideoReel({ musicSourceType: 'catalog' }), UID, VIDEO_CONTENT_TYPE);
   assert.equal(result.ok, false);
   assert.equal(result.code, 'failed-precondition');
 });
 
-check('video: pending photo-render Reel (needsPhotoVideoRender true) is REJECTED even with otherwise-valid device music', () => {
-  const result = checkReelVideoEligibility(baseEligibleMusicVideoReel({ needsPhotoVideoRender: true }), UID);
+check('video: Step 9C — a render-pending Reel (needsPhotoVideoRender true) with valid device music is now ELIGIBLE — renderPhotoToVideo is provider-aware', () => {
+  const result = checkReelVideoEligibility(baseEligibleRenderPendingReel(), UID, PHOTO_CONTENT_TYPE);
+  assert.equal(result.ok, true);
+});
+
+check('video: Step 9C — a plain photo Reel is now ELIGIBLE, with no music constraint at all', () => {
+  const result = checkReelVideoEligibility(baseEligiblePhotoReel(), UID, PHOTO_CONTENT_TYPE);
+  assert.equal(result.ok, true);
+});
+
+check('video: Step 9C — a plain photo Reel is eligible even with an unrecognized musicSourceType — photo variant never checks music state', () => {
+  const result = checkReelVideoEligibility(baseEligiblePhotoReel({ musicSourceType: 'catalog' }), UID, PHOTO_CONTENT_TYPE);
+  assert.equal(result.ok, true);
+});
+
+check('video: Step 9C — contentType mismatch: a plain video Reel sending an IMAGE content type is REJECTED', () => {
+  const result = checkReelVideoEligibility(baseEligibleVideoReel(), UID, PHOTO_CONTENT_TYPE);
   assert.equal(result.ok, false);
   assert.equal(result.code, 'failed-precondition');
 });
 
-check('video: pending photo-render Reel is rejected even with no music at all — needsPhotoVideoRender alone is disqualifying', () => {
-  const result = checkReelVideoEligibility(baseEligibleVideoReel({ needsPhotoVideoRender: true }), UID);
+check('video: Step 9C — contentType mismatch: a plain photo Reel sending a VIDEO content type is REJECTED', () => {
+  const result = checkReelVideoEligibility(baseEligiblePhotoReel(), UID, VIDEO_CONTENT_TYPE);
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'failed-precondition');
+});
+
+check('video: Step 9C — contentType mismatch: a render-pending Reel sending a VIDEO content type is REJECTED — its storagePath still holds the ORIGINAL PHOTO', () => {
+  const result = checkReelVideoEligibility(baseEligibleRenderPendingReel(), UID, VIDEO_CONTENT_TYPE);
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'failed-precondition');
+});
+
+check('video: Step 9C — HEIC is accepted for a plain photo Reel — genuinely unnormalized library-picked photos', () => {
+  const result = checkReelVideoEligibility(baseEligiblePhotoReel(), UID, 'image/heic');
+  assert.equal(result.ok, true);
+});
+
+check('video: Step 9C — an arbitrary/unsupported contentType is REJECTED regardless of the Reel\'s own shape', () => {
+  const result = checkReelVideoEligibility(baseEligiblePhotoReel(), UID, 'application/pdf');
   assert.equal(result.ok, false);
   assert.equal(result.code, 'failed-precondition');
 });
 
 check('video: ownership is checked before status — a wrong-owner nonexistent-status combo still reports permission-denied, not failed-precondition (checks run in a fixed order)', () => {
-  const result = checkReelVideoEligibility(baseEligibleVideoReel({ status: 'published' }), OTHER_UID);
+  const result = checkReelVideoEligibility(baseEligibleVideoReel({ status: 'published' }), OTHER_UID, VIDEO_CONTENT_TYPE);
   assert.equal(result.code, 'permission-denied');
 });
 
@@ -252,6 +312,60 @@ check('mux: a valid, owned, uploading, device-music Reel with a real musicStorag
 check('mux: eligibility does NOT depend on storageProvider — an R2-sourced music Reel is exactly as eligible for mux as a Firebase one', () => {
   assert.equal(checkReelMuxEligibility(baseEligibleMusicVideoReel({ storageProvider: 'r2' }), UID).ok, true);
   assert.equal(checkReelMuxEligibility(baseEligibleMusicVideoReel({ storageProvider: 'firebase' }), UID).ok, true);
+});
+
+// ---------------------------------------------------------------------------
+// checkReelPhotoRenderEligibility — Step 9C, renderPhotoToVideo's own
+// ownership/status/music-consistency gate, extracted from that function's
+// pre-existing inline checks the same way Step 9B extracted
+// checkReelMuxEligibility from muxReelMusic's.
+// ---------------------------------------------------------------------------
+
+check('photoRender: nonexistent Reel (null) is not-found', () => {
+  assert.equal(checkReelPhotoRenderEligibility(null, UID).code, 'not-found');
+});
+
+check('photoRender: wrong owner is permission-denied', () => {
+  assert.equal(checkReelPhotoRenderEligibility(baseEligibleRenderPendingReel(), OTHER_UID).code, 'permission-denied');
+});
+
+check('photoRender: status published is failed-precondition — render only ever runs pre-publish', () => {
+  const result = checkReelPhotoRenderEligibility(baseEligibleRenderPendingReel({ status: 'published' }), UID);
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'failed-precondition');
+});
+
+check('photoRender: a plain photo Reel (mediaType "photo") is REJECTED — never render-pending by definition', () => {
+  const result = checkReelPhotoRenderEligibility(baseEligiblePhotoReel(), UID);
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'failed-precondition');
+});
+
+check('photoRender: a plain video Reel (needsPhotoVideoRender false) is REJECTED — nothing to render', () => {
+  const result = checkReelPhotoRenderEligibility(baseEligibleMusicVideoReel({ needsPhotoVideoRender: false }), UID);
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'failed-precondition');
+});
+
+check('photoRender: a render-pending Reel with no music at all is REJECTED — this render mode always has device music by construction', () => {
+  const result = checkReelPhotoRenderEligibility(baseEligibleRenderPendingReel({ musicSourceType: 'none' }), UID);
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'failed-precondition');
+});
+
+check('photoRender: a render-pending Reel missing musicStorageAudioPath (inconsistent state) is REJECTED', () => {
+  const result = checkReelPhotoRenderEligibility(baseEligibleRenderPendingReel({ musicStorageAudioPath: '' }), UID);
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'failed-precondition');
+});
+
+check('photoRender: a valid, owned, uploading, render-pending Reel with real device music is eligible', () => {
+  assert.equal(checkReelPhotoRenderEligibility(baseEligibleRenderPendingReel(), UID).ok, true);
+});
+
+check('photoRender: eligibility does NOT depend on storageProvider — an R2-sourced render-pending Reel is exactly as eligible as a Firebase one', () => {
+  assert.equal(checkReelPhotoRenderEligibility(baseEligibleRenderPendingReel({ storageProvider: 'r2' }), UID).ok, true);
+  assert.equal(checkReelPhotoRenderEligibility(baseEligibleRenderPendingReel({ storageProvider: 'firebase' }), UID).ok, true);
 });
 
 console.log('\n=== functions/ Reel eligibility logic test results ===');
