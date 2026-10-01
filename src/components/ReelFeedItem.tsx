@@ -365,10 +365,28 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
     };
   }, [reel.musicSourceType, reel.soundOriginAuthorUid]);
 
-  // Never given a real source for a photo Reel — there is nothing to
-  // decode or play, and handing a still-image URL to expo-video would just
-  // surface as a spurious playback error.
-  const player = useVideoPlayer(isPhoto ? null : playbackUrl, (p) => {
+  // Step 11A perf audit — `useCaching: true` opts this source into
+  // expo-video's own native disk cache (AVFoundation resource-loader
+  // cache on iOS, ExoPlayer SimpleCache on Android — see
+  // VideoPlayer.types.d.ts; default is `false`, which this codebase had
+  // never overridden). This directly targets the audited root cause of
+  // the reported "scroll down ~2, scroll back, previous Reel reloads"
+  // behavior: shouldPrepare (above) deliberately releases this item's
+  // player — and therefore its in-memory buffer — once it's more than one
+  // position from active, to keep concurrent players/buffers bounded
+  // regardless of feed length; without a BYTE-level cache, recreating the
+  // player on return had no choice but a full fresh network fetch of
+  // identical bytes. The native cache lives independently of any single
+  // player instance, so it survives exactly that release/recreate cycle.
+  // Safe to pass a fresh object literal on every render: useVideoPlayer's
+  // own source-change detection keys on `JSON.stringify(source)` (see
+  // expo-video's VideoPlayer.tsx), not reference identity, so this never
+  // adds a render-driven player re-creation that didn't already happen
+  // for the same `playbackUrl` string before this change. Plain MP4,
+  // never HLS/DRM, so none of `useCaching`'s documented platform
+  // limitations apply here. The cache's own size is bounded app-wide by
+  // setVideoCacheSizeAsync (see src/app/_layout.tsx).
+  const player = useVideoPlayer(isPhoto ? null : playbackUrl ? { uri: playbackUrl, useCaching: true } : null, (p) => {
     // Deliberately NOT p.loop = true on native — on iOS/Android, expo-
     // video's own native loop visibly flashes black for a frame or two at
     // the loop point (it appears to fully reset the player item rather
