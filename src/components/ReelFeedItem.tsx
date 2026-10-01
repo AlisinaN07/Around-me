@@ -25,7 +25,15 @@ import type { Reel } from '@/types/reel';
 import type { RankingAttribution } from '@/types/recommendation';
 import type { PublicProfile } from '@/types/social';
 import { prefetchImageOnce } from '@/utils/imagePrefetch';
-import { recordReelPlaybackStartup } from '@/utils/reelPlaybackMetrics';
+import { recordReelActivation, recordReelPlaybackAborted, recordReelPlaybackCompletion } from '@/utils/reelPlaybackMetrics';
+import {
+  consumePendingStartup,
+  determineStartupOutcome,
+  isPrewarmedActivation,
+  type PendingReelStartup,
+  type PriorReelPreparationLevel,
+} from '@/utils/reelPlaybackSessionState';
+import type { ReelNetworkClass, ReelPreparationLevel } from '@/utils/reelPreparationPolicy';
 import { buildReelShareUrl, shareReel } from '@/utils/reelShare';
 
 // How far (px) a horizontal drag has to travel before it counts as a
@@ -46,6 +54,23 @@ type ReelFeedItemProps = {
    * bounded to at most 3 regardless of feed length.
    */
   shouldPrepare: boolean;
+  /**
+   * Step 11E — the exact ReelPreparationLevel this item is at right now
+   * (ReelFeed.tsx already computes this to derive `shouldPrepare` above —
+   * passed through unchanged, never recomputed here). Used ONLY for dev
+   * playback-measurement classification (prior-level/prewarmed context
+   * below) — never for any player/render decision; `shouldPrepare`
+   * remains the single source of truth for that, exactly as before this
+   * step.
+   */
+  preparationLevel: ReelPreparationLevel;
+  /**
+   * Step 11E — the feed's one live `useReelNetworkClass()` value (see
+   * ReelFeed.tsx), passed through so each dev playback-measurement record
+   * can report the network class actually active during that attempt —
+   * no second subscription is created here.
+   */
+  networkClass: ReelNetworkClass;
   onOpenOptions: () => void;
   /** Brief transient confirmation (e.g. "Saved") — rendered once by the shared parent feed, not per-item. */
   onToast: (message: string) => void;
@@ -63,7 +88,18 @@ const CATEGORY_LABEL_BY_ID = new Map(INTERESTS.map((interest) => [interest.id, `
  * `shouldPrepare`) — see ReelsScreen for how activity/prepare windows are
  * tracked and how only one item is ever active at a time.
  */
-export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOptions, onToast, attribution, feedSessionId }: ReelFeedItemProps) {
+export function ReelFeedItem({
+  reel,
+  height,
+  isActive,
+  shouldPrepare,
+  preparationLevel,
+  networkClass,
+  onOpenOptions,
+  onToast,
+  attribution,
+  feedSessionId,
+}: ReelFeedItemProps) {
   const { user } = useAuth();
   // Whether the screen THIS item lives on (Home, a single-Post route,
   // etc.) is the one currently on top — see isSoundSheetOpen's own doc
@@ -106,15 +142,23 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
   // Step 11D — dev-only startup-latency measurement (see
   // src/utils/reelPlaybackMetrics.ts). `urlAssignedAtRef` is the
   // timestamp of the most recent successful playbackUrl resolution
-  // below; `urlSourceRef` labels where that URL actually came from. Both
-  // are consumed (and reset to null) the first time the player reports
-  // 'readyToPlay' after them, so a later, unrelated statusChange (e.g.
-  // a brief re-buffer mid-playback) never re-logs a stale "startup."
-  // Refs, not state: this is a one-shot measurement with no UI to
-  // re-render for, and a state write here would just be extra renders
-  // this component doesn't need.
+  // below; `urlSourceRef` labels where that URL actually came from.
+  // `urlAssignedAtRef` is consumed (reset to null) the first time the
+  // player reports 'readyToPlay' after it's set, so a later, unrelated
+  // statusChange (e.g. a brief re-buffer mid-playback) never re-measures
+  // a stale "startup." Refs, not state: these are one-shot/latest-value
+  // measurements with no UI to re-render for.
   const urlAssignedAtRef = useRef<number | null>(null);
   const urlSourceRef = useRef<'r2-persisted' | 'cache-hit' | 'cache-miss' | null>(null);
+  // Step 11E — how long resolveReelVideoPlaybackUrl itself took for the
+  // most recent resolution (Firestore/getDownloadURL time for a Firebase
+  // Reel, a cache-hit's near-zero Map lookup, or an R2 Reel's synchronous
+  // persisted-URL read) — measured separately from urlAssignedAtRef so a
+  // slow URL resolution and a slow native buffer are never conflated into
+  // one undifferentiated number. Never reset to null on consumption (an
+  // aborted/prewarmed activation simply doesn't read it) — the NEXT
+  // resolution effect run always overwrites it before it's read again.
+  const urlResolutionMsRef = useRef<number | null>(null);
   // Mirrors the `isActive` prop for the statusChange listener below,
   // which is keyed only on `[player, isPhoto]` (re-subscribing on every
   // isActive change would leak listeners — see that effect's own doc
@@ -123,9 +167,83 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
   // the current one, for a component instance that genuinely does
   // transition active -> inactive -> active again while staying mounted.
   const isActiveRef = useRef(isActive);
+  // Step 11E — same "read the LATEST value inside a stable-keyed effect"
+  // pattern as isActiveRef above, for the statusChange listener's own
+  // completion record (that effect is also keyed only on [player,
+  // isPhoto], never on networkClass — a network-class CHANGE mid-playback
+  // must never tear down and recreate the player's own listener).
+  const networkClassRef = useRef(networkClass);
   useEffect(() => {
+    networkClassRef.current = networkClass;
+  }, [networkClass]);
+  // Step 11E — the latest ReelPreparationLevel this item held while NOT
+  // 'active' — i.e. its level right before whatever activation is about
+  // to happen. Read the instant isActive flips true, in the effect below.
+  const priorLevelRef = useRef<PriorReelPreparationLevel>('cold');
+  useEffect(() => {
+    if (preparationLevel !== 'active') {
+      priorLevelRef.current = preparationLevel;
+    }
+  }, [preparationLevel]);
+  // Step 11E — the in-flight measurement for an activation that hasn't
+  // reached readyToPlay yet. `null` whenever nothing is pending: no
+  // activation has happened yet, the last one already completed or
+  // aborted, or the most recent activation was PREWARMED and needed no
+  // pending record at all (see isPrewarmedActivation).
+  const pendingStartupRef = useRef<PendingReelStartup | null>(null);
+
+  useEffect(() => {
+    const wasActive = isActiveRef.current;
     isActiveRef.current = isActive;
-  }, [isActive]);
+    // Photos have no player/readyToPlay concept at all — Step 11E
+    // instrumentation is video-only, same scope as Step 11D's own
+    // startup metric (see this file's own isPhoto-gated effects below).
+    if (isPhoto) return;
+    if (isActive && !wasActive) {
+      // A fresh activation — classify it, then either emit an immediate
+      // PREWARMED completion (the player already reached readyToPlay
+      // while merely warm, so there is nothing left to wait for — Step
+      // 11D's own gap: this case previously produced NO record at all,
+      // since readyToPlay had already fired once before activation) or
+      // arm a pending record for the statusChange listener below to
+      // complete once a real readyToPlay arrives.
+      const { startupType } = recordReelActivation(reel.reelId);
+      if (isPrewarmedActivation(priorLevelRef.current, isVideoReady)) {
+        if (determineStartupOutcome({ reachedReady: true }) === 'completed') {
+          recordReelPlaybackCompletion({
+            reelId: reel.reelId,
+            networkClass: networkClassRef.current,
+            priorLevel: priorLevelRef.current,
+            startupType,
+            urlSource: urlSourceRef.current ?? 'cache-miss',
+            urlResolutionMs: urlResolutionMsRef.current,
+            sourceToReadyMs: null,
+            activeToReadyMs: 0,
+            prewarmed: true,
+          });
+        }
+        pendingStartupRef.current = null;
+      } else {
+        pendingStartupRef.current = { activatedAt: Date.now(), priorLevel: priorLevelRef.current, startupType };
+      }
+    } else if (!isActive && wasActive && pendingStartupRef.current) {
+      // Scrolled away before readyToPlay ever fired — an aborted
+      // attempt, never a fake completed measurement (Step 11D's silent
+      // drop here is now an explicit, logged, non-noisy dev event).
+      if (determineStartupOutcome({ reachedReady: false }) === 'aborted') {
+        recordReelPlaybackAborted(reel.reelId);
+      }
+      pendingStartupRef.current = null;
+    }
+    // Deliberately excludes networkClass/preparationLevel — both are read
+    // via their own refs (networkClassRef/priorLevelRef) so a value
+    // change that ISN'T an isActive/isVideoReady transition never
+    // re-evaluates this activation logic; the ref-based wasActive
+    // comparison above already makes any extra re-run (from isVideoReady
+    // alone changing while isActive stays the same) a safe no-op in both
+    // branches.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isActive, isPhoto, isVideoReady, reel.reelId]);
 
   const [isLiked, setIsLiked] = useState(false);
   const [likeCount, setLikeCount] = useState(0);
@@ -191,6 +309,11 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
       // later re-entry into the warm window log a bogus, huge "startup."
       urlAssignedAtRef.current = null;
       urlSourceRef.current = null;
+      // Step 11E — same reasoning, extended to the newer refs: a
+      // released item's pending activation measurement and resolution
+      // timing are both stale the moment it's out of the preload window.
+      urlResolutionMsRef.current = null;
+      pendingStartupRef.current = null;
       return;
     }
     // Resets fresh whenever the item's own reel (and therefore its
@@ -205,6 +328,10 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
     // labeled 'r2-persisted', never a guess). Dev-only measurement, read
     // by the statusChange listener below.
     urlSourceRef.current = reel.storageProvider === 'r2' ? 'r2-persisted' : isReelPlaybackUrlCached(reel.storagePath) ? 'cache-hit' : 'cache-miss';
+    // Step 11E — resolution-start timestamp for urlResolutionMs below;
+    // deliberately a local variable, not a ref — this value is only ever
+    // needed inside THIS specific `.then` callback, never read elsewhere.
+    const resolutionStartedAt = Date.now();
     // Step 9A — branches on this Reel's OWN persisted storageProvider
     // (Firebase, resolved lazily via the same resolveReelPlaybackUrl
     // cache as before; or R2, already resolved at upload-confirm time) —
@@ -212,6 +339,10 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
     resolveReelVideoPlaybackUrl(reel).then((url) => {
       if (cancelled) return;
       if (url) {
+        // Step 11E — how long THIS resolution actually took — a cheap
+        // cache-hit/R2-persisted read measures near-zero here, a real
+        // Firebase getDownloadURL measures its real network round trip.
+        urlResolutionMsRef.current = Date.now() - resolutionStartedAt;
         // Step 11D — the moment a real source is about to be handed to
         // the player (see useVideoPlayer below) — this IS "source
         // assigned," the start of the startup-latency window the
@@ -470,15 +601,37 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
       // thumbnail (shown instead of a blank state up to now) is no
       // longer needed. See isVideoReady's own doc comment above.
       setIsVideoReady(playerStatus === 'readyToPlay');
-      // Step 11D — dev-only startup-latency log, consumed exactly once
-      // per resolved URL: urlAssignedAtRef is cleared the first time this
-      // fires after it was set, so a later re-buffer mid-playback (also
-      // reported as a fresh 'readyToPlay') never logs a second, bogus
-      // "startup." See src/utils/reelPlaybackMetrics.ts.
-      if (playerStatus === 'readyToPlay' && urlAssignedAtRef.current !== null) {
-        const startupMs = Date.now() - urlAssignedAtRef.current;
+      // Step 11E — completes the PENDING activation measurement armed by
+      // the activation-tracking effect above, exactly once per activation
+      // (consumePendingStartup finds `pending` already cleared on any
+      // later re-buffer's own 'readyToPlay', so that never double-logs —
+      // see src/utils/reelPlaybackSessionState.ts). A readyToPlay that
+      // fires with nothing pending (a WARM player finishing its buffer
+      // while not yet active, or a rebuffer after this activation already
+      // completed) is correctly a silent no-op: Step 11D's own gap here
+      // (logging every readyToPlay regardless of activation) is what Step
+      // 11E's whole redesign replaces.
+      if (playerStatus === 'readyToPlay') {
+        const pending = pendingStartupRef.current;
+        const { shouldRecord } = consumePendingStartup(pending);
+        if (shouldRecord && pending && determineStartupOutcome({ reachedReady: true }) === 'completed') {
+          const now = Date.now();
+          recordReelPlaybackCompletion({
+            reelId: reel.reelId,
+            networkClass: networkClassRef.current,
+            priorLevel: pending.priorLevel,
+            startupType: pending.startupType,
+            urlSource: urlSourceRef.current ?? 'cache-miss',
+            urlResolutionMs: urlResolutionMsRef.current,
+            sourceToReadyMs: urlAssignedAtRef.current !== null ? now - urlAssignedAtRef.current : null,
+            activeToReadyMs: now - pending.activatedAt,
+            prewarmed: false,
+          });
+          pendingStartupRef.current = null;
+        }
+        // Consumed regardless of whether a pending record existed — same
+        // one-shot-per-resolved-URL reasoning as Step 11D.
         urlAssignedAtRef.current = null;
-        recordReelPlaybackStartup(reel.reelId, isActiveRef.current ? 'active' : 'warm', startupMs, urlSourceRef.current ?? 'cache-miss');
       }
     });
     return () => {
@@ -687,11 +840,22 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
     setPlaybackFailed(false);
     setUrlStatus('loading');
     setIsVideoReady(false);
-    // Step 11D — same measurement capture as the main resolution effect
-    // above, so a manual retry's own startup latency is measured too.
+    // Step 11D/11E — same measurement capture as the main resolution
+    // effect above. Deliberately does NOT re-arm pendingStartupRef: a
+    // manual retry is the SAME viewing session/activation, not a new
+    // scroll-to-this-Reel event, so it must never call
+    // recordReelActivation again (that would inflate activationCount and
+    // skew first-view/scroll-back classification). Its sourceToReadyMs is
+    // still captured in the refs below, but — same as any other
+    // non-activation-triggered readyToPlay (e.g. a plain WARM buffer
+    // completing) — it simply produces no completion record, consistent
+    // with every other call site's "completion records are
+    // activation-triggered only" rule.
     urlSourceRef.current = reel.storageProvider === 'r2' ? 'r2-persisted' : isReelPlaybackUrlCached(reel.storagePath) ? 'cache-hit' : 'cache-miss';
+    const resolutionStartedAt = Date.now();
     resolveReelVideoPlaybackUrl(reel).then((url) => {
       if (url) {
+        urlResolutionMsRef.current = Date.now() - resolutionStartedAt;
         urlAssignedAtRef.current = Date.now();
         setPlaybackUrl(url);
         setUrlStatus('ready');

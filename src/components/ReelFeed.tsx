@@ -402,28 +402,36 @@ export function ReelFeed({
             // both scrolled-to and marked active/playing from the start,
             // not just scrolled-to.
             initialScrollIndex={initialIndex != null ? Math.min(Math.max(initialIndex, 0), reels.length - 1) : undefined}
-            renderItem={({ item, index }) => (
-              <ReelFeedItem
-                reel={item}
-                height={containerHeight}
-                isActive={index === activeIndex && isScreenFocused}
-                // Step 11D — byte-identical to the pre-11D
-                // `Math.abs(index - activeIndex) <= 1` for every network
-                // class (WARM_WINDOW is still 1 unconditionally — see
-                // reelPreparationPolicy.ts's own doc comment for why);
-                // now computed through the shared policy function instead
-                // of an inline literal, so this and the LIGHT-tier effect
-                // above can never silently drift apart. Step 11D.1: still
-                // byte-identical in practice (WARM_WINDOW doesn't vary by
-                // network class), now driven by the live `networkClass`
-                // instead of a hardcoded constant for consistency.
-                shouldPrepare={isWithinWarmWindow(computeReelPreparationLevel({ index, activeIndex, networkClass }))}
-                onOpenOptions={() => setOptionsReel(item)}
-                onToast={showToast}
-                attribution={attributionByReelId?.[item.reelId]}
-                feedSessionId={feedSessionId}
-              />
-            )}
+            renderItem={({ item, index }) => {
+              // Step 11D — byte-identical to the pre-11D
+              // `Math.abs(index - activeIndex) <= 1` for every network
+              // class (WARM_WINDOW is still 1 unconditionally — see
+              // reelPreparationPolicy.ts's own doc comment for why); now
+              // computed through the shared policy function instead of an
+              // inline literal, so this and the LIGHT-tier effect above
+              // can never silently drift apart. Step 11D.1: driven by the
+              // live `networkClass` instead of a hardcoded constant.
+              // Step 11E — computed once per item per render and passed
+              // down as `preparationLevel` too (dev-measurement context
+              // only — see ReelFeedItem's own doc comment for that prop;
+              // `shouldPrepare` below remains the only thing that affects
+              // real player/URL behavior, unchanged).
+              const preparationLevel = computeReelPreparationLevel({ index, activeIndex, networkClass });
+              return (
+                <ReelFeedItem
+                  reel={item}
+                  height={containerHeight}
+                  isActive={index === activeIndex && isScreenFocused}
+                  shouldPrepare={isWithinWarmWindow(preparationLevel)}
+                  preparationLevel={preparationLevel}
+                  networkClass={networkClass}
+                  onOpenOptions={() => setOptionsReel(item)}
+                  onToast={showToast}
+                  attribution={attributionByReelId?.[item.reelId]}
+                  feedSessionId={feedSessionId}
+                />
+              );
+            }}
             pagingEnabled
             showsVerticalScrollIndicator={false}
             decelerationRate="fast"
