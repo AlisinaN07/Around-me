@@ -20,7 +20,8 @@
  * with no adapter/wrapper needed.
  */
 import { reelSourceKey, storySourceKey } from './objectKey';
-import { copyR2Object, deleteR2Object, downloadR2ObjectBuffer, putR2Object } from './r2Storage';
+import { copyR2Object, deleteR2Object, downloadR2ObjectBuffer, headR2ObjectDetails, putR2Object } from './r2Storage';
+import { buildReelVideoNormalizationMetadata, REEL_VIDEO_NORMALIZATION_METADATA_KEY } from './reelVideoProfile';
 
 export type RawReelData = Record<string, unknown>;
 
@@ -37,12 +38,33 @@ export interface BucketFileLike {
   // BucketFileLike/File in practice.
   copy(destination: any): Promise<unknown>;
   save(data: Buffer, options?: { contentType?: string }): Promise<unknown>;
+  /**
+   * Step 11B — a METADATA-ONLY read (never downloads the object's body) —
+   * the real `@google-cloud/storage` File.getMetadata() already returns
+   * exactly this shape (confirmed against the installed package's own
+   * FileMetadata type: `size` as a string, custom key/value pairs nested
+   * under `metadata.metadata`), so no adapter is needed at the one real
+   * production call site. Used by readReelCanonicalSourceState below to
+   * check a Reel's own normalization marker without fetching its (up to
+   * tens-of-megabytes) video bytes just to check a flag.
+   */
+  getMetadata(): Promise<[{ size?: string | number; metadata?: Record<string, unknown> }, unknown]>;
 }
 
 export interface BucketLike {
   file(path: string): BucketFileLike;
-  /** Uploads a LOCAL file to `options.destination` — the real `@google-cloud/storage` Bucket.upload's own shape, used only by uploadMuxedReelSourceToProvider's Firebase branch (an unchanged carry-over of muxReelMusic's own pre-Step-9B behavior). */
-  upload(localPath: string, options: { destination: string; metadata?: { contentType?: string } }): Promise<unknown>;
+  /**
+   * Uploads a LOCAL file to `options.destination` — the real
+   * `@google-cloud/storage` Bucket.upload's own shape, used only by
+   * uploadMuxedReelSourceToProvider's Firebase branch (an unchanged
+   * carry-over of muxReelMusic's own pre-Step-9B behavior). Step 11B —
+   * `metadata.metadata` is the real GCS "custom metadata" bag (confirmed
+   * against the installed package's own FileMetadata type:
+   * `metadata?: {[key:string]: string|boolean|number|null}`), used to
+   * stamp the same normalization marker R2 gets via putR2Object's own
+   * `metadata` parameter.
+   */
+  upload(localPath: string, options: { destination: string; metadata?: { contentType?: string; metadata?: Record<string, string> } }): Promise<unknown>;
 }
 
 /**
@@ -253,12 +275,14 @@ export async function copyReelSourceToR2StoryObject(
 export interface R2ObjectDeps {
   /** Defaults to the real, authenticated downloadR2ObjectBuffer — overridden in tests with a fake in-memory object store. */
   getObject?: (key: string) => Promise<Buffer>;
-  /** Defaults to the real, authenticated putR2Object — overridden in tests the same way. */
-  putObject?: (key: string, data: Buffer, contentType: string, cacheControl?: string) => Promise<void>;
+  /** Defaults to the real, authenticated putR2Object — overridden in tests the same way. Step 11B — `metadata`, when given, is attached as real object metadata (see putR2Object's own doc comment). */
+  putObject?: (key: string, data: Buffer, contentType: string, cacheControl?: string, metadata?: Record<string, string>) => Promise<void>;
   /** Defaults to `node:fs/promises`' own `writeFile` — see DownloadDeps' own doc comment on why this is overridable. */
   writeFileImpl?: (path: string, data: Buffer) => Promise<void>;
   /** Defaults to `node:fs/promises`' own `readFile`. */
   readFileImpl?: (path: string) => Promise<Buffer>;
+  /** Step 11B — defaults to the real, authenticated headR2ObjectDetails — overridden in tests. Used only by readReelCanonicalSourceState below. */
+  headObject?: (key: string) => Promise<{ sizeBytes: number; metadata: Record<string, string> } | null>;
 }
 
 /**
@@ -322,6 +346,16 @@ export async function downloadReelSourceForMux(
  * `cacheControl` is only ever meaningful for the R2 branch — see
  * putR2Object's own doc comment — and is ignored for Firebase (Firebase
  * Storage's own metadata/caching is unrelated to this step's scope).
+ *
+ * Step 11B — EVERY call site of this function (finalizeReelVideo/
+ * muxReelMusic/renderPhotoToVideo) is, by construction, writing a real,
+ * final, normalized asset at REEL_VIDEO_PROFILE — so this unconditionally
+ * stamps buildReelVideoNormalizationMetadata()'s marker onto the object
+ * on BOTH backends, in the exact same write that replaces its bytes. This
+ * is what makes a LATER retry (after e.g. a Firestore confirm-write
+ * failure) able to tell "already normalized" from "still raw" via a real
+ * storage fact, never a guess — see readReelCanonicalSourceState below,
+ * the read-side counterpart.
  */
 export async function uploadMuxedReelSourceToProvider(
   bucket: BucketLike,
@@ -333,6 +367,7 @@ export async function uploadMuxedReelSourceToProvider(
   cacheControl: string | undefined,
   deps: R2ObjectDeps = {}
 ): Promise<void> {
+  const normalizationMetadata = buildReelVideoNormalizationMetadata();
   if (reel.storageProvider === 'r2') {
     const putObject = deps.putObject ?? putR2Object;
     const readFileImpl =
@@ -342,8 +377,58 @@ export async function uploadMuxedReelSourceToProvider(
         return readFile(path);
       });
     const data = await readFileImpl(localFilePath);
-    await putObject(reelSourceKey(uid, reelId), data, contentType, cacheControl);
+    await putObject(reelSourceKey(uid, reelId), data, contentType, cacheControl, normalizationMetadata);
     return;
   }
-  await bucket.upload(localFilePath, { destination: reel.storagePath as string, metadata: { contentType } });
+  await bucket.upload(localFilePath, { destination: reel.storagePath as string, metadata: { contentType, metadata: normalizationMetadata } });
+}
+
+/**
+ * Step 11B — the READ-side counterpart to uploadMuxedReelSourceToProvider's
+ * normalization stamp: a METADATA-ONLY check (never downloads the
+ * object's full video bytes) of whether a Reel's CURRENT canonical source
+ * object already carries this codebase's own current-profile
+ * normalization marker. Returns `null` when the object doesn't exist yet,
+ * or on ANY read failure — deliberately fail-SAFE (see
+ * isReelSourceAlreadyNormalized's own doc comment): the caller
+ * (performReelVideoFinalization/performReelMux) treats `null` as "cannot
+ * confirm — run the full finalization pipeline," never as "assume
+ * already done."
+ *
+ * Provider-aware exactly like downloadReelSourceForMux above: an
+ * AUTHENTICATED read either way (bucket.file().getMetadata() for
+ * Firebase, headR2ObjectDetails/HeadObjectCommand for R2) — never the
+ * object's own public delivery URL, and never trusts `reel.sourceUrl`/
+ * `reel.sourceNormalized` as if either were itself proof of the object's
+ * real current state (that's exactly the gap this step closes: Firestore
+ * can say `sourceNormalized: false` while the OBJECT already holds the
+ * final bytes, if a prior confirm-write failed after the upload already
+ * succeeded).
+ */
+export async function readReelCanonicalSourceState(
+  bucket: BucketLike,
+  reel: RawReelData,
+  uid: string,
+  reelId: string,
+  deps: R2ObjectDeps = {}
+): Promise<{ sizeBytes: number; normalizationMarker: string | null } | null> {
+  if (reel.storageProvider === 'r2') {
+    const headObject = deps.headObject ?? headR2ObjectDetails;
+    const result = await headObject(reelSourceKey(uid, reelId));
+    if (!result) return null;
+    return { sizeBytes: result.sizeBytes, normalizationMarker: result.metadata[REEL_VIDEO_NORMALIZATION_METADATA_KEY] ?? null };
+  }
+  try {
+    const file = bucket.file(reel.storagePath as string);
+    const [metadata] = await file.getMetadata();
+    const sizeBytes = typeof metadata.size === 'string' ? Number.parseInt(metadata.size, 10) : (metadata.size ?? 0);
+    if (!Number.isFinite(sizeBytes) || sizeBytes <= 0) return null;
+    const rawMarker = metadata.metadata?.[REEL_VIDEO_NORMALIZATION_METADATA_KEY];
+    return { sizeBytes, normalizationMarker: typeof rawMarker === 'string' ? rawMarker : null };
+  } catch {
+    // Object doesn't exist yet, or a transient metadata-read error — fail
+    // safe: treat exactly like "not normalized," never like "already
+    // done."
+    return null;
+  }
 }

@@ -61,14 +61,17 @@ import ffmpegPath from 'ffmpeg-static';
 
 import { buildMediaUrl } from './media/mediaUrl';
 import { reelSourceKey, storySourceKey } from './media/objectKey';
-import { checkReelMuxEligibility, checkReelPhotoRenderEligibility } from './media/reelEligibility';
+import { checkReelMuxEligibility, checkReelPhotoRenderEligibility, checkReelVideoFinalizationEligibility } from './media/reelEligibility';
 import { cleanupReelOwnedMedia, cleanupReelOwnedMediaWithoutDocument, type ReelMediaCleanupResult } from './media/reelMediaCleanup';
 import { performReelMux, type ReelMuxFailureReason } from './media/reelMuxOrchestration';
+import { performReelVideoFinalization, type ReelVideoFinalizationFailureReason } from './media/reelVideoFinalization';
+import { buildReelVideoEncodeArgs, computeReelVideoOutputDimensions } from './media/reelVideoProfile';
 import {
   copyReelSourceToFirebaseStoryObject,
   copyReelSourceToR2StoryObject,
   downloadReelSourceForMux,
   downloadReelSourceToLocalFile,
+  readReelCanonicalSourceState,
   uploadMuxedReelSourceToProvider,
   type RawReelData,
 } from './media/reelSourceStorage';
@@ -1753,11 +1756,24 @@ export const muxReelMusic = onCall(
 
     try {
       const outcome = await performReelMux(paths, {
+        // Step 11B — true idempotency: see reelMuxOrchestration.ts's own
+        // top doc comment for why this check runs before anything else.
+        readCanonicalSourceState: () => readReelCanonicalSourceState(bucket, reelData, uid, reelId),
         downloadVideo: (destination) => downloadReelSourceForMux(bucket, reelData, uid, reelId, destination),
         // Step 10B — provider-aware (see reelMusicStorage.ts's own doc
         // comment): this Reel's own standalone music may now be on
         // Firebase or R2.
         downloadMusic: (destination) => downloadReelMusicToLocalFile(bucket, reelData, uid, reelId, destination),
+        // Step 11B — ONE encode pass does the music merge AND the
+        // universal delivery normalization together (see
+        // reelVideoProfile.ts's own doc comment for why this is the
+        // shared ffmpeg output profile every finalization pipeline uses)
+        // — replacing the pre-11B `-c:v copy` passthrough, which left a
+        // music Reel's own video stream completely untouched (original
+        // resolution/fps/codec/bitrate, whatever the device produced).
+        // Dimensions come from this Reel's own already-persisted
+        // width/height (see computeReelVideoOutputDimensions's own doc
+        // comment for why no ffprobe step is needed).
         runFfmpegMux: (localVideoPath, localMusicPath, localOutputPath) =>
           execFileAsync(
             ffmpegPath!,
@@ -1768,10 +1784,8 @@ export const muxReelMusic = onCall(
               '-i', localMusicPath,
               '-map', '0:v:0',
               '-map', '1:a:0',
-              '-c:v', 'copy',
-              '-c:a', 'aac',
-              '-b:a', '192k',
               '-shortest',
+              ...buildReelVideoEncodeArgs(computeReelVideoOutputDimensions(reelData.width as number, reelData.height as number)),
               localOutputPath,
             ],
             { timeout: 240_000 }
@@ -1798,7 +1812,15 @@ export const muxReelMusic = onCall(
           if (!publicMediaBaseUrl) return null;
           return buildMediaUrl(publicMediaBaseUrl, reelSourceKey(uid, reelId), Date.now());
         },
-      });
+      },
+      // Step 11B — the mux encode pass ALREADY applies the shared
+      // REEL_VIDEO_PROFILE above, so this Reel's video is just as
+      // "finalized" as one that went through finalizeReelVideo —
+      // recorded in the exact same atomic confirm-write, via the same
+      // extraConfirmFields mechanism renderPhotoToVideo already uses
+      // below, so no reader can ever see a published music Reel with
+      // `sourceNormalized` still false.
+      { sourceNormalized: true });
 
       if (!outcome.ok) {
         throw new HttpsError(outcome.reason === 'video-unavailable' || outcome.reason === 'music-unavailable' ? 'failed-precondition' : 'internal', muxFailureMessage(outcome.reason));
@@ -1908,6 +1930,10 @@ export const renderPhotoToVideo = onCall(
       const outcome = await performReelMux(
         paths,
         {
+          // Step 11B — true idempotency: see reelMuxOrchestration.ts's
+          // own top doc comment for why this check runs before anything
+          // else — never re-render an already-normalized photo video.
+          readCanonicalSourceState: () => readReelCanonicalSourceState(bucket, reelData, uid, reelId),
           // performReelMux's own `downloadVideo` slot — here downloading
           // the ORIGINAL PHOTO, provider-aware exactly like muxReelMusic's
           // own video download (see reelSourceStorage.ts: this helper
@@ -1916,6 +1942,20 @@ export const renderPhotoToVideo = onCall(
           // Step 10B — provider-aware (see reelMusicStorage.ts's own doc
           // comment).
           downloadMusic: (destination) => downloadReelMusicToLocalFile(bucket, reelData, uid, reelId, destination),
+          // Step 11B — reuses the exact same shared encode profile as
+          // muxReelMusic and finalizeReelVideo (see reelVideoProfile.ts's
+          // own doc comment) instead of this workflow's own separate,
+          // looser settings (no resolution cap, implicit CRF, no
+          // faststart, 192k audio) — this render itself now produces the
+          // FINAL normalized delivery asset directly, with no second
+          // transcode needed afterward. `-tune stillimage` is kept as an
+          // ADDITION on top of the shared profile, not part of it: x264's
+          // own tuning for genuinely static source content, which applies
+          // ONLY here (a true `-loop 1` still image) and would be wrong
+          // for muxReelMusic's/finalizeReelVideo's own real motion video
+          // inputs. Dimensions come from this Reel's own already-
+          // persisted width/height — the ORIGINAL PHOTO's dimensions,
+          // same field read elsewhere for this exact Reel variant.
           runFfmpegMux: (localPhotoPath, localMusicPath, localOutputPath) =>
             execFileAsync(
               ffmpegPath!,
@@ -1927,13 +1967,9 @@ export const renderPhotoToVideo = onCall(
                 '-i', localMusicPath,
                 '-map', '0:v:0',
                 '-map', '1:a:0',
-                '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
-                '-c:v', 'libx264',
-                '-tune', 'stillimage',
-                '-pix_fmt', 'yuv420p',
-                '-c:a', 'aac',
-                '-b:a', '192k',
                 '-t', String(REEL_PHOTO_RENDER_DURATION_SECONDS),
+                '-tune', 'stillimage',
+                ...buildReelVideoEncodeArgs(computeReelVideoOutputDimensions(reelData.width as number, reelData.height as number)),
                 localOutputPath,
               ],
               { timeout: 240_000 }
@@ -1961,10 +1997,15 @@ export const renderPhotoToVideo = onCall(
             return buildMediaUrl(publicMediaBaseUrl, reelSourceKey(uid, reelId), Date.now());
           },
         },
-        // The one extra field this workflow needs, atomically, in the
+        // The extra fields this workflow needs, atomically, in the
         // SAME confirm-write that records the render succeeded — see
-        // this function's own top doc comment.
-        { needsPhotoVideoRender: false }
+        // this function's own top doc comment. sourceNormalized: true
+        // (Step 11B) — the render's own ffmpeg pass already applies the
+        // shared REEL_VIDEO_PROFILE above, so a rendered Reel is exactly
+        // as "finalized" as a plain video that went through
+        // finalizeReelVideo or a music Reel muxReelMusic already
+        // finalized the same way.
+        { needsPhotoVideoRender: false, sourceNormalized: true }
       );
 
       if (!outcome.ok) {
@@ -1978,6 +2019,148 @@ export const renderPhotoToVideo = onCall(
     }
 
     return { reelId, rendered: true as const };
+  }
+);
+
+/**
+ * Step 11B — maps a performReelVideoFinalization failure `reason` to a
+ * user-facing message, same convention as muxFailureMessage/
+ * photoRenderFailureMessage above.
+ */
+function reelVideoFinalizationFailureMessage(reason: ReelVideoFinalizationFailureReason): string {
+  switch (reason) {
+    case 'video-unavailable':
+      return 'Your video must finish uploading before it can be processed.';
+    default:
+      return "Couldn't finish processing this post's video.";
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Step 11B — UNIVERSAL REEL VIDEO NORMALIZATION, the plain-video branch:
+// closes the biggest pre-11B gap, where a Reel with NO music and NO
+// pending photo-render (checkReelVideoFinalizationEligibility's own exact
+// scope — see reelEligibility.ts) could reach publishReel having never
+// touched ffmpeg at all, leaving its video exactly whatever the device
+// camera/library produced (up to 4K/60fps/HEVC/high-bitrate/non-faststart
+// — see this step's own audit). A video+music Reel is finalized by
+// muxReelMusic above (same encode pass that merges the music in); a
+// render-pending Reel is finalized by renderPhotoToVideo above (same
+// encode pass that renders it); a plain photo Reel never reaches ffmpeg
+// at all (Part 9 of this step's spec — it is not a video). This callable
+// is the ONLY one of the three that exists purely to add normalization
+// where NOTHING else in the pipeline already produces a real encode.
+//
+// Called from src/app/(app)/create/reel/index.tsx's own plain-video
+// publish path, between the thumbnail upload finishing and publishReel —
+// publishReel itself additionally REFUSES to run at all for a video Reel
+// whose `sourceNormalized` isn't already `true` (see firestore.rules'
+// own isValidReelPublish), so this is a real server-enforced invariant,
+// not just client-side call-ordering discipline.
+//
+// IDEMPOTENT: a Reel whose `sourceNormalized` is already `true` (a retry
+// after this callable's own confirm-write already succeeded, but some
+// LATER step — e.g. publishReel itself — failed) short-circuits here with
+// no download/ffmpeg/upload at all, per Part 13 of this step's spec.
+// ---------------------------------------------------------------------------
+
+export const finalizeReelVideo = onCall(
+  { region: REGION, timeoutSeconds: 300, memory: '1GiB', secrets: [r2AccessKeyIdSecret, r2SecretAccessKeySecret] },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError('unauthenticated', 'Sign in required.');
+    }
+    const reelId = parseReelIdParam(request);
+    const uid = request.auth.uid;
+
+    const db = getFirestore();
+    const reelDocRef = db.doc(`reels/${reelId}`);
+    const reelSnap = await reelDocRef.get();
+    const reel = reelSnap.exists ? (reelSnap.data() as Record<string, unknown>) : null;
+    const eligibility = checkReelVideoFinalizationEligibility(reel, uid);
+    if (!eligibility.ok) {
+      throw new HttpsError(eligibility.code, eligibility.message);
+    }
+    // eligibility.ok guarantees `reel` is non-null.
+    const reelData = reel as Record<string, unknown>;
+
+    // Idempotency short-circuit — see this function's own top doc
+    // comment. Deliberately checked HERE, not inside
+    // checkReelVideoFinalizationEligibility: "already normalized" is a
+    // legitimate different OUTCOME (a no-op success), never a rejection.
+    if (reelData.sourceNormalized === true) {
+      return { reelId, finalized: true as const, alreadyNormalized: true as const };
+    }
+
+    if (!ffmpegPath) {
+      // Genuinely unexpected (ffmpeg-static failed to resolve a binary for
+      // this runtime) — never silently skip normalization and publish the
+      // raw, un-processed upload as if it were already finalized.
+      throw new HttpsError('internal', "Couldn't process this post's video.");
+    }
+
+    const bucket = getStorage().bucket();
+    // Provider-aware, same convention as muxReelMusic/renderPhotoToVideo
+    // above: `undefined` (a legacy Reel predating storageProvider)
+    // defaults to 'firebase'.
+    const videoProvider = (reelData.storageProvider as string | undefined) ?? 'firebase';
+
+    const workDir = await mkdtemp(join(tmpdir(), `reel-finalize-${reelId}-`));
+    const paths = {
+      localVideoPath: join(workDir, 'input-video'),
+      localOutputPath: join(workDir, 'output.mp4'),
+    };
+
+    try {
+      const outcome = await performReelVideoFinalization(paths, {
+        // Step 11B — true idempotency: see reelVideoFinalization.ts's own
+        // top doc comment for why this check runs before anything else.
+        readCanonicalSourceState: () => readReelCanonicalSourceState(bucket, reelData, uid, reelId),
+        downloadVideo: (destination) => downloadReelSourceForMux(bucket, reelData, uid, reelId, destination),
+        // Step 11B — the single shared encode profile (see
+        // reelVideoProfile.ts's own doc comment) — the ONE ffmpeg input
+        // is this Reel's own current video source; no second input, no
+        // mapping needed (ffmpeg's own default stream selection already
+        // picks the first video+audio stream of a single-file input,
+        // which re-encodes the device's own embedded audio track to AAC
+        // too, exactly as intended).
+        runFfmpegNormalize: (localVideoPath, localOutputPath) =>
+          execFileAsync(
+            ffmpegPath!,
+            [
+              '-y',
+              '-i', localVideoPath,
+              ...buildReelVideoEncodeArgs(computeReelVideoOutputDimensions(reelData.width as number, reelData.height as number)),
+              localOutputPath,
+            ],
+            { timeout: 240_000 }
+          ).then(() => undefined),
+        statFileSize: async (path) => (await stat(path)).size,
+        uploadNormalizedVideo: (localOutputPath) =>
+          uploadMuxedReelSourceToProvider(bucket, reelData, uid, reelId, localOutputPath, 'video/mp4', muxedVideoCacheControl(videoProvider)),
+        updateReelDocument: (fields) => reelDocRef.update({ ...fields, updatedAt: FieldValue.serverTimestamp() }).then(() => undefined),
+        buildVersionedSourceUrl: () => {
+          if (videoProvider !== 'r2') return null;
+          const publicMediaBaseUrl = getR2Config()?.publicMediaBaseUrl ?? null;
+          if (!publicMediaBaseUrl) return null;
+          return buildMediaUrl(publicMediaBaseUrl, reelSourceKey(uid, reelId), Date.now());
+        },
+      });
+
+      if (!outcome.ok) {
+        throw new HttpsError(
+          outcome.reason === 'video-unavailable' ? 'failed-precondition' : 'internal',
+          reelVideoFinalizationFailureMessage(outcome.reason)
+        );
+      }
+    } catch (error) {
+      if (error instanceof HttpsError) throw error;
+      throw new HttpsError('internal', "Couldn't process this post's video.");
+    } finally {
+      await rm(workDir, { recursive: true, force: true });
+    }
+
+    return { reelId, finalized: true as const, alreadyNormalized: false as const };
   }
 );
 

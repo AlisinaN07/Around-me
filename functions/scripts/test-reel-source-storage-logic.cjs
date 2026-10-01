@@ -27,7 +27,9 @@ const {
   deleteReelSourceMedia,
   downloadReelSourceToLocalFile,
   copyReelSourceToFirebaseStoryObject,
+  readReelCanonicalSourceState,
 } = require('../lib/media/reelSourceStorage.js');
+const { REEL_VIDEO_NORMALIZATION_METADATA_KEY, buildReelVideoNormalizationMetadata } = require('../lib/media/reelVideoProfile.js');
 const { startFakeDeliveryServer } = require('./testHelpers/fakeHttpMediaServer.cjs');
 
 const results = [];
@@ -40,10 +42,19 @@ async function check(name, fn) {
   }
 }
 
-/** A minimal fake Bucket satisfying reelSourceStorage.ts's own BucketLike/BucketFileLike shape, with call-recording so tests can assert exactly what was invoked. */
-function makeFakeBucket(initialFiles = {}) {
+/**
+ * A minimal fake Bucket satisfying reelSourceStorage.ts's own
+ * BucketLike/BucketFileLike shape, with call-recording so tests can
+ * assert exactly what was invoked. `fileMetadata` (keyed by path) backs
+ * getMetadata() for the Step 11B canonical-state-read tests below —
+ * `{size, metadata}` per entry; a path with no entry simulates a
+ * metadata-read failure (object missing, or a transient error), same
+ * fail-safe shape `readReelCanonicalSourceState` itself expects.
+ */
+function makeFakeBucket(initialFiles = {}, fileMetadata = {}) {
   const store = new Map(Object.entries(initialFiles));
-  const calls = { exists: [], delete: [], download: [], copy: [], save: [] };
+  const metadataStore = new Map(Object.entries(fileMetadata));
+  const calls = { exists: [], delete: [], download: [], copy: [], save: [], getMetadata: [] };
   const bucket = {
     store,
     calls,
@@ -69,6 +80,13 @@ function makeFakeBucket(initialFiles = {}) {
         async save(data, options) {
           calls.save.push({ path: filePath, options });
           store.set(filePath, data);
+        },
+        async getMetadata() {
+          calls.getMetadata.push(filePath);
+          if (!metadataStore.has(filePath)) {
+            throw new Error(`404: no object at "${filePath}"`);
+          }
+          return [metadataStore.get(filePath), {}];
         },
       };
     },
@@ -235,6 +253,81 @@ async function main() {
   });
 
   await server.close();
+
+  // -------------------------------------------------------------------
+  // Step 11B — readReelCanonicalSourceState: the idempotency fix's own
+  // READ side. Metadata-only (never downloads bytes), provider-aware,
+  // fail-safe on any read failure.
+  // -------------------------------------------------------------------
+
+  const normalizedMetadataValue = buildReelVideoNormalizationMetadata();
+
+  await check('canonical state: Firebase Reel whose object already carries the CURRENT normalization marker — returns the marker and real size, never touches R2', async () => {
+    const bucket = makeFakeBucket({}, { 'reels/u1/r1/source': { size: '12345', metadata: normalizedMetadataValue } });
+    const reel = { storageProvider: 'firebase', storagePath: 'reels/u1/r1/source' };
+    const result = await readReelCanonicalSourceState(bucket, reel, 'u1', 'r1');
+    assert.deepEqual(result, { sizeBytes: 12345, normalizationMarker: normalizedMetadataValue[REEL_VIDEO_NORMALIZATION_METADATA_KEY] });
+    assert.equal(bucket.calls.getMetadata.length, 1);
+    assert.equal(bucket.calls.download.length, 0, 'a metadata check must never download the full video');
+  });
+
+  await check('canonical state: Firebase Reel with NO marker at all (raw, never-finalized source) — returns normalizationMarker: null, real size still reported', async () => {
+    const bucket = makeFakeBucket({}, { 'reels/u1/r1/source': { size: 98765, metadata: {} } });
+    const reel = { storageProvider: 'firebase', storagePath: 'reels/u1/r1/source' };
+    const result = await readReelCanonicalSourceState(bucket, reel, 'u1', 'r1');
+    assert.deepEqual(result, { sizeBytes: 98765, normalizationMarker: null });
+  });
+
+  await check('canonical state: Firebase Reel whose object does not exist — getMetadata throws — returns null (fail-safe, never assumes normalized)', async () => {
+    const bucket = makeFakeBucket({}, {});
+    const reel = { storageProvider: 'firebase', storagePath: 'reels/u1/r1/source' };
+    const result = await readReelCanonicalSourceState(bucket, reel, 'u1', 'r1');
+    assert.equal(result, null);
+  });
+
+  await check('canonical state: Firebase Reel whose metadata read reports a zero/garbage size — treated as unreadable, returns null rather than a bogus fileSizeBytes', async () => {
+    const bucket = makeFakeBucket({}, { 'reels/u1/r1/source': { size: '0', metadata: normalizedMetadataValue } });
+    const reel = { storageProvider: 'firebase', storagePath: 'reels/u1/r1/source' };
+    const result = await readReelCanonicalSourceState(bucket, reel, 'u1', 'r1');
+    assert.equal(result, null);
+  });
+
+  await check('canonical state: R2 Reel whose object already carries the CURRENT normalization marker — uses the injected headObject, derives the key from uid/reelId, never touches the Firebase bucket', async () => {
+    const bucket = makeFakeBucket({});
+    const headCalls = [];
+    const headObject = async (key) => {
+      headCalls.push(key);
+      return { sizeBytes: 54321, metadata: normalizedMetadataValue };
+    };
+    const result = await readReelCanonicalSourceState(bucket, { storageProvider: 'r2' }, 'u1', 'r1', { headObject });
+    assert.deepEqual(result, { sizeBytes: 54321, normalizationMarker: normalizedMetadataValue[REEL_VIDEO_NORMALIZATION_METADATA_KEY] });
+    assert.deepEqual(headCalls, ['reels/u1/r1/source']);
+    assert.equal(bucket.calls.getMetadata.length, 0);
+  });
+
+  await check('canonical state: R2 Reel with no marker at all — returns normalizationMarker: null', async () => {
+    const headObject = async () => ({ sizeBytes: 111, metadata: {} });
+    const result = await readReelCanonicalSourceState(makeFakeBucket({}), { storageProvider: 'r2' }, 'u1', 'r1', { headObject });
+    assert.deepEqual(result, { sizeBytes: 111, normalizationMarker: null });
+  });
+
+  await check('canonical state: R2 Reel whose headObject reports the object missing (null) — returns null (fail-safe)', async () => {
+    const headObject = async () => null;
+    const result = await readReelCanonicalSourceState(makeFakeBucket({}), { storageProvider: 'r2' }, 'u1', 'r1', { headObject });
+    assert.equal(result, null);
+  });
+
+  await check('canonical state: R2 Reel with an OLDER/different profile-version marker — returned verbatim (the CALLER, isReelSourceAlreadyNormalized, decides it does not match — never pre-filtered here)', async () => {
+    const headObject = async () => ({ sizeBytes: 222, metadata: { [REEL_VIDEO_NORMALIZATION_METADATA_KEY]: '0' } });
+    const result = await readReelCanonicalSourceState(makeFakeBucket({}), { storageProvider: 'r2' }, 'u1', 'r1', { headObject });
+    assert.deepEqual(result, { sizeBytes: 222, normalizationMarker: '0' });
+  });
+
+  await check('canonical state: a legacy Reel missing storageProvider entirely defaults to Firebase', async () => {
+    const bucket = makeFakeBucket({}, { 'reels/u1/r1/source': { size: '5000', metadata: {} } });
+    const result = await readReelCanonicalSourceState(bucket, { storagePath: 'reels/u1/r1/source' }, 'u1', 'r1');
+    assert.deepEqual(result, { sizeBytes: 5000, normalizationMarker: null });
+  });
 
   console.log('\n=== functions/ Reel source storage (delete/download/copy) logic test results ===');
   let failures = 0;

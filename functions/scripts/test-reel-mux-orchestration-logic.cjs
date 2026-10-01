@@ -278,6 +278,129 @@ async function main() {
     assert.equal(calls.some((c) => c[0] === 'updateReelDocument'), false);
   });
 
+  // ---------------------------------------------------------------------------
+  // Step 11B — TRUE IDEMPOTENCY fix. Covers BOTH muxReelMusic (video+music)
+  // and renderPhotoToVideo (photo+music render) — both share this exact
+  // orchestration, so one set of tests here proves the fix for both real
+  // callables. Part 10's own explicit requirement: ffmpeg/mux must run
+  // exactly once across a confirm-failure-then-retry sequence, and the
+  // standalone music must be deleted exactly once, only after confirm
+  // actually succeeds.
+  // ---------------------------------------------------------------------------
+
+  const CURRENT_MARKER = '1'; // mirrors reelVideoProfile.ts's REEL_VIDEO_NORMALIZATION_PROFILE_VERSION's own stamped string value — kept as a literal here deliberately, so this file has ZERO import dependency on reelVideoProfile.ts (isReelSourceAlreadyNormalized's own exact-match behavior is already covered in test-reel-video-profile-logic.cjs; this file only needs performReelMux's own REACTION to a marker match/mismatch, via the real isReelSourceAlreadyNormalized the compiled orchestration itself imports).
+
+  await check('IDEMPOTENCY: canonical source already carries the CURRENT normalization marker — ffmpeg/video-download/upload are skipped, but music is STILL downloaded/hashed/resolved (needed for the confirm-write), and confirm+delete still run', async () => {
+    const { deps, calls } = makeDeps({ readCanonicalSourceState: async () => ({ sizeBytes: 4242, normalizationMarker: CURRENT_MARKER }) });
+    const outcome = await performReelMux(PATHS, deps);
+    assert.deepEqual(outcome, { ok: true });
+    assert.equal(calls.some((c) => c[0] === 'downloadVideo'), false, 'must never download the video when already normalized');
+    assert.equal(calls.some((c) => c[0] === 'runFfmpegMux'), false, 'must never mux/re-encode an already-normalized asset');
+    assert.equal(calls.some((c) => c[0] === 'uploadMuxedVideo'), false, 'must never re-upload — the canonical object is already correct');
+    assert.equal(calls.some((c) => c[0] === 'downloadMusic'), true, 'music must STILL be downloaded — its hash/sound-origin were never necessarily confirmed before the (simulated) prior failure');
+    const updateCall = calls.find((c) => c[0] === 'updateReelDocument');
+    assert.deepEqual(updateCall[1], {
+      storageContentType: 'video/mp4',
+      fileSizeBytes: 4242,
+      musicHash: 'fake-music-hash',
+      soundOriginAuthorUid: 'uid1',
+      soundOriginReelId: 'reel1',
+    });
+    assert.equal(calls.some((c) => c[0] === 'deleteStandaloneMusic'), true, 'music IS deleted once confirmation succeeds, even on the already-normalized retry path');
+  });
+
+  await check('IDEMPOTENCY — THE KEY SCENARIO (covers both muxReelMusic and renderPhotoToVideo, which share this function): confirm fails once after a real first-time mux, retry detects the stamped marker and does NOT mux a second time — exactly 1 runFfmpegMux call total across both attempts, standalone music deleted exactly once', async () => {
+    let canonicalMarker = null;
+    let confirmAttempt = 0;
+    const allCalls = [];
+    const deps = {
+      readCanonicalSourceState: async () => {
+        allCalls.push(['readCanonicalSourceState']);
+        return canonicalMarker ? { sizeBytes: 9000, normalizationMarker: canonicalMarker } : null;
+      },
+      downloadVideo: async () => {
+        allCalls.push(['downloadVideo']);
+        return true;
+      },
+      downloadMusic: async () => {
+        allCalls.push(['downloadMusic']);
+        return true;
+      },
+      runFfmpegMux: async () => {
+        allCalls.push(['runFfmpegMux']);
+      },
+      statFileSize: async () => 9000,
+      computeSha256: async () => 'fake-music-hash',
+      resolveSoundOrigin: async () => ({ originAuthorUid: 'uid1', originReelId: 'reel1', isNewOrigin: false }),
+      uploadMuxedVideo: async () => {
+        allCalls.push(['uploadMuxedVideo']);
+        // Models uploadMuxedReelSourceToProvider's real behavior: the
+        // normalization marker is stamped in the SAME write that
+        // replaces the bytes, before confirm ever runs.
+        canonicalMarker = CURRENT_MARKER;
+      },
+      uploadSoundOriginCopy: async () => {
+        allCalls.push(['uploadSoundOriginCopy']);
+      },
+      deleteStandaloneMusic: async () => {
+        allCalls.push(['deleteStandaloneMusic']);
+      },
+      updateReelDocument: async () => {
+        allCalls.push(['updateReelDocument']);
+        confirmAttempt += 1;
+        if (confirmAttempt === 1) throw new Error('transient Firestore error');
+      },
+      buildVersionedSourceUrl: () => null,
+    };
+
+    const firstOutcome = await performReelMux(PATHS, deps);
+    assert.deepEqual(firstOutcome, { ok: false, reason: 'confirm-write-failed' });
+    assert.equal(allCalls.filter((c) => c[0] === 'runFfmpegMux').length, 1, 'the first attempt mux/encodes exactly once');
+    assert.equal(allCalls.some((c) => c[0] === 'deleteStandaloneMusic'), false, 'music must NOT be deleted yet — confirm has not succeeded');
+
+    const secondOutcome = await performReelMux(PATHS, deps);
+    assert.deepEqual(secondOutcome, { ok: true });
+
+    assert.equal(allCalls.filter((c) => c[0] === 'runFfmpegMux').length, 1, 'runFfmpegMux calls = 1 TOTAL across both attempts, not 2 — the key requirement');
+    assert.equal(allCalls.filter((c) => c[0] === 'downloadVideo').length, 1, 'video download = 1 total across both attempts');
+    assert.equal(allCalls.filter((c) => c[0] === 'uploadMuxedVideo').length, 1, 'upload = 1 total across both attempts');
+    assert.equal(allCalls.filter((c) => c[0] === 'downloadMusic').length, 2, 'music IS re-downloaded on retry — needed for hash/sound-origin, never muxed again though');
+    assert.equal(allCalls.filter((c) => c[0] === 'updateReelDocument').length, 2, 'confirm itself IS retried — that is the whole point');
+    assert.equal(allCalls.filter((c) => c[0] === 'deleteStandaloneMusic').length, 1, 'standalone music deleted EXACTLY ONCE, only after the second confirm actually succeeds');
+  });
+
+  await check('IDEMPOTENCY: marker absent entirely — normal full mux path executes (video downloaded, ffmpeg runs), exactly as if this were the very first attempt', async () => {
+    const { deps, calls } = makeDeps({ readCanonicalSourceState: async () => null });
+    const outcome = await performReelMux(PATHS, deps);
+    assert.deepEqual(outcome, { ok: true });
+    assert.equal(calls.some((c) => c[0] === 'downloadVideo'), true);
+    assert.equal(calls.some((c) => c[0] === 'runFfmpegMux'), true);
+  });
+
+  await check('IDEMPOTENCY: marker present but WRONG/OLD profile version — normal full mux path executes, never silently treated as current', async () => {
+    const { deps, calls } = makeDeps({ readCanonicalSourceState: async () => ({ sizeBytes: 999, normalizationMarker: '0' }) });
+    const outcome = await performReelMux(PATHS, deps);
+    assert.deepEqual(outcome, { ok: true });
+    assert.equal(calls.some((c) => c[0] === 'runFfmpegMux'), true, 'an old/wrong profile version must trigger a real re-mux/encode');
+  });
+
+  await check('IDEMPOTENCY: readCanonicalSourceState is OPTIONAL — omitting it entirely runs the full pipeline exactly as before this fix, never throws (every pre-Step-11B test in this file relies on exactly this default)', async () => {
+    const { deps } = makeDeps();
+    delete deps.readCanonicalSourceState;
+    const outcome = await performReelMux(PATHS, deps);
+    assert.deepEqual(outcome, { ok: true });
+  });
+
+  await check('IDEMPOTENCY — photo-render reuse: the already-normalized skip path ALSO correctly merges extraConfirmFields (renderPhotoToVideo\'s own needsPhotoVideoRender:false) into the retried confirm-write', async () => {
+    const { deps, calls } = makeDeps({ readCanonicalSourceState: async () => ({ sizeBytes: 5000, normalizationMarker: CURRENT_MARKER }) });
+    const outcome = await performReelMux(PATHS, deps, { needsPhotoVideoRender: false });
+    assert.deepEqual(outcome, { ok: true });
+    assert.equal(calls.some((c) => c[0] === 'runFfmpegMux'), false, 'photo-render must not re-render when already normalized');
+    const updateCall = calls.find((c) => c[0] === 'updateReelDocument');
+    assert.equal(updateCall[1].needsPhotoVideoRender, false);
+    assert.equal(updateCall[1].fileSizeBytes, 5000);
+  });
+
   console.log('\n=== functions/ Reel mux orchestration logic test results ===');
   let failures = 0;
   for (const result of results) {

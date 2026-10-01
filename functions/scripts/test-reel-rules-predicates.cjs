@@ -48,7 +48,7 @@ const REEL_BASE_KEYS = [
   'reelId', 'authorUid', 'authorDisplayName', 'authorUsername',
   'cityName', 'countryCode', 'cityKey', 'categoryId', 'caption', 'hashtags',
   'mediaType', 'needsPhotoVideoRender', 'storagePath', 'storageContentType', 'fileSizeBytes', 'durationMs',
-  'storageProvider', 'sourceUrl',
+  'storageProvider', 'sourceUrl', 'sourceNormalized',
   'width', 'height', 'status', 'visibility',
   'musicSourceType', 'musicTitle', 'musicStorageAudioPath', 'musicStorageProvider',
   'musicStorageContentType', 'musicFileSizeBytes', 'musicDurationMs',
@@ -111,6 +111,7 @@ function isValidReelSourceProviderUpdate(newData, oldData) {
     newData.storageContentType === oldData.storageContentType &&
     newData.fileSizeBytes === oldData.fileSizeBytes &&
     newData.durationMs === oldData.durationMs &&
+    newData.sourceNormalized === oldData.sourceNormalized &&
     newData.width === oldData.width &&
     newData.height === oldData.height &&
     newData.visibility === oldData.visibility &&
@@ -166,6 +167,7 @@ function isValidReelThumbnailProviderUpdate(newData, oldData) {
     newData.fileSizeBytes === oldData.fileSizeBytes &&
     newData.storageProvider === oldData.storageProvider &&
     newData.sourceUrl === oldData.sourceUrl &&
+    newData.sourceNormalized === oldData.sourceNormalized &&
     newData.durationMs === oldData.durationMs &&
     newData.width === oldData.width &&
     newData.height === oldData.height &&
@@ -229,6 +231,7 @@ function isValidReelPhotoSourceProviderUpdate(newData, oldData) {
     newData.storageContentType === oldData.storageContentType &&
     newData.fileSizeBytes === oldData.fileSizeBytes &&
     newData.durationMs === oldData.durationMs &&
+    newData.sourceNormalized === oldData.sourceNormalized &&
     newData.width === oldData.width &&
     newData.height === oldData.height &&
     newData.visibility === oldData.visibility &&
@@ -274,6 +277,8 @@ function isValidReelPublish(newData, oldData) {
     newData.mediaType === oldData.mediaType &&
     oldData.needsPhotoVideoRender === false &&
     newData.needsPhotoVideoRender === false &&
+    (oldData.mediaType === 'photo' || oldData.sourceNormalized === true) &&
+    newData.sourceNormalized === oldData.sourceNormalized &&
     newData.storagePath === oldData.storagePath &&
     newData.storageContentType === oldData.storageContentType &&
     newData.fileSizeBytes === oldData.fileSizeBytes &&
@@ -341,6 +346,7 @@ function isValidReelMusicProviderUpdate(newData, oldData) {
     newData.fileSizeBytes === oldData.fileSizeBytes &&
     newData.storageProvider === oldData.storageProvider &&
     newData.sourceUrl === oldData.sourceUrl &&
+    newData.sourceNormalized === oldData.sourceNormalized &&
     newData.durationMs === oldData.durationMs &&
     newData.width === oldData.width &&
     newData.height === oldData.height &&
@@ -383,6 +389,7 @@ function isValidReelCreateProviderDefaults(data) {
   return (
     data.storageProvider === 'firebase' &&
     data.sourceUrl === '' &&
+    data.sourceNormalized === false &&
     data.thumbnailStorageProvider === 'firebase' &&
     data.thumbnailUrl === '' &&
     data.musicStorageProvider === 'firebase'
@@ -425,6 +432,7 @@ function baseReelDoc(overrides = {}) {
     fileSizeBytes: 1024,
     storageProvider: 'firebase',
     sourceUrl: '',
+    sourceNormalized: false,
     durationMs: 5000,
     width: 720,
     height: 1280,
@@ -792,6 +800,10 @@ check('Step 10B — a Reel already confirmed as musicStorageProvider "r2" can st
     musicHash: 'abc123',
     soundOriginAuthorUid: 'uid1',
     soundOriginReelId: 'reel1',
+    // Step 11B — muxReelMusic's own encode pass already normalizes the
+    // video in the same confirm-write that records the music merge; a
+    // real music Reel reaching publishReel always has this already true.
+    sourceNormalized: true,
   });
   const newData = { ...oldData, status: 'published', publishedAt: 'SERVER_TIMESTAMP', updatedAt: 'SERVER_TIMESTAMP' };
   assert.equal(isValidReelUpdate(newData, oldData, 'uid1'), true);
@@ -811,17 +823,23 @@ check('Step 10B — create: a draft that already claims musicStorageProvider "r2
 // 11. publish after valid R2 confirmation
 // ---------------------------------------------------------------------------
 check('publish: a Reel already confirmed as storageProvider "r2" (from an earlier, separate transition) can still publish — isValidReelPublish requires equality, not a fixed provider value', () => {
-  const oldData = baseReelDoc({ storageProvider: 'r2', sourceUrl: 'https://media.example.com/x' });
+  // Step 11B — a video Reel's source provider transition runs well before
+  // finalization/publish (right after the raw upload) — finalizeReelVideo
+  // is what later stamps sourceNormalized: true, independently of which
+  // provider the source ended up on. Explicit here since this test's own
+  // point is specifically about storageProvider, not finalization.
+  const oldData = baseReelDoc({ storageProvider: 'r2', sourceUrl: 'https://media.example.com/x', sourceNormalized: true });
   const newData = { ...oldData, status: 'published', publishedAt: 'SERVER_TIMESTAMP', updatedAt: 'SERVER_TIMESTAMP' };
   assert.equal(isValidReelUpdate(newData, oldData, 'uid1'), true);
 });
 check('publish: a Reel still on storageProvider "firebase" can also still publish, unaffected by Step 9A', () => {
-  const oldData = baseReelDoc();
+  // Step 11B — finalizeReelVideo already ran for this plain video Reel.
+  const oldData = baseReelDoc({ sourceNormalized: true });
   const newData = { ...oldData, status: 'published', publishedAt: 'SERVER_TIMESTAMP', updatedAt: 'SERVER_TIMESTAMP' };
   assert.equal(isValidReelUpdate(newData, oldData, 'uid1'), true);
 });
 check('publish: sneaking a storageProvider change INTO the publish write itself is REJECTED — publish requires storageProvider stay byte-identical', () => {
-  const oldData = baseReelDoc();
+  const oldData = baseReelDoc({ sourceNormalized: true });
   const newData = { ...oldData, status: 'published', publishedAt: 'SERVER_TIMESTAMP', updatedAt: 'SERVER_TIMESTAMP', storageProvider: 'r2', sourceUrl: 'https://media.example.com/x' };
   assert.equal(isValidReelUpdate(newData, oldData, 'uid1'), false);
 });
@@ -835,6 +853,9 @@ check('Step 9B — publish: a MUSIC Reel already confirmed as storageProvider "r
     musicHash: 'abc123',
     soundOriginAuthorUid: 'uid1',
     soundOriginReelId: 'reel1',
+    // Step 11B — muxReelMusic's own encode pass already normalizes the
+    // video in the exact same write that set storageProvider/sourceUrl.
+    sourceNormalized: true,
   });
   const newData = { ...oldData, status: 'published', publishedAt: 'SERVER_TIMESTAMP', updatedAt: 'SERVER_TIMESTAMP' };
   assert.equal(isValidReelUpdate(newData, oldData, 'uid1'), true);
@@ -867,6 +888,64 @@ check('update: a valid source transition attempted by a non-author is REJECTED a
   const oldData = baseReelDoc();
   const newData = { ...oldData, storageProvider: 'r2', sourceUrl: 'https://media.example.com/x', updatedAt: 'SERVER_TIMESTAMP' };
   assert.equal(isValidReelUpdate(newData, oldData, 'attacker-uid'), false);
+});
+
+// ---------------------------------------------------------------------------
+// Step 11B — the universal video normalization publish gate.
+// ---------------------------------------------------------------------------
+
+check('Step 11B — create: a draft that already claims sourceNormalized true is rejected — a client can never pre-claim finalization', () => {
+  assert.equal(isValidReelCreateProviderDefaults(baseReelDoc({ sourceNormalized: true })), false);
+});
+
+check('Step 11B — publish: a VIDEO Reel still at sourceNormalized false is REJECTED — it must be finalized first, matching the pre-11B needsPhotoVideoRender gate exactly', () => {
+  const oldData = baseReelDoc(); // sourceNormalized: false (the default)
+  const newData = { ...oldData, status: 'published', publishedAt: 'SERVER_TIMESTAMP', updatedAt: 'SERVER_TIMESTAMP' };
+  assert.equal(isValidReelUpdate(newData, oldData, 'uid1'), false);
+});
+
+check('Step 11B — publish: the SAME VIDEO Reel, once sourceNormalized flips to true (finalizeReelVideo\'s own Admin SDK write, bypassing these Rules), can now publish', () => {
+  const oldData = baseReelDoc({ sourceNormalized: true });
+  const newData = { ...oldData, status: 'published', publishedAt: 'SERVER_TIMESTAMP', updatedAt: 'SERVER_TIMESTAMP' };
+  assert.equal(isValidReelUpdate(newData, oldData, 'uid1'), true);
+});
+
+check('Step 11B — publish: a PHOTO Reel can publish while sourceNormalized is still false — Part 9, a photo is never transcoded, so it is exempt from this gate entirely', () => {
+  const oldData = basePhotoReelDoc(); // sourceNormalized: false (inherited default), mediaType: 'photo'
+  assert.equal(oldData.sourceNormalized, false);
+  const newData = { ...oldData, status: 'published', publishedAt: 'SERVER_TIMESTAMP', updatedAt: 'SERVER_TIMESTAMP' };
+  assert.equal(isValidReelUpdate(newData, oldData, 'uid1'), true);
+});
+
+check('Step 11B — publish: sneaking a sourceNormalized flip (false -> true) INTO the publish write itself is REJECTED — publish requires it stay byte-identical, the flip must already be done by a SEPARATE prior Admin SDK write', () => {
+  const oldData = baseReelDoc({ sourceNormalized: false });
+  const newData = { ...oldData, status: 'published', publishedAt: 'SERVER_TIMESTAMP', updatedAt: 'SERVER_TIMESTAMP', sourceNormalized: true };
+  assert.equal(isValidReelUpdate(newData, oldData, 'uid1'), false);
+});
+
+check('Step 11B — a render-pending Reel (needsPhotoVideoRender true) is ALREADY blocked from publishing regardless of sourceNormalized — the pre-existing needsPhotoVideoRender gate and the new sourceNormalized gate are independent, both must pass', () => {
+  const oldData = baseReelDoc({
+    needsPhotoVideoRender: true,
+    musicSourceType: 'device',
+    musicTitle: 'Song.mp3',
+    musicStorageAudioPath: 'reels/uid1/reel1/music',
+    sourceNormalized: true, // even if somehow already true, needsPhotoVideoRender alone still blocks publish
+  });
+  const newData = { ...oldData, status: 'published', publishedAt: 'SERVER_TIMESTAMP', updatedAt: 'SERVER_TIMESTAMP' };
+  assert.equal(isValidReelUpdate(newData, oldData, 'uid1'), false);
+});
+
+check('Step 11B — sneaking a sourceNormalized change into an UNRELATED transition (the thumbnail-provider confirm) is REJECTED — piggybacking through a narrow door is blocked the same way every other field already is', () => {
+  const oldData = baseReelDoc();
+  const newData = {
+    ...oldData,
+    thumbnailStorageProvider: 'r2',
+    thumbnailUrl: 'https://media.example.com/thumb',
+    sourceNormalized: true,
+    updatedAt: 'SERVER_TIMESTAMP',
+  };
+  assert.equal(isValidReelThumbnailProviderUpdate(newData, oldData), false);
+  assert.equal(isValidReelUpdate(newData, oldData, 'uid1'), false);
 });
 
 console.log('\n=== firestore.rules Reel-provider-transition predicate mirror test results ===');

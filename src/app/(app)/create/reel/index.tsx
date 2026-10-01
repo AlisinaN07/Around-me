@@ -20,6 +20,7 @@ import { searchPublicProfilesByUsername } from '@/services/publicProfile';
 import {
   createReelDraft,
   discardReelDraft,
+  finalizeReelVideo,
   muxReelMusic,
   publishReel,
   renderPhotoToVideo,
@@ -47,7 +48,7 @@ import {
 import { formatPostCount } from '@/utils/postCount';
 import { normalizeUsernameSearchQuery } from '@/utils/username';
 
-type Stage = 'ready' | 'creating' | 'uploading' | 'uploadingThumbnail' | 'uploadingMusic' | 'merging' | 'renderingPhoto' | 'publishing';
+type Stage = 'ready' | 'creating' | 'uploading' | 'uploadingThumbnail' | 'uploadingMusic' | 'merging' | 'renderingPhoto' | 'finalizing' | 'publishing';
 
 // @ mention autocomplete (per explicit request) — same debounce +
 // generation-counter pattern src/app/(app)/search.tsx already uses for
@@ -309,6 +310,7 @@ export default function CreateReelScreen() {
     stage === 'uploadingMusic' ||
     stage === 'merging' ||
     stage === 'renderingPhoto' ||
+    stage === 'finalizing' ||
     stage === 'publishing';
 
   const resetAfterFailure = async (message: string, { keepFailureBanner = false }: { keepFailureBanner?: boolean } = {}) => {
@@ -684,7 +686,23 @@ export default function CreateReelScreen() {
               return;
             }
 
+            // Step 11B — a plain video with no music at all: the one
+            // Reel variant that previously reached publishReel having
+            // never touched ffmpeg (muxReelMusic/renderPhotoToVideo
+            // normalize their own variants in the same pass that merges/
+            // renders them — see finalizeReelVideo's own doc comment in
+            // reels.ts). Must run, and succeed, before publishReel —
+            // firestore.rules' own isValidReelPublish independently
+            // refuses to publish a video Reel whose sourceNormalized
+            // isn't already true, so this is enforced server-side too,
+            // not just by this call ordering.
             uploadHandleRef.current = null;
+            setStage('finalizing');
+            const finalizeResult = await finalizeReelVideo(draftResult.reel.reelId);
+            if (!finalizeResult.ok) {
+              await resetAfterFailure("Couldn't finish processing this post's video.", { keepFailureBanner: true });
+              return;
+            }
             await finishPublish();
           }
         );
@@ -876,13 +894,15 @@ export default function CreateReelScreen() {
                   ? 'Adding music…'
                   : stage === 'renderingPhoto'
                     ? 'Processing photo…'
-                    : stage === 'publishing'
-                      ? 'Publishing…'
-                      : stage === 'uploadingMusic'
-                        ? `Uploading music ${progress}%`
-                        : stage === 'uploadingThumbnail'
-                          ? `Uploading cover ${progress}%`
-                          : `Uploading ${progress}%`}
+                    : stage === 'finalizing'
+                      ? 'Processing video…'
+                      : stage === 'publishing'
+                        ? 'Publishing…'
+                        : stage === 'uploadingMusic'
+                          ? `Uploading music ${progress}%`
+                          : stage === 'uploadingThumbnail'
+                            ? `Uploading cover ${progress}%`
+                            : `Uploading ${progress}%`}
             </Text>
             {(stage === 'uploading' || stage === 'uploadingThumbnail' || stage === 'uploadingMusic') && (
               <Pressable onPress={handleCancelUpload} accessibilityRole="button">
@@ -907,15 +927,17 @@ export default function CreateReelScreen() {
                 ? 'Adding music…'
                 : stage === 'renderingPhoto'
                   ? 'Processing photo…'
-                  : stage === 'publishing'
-                    ? 'Publishing…'
-                    : stage === 'uploadingMusic'
-                      ? `Uploading music ${progress}%`
-                      : stage === 'uploadingThumbnail'
-                        ? `Uploading cover ${progress}%`
-                        : stage === 'uploading'
-                          ? `Uploading ${progress}%`
-                          : 'Post'
+                  : stage === 'finalizing'
+                    ? 'Processing video…'
+                    : stage === 'publishing'
+                      ? 'Publishing…'
+                      : stage === 'uploadingMusic'
+                        ? `Uploading music ${progress}%`
+                        : stage === 'uploadingThumbnail'
+                          ? `Uploading cover ${progress}%`
+                          : stage === 'uploading'
+                            ? `Uploading ${progress}%`
+                            : 'Post'
           }
           onPress={handlePublish}
           disabled={!canPublish}

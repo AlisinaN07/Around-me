@@ -185,7 +185,29 @@ export async function downloadR2ObjectBuffer(key: string): Promise<Buffer> {
  * Every other R2 write in this codebase (createPresignedUploadUrl) sets
  * no Cache-Control at all, unaffected by this new optional parameter.
  */
-export async function putR2Object(key: string, data: Buffer, contentType: string, cacheControl?: string): Promise<void> {
+/**
+ * Step 11B — `metadata`, when given, is attached as S3/R2 OBJECT
+ * METADATA (arbitrary `x-amz-meta-*` string key/value pairs, read back
+ * later via `headR2ObjectDetails` below WITHOUT downloading the object's
+ * body) — used specifically to stamp a durable
+ * REEL_VIDEO_NORMALIZATION_PROFILE marker onto a Reel's canonical source
+ * object the moment this codebase's own server-side ffmpeg pipeline
+ * finishes normalizing it (see reelVideoProfile.ts's own doc comment),
+ * so a LATER retry (after e.g. a Firestore confirm-write failure) can
+ * tell "this object already IS the final normalized asset" from a real,
+ * server-verifiable storage fact — never from a URL shape, a codec
+ * guess, or client-reported state. S3's own Metadata values must be
+ * plain strings (confirmed against this installed @aws-sdk/client-s3
+ * version's own PutObjectRequest/HeadObjectOutput types — never numbers/
+ * booleans), so callers pass pre-stringified values.
+ */
+export async function putR2Object(
+  key: string,
+  data: Buffer,
+  contentType: string,
+  cacheControl?: string,
+  metadata?: Record<string, string>
+): Promise<void> {
   const { client, bucketName } = requireR2Client();
   await client.send(
     new PutObjectCommand({
@@ -194,8 +216,35 @@ export async function putR2Object(key: string, data: Buffer, contentType: string
       Body: data,
       ContentType: contentType,
       ...(cacheControl ? { CacheControl: cacheControl } : {}),
+      ...(metadata ? { Metadata: metadata } : {}),
     })
   );
+}
+
+/**
+ * Step 11B — a METADATA-ONLY read (S3 HeadObjectCommand — never downloads
+ * the object's body, unlike downloadR2ObjectBuffer above) of an R2
+ * object's current size and custom metadata, used by
+ * reelSourceStorage.ts's readReelCanonicalSourceState to check whether a
+ * Reel's canonical source object already carries this codebase's own
+ * normalization marker, without ever fetching the (potentially tens-of-
+ * megabytes) video bytes just to check a flag. Returns `null` for a
+ * missing object OR any other read failure — deliberately fail-SAFE: the
+ * caller treats `null` as "cannot confirm this is already normalized,"
+ * never as "assume it is" — see this codebase's own explicit "metadata
+ * read failure must fail safely, not incorrectly assume normalization"
+ * requirement.
+ */
+export async function headR2ObjectDetails(key: string): Promise<{ sizeBytes: number; metadata: Record<string, string> } | null> {
+  const { client, bucketName } = requireR2Client();
+  try {
+    const result = await client.send(new HeadObjectCommand({ Bucket: bucketName, Key: key }));
+    const sizeBytes = typeof result.ContentLength === 'number' ? result.ContentLength : 0;
+    if (sizeBytes <= 0) return null;
+    return { sizeBytes, metadata: result.Metadata ?? {} };
+  } catch {
+    return null;
+  }
 }
 
 /**

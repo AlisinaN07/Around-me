@@ -32,7 +32,28 @@
  * pre-existing Firebase path (an unobservable change when everything
  * succeeds) and the new R2 path, and is what makes "client retries mux"
  * genuinely safe per the Step 9B spec's own Part 10/15.
+ *
+ * TRUE IDEMPOTENCY (Step 11B, fixed after an initial review caught the
+ * gap): the paragraph above makes a confirm-write-failure retry SAFE, but
+ * not actually idempotent on its own — a naive retry would re-download
+ * the already-muxed/already-normalized canonical video and run ffmpeg
+ * (the merge AND the Step 11B normalization encode) on it AGAIN, every
+ * time confirmation fails, risking repeated lossy re-encodes. `deps.
+ * readCanonicalSourceState` (optional; see its own doc comment) is
+ * checked FIRST: if the canonical source object already carries the
+ * CURRENT profile's normalization marker (stamped by
+ * uploadMuxedVideo's/reelSourceStorage.ts's own prior, already-successful
+ * run), this skips downloading/encoding the video entirely — but STILL
+ * downloads the music, computes its hash, and resolves/archives its sound
+ * origin (none of which were necessarily recorded anywhere durable before
+ * the failed confirm — the standalone music object is deliberately still
+ * present at this point, exactly because of the ordering fix above), then
+ * retries ONLY the Firestore confirmation, then deletes the standalone
+ * music exactly once, after that confirmation actually succeeds. No
+ * second ffmpeg mux/render ever runs for an already-normalized canonical
+ * asset.
  */
+import { isReelSourceAlreadyNormalized } from './reelVideoProfile';
 
 export type ReelMuxFailureReason =
   | 'video-unavailable'
@@ -53,7 +74,21 @@ export type ReelMuxPaths = {
   localOutputPath: string;
 };
 
+export type ReelMuxCanonicalState = { sizeBytes: number; normalizationMarker: string | null };
+
 export type ReelMuxDeps = {
+  /**
+   * Step 11B — a METADATA-ONLY check (reelSourceStorage.ts's
+   * readReelCanonicalSourceState) of whether the Reel's CURRENT canonical
+   * source object already carries the CURRENT profile's normalization
+   * marker — see this file's own top doc comment for the full
+   * idempotency reasoning. `null` means "cannot confirm — run the full
+   * pipeline," the safe default for a missing object or any read
+   * failure. Optional and defaults to "always run the full pipeline"
+   * when omitted — every existing caller/test that has no reason to
+   * exercise this new short-circuit is unaffected.
+   */
+  readCanonicalSourceState?(): Promise<ReelMuxCanonicalState | null>;
   /** Provider-aware — writes the CURRENT original video to `paths.localVideoPath`. `false` (not a throw) means "not available," mapped to the `video-unavailable` failure reason. */
   downloadVideo(localVideoPath: string): Promise<boolean>;
   /** Always Firebase (Reel audio/music itself is not migrated in Step 9B) — writes the picked music file to `paths.localMusicPath`. */
@@ -125,33 +160,51 @@ export async function performReelMux(
   deps: ReelMuxDeps,
   extraConfirmFields: ReelMuxExtraConfirmFields = {}
 ): Promise<ReelMuxOutcome> {
-  const videoReady = await deps.downloadVideo(paths.localVideoPath);
-  if (!videoReady) return { ok: false, reason: 'video-unavailable' };
+  const canonicalState = deps.readCanonicalSourceState ? await deps.readCanonicalSourceState() : null;
+  const alreadyNormalized = !!canonicalState && isReelSourceAlreadyNormalized(canonicalState.normalizationMarker);
+
+  let outputSize: number;
+
+  if (!alreadyNormalized) {
+    const videoReady = await deps.downloadVideo(paths.localVideoPath);
+    if (!videoReady) return { ok: false, reason: 'video-unavailable' };
+  }
 
   const musicReady = await deps.downloadMusic(paths.localMusicPath);
   if (!musicReady) return { ok: false, reason: 'music-unavailable' };
 
   // Hashed from the exact bytes just downloaded, BEFORE the standalone
   // music object is ever deleted — see this file's own "Sound
-  // attribution" reasoning (unchanged from before Step 9B).
+  // attribution" reasoning (unchanged from before Step 9B). Computed
+  // and resolved EVEN on the already-normalized retry path: neither the
+  // hash nor the sound-origin attribution was necessarily ever recorded
+  // anywhere durable before the previous confirm-write failed.
   const musicHash = await deps.computeSha256(paths.localMusicPath);
   const soundOrigin = await deps.resolveSoundOrigin(musicHash);
 
-  try {
-    await deps.runFfmpegMux(paths.localVideoPath, paths.localMusicPath, paths.localOutputPath);
-  } catch {
-    return { ok: false, reason: 'ffmpeg-failed' };
-  }
+  if (alreadyNormalized) {
+    // TRUE IDEMPOTENCY — see this file's own top doc comment. The
+    // canonical object already IS the final merged+normalized asset;
+    // never mux/encode it a second time (which could duplicate or alter
+    // the audio, not just waste CPU).
+    outputSize = canonicalState!.sizeBytes;
+  } else {
+    try {
+      await deps.runFfmpegMux(paths.localVideoPath, paths.localMusicPath, paths.localOutputPath);
+    } catch {
+      return { ok: false, reason: 'ffmpeg-failed' };
+    }
 
-  const outputSize = await deps.statFileSize(paths.localOutputPath);
-  if (outputSize <= 0) {
-    return { ok: false, reason: 'ffmpeg-empty-output' };
-  }
+    outputSize = await deps.statFileSize(paths.localOutputPath);
+    if (outputSize <= 0) {
+      return { ok: false, reason: 'ffmpeg-empty-output' };
+    }
 
-  try {
-    await deps.uploadMuxedVideo(paths.localOutputPath);
-  } catch {
-    return { ok: false, reason: 'final-upload-failed' };
+    try {
+      await deps.uploadMuxedVideo(paths.localOutputPath);
+    } catch {
+      return { ok: false, reason: 'final-upload-failed' };
+    }
   }
 
   if (soundOrigin.isNewOrigin) {
@@ -179,13 +232,13 @@ export async function performReelMux(
     await deps.updateReelDocument(fields);
   } catch {
     // The muxed video is ALREADY the object at the Reel's own source
-    // key at this point (uploadMuxedVideo above already succeeded) — a
-    // retry of the whole callable will re-download that SAME (already
-    // muxed) video, re-download the STILL-PRESENT standalone music
-    // object (not yet deleted — see below), and re-run ffmpeg/re-upload
-    // idempotently (same deterministic output for the same inputs),
-    // then retry this exact write. See this file's own top doc comment
-    // for why the ordering below is what makes this safe.
+    // key at this point (uploadMuxedVideo above already succeeded, and
+    // already carries the normalization marker) — a retry re-reads the
+    // canonical state above, finds that SAME marker, skips ffmpeg
+    // entirely (Step 11B's own idempotency fix — see this file's own top
+    // doc comment), re-downloads the STILL-PRESENT standalone music
+    // object (not yet deleted — see below) only to re-resolve its hash/
+    // sound-origin, and retries only this exact confirm-write.
     return { ok: false, reason: 'confirm-write-failed' };
   }
 

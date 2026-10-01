@@ -230,16 +230,49 @@ export type Reel = {
    * resolved lazily at render time — see resolveReelVideoPlaybackUrl in
    * reels.ts). `''` whenever `storageProvider` is `'firebase'` (including
    * every legacy Reel) — meaningful ONLY when `storageProvider ===
-   * 'r2'`. Deliberately carries NO cache-busting query string (unlike
-   * thumbnailUrl/profile-photo URLs) — an R2-eligible Reel's source is
-   * never rewritten server-side after upload (that's the whole point of
-   * this provider only being reachable for a plain, no-music,
-   * no-pending-render video — see ReelStorageProvider's own doc
-   * comment), so there is nothing here for a version token to ever bust.
-   * Set exactly once by a trusted server write, never client-writable
-   * directly (same rule as `storageProvider` above).
+   * 'r2'`. Initially set with no cache-busting query string by the
+   * client's own one-shot upload-confirm write. Step 11B — UPDATED: this
+   * is no longer the end of the story for EVERY R2 Reel — any of the
+   * three finalization pipelines (finalizeReelVideo/muxReelMusic/
+   * renderPhotoToVideo) that end up touching this Reel's video
+   * (every VIDEO Reel does, exactly one of the three — see
+   * Reel.sourceNormalized's own doc comment) overwrites this with a
+   * FRESH version-stamped URL (`?v=<timestamp>`) in the SAME trusted
+   * Admin SDK write that stamps `sourceNormalized: true`, since the
+   * underlying object's bytes just changed in place at the same key —
+   * see muxedVideoCacheControl's own doc comment in
+   * functions/src/index.ts for why that overwrite is safe (the object is
+   * marked long-lived+immutable specifically BECAUSE it's now only ever
+   * reachable via a fresh version token). Set exactly once per write by a
+   * trusted server write, never client-writable directly (same rule as
+   * `storageProvider` above).
    */
   sourceUrl: string;
+  /**
+   * Step 11B — whether this Reel's OWN video source object (at
+   * `storagePath`) has already been through one of the three
+   * finalization pipelines and is therefore in its FINAL, normalized
+   * delivery shape (see functions/src/media/reelVideoProfile.ts's own
+   * REEL_VIDEO_PROFILE — max 1080x1920 bounding box, H.264/yuv420p, CRF
+   * 23, capped at 30fps, AAC 128k, faststart). Always `false` at create
+   * (every draft, regardless of mediaType — see isValidReelCreate), and
+   * for a PHOTO Reel stays `false` forever (Part 9 of the Step 11B spec:
+   * a photo is never transcoded at all — see isValidReelPublish's own
+   * exemption for `mediaType === 'photo'`). For a VIDEO Reel, flips to
+   * `true` exactly once, via whichever ONE of finalizeReelVideo (a plain
+   * video with no music)/muxReelMusic (video+music, same pass that
+   * merges the music)/renderPhotoToVideo (photo+music render, same pass
+   * that renders it) actually applies to it — never client-writable
+   * directly; there is no Firestore Rules transition for this field at
+   * all, since every write to it is a trusted Admin SDK write that
+   * already bypasses Rules. isValidReelPublish independently REQUIRES
+   * this to already be `true` before a video Reel can ever reach
+   * `status: 'published'` — a real server-enforced invariant, not just
+   * client call-ordering discipline (see src/app/(app)/create/reel/
+   * index.tsx's own publish sequencing for how the client normally
+   * reaches this state before ever calling publishReel).
+   */
+  sourceNormalized: boolean;
   /**
    * Declared duration in milliseconds, taken from the picked asset's own
    * metadata. This is a CLIENT-DECLARED value, re-validated by Firestore

@@ -132,6 +132,17 @@ export function normalizeReel(data: Reel): Reel {
     // source this time. See ReelStorageProvider's own doc comment.
     storageProvider: data.storageProvider ?? 'firebase',
     sourceUrl: data.sourceUrl ?? '',
+    // Step 11B — a Reel published before this field existed was
+    // necessarily already in its final delivery shape by the time this
+    // app ever had any OTHER delivery shape to compare against — treating
+    // it as `false` here would be misleading (nothing would ever re-
+    // normalize a legacy Reel), but nothing actually reads this field for
+    // anything other than the publish gate / finalizeReelVideo's own
+    // idempotency short-circuit, neither of which a legacy, already-
+    // published Reel could ever reach again — so the exact default value
+    // here is inert in practice. `false` is chosen only for consistency
+    // with every other "missing means not yet done" field above.
+    sourceNormalized: data.sourceNormalized ?? false,
   };
 }
 
@@ -414,6 +425,14 @@ export async function createReelDraft(input: CreateReelDraftInput): Promise<Crea
     // isValidReelSourceProviderUpdate, not just by this client code.
     storageProvider: 'firebase',
     sourceUrl: '',
+    // Step 11B — every draft is created not-yet-finalized, regardless of
+    // mediaType — only a trusted Cloud Function (finalizeReelVideo/
+    // muxReelMusic/renderPhotoToVideo, via the Admin SDK) can ever flip
+    // this to true; enforced server-side by firestore.rules'
+    // isValidReelPublish, which refuses to publish a VIDEO Reel while
+    // this is still false. A photo Reel never needs this flipped at all
+    // (see Reel.sourceNormalized's own doc comment in src/types/reel.ts).
+    sourceNormalized: false,
     durationMs: isPhoto ? 0 : isPhotoPendingRender ? REEL_PHOTO_DURATION_MS : input.durationMs,
     width: input.width,
     height: input.height,
@@ -1158,6 +1177,38 @@ export async function renderPhotoToVideo(reelId: string): Promise<RenderPhotoToV
     await httpsCallable(functions, 'renderPhotoToVideo')({ reelId });
   } catch {
     return { ok: false, message: "Couldn't finish processing this post." };
+  }
+  return { ok: true };
+}
+
+// ---------------------------------------------------------------------------
+// Step 11B — UNIVERSAL REEL VIDEO NORMALIZATION, the plain-video branch: a
+// trusted backend callable, same reasoning as muxReelMusic/
+// renderPhotoToVideo above (real ffmpeg processing, no client SDK can do
+// this). Called ONLY for a plain video with NO music and NO pending
+// photo-render — a music Reel is normalized by muxReelMusic itself (the
+// same pass that merges the music in), and a render-pending Reel by
+// renderPhotoToVideo itself (the same pass that renders it) — see
+// functions/src/media/reelEligibility.ts's own
+// checkReelVideoFinalizationEligibility for the exact, mutually exclusive
+// scope each of the three callables owns. Must run, and succeed, before
+// publishReel for this variant — firestore.rules' own isValidReelPublish
+// independently refuses to publish a video Reel whose sourceNormalized
+// isn't already true, so this is enforced server-side, not just by this
+// client's own call ordering (see src/app/(app)/create/reel/index.tsx's
+// own publish sequencing).
+// ---------------------------------------------------------------------------
+
+export type FinalizeReelVideoResult = { ok: true } | { ok: false; message: string };
+
+export async function finalizeReelVideo(reelId: string): Promise<FinalizeReelVideoResult> {
+  if (!functions) {
+    return { ok: false, message: 'This feature is not available right now.' };
+  }
+  try {
+    await httpsCallable(functions, 'finalizeReelVideo')({ reelId });
+  } catch {
+    return { ok: false, message: "Couldn't finish processing this post's video." };
   }
   return { ok: true };
 }

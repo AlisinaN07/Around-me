@@ -1398,7 +1398,7 @@ service cloud.firestore {
         'reelId', 'authorUid', 'authorDisplayName', 'authorUsername',
         'cityName', 'countryCode', 'cityKey', 'categoryId', 'caption', 'hashtags',
         'mediaType', 'needsPhotoVideoRender', 'storagePath', 'storageContentType', 'fileSizeBytes', 'durationMs',
-        'storageProvider', 'sourceUrl',
+        'storageProvider', 'sourceUrl', 'sourceNormalized',
         'width', 'height', 'status', 'visibility',
         'musicSourceType', 'musicTitle', 'musicStorageAudioPath', 'musicStorageProvider',
         'musicStorageContentType', 'musicFileSizeBytes', 'musicDurationMs',
@@ -1514,6 +1514,19 @@ service cloud.firestore {
         // a draft already claiming R2, regardless of mediaType/music.
         && data.storageProvider == 'firebase'
         && data.sourceUrl == ''
+        // Step 11B — every draft is created not-yet-normalized, same
+        // "required field, fixed default at create" pattern as
+        // storageProvider above, applied uniformly regardless of
+        // mediaType (a plain photo Reel never gets this flipped to true —
+        // see isValidReelPublish below, which exempts photo Reels from
+        // the gate entirely — but it still defaults the same way as
+        // every other Reel field, never conditionally omitted). Only a
+        // trusted Cloud Function (finalizeReelVideo/muxReelMusic/
+        // renderPhotoToVideo, via the Admin SDK) can ever flip this to
+        // true — there is no client-facing transition rule for it at
+        // all, unlike storageProvider/musicStorageProvider, because no
+        // client ever writes this field directly.
+        && data.sourceNormalized == false
         && (
           (
             data.mediaType == 'video'
@@ -1634,6 +1647,20 @@ service cloud.firestore {
         // as if it were a real video.
         && oldData.needsPhotoVideoRender == false
         && newData.needsPhotoVideoRender == false
+        // Step 11B — a VIDEO Reel can never publish until its source has
+        // actually been through one of the three finalization pipelines
+        // (finalizeReelVideo/muxReelMusic/renderPhotoToVideo, all of
+        // which stamp sourceNormalized: true in their own Admin-SDK
+        // confirm-write, bypassing these Rules entirely — see each
+        // function's own doc comment in functions/src/index.ts). A plain
+        // PHOTO Reel is exempt: it is never transcoded at all (Part 9 of
+        // the Step 11B spec), so it would otherwise be stuck at
+        // sourceNormalized: false forever. This is a REAL server-enforced
+        // invariant, not just client call-ordering discipline — a
+        // modified or buggy client calling publishReel too early is
+        // rejected here regardless of what it intended to do first.
+        && (oldData.mediaType == 'photo' || oldData.sourceNormalized == true)
+        && newData.sourceNormalized == oldData.sourceNormalized
         && newData.storagePath == oldData.storagePath
         && newData.storageContentType == oldData.storageContentType
         && newData.fileSizeBytes == oldData.fileSizeBytes
@@ -1727,6 +1754,7 @@ service cloud.firestore {
         && newData.musicTitle == oldData.musicTitle
         && newData.musicStorageAudioPath == oldData.musicStorageAudioPath
         && newData.musicStorageProvider == oldData.musicStorageProvider
+        && newData.sourceNormalized == oldData.sourceNormalized
         && newData.musicStorageContentType == oldData.musicStorageContentType
         && newData.musicFileSizeBytes == oldData.musicFileSizeBytes
         && newData.musicDurationMs == oldData.musicDurationMs
@@ -1817,6 +1845,7 @@ service cloud.firestore {
         && newData.musicTitle == oldData.musicTitle
         && newData.musicStorageAudioPath == oldData.musicStorageAudioPath
         && newData.musicStorageProvider == oldData.musicStorageProvider
+        && newData.sourceNormalized == oldData.sourceNormalized
         && newData.musicStorageContentType == oldData.musicStorageContentType
         && newData.musicFileSizeBytes == oldData.musicFileSizeBytes
         && newData.musicDurationMs == oldData.musicDurationMs
@@ -1897,6 +1926,7 @@ service cloud.firestore {
         && newData.musicTitle == oldData.musicTitle
         && newData.musicStorageAudioPath == oldData.musicStorageAudioPath
         && newData.musicStorageProvider == oldData.musicStorageProvider
+        && newData.sourceNormalized == oldData.sourceNormalized
         && newData.musicStorageContentType == oldData.musicStorageContentType
         && newData.musicFileSizeBytes == oldData.musicFileSizeBytes
         && newData.musicDurationMs == oldData.musicDurationMs
@@ -1956,6 +1986,7 @@ service cloud.firestore {
         && newData.fileSizeBytes == oldData.fileSizeBytes
         && newData.storageProvider == oldData.storageProvider
         && newData.sourceUrl == oldData.sourceUrl
+        && newData.sourceNormalized == oldData.sourceNormalized
         && newData.durationMs == oldData.durationMs
         && newData.width == oldData.width
         && newData.height == oldData.height

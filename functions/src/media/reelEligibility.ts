@@ -254,6 +254,50 @@ export function checkReelPhotoRenderEligibility(reel: RawReelData | null, uid: s
 }
 
 /**
+ * Step 11B — finalizeReelVideo's own eligibility check: the NEW gate for
+ * the biggest pre-11B gap, a plain video Reel with NO music and NO
+ * pending photo-render, which previously reached `publishReel` having
+ * never touched ffmpeg at all. Deliberately scoped to EXACTLY that one
+ * variant — a music Reel is finalized as part of its own
+ * checkReelMuxEligibility-gated merge (muxReelMusic already normalizes in
+ * the same encode pass, see reelVideoProfile.ts), and a render-pending
+ * Reel is finalized as part of its own checkReelPhotoRenderEligibility-
+ * gated render — calling this callable for either of those is rejected,
+ * not silently redundant, so a client can never accidentally run TWO
+ * separate ffmpeg passes over the same Reel by calling the wrong one:
+ *  1. Reel exists, `authorUid === uid`, `status === 'uploading'` — same
+ *     as every other check in this file.
+ *  2. `mediaType === 'video'` — a plain photo Reel is never a video at
+ *     all (see checkReelVideoEligibility's own doc comment) and must
+ *     never reach ffmpeg (Part 9 of the Step 11B spec).
+ *  3. `needsPhotoVideoRender !== true` — that variant's source is still
+ *     the ORIGINAL PHOTO until renderPhotoToVideo runs; finalizing it
+ *     here would normalize a still image as if it were already a video.
+ *  4. `musicSourceType === 'none'` — a device-music Reel is finalized by
+ *     muxReelMusic instead, in the same pass that merges the music in.
+ *
+ * Deliberately does NOT gate on `reel.storageProvider`, `sourceNormalized`,
+ * or anything about the UPLOADED video's own actual resolution/bitrate —
+ * same reasoning as checkReelMuxEligibility/checkReelPhotoRenderEligibility:
+ * the provider only decides WHICH download/upload path
+ * performReelVideoFinalization takes, never whether finalization is
+ * allowed to run; the `sourceNormalized` IDEMPOTENCY short-circuit (skip
+ * re-encoding an already-normalized Reel) is the CALLER's own job, one
+ * level up in index.ts's finalizeReelVideo, not this eligibility gate's —
+ * "already normalized" is a legitimate different OUTCOME (a no-op
+ * success), not a rejection.
+ */
+export function checkReelVideoFinalizationEligibility(reel: RawReelData | null, uid: string): EligibilityResult {
+  if (!reel) return notFound();
+  if (reel.authorUid !== uid) return permissionDenied('You can only process your own post.');
+  if (reel.status !== 'uploading') return failedPrecondition('This post is not awaiting video processing.');
+  if (reel.mediaType !== 'video') return failedPrecondition('This post has no video to process.');
+  if (reel.needsPhotoVideoRender === true) return failedPrecondition('This post still needs photo rendering first.');
+  if (reel.musicSourceType !== 'none') return failedPrecondition('This post merges its music separately.');
+  return OK;
+}
+
+/**
  * discardReelSource.ts's own eligibility check — deliberately LOOSER than
  * checkReelVideoEligibility above in one respect (no mediaType/
  * musicSourceType/needsPhotoVideoRender constraint at all): discarding is

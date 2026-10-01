@@ -29,6 +29,7 @@ const {
   checkReelMuxEligibility,
   checkReelPhotoRenderEligibility,
   checkReelMusicUploadEligibility,
+  checkReelVideoFinalizationEligibility,
 } = require('../lib/media/reelEligibility.js');
 
 const VIDEO_CONTENT_TYPE = 'video/mp4';
@@ -433,6 +434,67 @@ check('musicUpload: a render-pending Reel is also eligible for a music upload �
 
 check('musicUpload: ownership is checked before status — a wrong-owner published-status combo still reports permission-denied, not failed-precondition', () => {
   const result = checkReelMusicUploadEligibility(baseEligibleMusicVideoReel({ status: 'published' }), OTHER_UID, AUDIO_CONTENT_TYPE);
+  assert.equal(result.code, 'permission-denied');
+});
+
+// ---------------------------------------------------------------------------
+// checkReelVideoFinalizationEligibility — Step 11B, finalizeReelVideo's
+// own gate, scoped to EXACTLY the plain-video/no-music/not-render-pending
+// variant (muxReelMusic/renderPhotoToVideo own the other two).
+// ---------------------------------------------------------------------------
+
+check('finalize: nonexistent Reel (null) is not-found', () => {
+  assert.equal(checkReelVideoFinalizationEligibility(null, UID).code, 'not-found');
+});
+
+check('finalize: wrong owner is permission-denied', () => {
+  const result = checkReelVideoFinalizationEligibility(baseEligibleVideoReel(), OTHER_UID);
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'permission-denied');
+});
+
+check('finalize: status published is failed-precondition — finalization only ever runs pre-publish', () => {
+  const result = checkReelVideoFinalizationEligibility(baseEligibleVideoReel({ status: 'published' }), UID);
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'failed-precondition');
+});
+
+check('finalize: a plain photo Reel (mediaType "photo") is REJECTED — Part 9, never transcode a photo', () => {
+  const result = checkReelVideoFinalizationEligibility(baseEligiblePhotoReel(), UID);
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'failed-precondition');
+});
+
+check('finalize: a render-pending Reel is REJECTED — renderPhotoToVideo finalizes that variant itself, in the same pass that renders it', () => {
+  const result = checkReelVideoFinalizationEligibility(baseEligibleRenderPendingReel(), UID);
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'failed-precondition');
+});
+
+check('finalize: a Reel WITH device music is REJECTED — muxReelMusic finalizes that variant itself, in the same pass that merges the music', () => {
+  const result = checkReelVideoFinalizationEligibility(baseEligibleMusicVideoReel(), UID);
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'failed-precondition');
+});
+
+check('finalize: a plain video Reel with no music and no pending render is ELIGIBLE — exactly the pre-11B gap this closes', () => {
+  assert.equal(checkReelVideoFinalizationEligibility(baseEligibleVideoReel(), UID).ok, true);
+});
+
+check('finalize: eligibility does NOT depend on storageProvider or sourceNormalized — the idempotency short-circuit is the CALLER\'s own job, one level up, not this gate\'s', () => {
+  assert.equal(checkReelVideoFinalizationEligibility(baseEligibleVideoReel({ storageProvider: 'r2' }), UID).ok, true);
+  assert.equal(checkReelVideoFinalizationEligibility(baseEligibleVideoReel({ sourceNormalized: true }), UID).ok, true);
+  assert.equal(checkReelVideoFinalizationEligibility(baseEligibleVideoReel({ sourceNormalized: false }), UID).ok, true);
+});
+
+check('finalize: an unrecognized/future musicSourceType value is REJECTED — an allowlist (only "none" passes), not a blocklist', () => {
+  const result = checkReelVideoFinalizationEligibility(baseEligibleVideoReel({ musicSourceType: 'catalog' }), UID);
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'failed-precondition');
+});
+
+check('finalize: ownership is checked before status — a wrong-owner published-status combo still reports permission-denied, not failed-precondition', () => {
+  const result = checkReelVideoFinalizationEligibility(baseEligibleVideoReel({ status: 'published' }), OTHER_UID);
   assert.equal(result.code, 'permission-denied');
 });
 
