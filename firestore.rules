@@ -2156,7 +2156,7 @@ service cloud.firestore {
         'storyId', 'authorUid', 'authorDisplayName', 'authorUsername',
         'mediaType', 'storagePath', 'storageContentType', 'fileSizeBytes',
         'durationMs', 'width', 'height', 'status',
-        'storageProvider', 'mediaUrl',
+        'storageProvider', 'mediaUrl', 'sourceNormalized',
         'createdAt', 'updatedAt', 'publishedAt', 'expiresAt'
       ];
     }
@@ -2178,6 +2178,18 @@ service cloud.firestore {
         // transition below can ever flip this.
         && data.storageProvider == 'firebase'
         && data.mediaUrl == ''
+        // Step 11C — every draft is created not-yet-normalized, same
+        // "required field, fixed default at create" pattern as a Reel's
+        // own sourceNormalized (see isValidReelCreate) — applied
+        // uniformly regardless of mediaType (a photo Story never gets
+        // this flipped to true — see isValidStoryPublish below, which
+        // exempts photo Stories from the gate entirely). Only a trusted
+        // Cloud Function (finalizeStoryVideo, via the Admin SDK) can ever
+        // flip this to true for a direct video Story; addReelToMyStory
+        // (also Admin SDK) may set it true directly at CREATE time for a
+        // Reel->Story copy, since that write bypasses this predicate
+        // entirely (allow create only governs CLIENT writes).
+        && data.sourceNormalized == false
         && (
           (
             data.mediaType == 'video'
@@ -2233,6 +2245,18 @@ service cloud.firestore {
         && newData.authorDisplayName == oldData.authorDisplayName
         && newData.authorUsername == oldData.authorUsername
         && newData.mediaType == oldData.mediaType
+        // Step 11C — a VIDEO Story can never publish until its source has
+        // actually been through finalizeStoryVideo (which stamps
+        // sourceNormalized: true in its own Admin-SDK confirm-write,
+        // bypassing these Rules entirely). A plain PHOTO Story is exempt:
+        // it is never transcoded at all (Part 4 of the Step 11C spec) —
+        // same exemption pattern as isValidReelPublish's own
+        // `mediaType == 'photo'` carve-out. A REEL-COPIED Story
+        // (addReelToMyStory) is created ALREADY published — it never
+        // reaches this transition at all, so this gate only ever governs
+        // a direct capture/picker Story's own client-driven publish.
+        && (oldData.mediaType == 'photo' || oldData.sourceNormalized == true)
+        && newData.sourceNormalized == oldData.sourceNormalized
         && newData.storagePath == oldData.storagePath
         && newData.storageContentType == oldData.storageContentType
         && newData.fileSizeBytes == oldData.fileSizeBytes
@@ -2285,6 +2309,7 @@ service cloud.firestore {
         && newData.durationMs == oldData.durationMs
         && newData.width == oldData.width
         && newData.height == oldData.height
+        && newData.sourceNormalized == oldData.sourceNormalized
         && newData.publishedAt == oldData.publishedAt
         && newData.expiresAt == oldData.expiresAt
         && newData.createdAt == oldData.createdAt

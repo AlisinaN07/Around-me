@@ -1,7 +1,7 @@
 /**
  * Step 11B — the full, pure ORCHESTRATION of the NEW finalizeReelVideo
  * callable's own workflow (download the current video source -> run
- * ffmpeg to normalize it to REEL_VIDEO_PROFILE -> upload the result back
+ * ffmpeg to normalize it to VIDEO_DELIVERY_PROFILE -> upload the result back
  * over the Reel's OWN existing source object -> confirm the Firestore
  * document), extracted into its own file with ZERO
  * firebase-functions/firebase-admin import — same reasoning, and the same
@@ -18,7 +18,7 @@
  * `deleteStandaloneMusic` implementations for every caller, for no real
  * code reuse (the two workflows' own STEP SEQUENCES genuinely differ).
  * What IS shared between every finalization pipeline is the ENCODE
- * PROFILE itself — see reelVideoProfile.ts's own doc comment for why that
+ * PROFILE itself — see videoNormalizationProfile.ts's own doc comment for why that
  * one shared piece is what actually matters for this step's stated goal.
  *
  * Never publishes/confirms a half-finished result, same invariant as
@@ -38,8 +38,8 @@
  * reelSourceStorage.ts) is checked FIRST, before any download: if the
  * canonical object already carries the CURRENT profile's own
  * normalization marker (stamped by uploadNormalizedVideo's own prior,
- * already-successful run — see reelVideoProfile.ts's own
- * isReelSourceAlreadyNormalized), this skips download/ffmpeg/upload
+ * already-successful run — see videoNormalizationProfile.ts's own
+ * isVideoSourceAlreadyNormalized), this skips download/ffmpeg/upload
  * entirely and goes straight to the (idempotent, safe-to-repeat)
  * Firestore confirm — reading the object's own CURRENT size via the same
  * metadata call rather than a stale locally-remembered one. A marker
@@ -48,7 +48,7 @@
  * normal pipeline — see readReelCanonicalSourceState's own doc comment
  * for why that's the deliberately safe default.
  */
-import { isReelSourceAlreadyNormalized } from './reelVideoProfile';
+import { isVideoSourceAlreadyNormalized, NORMALIZED_VIDEO_MAX_SIZE_BYTES_60S } from './videoNormalizationProfile';
 
 export type ReelVideoFinalizationFailureReason =
   | 'video-unavailable'
@@ -82,7 +82,7 @@ export type ReelVideoFinalizationDeps = {
   readCanonicalSourceState?(): Promise<ReelVideoFinalizationCanonicalState | null>;
   /** Provider-aware — writes the CURRENT video source to `paths.localVideoPath`. `false` (not a throw) means "not available," mapped to the `video-unavailable` failure reason — mirrors performReelMux's own `downloadVideo` contract exactly (same reelSourceStorage.ts helper, reused unchanged). */
   downloadVideo(localVideoPath: string): Promise<boolean>;
-  /** The ENTIRE native-process boundary — a real implementation shells out to ffmpeg with the shared REEL_VIDEO_PROFILE args (see reelVideoProfile.ts); a test substitutes a fake that writes whatever bytes it wants to `localOutputPath`, or throws to simulate a real ffmpeg failure. This file never inspects HOW normalization happened, only whether it produced a real, non-empty, size-bounded output file. */
+  /** The ENTIRE native-process boundary — a real implementation shells out to ffmpeg with the shared VIDEO_DELIVERY_PROFILE args (see videoNormalizationProfile.ts); a test substitutes a fake that writes whatever bytes it wants to `localOutputPath`, or throws to simulate a real ffmpeg failure. This file never inspects HOW normalization happened, only whether it produced a real, non-empty, size-bounded output file. */
   runFfmpegNormalize(localVideoPath: string, localOutputPath: string): Promise<void>;
   /** Real file size, in bytes, of the path given — used both to detect an empty/corrupt ffmpeg output and to enforce the final-output size guard, and to record `fileSizeBytes` on the Reel document. */
   statFileSize(path: string): Promise<number>;
@@ -102,23 +102,17 @@ export type ReelVideoFinalizationDeps = {
 };
 
 /**
- * The upper bound this step enforces on a normalized output's own byte
- * size — see reelVideoProfile.ts's own REEL_VIDEO_PROFILE doc comment for
- * the exact rate-control numbers this is derived from: at the configured
- * ceiling (5000 kbps video + 128 kbps audio = 5128 kbps) sustained for
- * the maximum possible Reel duration (60_000ms, REEL_MAX_DURATION_MS in
- * src/types/reel.ts), the theoretical largest legitimate output is
- * 5128 * 60 / 8 ≈ 38.46 MB. 40 MB sits just above that ceiling — enough
- * headroom that no legitimately-encoded Reel at this profile is ever
- * rejected, while still catching a genuinely pathological/runaway ffmpeg
- * output (a rate-control failure, a corrupt/looping encode) before it
- * ever reaches Storage. Deliberately NOT the raw 50 MB upload cap
- * (REEL_VIDEO_MAX_SIZE_BYTES in mediaUploadValidation.ts) — that limit
- * bounds an arbitrary, unprocessed device capture; this one bounds an
- * output this codebase itself just produced under known, fixed
- * rate-control settings, which should be materially smaller.
+ * Step 11C — this Reel-specific name is now just a re-export of the
+ * shared, duration-parameterized guard (see videoNormalizationProfile.ts's
+ * own NORMALIZED_VIDEO_MAX_SIZE_BYTES_60S doc comment for the full
+ * derivation) — Story's own storyVideoFinalization.ts reuses the EXACT
+ * same constant directly, since a Story video shares the identical 60s
+ * duration cap as a Reel (see createStoryDraft in src/services/stories.ts,
+ * which imports REEL_MAX_DURATION_MS unchanged for this exact reason).
+ * Kept under this name here only so this file's own existing references
+ * don't need touching — never redefined/duplicated.
  */
-export const REEL_NORMALIZED_VIDEO_MAX_SIZE_BYTES = 40 * 1024 * 1024;
+export const REEL_NORMALIZED_VIDEO_MAX_SIZE_BYTES = NORMALIZED_VIDEO_MAX_SIZE_BYTES_60S;
 
 /**
  * Runs the full plain-video finalization workflow against injected
@@ -131,7 +125,7 @@ export async function performReelVideoFinalization(
   deps: ReelVideoFinalizationDeps
 ): Promise<ReelVideoFinalizationOutcome> {
   const canonicalState = deps.readCanonicalSourceState ? await deps.readCanonicalSourceState() : null;
-  const alreadyNormalized = !!canonicalState && isReelSourceAlreadyNormalized(canonicalState.normalizationMarker);
+  const alreadyNormalized = !!canonicalState && isVideoSourceAlreadyNormalized(canonicalState.normalizationMarker);
 
   let outputSize: number;
 

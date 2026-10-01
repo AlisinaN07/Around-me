@@ -29,7 +29,7 @@ const {
   copyReelSourceToFirebaseStoryObject,
   readReelCanonicalSourceState,
 } = require('../lib/media/reelSourceStorage.js');
-const { REEL_VIDEO_NORMALIZATION_METADATA_KEY, buildReelVideoNormalizationMetadata } = require('../lib/media/reelVideoProfile.js');
+const { VIDEO_NORMALIZATION_METADATA_KEY, buildVideoNormalizationMetadata } = require('../lib/media/videoNormalizationProfile.js');
 const { startFakeDeliveryServer } = require('./testHelpers/fakeHttpMediaServer.cjs');
 
 const results = [];
@@ -260,13 +260,13 @@ async function main() {
   // fail-safe on any read failure.
   // -------------------------------------------------------------------
 
-  const normalizedMetadataValue = buildReelVideoNormalizationMetadata();
+  const normalizedMetadataValue = buildVideoNormalizationMetadata();
 
   await check('canonical state: Firebase Reel whose object already carries the CURRENT normalization marker — returns the marker and real size, never touches R2', async () => {
     const bucket = makeFakeBucket({}, { 'reels/u1/r1/source': { size: '12345', metadata: normalizedMetadataValue } });
     const reel = { storageProvider: 'firebase', storagePath: 'reels/u1/r1/source' };
     const result = await readReelCanonicalSourceState(bucket, reel, 'u1', 'r1');
-    assert.deepEqual(result, { sizeBytes: 12345, normalizationMarker: normalizedMetadataValue[REEL_VIDEO_NORMALIZATION_METADATA_KEY] });
+    assert.deepEqual(result, { sizeBytes: 12345, normalizationMarker: normalizedMetadataValue[VIDEO_NORMALIZATION_METADATA_KEY] });
     assert.equal(bucket.calls.getMetadata.length, 1);
     assert.equal(bucket.calls.download.length, 0, 'a metadata check must never download the full video');
   });
@@ -300,7 +300,7 @@ async function main() {
       return { sizeBytes: 54321, metadata: normalizedMetadataValue };
     };
     const result = await readReelCanonicalSourceState(bucket, { storageProvider: 'r2' }, 'u1', 'r1', { headObject });
-    assert.deepEqual(result, { sizeBytes: 54321, normalizationMarker: normalizedMetadataValue[REEL_VIDEO_NORMALIZATION_METADATA_KEY] });
+    assert.deepEqual(result, { sizeBytes: 54321, normalizationMarker: normalizedMetadataValue[VIDEO_NORMALIZATION_METADATA_KEY] });
     assert.deepEqual(headCalls, ['reels/u1/r1/source']);
     assert.equal(bucket.calls.getMetadata.length, 0);
   });
@@ -317,8 +317,8 @@ async function main() {
     assert.equal(result, null);
   });
 
-  await check('canonical state: R2 Reel with an OLDER/different profile-version marker — returned verbatim (the CALLER, isReelSourceAlreadyNormalized, decides it does not match — never pre-filtered here)', async () => {
-    const headObject = async () => ({ sizeBytes: 222, metadata: { [REEL_VIDEO_NORMALIZATION_METADATA_KEY]: '0' } });
+  await check('canonical state: R2 Reel with an OLDER/different profile-version marker — returned verbatim (the CALLER, isVideoSourceAlreadyNormalized, decides it does not match — never pre-filtered here)', async () => {
+    const headObject = async () => ({ sizeBytes: 222, metadata: { [VIDEO_NORMALIZATION_METADATA_KEY]: '0' } });
     const result = await readReelCanonicalSourceState(makeFakeBucket({}), { storageProvider: 'r2' }, 'u1', 'r1', { headObject });
     assert.deepEqual(result, { sizeBytes: 222, normalizationMarker: '0' });
   });

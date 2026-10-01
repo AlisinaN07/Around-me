@@ -85,6 +85,33 @@ export type Story = {
    * like resolveReelVideoPlaybackUrl already does for Reels.
    */
   mediaUrl?: string;
+  /**
+   * Step 11C — whether this Story's OWN video source object (at
+   * `storagePath`) has already been through server-side normalization
+   * (see functions/src/media/videoNormalizationProfile.ts's own
+   * VIDEO_DELIVERY_PROFILE — the exact same target a Reel's video
+   * normalizes to: max 1920x1080 bounding box, H.264/yuv420p, CRF 23,
+   * capped at 30fps, AAC 128k, faststart). Always `false` at create,
+   * regardless of mediaType (same uniform-default convention as every
+   * other Story field — see isValidStoryCreate). For a PHOTO Story stays
+   * `false` forever — a photo is never transcoded at all (Part 4 of the
+   * Step 11C spec) and isValidStoryPublish exempts photo Stories from
+   * requiring this entirely. For a DIRECT video Story, flips to `true`
+   * exactly once via finalizeStoryVideo (a trusted Admin SDK write,
+   * never client-writable directly — there is no Firestore Rules
+   * transition for this field at all, since every write to it bypasses
+   * Rules already). For a Story copied from an already-published Reel
+   * (addReelToMyStory), this is set directly from that Reel's OWN
+   * `sourceNormalized` value at creation time — a video Reel can only
+   * ever be `published` once its own source is normalized (see
+   * firestore.rules' own isValidReelPublish), so copying that already-
+   * trusted value forward is correct without re-touching storage
+   * metadata or running ffmpeg a second time. isValidStoryPublish
+   * independently REQUIRES this to already be `true` before a video
+   * Story can reach `status: 'published'` through the normal client
+   * publish path — a real server-enforced invariant.
+   */
+  sourceNormalized: boolean;
   createdAt: Timestamp;
   updatedAt: Timestamp;
   publishedAt: Timestamp | null;

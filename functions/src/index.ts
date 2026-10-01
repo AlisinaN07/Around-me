@@ -65,7 +65,7 @@ import { checkReelMuxEligibility, checkReelPhotoRenderEligibility, checkReelVide
 import { cleanupReelOwnedMedia, cleanupReelOwnedMediaWithoutDocument, type ReelMediaCleanupResult } from './media/reelMediaCleanup';
 import { performReelMux, type ReelMuxFailureReason } from './media/reelMuxOrchestration';
 import { performReelVideoFinalization, type ReelVideoFinalizationFailureReason } from './media/reelVideoFinalization';
-import { buildReelVideoEncodeArgs, computeReelVideoOutputDimensions } from './media/reelVideoProfile';
+import { buildVideoEncodeArgs, computeVideoOutputDimensions } from './media/videoNormalizationProfile';
 import {
   copyReelSourceToFirebaseStoryObject,
   copyReelSourceToR2StoryObject,
@@ -77,6 +77,14 @@ import {
 } from './media/reelSourceStorage';
 import { getR2Config } from './media/r2Config';
 import { deleteReelMusic, downloadReelMusicToLocalFile } from './media/reelMusicStorage';
+import { checkStoryVideoFinalizationEligibility } from './media/storyEligibility';
+import {
+  deriveCopiedStorySourceNormalized,
+  downloadStorySourceForFinalization,
+  readStoryCanonicalSourceState,
+  uploadNormalizedStorySourceToProvider,
+} from './media/storySourceStorage';
+import { performStoryVideoFinalization, type StoryVideoFinalizationFailureReason } from './media/storyVideoFinalization';
 import { cleanupExpiredStoriesBatch } from './media/storyExpiryCleanup';
 import { cleanupStoryOwnedMedia } from './media/storyMediaCleanup';
 
@@ -1466,6 +1474,15 @@ function parseReelIdParam(request: CallableRequest): string {
   return reelId;
 }
 
+/** Step 11C — same shape/convention as parseReelIdParam above, for finalizeStoryVideo's own `storyId` param. */
+function parseStoryIdParam(request: CallableRequest): string {
+  const storyId = request.data?.storyId;
+  if (typeof storyId !== 'string' || storyId.length === 0 || storyId.length > MAX_REPORT_ID_LENGTH) {
+    throw new HttpsError('invalid-argument', 'storyId must be a non-empty string.');
+  }
+  return storyId;
+}
+
 /**
  * Deletes exactly one Post/Activity/Event the caller authored. Never
  * touches any other document the same author owns — the target is the
@@ -1766,13 +1783,13 @@ export const muxReelMusic = onCall(
         downloadMusic: (destination) => downloadReelMusicToLocalFile(bucket, reelData, uid, reelId, destination),
         // Step 11B — ONE encode pass does the music merge AND the
         // universal delivery normalization together (see
-        // reelVideoProfile.ts's own doc comment for why this is the
+        // videoNormalizationProfile.ts's own doc comment for why this is the
         // shared ffmpeg output profile every finalization pipeline uses)
         // — replacing the pre-11B `-c:v copy` passthrough, which left a
         // music Reel's own video stream completely untouched (original
         // resolution/fps/codec/bitrate, whatever the device produced).
         // Dimensions come from this Reel's own already-persisted
-        // width/height (see computeReelVideoOutputDimensions's own doc
+        // width/height (see computeVideoOutputDimensions's own doc
         // comment for why no ffprobe step is needed).
         runFfmpegMux: (localVideoPath, localMusicPath, localOutputPath) =>
           execFileAsync(
@@ -1785,7 +1802,7 @@ export const muxReelMusic = onCall(
               '-map', '0:v:0',
               '-map', '1:a:0',
               '-shortest',
-              ...buildReelVideoEncodeArgs(computeReelVideoOutputDimensions(reelData.width as number, reelData.height as number)),
+              ...buildVideoEncodeArgs(computeVideoOutputDimensions(reelData.width as number, reelData.height as number)),
               localOutputPath,
             ],
             { timeout: 240_000 }
@@ -1814,7 +1831,7 @@ export const muxReelMusic = onCall(
         },
       },
       // Step 11B — the mux encode pass ALREADY applies the shared
-      // REEL_VIDEO_PROFILE above, so this Reel's video is just as
+      // VIDEO_DELIVERY_PROFILE above, so this Reel's video is just as
       // "finalized" as one that went through finalizeReelVideo —
       // recorded in the exact same atomic confirm-write, via the same
       // extraConfirmFields mechanism renderPhotoToVideo already uses
@@ -1943,7 +1960,7 @@ export const renderPhotoToVideo = onCall(
           // comment).
           downloadMusic: (destination) => downloadReelMusicToLocalFile(bucket, reelData, uid, reelId, destination),
           // Step 11B — reuses the exact same shared encode profile as
-          // muxReelMusic and finalizeReelVideo (see reelVideoProfile.ts's
+          // muxReelMusic and finalizeReelVideo (see videoNormalizationProfile.ts's
           // own doc comment) instead of this workflow's own separate,
           // looser settings (no resolution cap, implicit CRF, no
           // faststart, 192k audio) — this render itself now produces the
@@ -1969,7 +1986,7 @@ export const renderPhotoToVideo = onCall(
                 '-map', '1:a:0',
                 '-t', String(REEL_PHOTO_RENDER_DURATION_SECONDS),
                 '-tune', 'stillimage',
-                ...buildReelVideoEncodeArgs(computeReelVideoOutputDimensions(reelData.width as number, reelData.height as number)),
+                ...buildVideoEncodeArgs(computeVideoOutputDimensions(reelData.width as number, reelData.height as number)),
                 localOutputPath,
               ],
               { timeout: 240_000 }
@@ -2001,7 +2018,7 @@ export const renderPhotoToVideo = onCall(
         // SAME confirm-write that records the render succeeded — see
         // this function's own top doc comment. sourceNormalized: true
         // (Step 11B) — the render's own ffmpeg pass already applies the
-        // shared REEL_VIDEO_PROFILE above, so a rendered Reel is exactly
+        // shared VIDEO_DELIVERY_PROFILE above, so a rendered Reel is exactly
         // as "finalized" as a plain video that went through
         // finalizeReelVideo or a music Reel muxReelMusic already
         // finalized the same way.
@@ -2118,7 +2135,7 @@ export const finalizeReelVideo = onCall(
         readCanonicalSourceState: () => readReelCanonicalSourceState(bucket, reelData, uid, reelId),
         downloadVideo: (destination) => downloadReelSourceForMux(bucket, reelData, uid, reelId, destination),
         // Step 11B — the single shared encode profile (see
-        // reelVideoProfile.ts's own doc comment) — the ONE ffmpeg input
+        // videoNormalizationProfile.ts's own doc comment) — the ONE ffmpeg input
         // is this Reel's own current video source; no second input, no
         // mapping needed (ffmpeg's own default stream selection already
         // picks the first video+audio stream of a single-file input,
@@ -2130,7 +2147,7 @@ export const finalizeReelVideo = onCall(
             [
               '-y',
               '-i', localVideoPath,
-              ...buildReelVideoEncodeArgs(computeReelVideoOutputDimensions(reelData.width as number, reelData.height as number)),
+              ...buildVideoEncodeArgs(computeVideoOutputDimensions(reelData.width as number, reelData.height as number)),
               localOutputPath,
             ],
             { timeout: 240_000 }
@@ -2161,6 +2178,153 @@ export const finalizeReelVideo = onCall(
     }
 
     return { reelId, finalized: true as const, alreadyNormalized: false as const };
+  }
+);
+
+/**
+ * Step 11C — maps a performStoryVideoFinalization failure `reason` to a
+ * user-facing message, same convention as reelVideoFinalizationFailureMessage
+ * above.
+ */
+function storyVideoFinalizationFailureMessage(reason: StoryVideoFinalizationFailureReason): string {
+  switch (reason) {
+    case 'video-unavailable':
+      return 'Your video must finish uploading before it can be processed.';
+    default:
+      return "Couldn't finish processing this Story's video.";
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Step 11C — UNIVERSAL STORY VIDEO NORMALIZATION, the direct-capture
+// branch: a direct video Story (createStoryDraft -> uploadStoryMedia ->
+// publishStory, see src/services/stories.ts) previously reached
+// publishStory having never touched ffmpeg at all — exactly the same gap
+// Step 11B closed for a plain video Reel (finalizeReelVideo above),
+// mirrored here field-for-field: same shared VIDEO_DELIVERY_PROFILE (see
+// videoNormalizationProfile.ts), same idempotency marker/metadata-check
+// architecture (storySourceStorage.ts's readStoryCanonicalSourceState),
+// same ordering guarantee (the confirm-write is the one trusted write
+// that both stamps `sourceNormalized: true` AND is independently required
+// by firestore.rules' own isValidStoryPublish before a video Story can
+// ever publish).
+//
+// Called ONLY for mediaType === 'video' (checkStoryVideoFinalizationEligibility's
+// own exact scope) — a photo Story never reaches ffmpeg at all (Part 4 of
+// this step's spec), and a Story copied from an already-published Reel
+// (addReelToMyStory below) never needs this either: that Reel's own
+// video was already normalized before IT could publish, and
+// addReelToMyStory carries that trusted `sourceNormalized` value forward
+// directly rather than re-encoding — see that callable's own doc comment.
+//
+// Called from src/app/(app)/create/reel/camera.tsx's own
+// handlePublishAsStory, between the upload finishing and publishStory,
+// ONLY for a direct video Story.
+//
+// IDEMPOTENT: a Story whose `sourceNormalized` is already `true` (a retry
+// after this callable's own confirm-write already succeeded, but some
+// LATER step — e.g. publishStory itself — failed) short-circuits here
+// with no download/ffmpeg/upload at all; and even on a genuine
+// confirm-write-failure retry, performStoryVideoFinalization's own
+// readCanonicalSourceState check (see storyVideoFinalization.ts) detects
+// the already-stamped storage marker and skips ffmpeg entirely, never
+// re-encoding an already-normalized asset.
+// ---------------------------------------------------------------------------
+
+export const finalizeStoryVideo = onCall(
+  { region: REGION, timeoutSeconds: 300, memory: '1GiB', secrets: [r2AccessKeyIdSecret, r2SecretAccessKeySecret] },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError('unauthenticated', 'Sign in required.');
+    }
+    const storyId = parseStoryIdParam(request);
+    const uid = request.auth.uid;
+
+    const db = getFirestore();
+    const storyDocRef = db.doc(`stories/${storyId}`);
+    const storySnap = await storyDocRef.get();
+    const story = storySnap.exists ? (storySnap.data() as Record<string, unknown>) : null;
+    const eligibility = checkStoryVideoFinalizationEligibility(story, uid);
+    if (!eligibility.ok) {
+      throw new HttpsError(eligibility.code, eligibility.message);
+    }
+    // eligibility.ok guarantees `story` is non-null.
+    const storyData = story as Record<string, unknown>;
+
+    // Idempotency short-circuit — see this function's own top doc
+    // comment. Deliberately checked HERE, not inside
+    // checkStoryVideoFinalizationEligibility: "already normalized" is a
+    // legitimate different OUTCOME (a no-op success), never a rejection.
+    if (storyData.sourceNormalized === true) {
+      return { storyId, finalized: true as const, alreadyNormalized: true as const };
+    }
+
+    if (!ffmpegPath) {
+      // Genuinely unexpected (ffmpeg-static failed to resolve a binary for
+      // this runtime) — never silently skip normalization and publish the
+      // raw, un-processed upload as if it were already finalized.
+      throw new HttpsError('internal', "Couldn't process this Story's video.");
+    }
+
+    const bucket = getStorage().bucket();
+    // Provider-aware, same convention as finalizeReelVideo above:
+    // `undefined` (a legacy Story predating storageProvider) defaults to
+    // 'firebase'.
+    const videoProvider = (storyData.storageProvider as string | undefined) ?? 'firebase';
+
+    const workDir = await mkdtemp(join(tmpdir(), `story-finalize-${storyId}-`));
+    const paths = {
+      localVideoPath: join(workDir, 'input-video'),
+      localOutputPath: join(workDir, 'output.mp4'),
+    };
+
+    try {
+      const outcome = await performStoryVideoFinalization(paths, {
+        // Step 11C — true idempotency, built in from the start (see
+        // storyVideoFinalization.ts's own top doc comment).
+        readCanonicalSourceState: () => readStoryCanonicalSourceState(bucket, storyData, uid, storyId),
+        downloadVideo: (destination) => downloadStorySourceForFinalization(bucket, storyData, uid, storyId, destination),
+        // Step 11C — the same shared encode profile Reel's own
+        // finalization uses (see videoNormalizationProfile.ts's own doc
+        // comment) — the ONE ffmpeg input is this Story's own current
+        // video source; no second input, no mapping needed.
+        runFfmpegNormalize: (localVideoPath, localOutputPath) =>
+          execFileAsync(
+            ffmpegPath!,
+            [
+              '-y',
+              '-i', localVideoPath,
+              ...buildVideoEncodeArgs(computeVideoOutputDimensions(storyData.width as number, storyData.height as number)),
+              localOutputPath,
+            ],
+            { timeout: 240_000 }
+          ).then(() => undefined),
+        statFileSize: async (path) => (await stat(path)).size,
+        uploadNormalizedVideo: (localOutputPath) =>
+          uploadNormalizedStorySourceToProvider(bucket, storyData, uid, storyId, localOutputPath, 'video/mp4', muxedVideoCacheControl(videoProvider)),
+        updateStoryDocument: (fields) => storyDocRef.update({ ...fields, updatedAt: FieldValue.serverTimestamp() }).then(() => undefined),
+        buildVersionedSourceUrl: () => {
+          if (videoProvider !== 'r2') return null;
+          const publicMediaBaseUrl = getR2Config()?.publicMediaBaseUrl ?? null;
+          if (!publicMediaBaseUrl) return null;
+          return buildMediaUrl(publicMediaBaseUrl, storySourceKey(uid, storyId), Date.now());
+        },
+      });
+
+      if (!outcome.ok) {
+        throw new HttpsError(
+          outcome.reason === 'video-unavailable' ? 'failed-precondition' : 'internal',
+          storyVideoFinalizationFailureMessage(outcome.reason)
+        );
+      }
+    } catch (error) {
+      if (error instanceof HttpsError) throw error;
+      throw new HttpsError('internal', "Couldn't process this Story's video.");
+    } finally {
+      await rm(workDir, { recursive: true, force: true });
+    }
+
+    return { storyId, finalized: true as const, alreadyNormalized: false as const };
   }
 );
 
@@ -2286,6 +2450,22 @@ export const addReelToMyStory = onCall(
       status: 'published',
       storageProvider: targetProvider,
       mediaUrl,
+      // Step 11C — this Story's media is a COPY of an already-published
+      // Reel's own source — that Reel could only reach `published` with
+      // its OWN sourceNormalized already true for a video (see
+      // firestore.rules' own isValidReelPublish); a photo Reel's
+      // sourceNormalized is always false, which is exactly correct here
+      // too (a photo Story is exempt from the normalization gate
+      // entirely — see isValidStoryPublish). Carrying this TRUSTED value
+      // forward is what makes this copy safe WITHOUT re-running ffmpeg or
+      // depending on whether the R2 CopyObjectCommand above happens to
+      // preserve custom object metadata (audited, not assumed — S3's own
+      // default CopyObjectCommand behavior is MetadataDirective: 'COPY',
+      // so it likely would anyway, but this doesn't rely on that at all).
+      // `=== true` rather than a bare truthy check: a legacy Reel
+      // predating this field reads as `undefined` here, which must NOT
+      // be treated as normalized.
+      sourceNormalized: deriveCopiedStorySourceNormalized(reel),
       createdAt: FieldValue.serverTimestamp(),
       updatedAt: FieldValue.serverTimestamp(),
       publishedAt: FieldValue.serverTimestamp(),

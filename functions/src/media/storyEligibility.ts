@@ -94,3 +94,37 @@ export function checkStoryDeleteEligibility(story: RawStoryData | null, uid: str
   if (story.authorUid !== uid) return permissionDenied('You do not own this Story.');
   return OK;
 }
+
+/**
+ * Step 11C — finalizeStoryVideo's own eligibility check: the gate for a
+ * DIRECTLY captured/picked video Story (checkStoryMediaEligibility's own
+ * gate for the UPLOAD step already ran earlier in this same lifecycle;
+ * this is the separate gate for the NORMALIZE step, same two-step
+ * pattern Reel's own checkReelVideoEligibility/
+ * checkReelVideoFinalizationEligibility already establish). Deliberately
+ * simpler than Reel's equivalent: a Story has no music/mux/render concept
+ * at all (see Story.mediaType's own doc comment, src/types/story.ts) —
+ * every video Story is finalized exactly one way, so there is no "which
+ * of several variants is this" branch to make here, only ownership/
+ * status/mediaType:
+ *  1. Story exists, `authorUid === uid`, `status === 'uploading'` — same
+ *     as checkStoryMediaEligibility/checkStoryDeleteEligibility above.
+ *  2. `mediaType === 'video'` — a photo Story is never transcoded at all
+ *     (Part 4 of the Step 11C spec) and must never reach ffmpeg.
+ *
+ * Deliberately does NOT gate on `story.storageProvider` or
+ * `sourceNormalized` — same reasoning as Reel's own
+ * checkReelVideoFinalizationEligibility: the provider only decides WHICH
+ * download/upload path performStoryVideoFinalization takes, never
+ * whether finalization is allowed to run; the `sourceNormalized`
+ * IDEMPOTENCY short-circuit (skip re-encoding an already-normalized
+ * Story) is the CALLER's own job, one level up in index.ts's
+ * finalizeStoryVideo, not this eligibility gate's.
+ */
+export function checkStoryVideoFinalizationEligibility(story: RawStoryData | null, uid: string): EligibilityResult {
+  if (!story) return notFound();
+  if (story.authorUid !== uid) return permissionDenied('You can only process your own Story.');
+  if (story.status !== 'uploading') return failedPrecondition('This Story is not awaiting video processing.');
+  if (story.mediaType !== 'video') return failedPrecondition('This Story has no video to process.');
+  return OK;
+}

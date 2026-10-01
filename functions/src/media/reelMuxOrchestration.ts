@@ -53,7 +53,7 @@
  * second ffmpeg mux/render ever runs for an already-normalized canonical
  * asset.
  */
-import { isReelSourceAlreadyNormalized } from './reelVideoProfile';
+import { isVideoSourceAlreadyNormalized } from './videoNormalizationProfile';
 
 export type ReelMuxFailureReason =
   | 'video-unavailable'
@@ -161,7 +161,7 @@ export async function performReelMux(
   extraConfirmFields: ReelMuxExtraConfirmFields = {}
 ): Promise<ReelMuxOutcome> {
   const canonicalState = deps.readCanonicalSourceState ? await deps.readCanonicalSourceState() : null;
-  const alreadyNormalized = !!canonicalState && isReelSourceAlreadyNormalized(canonicalState.normalizationMarker);
+  const alreadyNormalized = !!canonicalState && isVideoSourceAlreadyNormalized(canonicalState.normalizationMarker);
 
   let outputSize: number;
 

@@ -10,7 +10,7 @@
  * first.
  */
 const assert = require('node:assert/strict');
-const { checkStoryMediaEligibility, checkStoryDeleteEligibility } = require('../lib/media/storyEligibility.js');
+const { checkStoryMediaEligibility, checkStoryDeleteEligibility, checkStoryVideoFinalizationEligibility } = require('../lib/media/storyEligibility.js');
 
 const results = [];
 function check(name, fn) {
@@ -115,6 +115,50 @@ check('delete: an already-published Story CAN also be deleted — unlike a Reel,
 
 check('delete: a photo Story can be deleted too, regardless of mediaType', () => {
   assert.equal(checkStoryDeleteEligibility(basePhotoStory({ status: 'published' }), UID).ok, true);
+});
+
+// ---------------------------------------------------------------------------
+// Step 11C — checkStoryVideoFinalizationEligibility: finalizeStoryVideo's
+// own gate, scoped to exactly a direct VIDEO Story (no music/mux/render
+// concept exists for Stories at all — see Story.mediaType's own doc
+// comment).
+// ---------------------------------------------------------------------------
+
+check('finalize: nonexistent Story (null) is not-found', () => {
+  assert.equal(checkStoryVideoFinalizationEligibility(null, UID).code, 'not-found');
+});
+
+check('finalize: wrong owner is permission-denied', () => {
+  const result = checkStoryVideoFinalizationEligibility(baseVideoStory(), OTHER_UID);
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'permission-denied');
+});
+
+check('finalize: status published is failed-precondition — finalization only ever runs pre-publish', () => {
+  const result = checkStoryVideoFinalizationEligibility(baseVideoStory({ status: 'published' }), UID);
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'failed-precondition');
+});
+
+check('finalize: a plain photo Story (mediaType "photo") is REJECTED — Part 4, never transcode a photo', () => {
+  const result = checkStoryVideoFinalizationEligibility(basePhotoStory(), UID);
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'failed-precondition');
+});
+
+check('finalize: a direct video Story with no music/render concept at all is ELIGIBLE', () => {
+  assert.equal(checkStoryVideoFinalizationEligibility(baseVideoStory(), UID).ok, true);
+});
+
+check('finalize: eligibility does NOT depend on storageProvider or sourceNormalized — the idempotency short-circuit is the CALLER\'s own job, one level up, not this gate\'s', () => {
+  assert.equal(checkStoryVideoFinalizationEligibility(baseVideoStory({ storageProvider: 'r2' }), UID).ok, true);
+  assert.equal(checkStoryVideoFinalizationEligibility(baseVideoStory({ sourceNormalized: true }), UID).ok, true);
+  assert.equal(checkStoryVideoFinalizationEligibility(baseVideoStory({ sourceNormalized: false }), UID).ok, true);
+});
+
+check('finalize: ownership is checked before status — a wrong-owner published-status combo still reports permission-denied, not failed-precondition', () => {
+  const result = checkStoryVideoFinalizationEligibility(baseVideoStory({ status: 'published' }), OTHER_UID);
+  assert.equal(result.code, 'permission-denied');
 });
 
 console.log('\n=== functions/ Story eligibility logic test results ===');

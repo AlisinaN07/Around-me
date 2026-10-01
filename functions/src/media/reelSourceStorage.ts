@@ -21,7 +21,7 @@
  */
 import { reelSourceKey, storySourceKey } from './objectKey';
 import { copyR2Object, deleteR2Object, downloadR2ObjectBuffer, headR2ObjectDetails, putR2Object } from './r2Storage';
-import { buildReelVideoNormalizationMetadata, REEL_VIDEO_NORMALIZATION_METADATA_KEY } from './reelVideoProfile';
+import { buildVideoNormalizationMetadata, VIDEO_NORMALIZATION_METADATA_KEY } from './videoNormalizationProfile';
 
 export type RawReelData = Record<string, unknown>;
 
@@ -349,8 +349,8 @@ export async function downloadReelSourceForMux(
  *
  * Step 11B — EVERY call site of this function (finalizeReelVideo/
  * muxReelMusic/renderPhotoToVideo) is, by construction, writing a real,
- * final, normalized asset at REEL_VIDEO_PROFILE — so this unconditionally
- * stamps buildReelVideoNormalizationMetadata()'s marker onto the object
+ * final, normalized asset at VIDEO_DELIVERY_PROFILE — so this unconditionally
+ * stamps buildVideoNormalizationMetadata()'s marker onto the object
  * on BOTH backends, in the exact same write that replaces its bytes. This
  * is what makes a LATER retry (after e.g. a Firestore confirm-write
  * failure) able to tell "already normalized" from "still raw" via a real
@@ -367,7 +367,7 @@ export async function uploadMuxedReelSourceToProvider(
   cacheControl: string | undefined,
   deps: R2ObjectDeps = {}
 ): Promise<void> {
-  const normalizationMetadata = buildReelVideoNormalizationMetadata();
+  const normalizationMetadata = buildVideoNormalizationMetadata();
   if (reel.storageProvider === 'r2') {
     const putObject = deps.putObject ?? putR2Object;
     const readFileImpl =
@@ -390,7 +390,7 @@ export async function uploadMuxedReelSourceToProvider(
  * object already carries this codebase's own current-profile
  * normalization marker. Returns `null` when the object doesn't exist yet,
  * or on ANY read failure — deliberately fail-SAFE (see
- * isReelSourceAlreadyNormalized's own doc comment): the caller
+ * isVideoSourceAlreadyNormalized's own doc comment): the caller
  * (performReelVideoFinalization/performReelMux) treats `null` as "cannot
  * confirm — run the full finalization pipeline," never as "assume
  * already done."
@@ -416,14 +416,14 @@ export async function readReelCanonicalSourceState(
     const headObject = deps.headObject ?? headR2ObjectDetails;
     const result = await headObject(reelSourceKey(uid, reelId));
     if (!result) return null;
-    return { sizeBytes: result.sizeBytes, normalizationMarker: result.metadata[REEL_VIDEO_NORMALIZATION_METADATA_KEY] ?? null };
+    return { sizeBytes: result.sizeBytes, normalizationMarker: result.metadata[VIDEO_NORMALIZATION_METADATA_KEY] ?? null };
   }
   try {
     const file = bucket.file(reel.storagePath as string);
     const [metadata] = await file.getMetadata();
     const sizeBytes = typeof metadata.size === 'string' ? Number.parseInt(metadata.size, 10) : (metadata.size ?? 0);
     if (!Number.isFinite(sizeBytes) || sizeBytes <= 0) return null;
-    const rawMarker = metadata.metadata?.[REEL_VIDEO_NORMALIZATION_METADATA_KEY];
+    const rawMarker = metadata.metadata?.[VIDEO_NORMALIZATION_METADATA_KEY];
     return { sizeBytes, normalizationMarker: typeof rawMarker === 'string' ? rawMarker : null };
   } catch {
     // Object doesn't exist yet, or a transient metadata-read error — fail

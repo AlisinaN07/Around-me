@@ -21,7 +21,7 @@ const {
   performReelVideoFinalization,
   REEL_NORMALIZED_VIDEO_MAX_SIZE_BYTES,
 } = require('../lib/media/reelVideoFinalization.js');
-const { buildReelVideoNormalizationMetadata, REEL_VIDEO_NORMALIZATION_METADATA_KEY } = require('../lib/media/reelVideoProfile.js');
+const { buildVideoNormalizationMetadata, VIDEO_NORMALIZATION_METADATA_KEY } = require('../lib/media/videoNormalizationProfile.js');
 
 const results = [];
 async function check(name, fn) {
@@ -271,7 +271,7 @@ async function main() {
   // requirement: "ffmpeg calls = 1 total across both attempts, not 2."
   // -------------------------------------------------------------------
 
-  const CURRENT_MARKER = buildReelVideoNormalizationMetadata()[REEL_VIDEO_NORMALIZATION_METADATA_KEY];
+  const CURRENT_MARKER = buildVideoNormalizationMetadata()[VIDEO_NORMALIZATION_METADATA_KEY];
 
   await check('IDEMPOTENCY: canonical source already carries the CURRENT normalization marker — ffmpeg/download/upload are skipped entirely, confirm still runs', async () => {
     const deps = makeCountingDeps({ canonicalState: { sizeBytes: 777, normalizationMarker: CURRENT_MARKER } });

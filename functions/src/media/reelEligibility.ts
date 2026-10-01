@@ -260,7 +260,7 @@ export function checkReelPhotoRenderEligibility(reel: RawReelData | null, uid: s
  * never touched ffmpeg at all. Deliberately scoped to EXACTLY that one
  * variant — a music Reel is finalized as part of its own
  * checkReelMuxEligibility-gated merge (muxReelMusic already normalizes in
- * the same encode pass, see reelVideoProfile.ts), and a render-pending
+ * the same encode pass, see videoNormalizationProfile.ts), and a render-pending
  * Reel is finalized as part of its own checkReelPhotoRenderEligibility-
  * gated render — calling this callable for either of those is rejected,
  * not silently redundant, so a client can never accidentally run TWO

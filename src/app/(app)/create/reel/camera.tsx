@@ -51,7 +51,7 @@ import {
   takePendingPreselectedSound,
 } from '@/services/reelCameraHandoff';
 import { getMediaStorageProvider } from '@/services/media';
-import { createStoryDraft, discardStoryDraft, publishStory, uploadStoryMedia, type UploadStoryMediaHandle } from '@/services/stories';
+import { createStoryDraft, discardStoryDraft, finalizeStoryVideo, publishStory, uploadStoryMedia, type UploadStoryMediaHandle } from '@/services/stories';
 import {
   REEL_MAX_DURATION_MS,
   REEL_PHOTO_MAX_FILE_SIZE_BYTES,
@@ -347,6 +347,12 @@ export default function CreateReelCameraScreen() {
   // here, with its own small inline progress overlay below.
   const [isPublishingStory, setIsPublishingStory] = useState(false);
   const [storyUploadProgress, setStoryUploadProgress] = useState(0);
+  // Step 11C — true only during the server-side finalizeStoryVideo call
+  // (direct video Stories only), between the upload finishing and
+  // publishStory starting — distinct label, same reasoning as the Reel
+  // publish flow's own 'finalizing' stage (src/app/(app)/create/reel/
+  // index.tsx).
+  const [isFinalizingStoryVideo, setIsFinalizingStoryVideo] = useState(false);
   const storyUploadHandleRef = useRef<UploadStoryMediaHandle | null>(null);
   const storyDraftRef = useRef<Story | null>(null);
   // Step 10A — captured ONCE, right before uploadStoryMedia dispatches,
@@ -885,6 +891,26 @@ export default function CreateReelCameraScreen() {
           setError("Couldn't upload your Story.");
           return;
         }
+        // Step 11C — a direct VIDEO Story must be server-normalized
+        // before it can publish — firestore.rules' own isValidStoryPublish
+        // independently refuses to publish one whose sourceNormalized
+        // isn't already true, so this is enforced server-side too, not
+        // just by this call ordering. A photo Story skips this entirely
+        // (mediaType === 'photo' is never eligible for finalization —
+        // see checkStoryVideoFinalizationEligibility, functions/src/media/
+        // storyEligibility.ts).
+        if (mediaType === 'video') {
+          setIsFinalizingStoryVideo(true);
+          const finalizeResult = await finalizeStoryVideo(draftResult.story.storyId);
+          setIsFinalizingStoryVideo(false);
+          if (!finalizeResult.ok) {
+            await discardStoryDraft(draftResult.story.storyId, draftResult.story.storagePath, storyUploadProviderRef.current);
+            storyDraftRef.current = null;
+            setIsPublishingStory(false);
+            setError("Couldn't finish processing your Story's video.");
+            return;
+          }
+        }
         // authorUid passed through so publishStory can invalidate its own
         // active-story cache immediately (Phase 2 perf pass) instead of
         // this author's story ring taking up to 60s to appear elsewhere.
@@ -913,6 +939,7 @@ export default function CreateReelCameraScreen() {
     }
     setIsPublishingStory(false);
     setStoryUploadProgress(0);
+    setIsFinalizingStoryVideo(false);
   };
 
   const bothGranted = !!cameraPermission?.granted && !!microphonePermission?.granted;
@@ -989,7 +1016,9 @@ export default function CreateReelCameraScreen() {
         {isPublishingStory ? (
           <View style={[StyleSheet.absoluteFill, styles.storyPublishOverlay]} pointerEvents="auto">
             <ActivityIndicator size="large" color={Colors.text} />
-            <Text style={styles.storyPublishText}>Publishing Story… {storyUploadProgress}%</Text>
+            <Text style={styles.storyPublishText}>
+              {isFinalizingStoryVideo ? 'Processing video…' : `Publishing Story… ${storyUploadProgress}%`}
+            </Text>
             <Pressable onPress={handleCancelStoryUpload} accessibilityRole="button" hitSlop={12}>
               <Text style={styles.storyPublishCancel}>Cancel</Text>
             </Pressable>

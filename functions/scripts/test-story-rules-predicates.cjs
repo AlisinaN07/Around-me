@@ -20,7 +20,7 @@ const STORY_BASE_KEYS = [
   'storyId', 'authorUid', 'authorDisplayName', 'authorUsername',
   'mediaType', 'storagePath', 'storageContentType', 'fileSizeBytes',
   'durationMs', 'width', 'height', 'status',
-  'storageProvider', 'mediaUrl',
+  'storageProvider', 'mediaUrl', 'sourceNormalized',
   'createdAt', 'updatedAt', 'publishedAt', 'expiresAt',
 ];
 
@@ -33,7 +33,7 @@ function isServerTimestampSentinel(value) {
 
 /** Mirrors isValidStoryCreate's provider-relevant subset (firestore.rules) — NOT the full image/video size-branch logic, which predates Step 10A and is unrelated to the provider fields this step introduced. */
 function isValidStoryCreateProviderDefaults(data) {
-  return data.storageProvider === 'firebase' && data.mediaUrl === '';
+  return data.storageProvider === 'firebase' && data.mediaUrl === '' && data.sourceNormalized === false;
 }
 
 /** Mirrors isValidStoryPublish (firestore.rules). */
@@ -49,6 +49,12 @@ function isValidStoryPublish(newData, oldData) {
     newData.authorDisplayName === oldData.authorDisplayName &&
     newData.authorUsername === oldData.authorUsername &&
     newData.mediaType === oldData.mediaType &&
+    // Step 11C — a VIDEO Story can never publish until finalizeStoryVideo
+    // has stamped sourceNormalized: true (an Admin SDK write, bypassing
+    // these Rules entirely). A PHOTO Story is exempt — never transcoded
+    // at all (Part 4 of the Step 11C spec).
+    (oldData.mediaType === 'photo' || oldData.sourceNormalized === true) &&
+    newData.sourceNormalized === oldData.sourceNormalized &&
     newData.storagePath === oldData.storagePath &&
     newData.storageContentType === oldData.storageContentType &&
     newData.fileSizeBytes === oldData.fileSizeBytes &&
@@ -85,6 +91,7 @@ function isValidStoryProviderUpdate(newData, oldData) {
     newData.durationMs === oldData.durationMs &&
     newData.width === oldData.width &&
     newData.height === oldData.height &&
+    newData.sourceNormalized === oldData.sourceNormalized &&
     newData.publishedAt === oldData.publishedAt &&
     newData.expiresAt === oldData.expiresAt &&
     newData.createdAt === oldData.createdAt &&
@@ -130,6 +137,7 @@ function baseStoryDoc(overrides = {}) {
     status: 'uploading',
     storageProvider: 'firebase',
     mediaUrl: '',
+    sourceNormalized: false,
     createdAt: 'CREATED_AT_FIXED',
     updatedAt: 'SERVER_TIMESTAMP',
     publishedAt: null,
@@ -230,17 +238,18 @@ check('provider transition: a non-https mediaUrl is REJECTED', () => {
 // 8. publish after valid R2 confirmation
 // ---------------------------------------------------------------------------
 check('publish: a Story already confirmed as storageProvider "r2" (from an earlier, separate transition) can still publish', () => {
-  const oldData = baseStoryDoc({ storageProvider: 'r2', mediaUrl: 'https://media.example.com/x' });
+  // Step 11C — finalizeStoryVideo already ran for this direct video Story.
+  const oldData = baseStoryDoc({ storageProvider: 'r2', mediaUrl: 'https://media.example.com/x', sourceNormalized: true });
   const newData = { ...oldData, status: 'published', publishedAt: 'SERVER_TIMESTAMP', updatedAt: 'SERVER_TIMESTAMP', expiresAt: 'EXPIRES_AT_FIXED' };
   assert.equal(isValidStoryUpdate(newData, oldData, 'uid1'), true);
 });
 check('publish: a Story still on storageProvider "firebase" can also still publish, unaffected by Step 10A', () => {
-  const oldData = baseStoryDoc();
+  const oldData = baseStoryDoc({ sourceNormalized: true });
   const newData = { ...oldData, status: 'published', publishedAt: 'SERVER_TIMESTAMP', updatedAt: 'SERVER_TIMESTAMP', expiresAt: 'EXPIRES_AT_FIXED' };
   assert.equal(isValidStoryUpdate(newData, oldData, 'uid1'), true);
 });
 check('publish: sneaking a storageProvider change INTO the publish write itself is REJECTED — publish requires storageProvider stay byte-identical', () => {
-  const oldData = baseStoryDoc();
+  const oldData = baseStoryDoc({ sourceNormalized: true });
   const newData = {
     ...oldData,
     status: 'published',
@@ -250,6 +259,52 @@ check('publish: sneaking a storageProvider change INTO the publish write itself 
     storageProvider: 'r2',
     mediaUrl: 'https://media.example.com/x',
   };
+  assert.equal(isValidStoryUpdate(newData, oldData, 'uid1'), false);
+});
+
+// ---------------------------------------------------------------------------
+// Step 11C — the universal video normalization publish gate.
+// ---------------------------------------------------------------------------
+
+check('Step 11C — create: a draft that already claims sourceNormalized true is rejected', () => {
+  assert.equal(isValidStoryCreateProviderDefaults(baseStoryDoc({ sourceNormalized: true })), false);
+});
+
+check('Step 11C — publish: a VIDEO Story still at sourceNormalized false is REJECTED — it must be finalized first', () => {
+  const oldData = baseStoryDoc(); // sourceNormalized: false (the default)
+  const newData = { ...oldData, status: 'published', publishedAt: 'SERVER_TIMESTAMP', updatedAt: 'SERVER_TIMESTAMP', expiresAt: 'EXPIRES_AT_FIXED' };
+  assert.equal(isValidStoryUpdate(newData, oldData, 'uid1'), false);
+});
+
+check('Step 11C — publish: the SAME VIDEO Story, once sourceNormalized flips to true (finalizeStoryVideo\'s own Admin SDK write), can now publish', () => {
+  const oldData = baseStoryDoc({ sourceNormalized: true });
+  const newData = { ...oldData, status: 'published', publishedAt: 'SERVER_TIMESTAMP', updatedAt: 'SERVER_TIMESTAMP', expiresAt: 'EXPIRES_AT_FIXED' };
+  assert.equal(isValidStoryUpdate(newData, oldData, 'uid1'), true);
+});
+
+check('Step 11C — publish: a PHOTO Story can publish while sourceNormalized is still false — exempt from the gate entirely', () => {
+  const oldData = baseStoryDoc({ mediaType: 'photo', storageContentType: 'image/jpeg', durationMs: 0 }); // sourceNormalized: false (default)
+  assert.equal(oldData.sourceNormalized, false);
+  const newData = { ...oldData, status: 'published', publishedAt: 'SERVER_TIMESTAMP', updatedAt: 'SERVER_TIMESTAMP', expiresAt: 'EXPIRES_AT_FIXED' };
+  assert.equal(isValidStoryUpdate(newData, oldData, 'uid1'), true);
+});
+
+check('Step 11C — publish: sneaking a sourceNormalized flip (false -> true) INTO the publish write itself is REJECTED — must already be done by a separate prior Admin SDK write', () => {
+  const oldData = baseStoryDoc({ sourceNormalized: false });
+  const newData = { ...oldData, status: 'published', publishedAt: 'SERVER_TIMESTAMP', updatedAt: 'SERVER_TIMESTAMP', expiresAt: 'EXPIRES_AT_FIXED', sourceNormalized: true };
+  assert.equal(isValidStoryUpdate(newData, oldData, 'uid1'), false);
+});
+
+check('Step 11C — sneaking a sourceNormalized change into an UNRELATED transition (the provider confirm) is REJECTED', () => {
+  const oldData = baseStoryDoc();
+  const newData = {
+    ...oldData,
+    storageProvider: 'r2',
+    mediaUrl: 'https://media.example.com/x',
+    sourceNormalized: true,
+    updatedAt: 'SERVER_TIMESTAMP',
+  };
+  assert.equal(isValidStoryProviderUpdate(newData, oldData), false);
   assert.equal(isValidStoryUpdate(newData, oldData, 'uid1'), false);
 });
 

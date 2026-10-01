@@ -192,7 +192,7 @@ export async function downloadR2ObjectBuffer(key: string): Promise<Buffer> {
  * body) — used specifically to stamp a durable
  * REEL_VIDEO_NORMALIZATION_PROFILE marker onto a Reel's canonical source
  * object the moment this codebase's own server-side ffmpeg pipeline
- * finishes normalizing it (see reelVideoProfile.ts's own doc comment),
+ * finishes normalizing it (see videoNormalizationProfile.ts's own doc comment),
  * so a LATER retry (after e.g. a Firestore confirm-write failure) can
  * tell "this object already IS the final normalized asset" from a real,
  * server-verifiable storage fact — never from a URL shape, a codec

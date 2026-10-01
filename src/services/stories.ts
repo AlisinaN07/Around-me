@@ -150,6 +150,14 @@ export async function createStoryDraft(input: CreateStoryDraftInput): Promise<Cr
     // confirmStoryMediaProvider write can ever flip this to 'r2'.
     storageProvider: 'firebase',
     mediaUrl: '',
+    // Step 11C — every draft is created not-yet-normalized, regardless
+    // of mediaType — only a trusted Cloud Function (finalizeStoryVideo,
+    // via the Admin SDK) can ever flip this to true for a direct video
+    // Story; enforced server-side by firestore.rules' isValidStoryPublish,
+    // which refuses to publish a VIDEO Story while this is still false.
+    // A photo Story never needs this flipped at all (see
+    // Story.sourceNormalized's own doc comment in src/types/story.ts).
+    sourceNormalized: false,
     createdAt: serverTimestamp(),
     updatedAt: serverTimestamp(),
     publishedAt: null,
@@ -338,6 +346,39 @@ function uploadStoryMediaViaR2(
       cancelUpload?.();
     },
   };
+}
+
+// ---------------------------------------------------------------------------
+// Step 11C — UNIVERSAL STORY VIDEO NORMALIZATION, the direct-capture
+// branch: a trusted backend callable, same reasoning as Reel's own
+// muxReelMusic/renderPhotoToVideo/finalizeReelVideo (real ffmpeg
+// processing, no client SDK can do this). Called ONLY for a direct
+// video Story (mediaType === 'video') — a photo Story never calls this
+// at all (see camera.tsx's own handlePublishAsStory), and a Story copied
+// from an already-published Reel (addReelToMyStory) never needs it
+// either — that Reel's video was already normalized before IT could
+// publish (see functions/src/media/reelEligibility.ts/firestore.rules'
+// own isValidReelPublish), so addReelToMyStory carries that trusted
+// state forward instead of re-encoding. Must run, and succeed, before
+// publishStory for a direct video Story — firestore.rules' own
+// isValidStoryPublish independently refuses to publish a video Story
+// whose sourceNormalized isn't already true, so this is enforced
+// server-side too, not just by this client's own call ordering (see
+// camera.tsx's own handlePublishAsStory for the exact sequencing).
+// ---------------------------------------------------------------------------
+
+export type FinalizeStoryVideoResult = { ok: true } | { ok: false; message: string };
+
+export async function finalizeStoryVideo(storyId: string): Promise<FinalizeStoryVideoResult> {
+  if (!functions) {
+    return { ok: false, message: 'This feature is not available right now.' };
+  }
+  try {
+    await httpsCallable(functions, 'finalizeStoryVideo')({ storyId });
+  } catch {
+    return { ok: false, message: "Couldn't finish processing this Story's video." };
+  }
+  return { ok: true };
 }
 
 // ---------------------------------------------------------------------------

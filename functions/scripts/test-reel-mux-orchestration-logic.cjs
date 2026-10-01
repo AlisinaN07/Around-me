@@ -288,7 +288,7 @@ async function main() {
   // actually succeeds.
   // ---------------------------------------------------------------------------
 
-  const CURRENT_MARKER = '1'; // mirrors reelVideoProfile.ts's REEL_VIDEO_NORMALIZATION_PROFILE_VERSION's own stamped string value — kept as a literal here deliberately, so this file has ZERO import dependency on reelVideoProfile.ts (isReelSourceAlreadyNormalized's own exact-match behavior is already covered in test-reel-video-profile-logic.cjs; this file only needs performReelMux's own REACTION to a marker match/mismatch, via the real isReelSourceAlreadyNormalized the compiled orchestration itself imports).
+  const CURRENT_MARKER = '1'; // mirrors videoNormalizationProfile.ts's VIDEO_NORMALIZATION_PROFILE_VERSION's own stamped string value — kept as a literal here deliberately, so this file has ZERO import dependency on videoNormalizationProfile.ts (isVideoSourceAlreadyNormalized's own exact-match behavior is already covered in test-reel-video-profile-logic.cjs; this file only needs performReelMux's own REACTION to a marker match/mismatch, via the real isVideoSourceAlreadyNormalized the compiled orchestration itself imports).
 
   await check('IDEMPOTENCY: canonical source already carries the CURRENT normalization marker — ffmpeg/video-download/upload are skipped, but music is STILL downloaded/hashed/resolved (needed for the confirm-write), and confirm+delete still run', async () => {
     const { deps, calls } = makeDeps({ readCanonicalSourceState: async () => ({ sizeBytes: 4242, normalizationMarker: CURRENT_MARKER }) });
