@@ -38,8 +38,17 @@ const {
   REEL_THUMBNAIL_MAX_SIZE_BYTES,
   REEL_VIDEO_MAX_SIZE_BYTES,
   REEL_PHOTO_SOURCE_MAX_SIZE_BYTES,
+  REEL_MUSIC_MAX_SIZE_BYTES,
 } = require('../lib/media/mediaUploadValidation.js');
-const { eventCoverKey, profileCoverKey, profilePhotoKey, reelSourceKey, reelThumbnailKey, storySourceKey } = require('../lib/media/objectKey.js');
+const {
+  eventCoverKey,
+  profileCoverKey,
+  profilePhotoKey,
+  reelSourceKey,
+  reelThumbnailKey,
+  reelMusicKey,
+  storySourceKey,
+} = require('../lib/media/objectKey.js');
 
 const results = [];
 function check(name, fn) {
@@ -950,6 +959,164 @@ check('storySourceKey differs for a different uid at the same storyId — one us
 
 check('storySourceKey matches the exact existing Firebase convention', () => {
   assert.equal(storySourceKey('uid-a', 'story1'), 'stories/uid-a/story1/source');
+});
+
+// ---------------------------------------------------------------------------
+// Step 10B — 'reelMusic' media kind. Unlike reelVideo/storyMedia (narrow,
+// camera/library-bounded MIME allowlists), a Reel's own uploaded music comes
+// from the device's own arbitrary file picker (expo-document-picker,
+// `type: 'audio/*'`) — so this shape deliberately uses a WIDE
+// `contentType.startsWith('audio/')` prefix check, mirroring storage.rules'
+// own pre-existing `musicStorageContentType.matches('audio/.*')` wildcard,
+// rather than a narrow enumerated Set like every other media kind here. See
+// mediaUploadValidation.ts's own 'reelMusic' doc comment for the full
+// reasoning.
+// ---------------------------------------------------------------------------
+
+check('accepts mediaKind "reelMusic" with a valid reelId and audio/mp4', () => {
+  const result = validateMediaUploadInput({ mediaKind: 'reelMusic', contentType: 'audio/mp4', fileSizeBytes: 1000, reelId: 'reel-abc123' });
+  assert.equal(result.mediaKind, 'reelMusic');
+  assert.equal(result.reelId, 'reel-abc123');
+});
+
+check('accepts a wide range of real "audio/*" MIME types for reelMusic — a prefix check, not a narrow enumerated allowlist', () => {
+  for (const contentType of ['audio/mpeg', 'audio/mp4', 'audio/x-m4a', 'audio/aac', 'audio/wav', 'audio/ogg', 'audio/flac', 'audio/x-wav']) {
+    assert.doesNotThrow(() => validateMediaUploadInput({ mediaKind: 'reelMusic', contentType, fileSizeBytes: 1000, reelId: 'reel1' }));
+  }
+});
+
+check('rejects mediaKind "reelMusic" with no reelId at all', () => {
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'reelMusic', contentType: 'audio/mp4', fileSizeBytes: 1000 }),
+    MediaUploadValidationError
+  );
+});
+
+check('rejects mediaKind "reelMusic" with an empty-string reelId', () => {
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'reelMusic', contentType: 'audio/mp4', fileSizeBytes: 1000, reelId: '' }),
+    MediaUploadValidationError
+  );
+});
+
+check('rejects mediaKind "reelMusic" with a non-string reelId', () => {
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'reelMusic', contentType: 'audio/mp4', fileSizeBytes: 1000, reelId: 12345 }),
+    MediaUploadValidationError
+  );
+});
+
+check('rejects a malformed reelId containing a slash (path-fragment injection) for reelMusic', () => {
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'reelMusic', contentType: 'audio/mp4', fileSizeBytes: 1000, reelId: 'a/b' }),
+    MediaUploadValidationError
+  );
+});
+
+check('rejects a malformed reelId attempting parent-directory traversal for reelMusic', () => {
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'reelMusic', contentType: 'audio/mp4', fileSizeBytes: 1000, reelId: '../other-uid' }),
+    MediaUploadValidationError
+  );
+});
+
+check('rejects a malformed reelId containing whitespace for reelMusic', () => {
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'reelMusic', contentType: 'audio/mp4', fileSizeBytes: 1000, reelId: 'reel with spaces' }),
+    MediaUploadValidationError
+  );
+});
+
+check('rejects a non-audio contentType for reelMusic (video/mp4, image/jpeg, application/octet-stream)', () => {
+  for (const contentType of ['video/mp4', 'image/jpeg', 'application/octet-stream']) {
+    assert.throws(
+      () => validateMediaUploadInput({ mediaKind: 'reelMusic', contentType, fileSizeBytes: 1000, reelId: 'reel1' }),
+      MediaUploadValidationError
+    );
+  }
+});
+
+check('rejects a non-string contentType for reelMusic', () => {
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'reelMusic', contentType: 123, fileSizeBytes: 1000, reelId: 'reel1' }),
+    MediaUploadValidationError
+  );
+});
+
+check('REEL_MUSIC_MAX_SIZE_BYTES is 20 MB — mirrors src/types/reel.ts\'s REEL_MUSIC_MAX_FILE_SIZE_BYTES exactly', () => {
+  assert.equal(REEL_MUSIC_MAX_SIZE_BYTES, 20 * 1024 * 1024);
+});
+
+check('reelMusic accepts a file exactly at its own maximum size', () => {
+  assert.doesNotThrow(() =>
+    validateMediaUploadInput({ mediaKind: 'reelMusic', contentType: 'audio/mp4', fileSizeBytes: REEL_MUSIC_MAX_SIZE_BYTES, reelId: 'reel1' })
+  );
+});
+
+check('reelMusic rejects a file one byte over its own maximum size', () => {
+  assert.throws(
+    () =>
+      validateMediaUploadInput({
+        mediaKind: 'reelMusic',
+        contentType: 'audio/mp4',
+        fileSizeBytes: REEL_MUSIC_MAX_SIZE_BYTES + 1,
+        reelId: 'reel1',
+      }),
+    MediaUploadValidationError
+  );
+});
+
+check('reelMusic rejects a zero or negative file size', () => {
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'reelMusic', contentType: 'audio/mp4', fileSizeBytes: 0, reelId: 'reel1' }),
+    MediaUploadValidationError
+  );
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'reelMusic', contentType: 'audio/mp4', fileSizeBytes: -1, reelId: 'reel1' }),
+    MediaUploadValidationError
+  );
+});
+
+check('reelMusic rejects a non-finite or NaN file size', () => {
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'reelMusic', contentType: 'audio/mp4', fileSizeBytes: Infinity, reelId: 'reel1' }),
+    MediaUploadValidationError
+  );
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'reelMusic', contentType: 'audio/mp4', fileSizeBytes: NaN, reelId: 'reel1' }),
+    MediaUploadValidationError
+  );
+});
+
+check('ignores an extra uid/authorUid field in a reelMusic payload — ownership is verified server-side against Firestore, never trusted from request data', () => {
+  const result = validateMediaUploadInput({
+    mediaKind: 'reelMusic',
+    contentType: 'audio/mp4',
+    fileSizeBytes: 1000,
+    reelId: 'reel1',
+    uid: 'some-other-uid',
+    authorUid: 'some-other-uid',
+  });
+  assert.equal('uid' in result, false);
+  assert.equal('authorUid' in result, false);
+  assert.deepEqual(Object.keys(result).sort(), ['contentType', 'fileSizeBytes', 'mediaKind', 'reelId']);
+});
+
+check('reelMusicKey is deterministic for the same uid+reelId', () => {
+  assert.equal(reelMusicKey('uid-a', 'reel1'), reelMusicKey('uid-a', 'reel1'));
+});
+
+check('reelMusicKey differs for a different uid at the same reelId — one user\'s Reel can never target another user\'s namespace', () => {
+  assert.notEqual(reelMusicKey('uid-a', 'reel1'), reelMusicKey('uid-b', 'reel1'));
+});
+
+check('reelMusicKey matches the exact existing Firebase convention', () => {
+  assert.equal(reelMusicKey('uid-a', 'reel1'), 'reels/uid-a/reel1/music');
+});
+
+check('reelMusicKey never collides with reelSourceKey or reelThumbnailKey for the same uid+reelId', () => {
+  assert.notEqual(reelMusicKey('uid-a', 'reel1'), reelSourceKey('uid-a', 'reel1'));
+  assert.notEqual(reelMusicKey('uid-a', 'reel1'), reelThumbnailKey('uid-a', 'reel1'));
 });
 
 console.log('\n=== functions/ media upload authorization logic test results ===');

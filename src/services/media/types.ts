@@ -34,9 +34,12 @@ export type MediaProvider = 'firebase' | 'r2';
  * 'storyMedia' covers BOTH a photo Story and a video Story — a Story has
  * no music/render variant at all (see Story.mediaType's own doc comment,
  * src/types/story.ts), so unlike 'reelVideo' there is no sub-case to
- * exclude.
+ * exclude. 'reelMusic' (Step 10B) is a Reel's own separate, standalone
+ * device-picked music upload — never the shared soundOrigins/{hash}/audio
+ * object, which no client ever uploads to directly (only a trusted Cloud
+ * Function's own Admin SDK write does).
  */
-export type MediaKind = 'profilePhoto' | 'profileCover' | 'eventCover' | 'reelThumbnail' | 'reelVideo' | 'storyMedia';
+export type MediaKind = 'profilePhoto' | 'profileCover' | 'eventCover' | 'reelThumbnail' | 'reelVideo' | 'storyMedia' | 'reelMusic';
 
 /**
  * A storage-neutral pointer to one media object — the shape a Firestore

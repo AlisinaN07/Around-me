@@ -179,6 +179,41 @@ export function checkReelMuxEligibility(reel: RawReelData | null, uid: string): 
 }
 
 /**
+ * Step 10B — requestMediaUploadAuthorization.ts's own gate for
+ * `mediaKind: 'reelMusic'`. Deliberately built ON TOP of
+ * checkReelMuxEligibility above rather than duplicating its own
+ * ownership/status/music-state checks: authorizing a music UPLOAD and
+ * authorizing a music MERGE share the exact same precondition — "this
+ * Reel is mine, still uploading, and genuinely expects a device-picked
+ * music file" — the ONE thing upload-authorization additionally needs is
+ * confirming the declared content type is actually audio. This also
+ * means every one of checkReelMuxEligibility's own existing rejections
+ * (no-music Reel, published Reel, wrong owner, missing music path) is
+ * inherited automatically — see this codebase's own "reject inconsistent
+ * states" convention.
+ *
+ * `contentType.startsWith('audio/')` — deliberately a WIDE prefix check,
+ * not a narrow allowlist like ALLOWED_VIDEO_CONTENT_TYPES/
+ * ALLOWED_REEL_PHOTO_CONTENT_TYPES use for camera/library-captured media.
+ * Reel music comes from the device's OWN arbitrary file picker
+ * (expo-document-picker, `type: 'audio/*'` — see
+ * src/app/(app)/create/reel/music.tsx), not a bounded camera/library
+ * output — the real MIME universe is whatever audio codec/container the
+ * user's own file happens to be (mp3/m4a/aac/wav/flac/ogg/...), which
+ * this app has never narrowed. storage.rules' own pre-existing
+ * `musicStorageContentType.matches('audio/.*')` already uses this exact
+ * same wide check — mirrored here deliberately, not guessed.
+ */
+export function checkReelMusicUploadEligibility(reel: RawReelData | null, uid: string, contentType: string): EligibilityResult {
+  const base = checkReelMuxEligibility(reel, uid);
+  if (!base.ok) return base;
+  if (!contentType.startsWith('audio/')) {
+    return failedPrecondition('This file type is not a supported audio file.');
+  }
+  return OK;
+}
+
+/**
  * Step 9C — renderPhotoToVideo's own eligibility check, extracted from
  * that function's pre-existing inline checks the same way Step 9B
  * extracted checkReelMuxEligibility from muxReelMusic's — same shape,

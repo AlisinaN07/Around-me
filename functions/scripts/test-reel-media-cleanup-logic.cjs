@@ -261,6 +261,34 @@ async function main() {
     assert.deepEqual(bucket.calls.delete.map((c) => c.path), [`reels/${UID}/${REEL_ID}/source`, `reels/${UID}/${REEL_ID}/thumbnail`]);
   });
 
+  await check('Step 10B — music: an R2-provider music Reel deletes via the authenticated R2 delete, not the Firebase bucket', async () => {
+    const bucket = makeFakeBucket();
+    const r2 = makeFakeR2Delete([`reels/${UID}/${REEL_ID}/music`]);
+    const result = await cleanupReelOwnedMedia(bucket, baseMusicVideoReel({ musicStorageProvider: 'r2' }), UID, REEL_ID, { deleteR2: r2.deleteR2 });
+    assert.equal(result.musicAttempted, true);
+    assert.equal(result.musicDeleted, true);
+    assert.deepEqual(r2.calls, [`reels/${UID}/${REEL_ID}/music`]);
+    assert.equal(bucket.calls.exists.includes(`reels/${UID}/${REEL_ID}/music`), false, 'an R2-provider music delete must never touch the Firebase bucket at all');
+  });
+
+  await check('Step 10B — music: a failed R2 music delete is caught, reports musicDeleted false, never throws', async () => {
+    const bucket = makeFakeBucket();
+    const flakyDeleteR2 = async () => {
+      throw new Error('R2 network error');
+    };
+    const result = await cleanupReelOwnedMedia(bucket, baseMusicVideoReel({ musicStorageProvider: 'r2' }), UID, REEL_ID, { deleteR2: flakyDeleteR2 });
+    assert.equal(result.musicAttempted, true);
+    assert.equal(result.musicDeleted, false);
+  });
+
+  await check('Step 10B — music: legacy Reel missing musicStorageProvider entirely defaults to Firebase, same as video/thumbnail', async () => {
+    const bucket = makeFakeBucket({ [`reels/${UID}/${REEL_ID}/music`]: Buffer.from('MUSIC') });
+    const legacyMusicReel = baseMusicVideoReel();
+    delete legacyMusicReel.musicStorageProvider;
+    const result = await cleanupReelOwnedMedia(bucket, legacyMusicReel, UID, REEL_ID);
+    assert.equal(result.musicDeleted, true);
+  });
+
   await check('music: never deletes the SHARED soundOrigins/{hash}/audio object — only ever the Reel-owned reelMusicKey', async () => {
     const bucket = makeFakeBucket({
       [`reels/${UID}/${REEL_ID}/music`]: Buffer.from('MUSIC'),
@@ -398,7 +426,7 @@ async function main() {
   // missing-document branch (Step 9D Part 9).
   // -------------------------------------------------------------------
 
-  await check('missing-document cleanup: attempts BOTH Firebase and R2 deletes for source and thumbnail, plus Firebase for music — all from trusted uid/reelId alone', async () => {
+  await check('missing-document cleanup: attempts BOTH Firebase and R2 deletes for source, thumbnail, AND music — all from trusted uid/reelId alone (Step 10B extended music to both backends too)', async () => {
     const bucket = makeFakeBucket({
       [`reels/${UID}/${REEL_ID}/source`]: Buffer.from('X'),
       [`reels/${UID}/${REEL_ID}/thumbnail`]: Buffer.from('Y'),
@@ -411,7 +439,11 @@ async function main() {
     assert.equal(result.firebaseMusicDeleted, true);
     assert.equal(result.r2SourceAttempted, true);
     assert.equal(result.r2ThumbnailAttempted, true);
-    assert.deepEqual(r2.calls.sort(), [`reels/${UID}/${REEL_ID}/source`, `reels/${UID}/${REEL_ID}/thumbnail`].sort());
+    assert.equal(result.r2MusicAttempted, true);
+    assert.deepEqual(
+      r2.calls.sort(),
+      [`reels/${UID}/${REEL_ID}/source`, `reels/${UID}/${REEL_ID}/thumbnail`, `reels/${UID}/${REEL_ID}/music`].sort()
+    );
   });
 
   await check('missing-document cleanup: a Reel that was ACTUALLY an R2-sourced Reel is now actually found and deleted — the exact gap Step 9A/9D fixed', async () => {

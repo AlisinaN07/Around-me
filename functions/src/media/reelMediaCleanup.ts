@@ -63,7 +63,9 @@
  *    Reels via their own soundOriginReelId/soundOriginAuthorUid (see
  *    Reel.musicHash's own doc comment, src/types/reel.ts). Deleting a
  *    Reel that merely contributed to or reused this hash must never
- *    remove the shared copy other Reels still depend on.
+ *    remove the shared copy other Reels still depend on — Step 10B's own
+ *    audit confirmed this stays Firebase-only and untouched by ANY Reel
+ *    deletion path, regardless of that Reel's own music provider.
  *  - Any other Reel's own media, regardless of hashtag/city/author.
  *
  * Every key this function deletes is DERIVED, never read off the
@@ -169,7 +171,7 @@ export async function cleanupReelOwnedMedia(
     }
   }
 
-  // ---- 3. STANDALONE MUSIC — always Firebase, never migrated -------------
+  // ---- 3. STANDALONE MUSIC — Step 10B: provider-aware -------------------
   // Deliberately keyed on `musicSourceType === 'device'` alone, NOT on
   // Reel status or whether mux/render already ran — a still-"uploading"
   // draft abandoned mid-upload, and an already-published Reel whose mux
@@ -181,10 +183,19 @@ export async function cleanupReelOwnedMedia(
   if (reel.musicSourceType === 'device') {
     musicAttempted = true;
     const musicKey = reelMusicKey(uid, reelId);
-    const file = bucket.file(musicKey);
-    const [existedBefore] = await file.exists();
-    await file.delete({ ignoreNotFound: true });
-    musicDeleted = existedBefore;
+    if (reel.musicStorageProvider === 'r2') {
+      try {
+        await deleteR2(musicKey);
+        musicDeleted = true;
+      } catch (error) {
+        console.warn(`[cleanupReelOwnedMedia] Could not delete R2 music at "${musicKey}" for Reel "${reelId}":`, error);
+      }
+    } else {
+      const file = bucket.file(musicKey);
+      const [existedBefore] = await file.exists();
+      await file.delete({ ignoreNotFound: true });
+      musicDeleted = existedBefore;
+    }
   }
 
   return { sourceAttempted, sourceDeleted, thumbnailAttempted, thumbnailDeleted, thumbnailSameAsSource, musicAttempted, musicDeleted };
@@ -198,8 +209,9 @@ export type ReelMediaBlindCleanupResult = {
   /** Same as firebaseSourceDeleted, for reelThumbnailKey(uid, reelId). For a Reel that was actually a plain photo, this key was never written — the delete is a harmless no-op, same reasoning as cleanupReelOwnedMedia's own thumbnailSameAsSource branch, just without the ability to know that in advance. */
   firebaseThumbnailDeleted: boolean;
   r2ThumbnailAttempted: boolean;
-  /** Same as above, for reelMusicKey(uid, reelId) — Firebase only, music is never migrated to R2. For a Reel with no music at all, this key was never written — harmless no-op. */
+  /** Same as firebaseSourceDeleted, for reelMusicKey(uid, reelId). For a Reel with no music at all, this key was never written on either backend — harmless no-op either way. */
   firebaseMusicDeleted: boolean;
+  r2MusicAttempted: boolean;
 };
 
 /**
@@ -231,9 +243,11 @@ export type ReelMediaBlindCleanupResult = {
  * three keys — each individually best-effort/idempotent, so an object
  * that was never real on one backend (or never existed at all — a draft
  * reported and already discarded by its own author, say) costs nothing
- * beyond a few no-op calls. This still cannot know whether a given Reel
- * ever actually had music, or was a photo whose "thumbnail" key was
- * never written — but every one of those is already a safe no-op, never
+ * beyond a few no-op calls. Step 10B extended this to the music key too
+ * (previously Firebase-only here, since music hadn't migrated yet) — this
+ * still cannot know whether a given Reel ever actually had music, was a
+ * photo whose "thumbnail" key was never written, or had its music on
+ * Firebase vs. R2 — but every one of those is already a safe no-op, never
  * an error and never a risk to an unrelated object.
  */
 export async function cleanupReelOwnedMediaWithoutDocument(
@@ -268,9 +282,8 @@ export async function cleanupReelOwnedMediaWithoutDocument(
   const r2SourceAttempted = await attemptR2Delete(sourceKey);
   const firebaseThumbnailDeleted = await deleteFirebaseKey(thumbnailKey);
   const r2ThumbnailAttempted = await attemptR2Delete(thumbnailKey);
-  // Music is never migrated to R2 (Step 9A/9B/9C/9D's own standing
-  // constraint) — only the Firebase key is ever meaningful.
   const firebaseMusicDeleted = await deleteFirebaseKey(musicKey);
+  const r2MusicAttempted = await attemptR2Delete(musicKey);
 
-  return { firebaseSourceDeleted, r2SourceAttempted, firebaseThumbnailDeleted, r2ThumbnailAttempted, firebaseMusicDeleted };
+  return { firebaseSourceDeleted, r2SourceAttempted, firebaseThumbnailDeleted, r2ThumbnailAttempted, firebaseMusicDeleted, r2MusicAttempted };
 }

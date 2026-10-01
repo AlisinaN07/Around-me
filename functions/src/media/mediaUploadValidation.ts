@@ -21,8 +21,8 @@
  */
 import { isSafePathSegment } from './objectKey';
 
-/** The only media kinds this callable supports — Step 5A added 'profilePhoto', Step 5C added 'profileCover', Step 5D added 'eventCover', Step 5E added 'reelThumbnail', Step 9A adds 'reelVideo', Step 10A adds 'storyMedia'. Any other value (a Reel's own audio, or a made-up future kind) is rejected. */
-export type AllowedMediaKind = 'profilePhoto' | 'profileCover' | 'eventCover' | 'reelThumbnail' | 'reelVideo' | 'storyMedia';
+/** The only media kinds this callable supports — Step 5A added 'profilePhoto', Step 5C added 'profileCover', Step 5D added 'eventCover', Step 5E added 'reelThumbnail', Step 9A adds 'reelVideo', Step 10A adds 'storyMedia', Step 10B adds 'reelMusic'. Any other value (a made-up future kind) is rejected. */
+export type AllowedMediaKind = 'profilePhoto' | 'profileCover' | 'eventCover' | 'reelThumbnail' | 'reelVideo' | 'storyMedia' | 'reelMusic';
 
 /** Narrowly restricted to formats the app's existing image-upload flows actually produce — no video/*, no application/*, no arbitrary MIME type. Same set for every IMAGE media kind, including reelThumbnail: every real thumbnail-generation code path observed (src/utils/reelThumbnailCandidates.ts's expo-video-thumbnails output, and camera.tsx's own SaveFormat.JPEG render for a "FOTO" cover) only ever produces JPEG, but this allowlist is kept at the same 3-format set used elsewhere rather than narrowed to jpeg-only, since narrowing further without being certain every code path is JPEG-only would risk silently breaking a legitimate upload. Never used for 'reelVideo' — see ALLOWED_VIDEO_CONTENT_TYPES below for that kind's own, separate allowlist. */
 export const ALLOWED_CONTENT_TYPES: ReadonlySet<string> = new Set(['image/jpeg', 'image/png', 'image/webp']);
@@ -116,6 +116,17 @@ export const REEL_VIDEO_MAX_SIZE_BYTES = 50 * 1024 * 1024;
  */
 export const REEL_PHOTO_SOURCE_MAX_SIZE_BYTES = 10 * 1024 * 1024;
 
+/**
+ * Step 10B — mirrors src/types/reel.ts's own REEL_MUSIC_MAX_FILE_SIZE_BYTES
+ * and storage.rules' own existing `request.resource.size <= 20 * 1024 * 1024`
+ * cap for a Reel's own device-picked music file exactly (inspected
+ * directly, not guessed). Generous relative to the video/photo caps
+ * above — the app uploads the full picked audio file, not just the
+ * portion actually heard (see ReelMusicSourceType's own doc comment,
+ * src/types/reel.ts: there is no trim step).
+ */
+export const REEL_MUSIC_MAX_SIZE_BYTES = 20 * 1024 * 1024;
+
 /** The exact per-mediaKind maximum for an IMAGE upload — inspected from, and must be kept in sync with, the existing Firebase upload limits (5 MB for profilePhoto/reelThumbnail, 8 MB for profileCover/eventCover). Never consulted for 'reelVideo' — see REEL_VIDEO_MAX_SIZE_BYTES above, checked directly in validateMediaUploadInput's own 'reelVideo' branch instead. */
 function maxSizeForMediaKind(mediaKind: AllowedMediaKind): number {
   if (mediaKind === 'profileCover' || mediaKind === 'eventCover') return PROFILE_COVER_PHOTO_MAX_SIZE_BYTES;
@@ -200,16 +211,17 @@ export function validateMediaUploadInput(data: unknown): ValidatedMediaUploadInp
 
   const { mediaKind, contentType, fileSizeBytes, draftId, reelId, storyId } = data as Record<string, unknown>;
 
-  // Only these six exact kinds — any other value (including a real
-  // future media kind name typed too early, or the Reel's own audio) is
-  // rejected here, not silently accepted.
+  // Only these seven exact kinds — any other value (including a real
+  // future media kind name typed too early) is rejected here, not
+  // silently accepted.
   if (
     mediaKind !== 'profilePhoto' &&
     mediaKind !== 'profileCover' &&
     mediaKind !== 'eventCover' &&
     mediaKind !== 'reelThumbnail' &&
     mediaKind !== 'reelVideo' &&
-    mediaKind !== 'storyMedia'
+    mediaKind !== 'storyMedia' &&
+    mediaKind !== 'reelMusic'
   ) {
     throw invalid();
   }
@@ -245,6 +257,30 @@ export function validateMediaUploadInput(data: unknown): ValidatedMediaUploadInp
       fileSizeBytes > 0 &&
       fileSizeBytes <= REEL_PHOTO_SOURCE_MAX_SIZE_BYTES;
     if (!isValidVideoShape && !isValidPhotoShape) throw invalid();
+    if (typeof reelId !== 'string' || !isSafePathSegment(reelId)) throw invalid();
+    return { mediaKind, contentType: contentType as string, fileSizeBytes: fileSizeBytes as number, reelId };
+  }
+
+  // Step 10B — 'reelMusic', for a Reel's own device-picked music upload.
+  // Deliberately a WIDE `audio/*` prefix check, not a narrow Set-based
+  // allowlist like every other media kind here — unlike camera/library-
+  // captured video/photo (a genuinely bounded output), Reel music comes
+  // from the device's own arbitrary file picker (expo-document-picker,
+  // `type: 'audio/*'` — see src/app/(app)/create/reel/music.tsx and
+  // src/utils/reelMusicValidation.ts's own identical `startsWith('audio/')`
+  // check), so its real MIME universe cannot be enumerated the way a
+  // camera's fixed output can — mirrors storage.rules' own pre-existing
+  // `musicStorageContentType.matches('audio/.*')` wildcard exactly, not a
+  // narrower guess.
+  if (mediaKind === 'reelMusic') {
+    const isValidAudioShape =
+      typeof contentType === 'string' &&
+      contentType.startsWith('audio/') &&
+      typeof fileSizeBytes === 'number' &&
+      Number.isFinite(fileSizeBytes) &&
+      fileSizeBytes > 0 &&
+      fileSizeBytes <= REEL_MUSIC_MAX_SIZE_BYTES;
+    if (!isValidAudioShape) throw invalid();
     if (typeof reelId !== 'string' || !isSafePathSegment(reelId)) throw invalid();
     return { mediaKind, contentType: contentType as string, fileSizeBytes: fileSizeBytes as number, reelId };
   }

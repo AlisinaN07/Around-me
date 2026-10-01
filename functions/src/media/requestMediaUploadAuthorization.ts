@@ -6,15 +6,18 @@
  *
  * Deliberately narrow: supports ONLY `mediaKind: 'profilePhoto'` (Step
  * 5A), `'profileCover'` (Step 5C), `'eventCover'` (Step 5D),
- * `'reelThumbnail'` (Step 5E), and `'reelVideo'` (Step 9A — a video
+ * `'reelThumbnail'` (Step 5E), `'reelVideo'` (Step 9A — a video
  * Reel's own source; Step 9B extended this to include a video Reel with
  * device-picked music, since muxReelMusic became provider-aware — a
  * pending photo-to-video render is still always excluded, see
- * verifyReelVideoOwnership below) for the CALLING user's own uid — no
- * client-supplied uid, no other media kind.
- * In particular this never authorizes a Reel's own audio/music, or any
- * Story — extending this further is explicit future work, not something
- * this file's own shape should be stretched to cover prematurely.
+ * verifyReelVideoOwnership below), `'storyMedia'` (Step 10A), and
+ * `'reelMusic'` (Step 10B — a Reel's own standalone device-picked music
+ * upload; see verifyReelMusicOwnership below) for the CALLING user's own
+ * uid — no client-supplied uid, no other media kind. In particular this
+ * never authorizes the SHARED `soundOrigins/{hash}/audio` object (no
+ * client ever uploads to it directly — only a trusted Cloud Function's
+ * own Admin SDK write does, see soundOriginAudioStoragePath in
+ * functions/src/index.ts).
  *
  * `eventCover` is the one media kind that accepts a client-supplied,
  * NOT independently ownership-checked identifier (`draftId`) — see
@@ -46,9 +49,9 @@ import { HttpsError, onCall, type CallableRequest } from 'firebase-functions/v2/
 
 import { MediaUploadValidationError, validateMediaUploadInput, type AllowedMediaKind } from './mediaUploadValidation';
 import { buildMediaUrl } from './mediaUrl';
-import { eventCoverKey, profileCoverKey, profilePhotoKey, reelSourceKey, reelThumbnailKey, storySourceKey } from './objectKey';
+import { eventCoverKey, profileCoverKey, profilePhotoKey, reelMusicKey, reelSourceKey, reelThumbnailKey, storySourceKey } from './objectKey';
 import { getR2Config } from './r2Config';
-import { checkReelThumbnailEligibility, checkReelVideoEligibility, type RawReelData } from './reelEligibility';
+import { checkReelMusicUploadEligibility, checkReelThumbnailEligibility, checkReelVideoEligibility, type RawReelData } from './reelEligibility';
 import { createPresignedUploadUrl } from './r2Storage';
 import { checkStoryMediaEligibility, type RawStoryData } from './storyEligibility';
 
@@ -225,6 +228,22 @@ async function verifyReelVideoOwnership(reelId: string, uid: string, contentType
 }
 
 /**
+ * Step 10B — `mediaKind: 'reelMusic'`'s own ownership/eligibility gate.
+ * See checkReelMusicUploadEligibility's own doc comment (reelEligibility.ts)
+ * for the exact, directly-unit-tested decision logic this delegates to —
+ * this function's own job is only the impure Firestore read and
+ * translating a `{ok:false}` result into a real HttpsError.
+ */
+async function verifyReelMusicOwnership(reelId: string, uid: string, contentType: string): Promise<void> {
+  const snapshot = await getFirestore().collection('reels').doc(reelId).get();
+  const reel = snapshot.exists ? (snapshot.data() as RawReelData) : null;
+  const result = checkReelMusicUploadEligibility(reel, uid, contentType);
+  if (!result.ok) {
+    throw new HttpsError(result.code, result.message);
+  }
+}
+
+/**
  * Step 10A — `mediaKind: 'storyMedia'`'s own ownership/eligibility gate,
  * the Story counterpart of verifyReelVideoOwnership above. Simpler than
  * the Reel version — a Story has no music/mux/render variant at all, so
@@ -314,6 +333,11 @@ export async function handleRequest(request: CallableRequest<unknown>): Promise<
     // verifyStoryMediaOwnership's own doc comment.
     await verifyStoryMediaOwnership(input.storyId!, request.auth.uid, input.contentType);
     path = storySourceKey(request.auth.uid, input.storyId!);
+  } else if (input.mediaKind === 'reelMusic') {
+    // Same reasoning as the reelThumbnail/reelVideo branches above — see
+    // verifyReelMusicOwnership's own doc comment.
+    await verifyReelMusicOwnership(input.reelId!, request.auth.uid, input.contentType);
+    path = reelMusicKey(request.auth.uid, input.reelId!);
   } else if (input.mediaKind === 'profileCover') {
     path = profileCoverKey(request.auth.uid);
   } else {

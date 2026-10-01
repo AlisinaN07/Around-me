@@ -13,7 +13,7 @@
  * `deleteR2Object` as the default `deleteObject` — a test supplies a
  * plain spy instead.
  */
-import { reelSourceKey, reelThumbnailKey } from './objectKey';
+import { reelMusicKey, reelSourceKey, reelThumbnailKey } from './objectKey';
 import { deleteR2Object } from './r2Storage';
 
 export type RawReelData = Record<string, unknown>;
@@ -55,15 +55,24 @@ export type RawReelData = Record<string, unknown>;
  * `mediaType` at all, which it currently doesn't, and the cost of leaving
  * it as-is is zero (see test-discard-reel-source-logic.cjs's own Step 9C
  * test).
+ *
+ * Step 10B — ALSO attempts the Reel's own standalone music object at
+ * `reelMusicKey(uid, reelId)` when `musicStorageProvider === 'r2'`. Only
+ * ever real for a `musicSourceType === 'device'` Reel (createReelDraft's
+ * own Firestore Rules already guarantee `musicStorageProvider` stays at
+ * its fixed 'firebase' default for a no-music Reel, same sentinel
+ * convention as every other music field) — a no-music Reel's own check
+ * here simply never fires, costing nothing.
  */
 export async function performReelSourceDiscardCleanup(
   reel: RawReelData,
   uid: string,
   reelId: string,
   deleteObject: (key: string) => Promise<void> = deleteR2Object
-): Promise<{ videoAttempted: boolean; thumbnailAttempted: boolean }> {
+): Promise<{ videoAttempted: boolean; thumbnailAttempted: boolean; musicAttempted: boolean }> {
   let videoAttempted = false;
   let thumbnailAttempted = false;
+  let musicAttempted = false;
 
   if (reel.storageProvider === 'r2') {
     videoAttempted = true;
@@ -86,6 +95,14 @@ export async function performReelSourceDiscardCleanup(
       console.warn(`[discardReelSource] Could not delete R2 thumbnail for Reel "${reelId}":`, error);
     }
   }
+  if (reel.musicStorageProvider === 'r2') {
+    musicAttempted = true;
+    try {
+      await deleteObject(reelMusicKey(uid, reelId));
+    } catch (error) {
+      console.warn(`[discardReelSource] Could not delete R2 music for Reel "${reelId}":`, error);
+    }
+  }
 
-  return { videoAttempted, thumbnailAttempted };
+  return { videoAttempted, thumbnailAttempted, musicAttempted };
 }

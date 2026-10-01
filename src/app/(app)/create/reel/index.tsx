@@ -139,14 +139,16 @@ export default function CreateReelScreen() {
   // FIRESTORE, not back into this in-memory object) — so reading
   // `draft.storageProvider`/`draft.thumbnailStorageProvider` in
   // resetAfterFailure below would always see the stale pre-upload value.
-  // These two refs track the ACTUALLY-used provider for each independent
-  // object instead, captured right before each upload dispatch — the
-  // exact same eligibility check uploadReelVideo/uploadReelThumbnail
-  // themselves apply internally (reels.ts) to decide whether THIS upload
-  // goes to R2, so this is never a guess, just the same decision read
-  // here too. Same pattern as camera.tsx's own storyUploadProviderRef.
+  // These three refs track the ACTUALLY-used provider for each
+  // independent object instead, captured right before each upload
+  // dispatch — the exact same eligibility check uploadReelVideo/
+  // uploadReelThumbnail/uploadReelMusicAudio themselves apply internally
+  // (reels.ts) to decide whether THIS upload goes to R2, so this is never
+  // a guess, just the same decision read here too. Same pattern as
+  // camera.tsx's own storyUploadProviderRef.
   const videoProviderRef = useRef<'firebase' | 'r2'>('firebase');
   const thumbnailProviderRef = useRef<'firebase' | 'r2'>('firebase');
+  const musicProviderRef = useRef<'firebase' | 'r2'>('firebase');
 
   const handleCaptionChange = (text: string) => {
     setCaption(text);
@@ -317,10 +319,11 @@ export default function CreateReelScreen() {
       // musicStorageAudioPath is '' when no music was attached — see
       // ReelMusicSourceType's doc comment; discardReelDraft treats an
       // empty/falsy path as "nothing to delete," not an error.
-      // videoProviderRef/thumbnailProviderRef (not draft.storageProvider/
-      // draft.thumbnailStorageProvider, which never update after a real
-      // R2 confirm — see their own doc comment above) are what actually
-      // reflect whether either upload went to R2 — discardReelDraft only
+      // videoProviderRef/thumbnailProviderRef/musicProviderRef (not
+      // draft.storageProvider/draft.thumbnailStorageProvider/
+      // draft.musicStorageProvider, which never update after a real R2
+      // confirm — see their own doc comment above) are what actually
+      // reflect whether each upload went to R2 — discardReelDraft only
       // asks the server to clean up R2 when at least one of them says so.
       await discardReelDraft(
         draft.reelId,
@@ -328,11 +331,13 @@ export default function CreateReelScreen() {
         draft.thumbnailStoragePath,
         draft.musicStorageAudioPath || undefined,
         videoProviderRef.current,
-        thumbnailProviderRef.current
+        thumbnailProviderRef.current,
+        musicProviderRef.current
       );
     }
     videoProviderRef.current = 'firebase';
     thumbnailProviderRef.current = 'firebase';
+    musicProviderRef.current = 'firebase';
     setError(message);
     setUploadFailed(keepFailureBanner);
     setProgress(0);
@@ -438,6 +443,9 @@ export default function CreateReelScreen() {
 
             setStage('uploadingMusic');
             setProgress(0);
+            // Captured right before dispatch — see videoProviderRef's own
+            // doc comment above.
+            musicProviderRef.current = getMediaStorageProvider() === 'r2' ? 'r2' : 'firebase';
             uploadHandleRef.current = uploadReelMusicAudio(
               draftResult.reel,
               music.uri,
@@ -647,6 +655,9 @@ export default function CreateReelScreen() {
             if (music) {
               setStage('uploadingMusic');
               setProgress(0);
+              // Captured right before dispatch — see videoProviderRef's
+              // own doc comment above.
+              musicProviderRef.current = getMediaStorageProvider() === 'r2' ? 'r2' : 'firebase';
               uploadHandleRef.current = uploadReelMusicAudio(
                 draftResult.reel,
                 music.uri,

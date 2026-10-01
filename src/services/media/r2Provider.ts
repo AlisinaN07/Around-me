@@ -494,3 +494,72 @@ export async function uploadStoryVideoToR2(
   if (!result.ok) return result;
   return { ok: true, mediaUrl: result.sourceUrl };
 }
+
+type ReelMusicUploadResult = { ok: true } | { ok: false; message: string };
+
+/**
+ * Step 10B — the real, production-wired Reel-MUSIC upload path. Reuses
+ * the EXACT same native file-based upload architecture as
+ * uploadReelVideoToR2/uploadStoryVideoToR2 (performReelVideoUpload +
+ * expo-file-system's `File.createUploadTask`) rather than the Blob-based
+ * path above — up to REEL_MUSIC_MAX_FILE_SIZE_BYTES (20 MB), the same
+ * size class justification Part 6 of this step's own spec calls for.
+ *
+ * Unlike the video/Story-media variants, this never surfaces a
+ * `mediaUrl` — a Reel's own music object has no paired public URL at all
+ * (see Reel.musicStorageProvider's own doc comment, src/types/reel.ts:
+ * only mux/render ever read it back, server-side, via an authenticated
+ * R2 read, never a public delivery URL) — so a successful upload here
+ * just reports `{ok:true}`; the caller (reels.ts's own
+ * uploadReelMusicAudioViaR2) is responsible for the follow-up
+ * confirmReelMusicProvider write, which persists no URL either.
+ */
+export async function uploadReelMusicToR2(
+  reelId: string,
+  localUri: string,
+  contentType: string,
+  onProgress: MediaUploadProgressCallback,
+  onUploadTaskReady?: (cancel: () => void) => void
+): Promise<ReelMusicUploadResult> {
+  const result = await performReelVideoUpload(
+    () => {
+      const file = new File(localUri);
+      let task: ReturnType<File['createUploadTask']> | null = null;
+      return {
+        getFileSize: () => file.size,
+        start: (url, headers, onAdapterProgress) => {
+          task = file.createUploadTask(url, {
+            httpMethod: 'PUT',
+            uploadType: UploadType.BINARY_CONTENT,
+            headers,
+            onProgress: ({ bytesSent, totalBytes }) => onAdapterProgress(bytesSent, totalBytes),
+          });
+          return task.uploadAsync();
+        },
+        cancel: () => task?.cancel(),
+      };
+    },
+    (contentType, fileSizeBytes, reelId) =>
+      requestUploadAuthorization('reelMusic', contentType, fileSizeBytes, undefined, reelId).then((authorization) => ({
+        uploadUrl: authorization.uploadUrl,
+        contentType: authorization.contentType,
+        // Deliberately ignored by this function's own caller — see this
+        // function's own doc comment on why a Reel's music object has no
+        // real `mediaUrl` concept at all. performReelVideoUpload itself
+        // still requires SOME non-null value to report success (its own
+        // "never fabricate a URL" gate) — the server DOES still compute
+        // one (harmlessly unused) whenever R2_PUBLIC_MEDIA_BASE_URL is
+        // configured, so this only ever actually blocks an upload when
+        // R2 delivery isn't configured server-side AT ALL yet, same
+        // "fail closed until real infra exists" posture every other R2
+        // media kind already has.
+        mediaUrl: authorization.mediaUrl,
+      })),
+    reelId,
+    contentType,
+    onProgress,
+    onUploadTaskReady
+  );
+  if (!result.ok) return result;
+  return { ok: true };
+}

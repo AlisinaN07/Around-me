@@ -263,6 +263,33 @@ export type Reel = {
   musicTitle: string;
   /** reels/{authorUid}/{reelId}/music — deterministic, mirrors `storagePath`. '' when musicSourceType is 'none'. */
   musicStorageAudioPath: string;
+  /**
+   * Step 10B — which backend `musicStorageAudioPath` actually lives on.
+   * 'firebase' (the fixed default at create, regardless of
+   * musicSourceType — same always-present sentinel convention as every
+   * other music field) until a client-side R2 upload confirms otherwise
+   * via confirmReelMusicProvider (src/services/reels.ts), a narrow,
+   * one-time, server-authorized Firestore transition
+   * (isValidReelMusicProviderUpdate). Independent of `storageProvider`/
+   * `thumbnailStorageProvider` — a Reel's video, thumbnail, and music can
+   * each be on a different backend at once (see muxReelMusic/
+   * renderPhotoToVideo in functions/src/index.ts, which read this
+   * directly to decide which backend to download the music from).
+   *
+   * Deliberately NO paired `musicUrl` field: unlike the video source/
+   * thumbnail (which the client plays/displays directly), a Reel's own
+   * uploaded music object is NEVER fetched back by any client — only
+   * mux/render read it, server-side, via an authenticated R2
+   * GetObjectCommand (reelMusicStorage.ts) or the Admin Storage SDK,
+   * never a public delivery URL — and it's deleted once mux/render
+   * succeeds. A public URL would have no reader and no purpose.
+   *
+   * Optional/missing on a legacy Reel predating this field — every READ
+   * site (muxReelMusic, renderPhotoToVideo, cleanupReelOwnedMedia) treats
+   * missing the same as `'firebase'`, never inferred from a path/URL
+   * shape.
+   */
+  musicStorageProvider?: ReelStorageProvider;
   musicStorageContentType: string;
   musicFileSizeBytes: number;
   /** Declared duration in milliseconds from the picked audio file — same client-declared caveat as `durationMs` above. 0 when musicSourceType is 'none'. */

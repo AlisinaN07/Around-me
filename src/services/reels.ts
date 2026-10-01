@@ -63,7 +63,7 @@ import { extractHashtags, incrementHashtagCounts } from './hashtags';
 import { getMediaStorageProvider } from './media';
 import { pickProviderUrl } from './media/providerAwareUrl';
 import { isReelEligibleForR2VideoUpload } from './media/reelVideoEligibility';
-import { uploadReelThumbnailToR2, uploadReelVideoToR2 } from './media/r2Provider';
+import { uploadReelMusicToR2, uploadReelThumbnailToR2, uploadReelVideoToR2 } from './media/r2Provider';
 import { fetchEngagementStatsBatch } from './recommendations/engagementStats';
 import { scoreContentQuality } from './recommendations/ranking';
 import { storage } from './storage';
@@ -425,6 +425,11 @@ export async function createReelDraft(input: CreateReelDraftInput): Promise<Crea
     musicSourceType: input.music ? 'device' : 'none',
     musicTitle: input.music?.title ?? '',
     musicStorageAudioPath: input.music ? reelMusicStoragePath(profile.uid, draftRef.id) : '',
+    // Step 10B — same "required field, fixed default at create" pattern
+    // as storageProvider/thumbnailStorageProvider above — only a
+    // trusted, one-time server-authorized update (see
+    // confirmReelMusicProvider below) can ever flip this to 'r2'.
+    musicStorageProvider: 'firebase',
     musicStorageContentType: input.music?.storageContentType ?? '',
     musicFileSizeBytes: input.music?.fileSizeBytes ?? 0,
     musicDurationMs: input.music?.durationMs ?? 0,
@@ -755,6 +760,14 @@ export async function resolveReelVideoPlaybackUrl(reel: Reel): Promise<string | 
  * createReelDraft). This is a SEPARATE Storage object from the video, not
  * muxed into it — see ReelMusicSourceType's doc comment in
  * src/types/reel.ts for why.
+ *
+ * Step 10B — dispatches to uploadReelMusicAudioViaR2 (below) ONLY when
+ * getMediaStorageProvider() is 'r2' — unlike Reel video/thumbnail, there
+ * is no per-Reel eligibility predicate to check: this function is only
+ * EVER called for a Reel already confirmed to have device-picked music
+ * (see this function's own doc comment above), so the only real decision
+ * is "is R2 currently enabled," no exclusion needed. This function's own
+ * default, Firebase-mode behavior is otherwise completely untouched.
  */
 export function uploadReelMusicAudio(
   reel: Reel,
@@ -762,6 +775,10 @@ export function uploadReelMusicAudio(
   onProgress: (percent: number) => void,
   onComplete: (result: { ok: true } | { ok: false; message: string }) => void
 ): UploadReelVideoHandle {
+  if (getMediaStorageProvider() === 'r2') {
+    return uploadReelMusicAudioViaR2(reel, localUri, onProgress, onComplete);
+  }
+
   let cancelled = false;
   let task: UploadTask | null = null;
 
@@ -807,6 +824,95 @@ export function uploadReelMusicAudio(
     cancel: () => {
       cancelled = true;
       task?.cancel();
+    },
+  };
+}
+
+/**
+ * Step 10B — the one-time, server-authorized Firestore write that flips a
+ * still-"uploading" Reel's own standalone music from Firebase to R2, once
+ * (and only once) the direct client PUT to R2 has actually succeeded —
+ * see firestore.rules' own isValidReelMusicProviderUpdate for the exact
+ * narrow shape this write must take. Unlike confirmReelVideoProvider/
+ * confirmReelThumbnailProvider, this persists NO url field at all — see
+ * Reel.musicStorageProvider's own doc comment (src/types/reel.ts) for why
+ * a Reel's music object has no public-URL concept to begin with. The
+ * ONLY caller is uploadReelMusicAudioViaR2 below.
+ */
+async function confirmReelMusicProvider(reelId: string): Promise<{ ok: true } | { ok: false; message: string }> {
+  if (!firestore) {
+    return { ok: false, message: 'Firestore is not available.' };
+  }
+  try {
+    await updateDoc(reelRef(reelId), {
+      musicStorageProvider: 'r2',
+      updatedAt: serverTimestamp(),
+    });
+  } catch {
+    return { ok: false, message: "Couldn't finish saving this post's music." };
+  }
+  return { ok: true };
+}
+
+/**
+ * Step 10B's real, end-to-end R2 upload path for a Reel's own standalone
+ * music — reached ONLY from uploadReelMusicAudio above, when the provider
+ * is 'r2'. Reuses the native file-based upload architecture (same as
+ * uploadReelVideoToR2/uploadStoryVideoToR2), not the Blob-based path —
+ * see uploadReelMusicToR2's own doc comment (r2Provider.ts) for why.
+ * Mirrors uploadReelVideoViaR2's own "upload, then confirm, both must
+ * succeed" structure — this function performs the follow-up
+ * confirmReelMusicProvider write itself, since uploadReelMusicAudio's
+ * existing `{ok:true}|{ok:false}` contract exposes nothing else to its
+ * own caller.
+ *
+ * Same orphan-risk note as uploadReelVideoViaR2: if the R2 PUT succeeds
+ * but the follow-up Firestore write then fails, the R2 object is left
+ * behind with nothing in Firestore pointing at it yet — a real user
+ * retry re-PUTs to the exact same deterministic key, overwriting it in
+ * place. A genuinely abandoned draft is cleaned up server-side by
+ * discardReelDraft's own call to the discardReelSource callable.
+ */
+function uploadReelMusicAudioViaR2(
+  reel: Reel,
+  localUri: string,
+  onProgress: (percent: number) => void,
+  onComplete: (result: { ok: true } | { ok: false; message: string }) => void
+): UploadReelVideoHandle {
+  let cancelled = false;
+  let cancelUpload: (() => void) | null = null;
+
+  (async () => {
+    const uploadResult = await uploadReelMusicToR2(
+      reel.reelId,
+      localUri,
+      reel.musicStorageContentType,
+      onProgress,
+      (cancel) => {
+        cancelUpload = cancel;
+      }
+    );
+    if (cancelled) return;
+
+    if (!uploadResult.ok) {
+      onComplete(uploadResult);
+      return;
+    }
+
+    const confirmResult = await confirmReelMusicProvider(reel.reelId);
+    if (cancelled) return;
+
+    if (__DEV__) {
+      // eslint-disable-next-line no-console
+      console.log('[reels] R2 music upload for', reel.reelId, '->', uploadResult, confirmResult);
+    }
+    onComplete(confirmResult);
+  })();
+
+  return {
+    cancel: () => {
+      cancelled = true;
+      cancelUpload?.();
     },
   };
 }
@@ -1160,7 +1266,11 @@ export async function discardReelDraft(
   // caller (create/reel/index.tsx's handleDiscard) straight from the
   // draft Reel's own `storageProvider`/`thumbnailStorageProvider` fields.
   storageProvider?: ReelStorageProvider,
-  thumbnailStorageProvider?: ReelThumbnailStorageProvider
+  thumbnailStorageProvider?: ReelThumbnailStorageProvider,
+  // Step 10B — same convention as storageProvider/thumbnailStorageProvider
+  // above, for the Reel's own standalone music object (see
+  // uploadReelMusicAudioViaR2 above).
+  musicStorageProvider?: ReelStorageProvider
 ): Promise<void> {
   if (storage) {
     try {
@@ -1206,15 +1316,15 @@ export async function discardReelDraft(
       }
     }
   }
-  // Step 9A — a Firebase Storage object this draft never actually held
-  // (because its video/thumbnail went to R2 instead) has no equivalent
-  // client-reachable delete path — R2 credentials never leave the
-  // backend (see r2Config.ts's own doc comment) — so this asks the
-  // trusted discardReelSource callable to clean up whichever of the two
-  // objects actually exist there. Best-effort, same reasoning as every
-  // Firebase delete attempt above: a cleanup failure here must never
-  // block the draft's own Firestore deletion just below.
-  if ((storageProvider === 'r2' || thumbnailStorageProvider === 'r2') && functions) {
+  // Step 9A/10B — a Firebase Storage object this draft never actually
+  // held (because its video/thumbnail/music went to R2 instead) has no
+  // equivalent client-reachable delete path — R2 credentials never leave
+  // the backend (see r2Config.ts's own doc comment) — so this asks the
+  // trusted discardReelSource callable to clean up whichever of the
+  // three objects actually exist there. Best-effort, same reasoning as
+  // every Firebase delete attempt above: a cleanup failure here must
+  // never block the draft's own Firestore deletion just below.
+  if ((storageProvider === 'r2' || thumbnailStorageProvider === 'r2' || musicStorageProvider === 'r2') && functions) {
     try {
       await httpsCallable(functions, 'discardReelSource')({ reelId });
     } catch (error) {

@@ -52,6 +52,8 @@ type DiscardReelSourceResult = {
   videoAttempted: boolean;
   /** Same meaning as videoAttempted, for the Reel's own thumbnail. */
   thumbnailAttempted: boolean;
+  /** Step 10B — same meaning as videoAttempted, for the Reel's own standalone music object. */
+  musicAttempted: boolean;
 };
 
 export async function handleDiscardReelSourceRequest(request: CallableRequest<unknown>): Promise<DiscardReelSourceResult> {
@@ -75,9 +77,9 @@ export async function handleDiscardReelSourceRequest(request: CallableRequest<un
 
   // eligibility.ok guarantees `reel` is non-null (checkReelDiscardEligibility's
   // only ok:true path requires it).
-  const { videoAttempted, thumbnailAttempted } = await performReelSourceDiscardCleanup(reel as RawReelData, uid, reelId);
+  const { videoAttempted, thumbnailAttempted, musicAttempted } = await performReelSourceDiscardCleanup(reel as RawReelData, uid, reelId);
 
-  return { reelId, videoAttempted, thumbnailAttempted };
+  return { reelId, videoAttempted, thumbnailAttempted, musicAttempted };
 }
 
 export const discardReelSource = onCall(

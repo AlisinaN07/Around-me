@@ -28,10 +28,12 @@ const {
   checkReelDiscardEligibility,
   checkReelMuxEligibility,
   checkReelPhotoRenderEligibility,
+  checkReelMusicUploadEligibility,
 } = require('../lib/media/reelEligibility.js');
 
 const VIDEO_CONTENT_TYPE = 'video/mp4';
 const PHOTO_CONTENT_TYPE = 'image/jpeg';
+const AUDIO_CONTENT_TYPE = 'audio/mp4';
 
 const results = [];
 function check(name, fn) {
@@ -366,6 +368,72 @@ check('photoRender: a valid, owned, uploading, render-pending Reel with real dev
 check('photoRender: eligibility does NOT depend on storageProvider — an R2-sourced render-pending Reel is exactly as eligible as a Firebase one', () => {
   assert.equal(checkReelPhotoRenderEligibility(baseEligibleRenderPendingReel({ storageProvider: 'r2' }), UID).ok, true);
   assert.equal(checkReelPhotoRenderEligibility(baseEligibleRenderPendingReel({ storageProvider: 'firebase' }), UID).ok, true);
+});
+
+// ---------------------------------------------------------------------------
+// checkReelMusicUploadEligibility — Step 10B, the music-upload authorization
+// gate built ON TOP of checkReelMuxEligibility (same ownership/status/music-
+// state preconditions as a mux run — nothing to upload music FOR unless the
+// Reel is already in a mux-eligible music state), plus one additional
+// contentType cross-check against the wide `audio/*` allowlist storage.rules
+// itself already uses (device file-picker output is unbounded, unlike
+// camera/library video or photo output — see reelMusicStorage.ts's own doc
+// comment).
+// ---------------------------------------------------------------------------
+
+check('musicUpload: nonexistent Reel (null) is not-found — inherited from checkReelMuxEligibility', () => {
+  assert.equal(checkReelMusicUploadEligibility(null, UID, AUDIO_CONTENT_TYPE).code, 'not-found');
+});
+
+check('musicUpload: wrong owner is permission-denied — inherited from checkReelMuxEligibility', () => {
+  const result = checkReelMusicUploadEligibility(baseEligibleMusicVideoReel(), OTHER_UID, AUDIO_CONTENT_TYPE);
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'permission-denied');
+});
+
+check('musicUpload: status published is failed-precondition — inherited from checkReelMuxEligibility', () => {
+  const result = checkReelMusicUploadEligibility(baseEligibleMusicVideoReel({ status: 'published' }), UID, AUDIO_CONTENT_TYPE);
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'failed-precondition');
+});
+
+check('musicUpload: a Reel with no music at all (musicSourceType "none") is REJECTED — inherited from checkReelMuxEligibility, nothing to upload for', () => {
+  const result = checkReelMusicUploadEligibility(baseEligibleVideoReel(), UID, AUDIO_CONTENT_TYPE);
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'failed-precondition');
+});
+
+check('musicUpload: a valid, owned, uploading, device-music Reel with a real audio contentType is ELIGIBLE', () => {
+  assert.equal(checkReelMusicUploadEligibility(baseEligibleMusicVideoReel(), UID, AUDIO_CONTENT_TYPE).ok, true);
+});
+
+check('musicUpload: a wide range of real "audio/*" MIME types are all accepted — device file-picker output is unbounded, mirrors storage.rules\' own wildcard', () => {
+  for (const contentType of ['audio/mpeg', 'audio/mp4', 'audio/x-m4a', 'audio/aac', 'audio/wav', 'audio/ogg', 'audio/flac']) {
+    const result = checkReelMusicUploadEligibility(baseEligibleMusicVideoReel(), UID, contentType);
+    assert.equal(result.ok, true, `expected "${contentType}" to be accepted`);
+  }
+});
+
+check('musicUpload: a non-audio contentType is REJECTED regardless of the Reel\'s own shape', () => {
+  for (const contentType of ['video/mp4', 'image/jpeg', 'application/pdf', '']) {
+    const result = checkReelMusicUploadEligibility(baseEligibleMusicVideoReel(), UID, contentType);
+    assert.equal(result.ok, false, `expected "${contentType}" to be rejected`);
+    assert.equal(result.code, 'failed-precondition');
+  }
+});
+
+check('musicUpload: eligibility does NOT depend on storageProvider — an R2-sourced video Reel is exactly as eligible for a music upload as a Firebase one', () => {
+  assert.equal(checkReelMusicUploadEligibility(baseEligibleMusicVideoReel({ storageProvider: 'r2' }), UID, AUDIO_CONTENT_TYPE).ok, true);
+  assert.equal(checkReelMusicUploadEligibility(baseEligibleMusicVideoReel({ storageProvider: 'firebase' }), UID, AUDIO_CONTENT_TYPE).ok, true);
+});
+
+check('musicUpload: a render-pending Reel is also eligible for a music upload — same base gate as mux', () => {
+  assert.equal(checkReelMusicUploadEligibility(baseEligibleRenderPendingReel(), UID, AUDIO_CONTENT_TYPE).ok, true);
+});
+
+check('musicUpload: ownership is checked before status — a wrong-owner published-status combo still reports permission-denied, not failed-precondition', () => {
+  const result = checkReelMusicUploadEligibility(baseEligibleMusicVideoReel({ status: 'published' }), OTHER_UID, AUDIO_CONTENT_TYPE);
+  assert.equal(result.code, 'permission-denied');
 });
 
 console.log('\n=== functions/ Reel eligibility logic test results ===');

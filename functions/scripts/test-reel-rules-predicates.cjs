@@ -50,7 +50,7 @@ const REEL_BASE_KEYS = [
   'mediaType', 'needsPhotoVideoRender', 'storagePath', 'storageContentType', 'fileSizeBytes', 'durationMs',
   'storageProvider', 'sourceUrl',
   'width', 'height', 'status', 'visibility',
-  'musicSourceType', 'musicTitle', 'musicStorageAudioPath',
+  'musicSourceType', 'musicTitle', 'musicStorageAudioPath', 'musicStorageProvider',
   'musicStorageContentType', 'musicFileSizeBytes', 'musicDurationMs',
   'musicHash', 'soundOriginAuthorUid', 'soundOriginReelId',
   'thumbnailStoragePath', 'thumbnailStorageContentType',
@@ -116,6 +116,7 @@ function isValidReelSourceProviderUpdate(newData, oldData) {
     newData.visibility === oldData.visibility &&
     newData.musicTitle === oldData.musicTitle &&
     newData.musicStorageAudioPath === oldData.musicStorageAudioPath &&
+    newData.musicStorageProvider === oldData.musicStorageProvider &&
     newData.musicStorageContentType === oldData.musicStorageContentType &&
     newData.musicFileSizeBytes === oldData.musicFileSizeBytes &&
     newData.musicDurationMs === oldData.musicDurationMs &&
@@ -172,6 +173,7 @@ function isValidReelThumbnailProviderUpdate(newData, oldData) {
     newData.musicSourceType === oldData.musicSourceType &&
     newData.musicTitle === oldData.musicTitle &&
     newData.musicStorageAudioPath === oldData.musicStorageAudioPath &&
+    newData.musicStorageProvider === oldData.musicStorageProvider &&
     newData.musicStorageContentType === oldData.musicStorageContentType &&
     newData.musicFileSizeBytes === oldData.musicFileSizeBytes &&
     newData.musicDurationMs === oldData.musicDurationMs &&
@@ -233,6 +235,7 @@ function isValidReelPhotoSourceProviderUpdate(newData, oldData) {
     newData.musicSourceType === oldData.musicSourceType &&
     newData.musicTitle === oldData.musicTitle &&
     newData.musicStorageAudioPath === oldData.musicStorageAudioPath &&
+    newData.musicStorageProvider === oldData.musicStorageProvider &&
     newData.musicStorageContentType === oldData.musicStorageContentType &&
     newData.musicFileSizeBytes === oldData.musicFileSizeBytes &&
     newData.musicDurationMs === oldData.musicDurationMs &&
@@ -283,6 +286,7 @@ function isValidReelPublish(newData, oldData) {
     newData.musicSourceType === oldData.musicSourceType &&
     newData.musicTitle === oldData.musicTitle &&
     newData.musicStorageAudioPath === oldData.musicStorageAudioPath &&
+    newData.musicStorageProvider === oldData.musicStorageProvider &&
     newData.musicStorageContentType === oldData.musicStorageContentType &&
     newData.musicFileSizeBytes === oldData.musicFileSizeBytes &&
     newData.musicDurationMs === oldData.musicDurationMs &&
@@ -301,20 +305,88 @@ function isValidReelPublish(newData, oldData) {
   );
 }
 
-/** The actual `allow update` clause (firestore.rules line ~1203-1211): author-only, then any ONE of the FOUR transitions (Step 9C added the fourth). */
+/**
+ * Step 10B — mirrors isValidReelMusicProviderUpdate (firestore.rules,
+ * added right after isValidReelPhotoSourceProviderUpdate). The simplest
+ * of the four provider transitions — no url field to validate at all
+ * (a Reel's own music object has no public-URL concept — see
+ * Reel.musicStorageProvider's own doc comment, src/types/reel.ts).
+ * `oldData.musicSourceType == 'device'` is REQUIRED (not just unchanged
+ * either way) — a no-music Reel could never legitimately reach this
+ * transition.
+ */
+function isValidReelMusicProviderUpdate(newData, oldData) {
+  return (
+    oldData.status === 'uploading' &&
+    newData.status === 'uploading' &&
+    oldData.musicSourceType === 'device' &&
+    newData.musicSourceType === 'device' &&
+    oldData.musicStorageProvider === 'firebase' &&
+    newData.musicStorageProvider === 'r2' &&
+    isServerTimestampSentinel(newData.updatedAt) &&
+    newData.reelId === oldData.reelId &&
+    newData.authorUid === oldData.authorUid &&
+    newData.authorDisplayName === oldData.authorDisplayName &&
+    newData.authorUsername === oldData.authorUsername &&
+    newData.cityName === oldData.cityName &&
+    newData.countryCode === oldData.countryCode &&
+    newData.cityKey === oldData.cityKey &&
+    newData.categoryId === oldData.categoryId &&
+    newData.caption === oldData.caption &&
+    JSON.stringify(newData.hashtags) === JSON.stringify(oldData.hashtags) &&
+    newData.mediaType === oldData.mediaType &&
+    newData.needsPhotoVideoRender === oldData.needsPhotoVideoRender &&
+    newData.storagePath === oldData.storagePath &&
+    newData.storageContentType === oldData.storageContentType &&
+    newData.fileSizeBytes === oldData.fileSizeBytes &&
+    newData.storageProvider === oldData.storageProvider &&
+    newData.sourceUrl === oldData.sourceUrl &&
+    newData.durationMs === oldData.durationMs &&
+    newData.width === oldData.width &&
+    newData.height === oldData.height &&
+    newData.visibility === oldData.visibility &&
+    newData.musicTitle === oldData.musicTitle &&
+    newData.musicStorageAudioPath === oldData.musicStorageAudioPath &&
+    newData.musicStorageContentType === oldData.musicStorageContentType &&
+    newData.musicFileSizeBytes === oldData.musicFileSizeBytes &&
+    newData.musicDurationMs === oldData.musicDurationMs &&
+    newData.musicHash === oldData.musicHash &&
+    newData.soundOriginAuthorUid === oldData.soundOriginAuthorUid &&
+    newData.soundOriginReelId === oldData.soundOriginReelId &&
+    newData.thumbnailStoragePath === oldData.thumbnailStoragePath &&
+    newData.thumbnailStorageContentType === oldData.thumbnailStorageContentType &&
+    newData.thumbnailFileSizeBytes === oldData.thumbnailFileSizeBytes &&
+    newData.thumbnailWidth === oldData.thumbnailWidth &&
+    newData.thumbnailHeight === oldData.thumbnailHeight &&
+    newData.thumbnailStorageProvider === oldData.thumbnailStorageProvider &&
+    newData.thumbnailUrl === oldData.thumbnailUrl &&
+    newData.createdAt === oldData.createdAt &&
+    newData.publishedAt === oldData.publishedAt &&
+    hasOnlyKeys(newData, REEL_BASE_KEYS)
+  );
+}
+
+/** The actual `allow update` clause (firestore.rules line ~1205-1213): author-only, then any ONE of the FIVE transitions (Step 10B added the fifth). */
 function isValidReelUpdate(newData, oldData, requestAuthUid) {
   if (oldData.authorUid !== requestAuthUid) return false;
   return (
     isValidReelPublish(newData, oldData) ||
     isValidReelThumbnailProviderUpdate(newData, oldData) ||
     isValidReelSourceProviderUpdate(newData, oldData) ||
-    isValidReelPhotoSourceProviderUpdate(newData, oldData)
+    isValidReelPhotoSourceProviderUpdate(newData, oldData) ||
+    isValidReelMusicProviderUpdate(newData, oldData)
   );
 }
 
-/** Mirrors isValidReelCreate's storageProvider/sourceUrl-relevant subset (firestore.rules line ~1469-1587) — NOT the full image/video size-branch logic, which predates Step 9A and is unrelated to the provider fields this step introduced. */
+/** Mirrors isValidReelCreate's storageProvider/sourceUrl/musicStorageProvider-relevant subset (firestore.rules line ~1472-1596) — NOT the full image/video size-branch logic, which predates Step 9A and is unrelated to the provider fields this step introduced. */
 function isValidReelCreateProviderDefaults(data) {
-  return data.storageProvider === 'firebase' && data.sourceUrl === '' && data.thumbnailStorageProvider === 'firebase' && data.thumbnailUrl === '';
+  return (
+    data.storageProvider === 'firebase' &&
+    data.sourceUrl === '' &&
+    data.thumbnailStorageProvider === 'firebase' &&
+    data.thumbnailUrl === '' &&
+    data.musicStorageProvider === 'firebase'
+  );
 }
 
 /** Mirrors the plain `allow read` condition (firestore.rules line ~1187-1188) — included to prove a legacy document (missing storageProvider/sourceUrl entirely) is unaffected, since this predicate never references either field. */
@@ -361,6 +433,7 @@ function baseReelDoc(overrides = {}) {
     musicSourceType: 'none',
     musicTitle: '',
     musicStorageAudioPath: '',
+    musicStorageProvider: 'firebase',
     musicStorageContentType: '',
     musicFileSizeBytes: 0,
     musicDurationMs: 0,
@@ -645,6 +718,93 @@ check('Step 9C — a plain photo Reel is publishable after the lockstep confirma
   });
   const newData = { ...oldData, status: 'published', publishedAt: 'SERVER_TIMESTAMP', updatedAt: 'SERVER_TIMESTAMP' };
   assert.equal(isValidReelUpdate(newData, oldData, 'uid1'), true);
+});
+
+// ---------------------------------------------------------------------------
+// Step 10B — the music provider transition (isValidReelMusicProviderUpdate).
+// ---------------------------------------------------------------------------
+check('Step 10B — music transition: firebase -> r2 for a device-music Reel is ACCEPTED, with no url field at all', () => {
+  const oldData = baseReelDoc({ musicSourceType: 'device', musicTitle: 'Song.mp3', musicStorageAudioPath: 'reels/uid1/reel1/music' });
+  const newData = { ...oldData, musicStorageProvider: 'r2', updatedAt: 'SERVER_TIMESTAMP' };
+  assert.equal(isValidReelUpdate(newData, oldData, 'uid1'), true);
+});
+
+check('Step 10B — music transition: a no-music Reel (musicSourceType "none") can NEVER use this transition, even if musicStorageProvider is somehow already "firebase"', () => {
+  const oldData = baseReelDoc(); // musicSourceType: 'none'
+  const newData = { ...oldData, musicStorageProvider: 'r2', updatedAt: 'SERVER_TIMESTAMP' };
+  assert.equal(isValidReelMusicProviderUpdate(newData, oldData), false);
+});
+
+check('Step 10B — music transition: reverse r2 -> firebase is REJECTED — one-shot guard, same as every other provider transition', () => {
+  const oldData = baseReelDoc({ musicSourceType: 'device', musicTitle: 'Song.mp3', musicStorageAudioPath: 'reels/uid1/reel1/music', musicStorageProvider: 'r2' });
+  const newData = { ...oldData, musicStorageProvider: 'firebase' };
+  assert.equal(isValidReelUpdate(newData, oldData, 'uid1'), false);
+});
+
+check('Step 10B — music transition: a valid flip that ALSO sneaks in a caption change is REJECTED', () => {
+  const oldData = baseReelDoc({ musicSourceType: 'device', musicTitle: 'Song.mp3', musicStorageAudioPath: 'reels/uid1/reel1/music' });
+  const newData = { ...oldData, musicStorageProvider: 'r2', caption: 'sneaky edit', updatedAt: 'SERVER_TIMESTAMP' };
+  assert.equal(isValidReelUpdate(newData, oldData, 'uid1'), false);
+});
+
+check('Step 10B — music transition: a valid flip that ALSO sneaks in a video-source provider change (piggybacking through this narrow door) is REJECTED', () => {
+  const oldData = baseReelDoc({ musicSourceType: 'device', musicTitle: 'Song.mp3', musicStorageAudioPath: 'reels/uid1/reel1/music' });
+  const newData = { ...oldData, musicStorageProvider: 'r2', storageProvider: 'r2', sourceUrl: 'https://media.example.com/x', updatedAt: 'SERVER_TIMESTAMP' };
+  assert.equal(isValidReelUpdate(newData, oldData, 'uid1'), false);
+});
+
+check('Step 10B — music transition: attempted against an already-published Reel is REJECTED', () => {
+  const oldData = baseReelDoc({
+    musicSourceType: 'device',
+    musicTitle: 'Song.mp3',
+    musicStorageAudioPath: 'reels/uid1/reel1/music',
+    status: 'published',
+    publishedAt: 'PUBLISHED_AT_FIXED',
+  });
+  const newData = { ...oldData, musicStorageProvider: 'r2', updatedAt: 'SERVER_TIMESTAMP' };
+  assert.equal(isValidReelUpdate(newData, oldData, 'uid1'), false);
+});
+
+check('Step 10B — music transition: attempted by a non-author is REJECTED at the ownership gate', () => {
+  const oldData = baseReelDoc({ musicSourceType: 'device', musicTitle: 'Song.mp3', musicStorageAudioPath: 'reels/uid1/reel1/music' });
+  const newData = { ...oldData, musicStorageProvider: 'r2', updatedAt: 'SERVER_TIMESTAMP' };
+  assert.equal(isValidReelUpdate(newData, oldData, 'attacker-uid'), false);
+});
+
+check('Step 10B — music transition: independent of the video source\'s own provider — an already-R2 video Reel can still confirm its music separately', () => {
+  const oldData = baseReelDoc({
+    musicSourceType: 'device',
+    musicTitle: 'Song.mp3',
+    musicStorageAudioPath: 'reels/uid1/reel1/music',
+    storageProvider: 'r2',
+    sourceUrl: 'https://media.example.com/x',
+  });
+  const newData = { ...oldData, musicStorageProvider: 'r2', updatedAt: 'SERVER_TIMESTAMP' };
+  assert.equal(isValidReelUpdate(newData, oldData, 'uid1'), true);
+});
+
+check('Step 10B — a Reel already confirmed as musicStorageProvider "r2" can still publish', () => {
+  const oldData = baseReelDoc({
+    musicSourceType: 'device',
+    musicTitle: 'Song.mp3',
+    musicStorageAudioPath: 'reels/uid1/reel1/music',
+    musicStorageProvider: 'r2',
+    musicHash: 'abc123',
+    soundOriginAuthorUid: 'uid1',
+    soundOriginReelId: 'reel1',
+  });
+  const newData = { ...oldData, status: 'published', publishedAt: 'SERVER_TIMESTAMP', updatedAt: 'SERVER_TIMESTAMP' };
+  assert.equal(isValidReelUpdate(newData, oldData, 'uid1'), true);
+});
+
+check('Step 10B — publish: sneaking a musicStorageProvider change INTO the publish write itself is REJECTED', () => {
+  const oldData = baseReelDoc({ musicSourceType: 'device', musicTitle: 'Song.mp3', musicStorageAudioPath: 'reels/uid1/reel1/music' });
+  const newData = { ...oldData, status: 'published', publishedAt: 'SERVER_TIMESTAMP', updatedAt: 'SERVER_TIMESTAMP', musicStorageProvider: 'r2' };
+  assert.equal(isValidReelUpdate(newData, oldData, 'uid1'), false);
+});
+
+check('Step 10B — create: a draft that already claims musicStorageProvider "r2" is rejected', () => {
+  assert.equal(isValidReelCreateProviderDefaults(baseReelDoc({ musicStorageProvider: 'r2' })), false);
 });
 
 // ---------------------------------------------------------------------------

@@ -73,6 +73,7 @@ import {
   type RawReelData,
 } from './media/reelSourceStorage';
 import { getR2Config } from './media/r2Config';
+import { deleteReelMusic, downloadReelMusicToLocalFile } from './media/reelMusicStorage';
 import { cleanupExpiredStoriesBatch } from './media/storyExpiryCleanup';
 import { cleanupStoryOwnedMedia } from './media/storyMediaCleanup';
 
@@ -1735,8 +1736,6 @@ export const muxReelMusic = onCall(
     }
 
     const bucket = getStorage().bucket();
-    const musicStoragePath = reelData.musicStorageAudioPath as string;
-    const musicFile = bucket.file(musicStoragePath);
     // Step 9B — provider-aware: this Reel's video source may be on
     // Firebase or R2 (see downloadReelSourceForMux/
     // uploadMuxedReelSourceToProvider's own doc comments in
@@ -1755,12 +1754,10 @@ export const muxReelMusic = onCall(
     try {
       const outcome = await performReelMux(paths, {
         downloadVideo: (destination) => downloadReelSourceForMux(bucket, reelData, uid, reelId, destination),
-        downloadMusic: async (destination) => {
-          const [exists] = await musicFile.exists();
-          if (!exists) return false;
-          await musicFile.download({ destination });
-          return true;
-        },
+        // Step 10B — provider-aware (see reelMusicStorage.ts's own doc
+        // comment): this Reel's own standalone music may now be on
+        // Firebase or R2.
+        downloadMusic: (destination) => downloadReelMusicToLocalFile(bucket, reelData, uid, reelId, destination),
         runFfmpegMux: (localVideoPath, localMusicPath, localOutputPath) =>
           execFileAsync(
             ffmpegPath!,
@@ -1790,7 +1787,10 @@ export const muxReelMusic = onCall(
               metadata: { contentType: reelData.musicStorageContentType as string },
             })
             .then(() => undefined),
-        deleteStandaloneMusic: () => musicFile.delete({ ignoreNotFound: true }).then(() => undefined),
+        // Step 10B — provider-aware (see reelMusicStorage.ts's own doc
+        // comment). Unchanged ordering: still called ONLY after
+        // updateReelDocument succeeds below — Step 9B's own critical fix.
+        deleteStandaloneMusic: () => deleteReelMusic(bucket, reelData, uid, reelId),
         updateReelDocument: (fields) => reelDocRef.update({ ...fields, updatedAt: FieldValue.serverTimestamp() }).then(() => undefined),
         buildVersionedSourceUrl: () => {
           if (videoProvider !== 'r2') return null;
@@ -1893,8 +1893,6 @@ export const renderPhotoToVideo = onCall(
     }
 
     const bucket = getStorage().bucket();
-    const musicStoragePath = reelData.musicStorageAudioPath as string;
-    const musicFile = bucket.file(musicStoragePath);
     // Provider-aware, same convention as muxReelMusic above: `undefined`
     // (a legacy Reel predating storageProvider) defaults to 'firebase'.
     const photoProvider = (reelData.storageProvider as string | undefined) ?? 'firebase';
@@ -1915,12 +1913,9 @@ export const renderPhotoToVideo = onCall(
           // own video download (see reelSourceStorage.ts: this helper
           // only cares about bytes/key, never the media kind).
           downloadVideo: (destination) => downloadReelSourceForMux(bucket, reelData, uid, reelId, destination),
-          downloadMusic: async (destination) => {
-            const [exists] = await musicFile.exists();
-            if (!exists) return false;
-            await musicFile.download({ destination });
-            return true;
-          },
+          // Step 10B — provider-aware (see reelMusicStorage.ts's own doc
+          // comment).
+          downloadMusic: (destination) => downloadReelMusicToLocalFile(bucket, reelData, uid, reelId, destination),
           runFfmpegMux: (localPhotoPath, localMusicPath, localOutputPath) =>
             execFileAsync(
               ffmpegPath!,
@@ -1955,7 +1950,9 @@ export const renderPhotoToVideo = onCall(
                 metadata: { contentType: reelData.musicStorageContentType as string },
               })
               .then(() => undefined),
-          deleteStandaloneMusic: () => musicFile.delete({ ignoreNotFound: true }).then(() => undefined),
+          // Step 10B — provider-aware. Unchanged ordering: still called
+          // ONLY after updateReelDocument succeeds below.
+          deleteStandaloneMusic: () => deleteReelMusic(bucket, reelData, uid, reelId),
           updateReelDocument: (fields) => reelDocRef.update({ ...fields, updatedAt: FieldValue.serverTimestamp() }).then(() => undefined),
           buildVersionedSourceUrl: () => {
             if (photoProvider !== 'r2') return null;

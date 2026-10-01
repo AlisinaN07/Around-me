@@ -1189,19 +1189,21 @@ service cloud.firestore {
 
       allow create: if isSignedIn() && isValidReelCreate(reelId, request.resource.data);
 
-      // Four allowed updates, and only these: uploading -> published
+      // Five allowed updates, and only these: uploading -> published
       // (the original, still overwhelmingly common case), Step 5E's
       // narrow, one-time "thumbnail moved to R2" flip, Step 9A/9B's
-      // equally narrow, one-time "video source moved to R2" flip, and
-      // Step 9C's own lockstep "photo source+thumbnail moved to R2
-      // together" flip — all only while still "uploading" — see
+      // equally narrow, one-time "video source moved to R2" flip, Step
+      // 9C's own lockstep "photo source+thumbnail moved to R2 together"
+      // flip, and Step 10B's own narrow, one-time "music moved to R2"
+      // flip — all only while still "uploading" — see
       // isValidReelPublish/isValidReelThumbnailProviderUpdate/
-      // isValidReelSourceProviderUpdate/isValidReelPhotoSourceProviderUpdate's
-      // own doc comments for the full "every other field is immutable"
-      // reasoning each one separately enforces (including each other's
-      // own provider fields — a client can never piggyback a
-      // source-provider change through the thumbnail-update rule, or
-      // vice versa).
+      // isValidReelSourceProviderUpdate/isValidReelPhotoSourceProviderUpdate/
+      // isValidReelMusicProviderUpdate's own doc comments for the full
+      // "every other field is immutable" reasoning each one separately
+      // enforces (including each other's own provider fields — a client
+      // can never piggyback a source-provider change through the
+      // thumbnail-update rule, or a music-provider change through any of
+      // the others, or vice versa).
       allow update: if isSignedIn()
         && resource.data.authorUid == request.auth.uid
         && (
@@ -1209,6 +1211,7 @@ service cloud.firestore {
           || isValidReelThumbnailProviderUpdate(request.resource.data, resource.data)
           || isValidReelSourceProviderUpdate(request.resource.data, resource.data)
           || isValidReelPhotoSourceProviderUpdate(request.resource.data, resource.data)
+          || isValidReelMusicProviderUpdate(request.resource.data, resource.data)
         );
 
       // Only a still-uploading draft may be deleted, by its own author —
@@ -1397,7 +1400,7 @@ service cloud.firestore {
         'mediaType', 'needsPhotoVideoRender', 'storagePath', 'storageContentType', 'fileSizeBytes', 'durationMs',
         'storageProvider', 'sourceUrl',
         'width', 'height', 'status', 'visibility',
-        'musicSourceType', 'musicTitle', 'musicStorageAudioPath',
+        'musicSourceType', 'musicTitle', 'musicStorageAudioPath', 'musicStorageProvider',
         'musicStorageContentType', 'musicFileSizeBytes', 'musicDurationMs',
         'musicHash', 'soundOriginAuthorUid', 'soundOriginReelId',
         'thumbnailStoragePath', 'thumbnailStorageContentType',
@@ -1582,6 +1585,15 @@ service cloud.firestore {
         // 'r2' — a client can never create a draft already claiming R2.
         && data.thumbnailStorageProvider == 'firebase'
         && data.thumbnailUrl == ''
+        // Step 10B — same "required field, fixed default at create"
+        // pattern as storageProvider/thumbnailStorageProvider above, for
+        // the Reel's own standalone music this time — ALWAYS present and
+        // 'firebase', regardless of musicSourceType (same always-present
+        // sentinel convention isValidReelMusic already applies to every
+        // other music field). Only a trusted, one-time server-authorized
+        // update (see isValidReelMusicProviderUpdate below) can ever flip
+        // this to 'r2'.
+        && data.musicStorageProvider == 'firebase'
         && isValidReelMusic(reelId, request.auth.uid, data)
         && isValidReelThumbnail(reelId, request.auth.uid, data)
         && isServerTimestamp(data.createdAt)
@@ -1634,6 +1646,7 @@ service cloud.firestore {
         && newData.musicSourceType == oldData.musicSourceType
         && newData.musicTitle == oldData.musicTitle
         && newData.musicStorageAudioPath == oldData.musicStorageAudioPath
+        && newData.musicStorageProvider == oldData.musicStorageProvider
         && newData.musicStorageContentType == oldData.musicStorageContentType
         && newData.musicFileSizeBytes == oldData.musicFileSizeBytes
         && newData.musicDurationMs == oldData.musicDurationMs
@@ -1713,6 +1726,7 @@ service cloud.firestore {
         && newData.musicSourceType == oldData.musicSourceType
         && newData.musicTitle == oldData.musicTitle
         && newData.musicStorageAudioPath == oldData.musicStorageAudioPath
+        && newData.musicStorageProvider == oldData.musicStorageProvider
         && newData.musicStorageContentType == oldData.musicStorageContentType
         && newData.musicFileSizeBytes == oldData.musicFileSizeBytes
         && newData.musicDurationMs == oldData.musicDurationMs
@@ -1802,6 +1816,7 @@ service cloud.firestore {
         && newData.visibility == oldData.visibility
         && newData.musicTitle == oldData.musicTitle
         && newData.musicStorageAudioPath == oldData.musicStorageAudioPath
+        && newData.musicStorageProvider == oldData.musicStorageProvider
         && newData.musicStorageContentType == oldData.musicStorageContentType
         && newData.musicFileSizeBytes == oldData.musicFileSizeBytes
         && newData.musicDurationMs == oldData.musicDurationMs
@@ -1881,6 +1896,7 @@ service cloud.firestore {
         && newData.musicSourceType == oldData.musicSourceType
         && newData.musicTitle == oldData.musicTitle
         && newData.musicStorageAudioPath == oldData.musicStorageAudioPath
+        && newData.musicStorageProvider == oldData.musicStorageProvider
         && newData.musicStorageContentType == oldData.musicStorageContentType
         && newData.musicFileSizeBytes == oldData.musicFileSizeBytes
         && newData.musicDurationMs == oldData.musicDurationMs
@@ -1892,6 +1908,73 @@ service cloud.firestore {
         && newData.thumbnailFileSizeBytes == oldData.thumbnailFileSizeBytes
         && newData.thumbnailWidth == oldData.thumbnailWidth
         && newData.thumbnailHeight == oldData.thumbnailHeight
+        && newData.createdAt == oldData.createdAt
+        && newData.publishedAt == oldData.publishedAt
+        && newData.keys().hasOnly(reelBaseKeys());
+    }
+
+    // Step 10B — a still-"uploading" Reel's own standalone music moving
+    // from Firebase to R2, once (and only once) a direct client upload to
+    // R2 has actually succeeded (see
+    // functions/src/media/requestMediaUploadAuthorization.ts's own
+    // verifyReelMusicOwnership for the server-side authorization that
+    // must happen BEFORE that upload, and src/services/reels.ts's
+    // confirmReelMusicProvider, the only client-side caller of this
+    // path). `oldData.musicStorageProvider == 'firebase'` is what makes
+    // this fire at most once ever per Reel, exactly mirroring every other
+    // provider-transition rule's own one-shot guard. Unlike the video
+    // source/thumbnail transitions, there is NO url field to validate at
+    // all — a Reel's music object has no public-URL concept (see
+    // Reel.musicStorageProvider's own doc comment, src/types/reel.ts) —
+    // making this the simplest of the four provider transitions.
+    // `oldData.musicSourceType == 'device'` (required, not just an
+    // unchanged-either-way check) mirrors checkReelMusicUploadEligibility's
+    // own server-side gate — a no-music Reel could never legitimately
+    // reach this transition in the first place.
+    function isValidReelMusicProviderUpdate(newData, oldData) {
+      return oldData.status == 'uploading'
+        && newData.status == 'uploading'
+        && oldData.musicSourceType == 'device'
+        && newData.musicSourceType == 'device'
+        && oldData.musicStorageProvider == 'firebase'
+        && newData.musicStorageProvider == 'r2'
+        && isServerTimestamp(newData.updatedAt)
+        && newData.reelId == oldData.reelId
+        && newData.authorUid == oldData.authorUid
+        && newData.authorDisplayName == oldData.authorDisplayName
+        && newData.authorUsername == oldData.authorUsername
+        && newData.cityName == oldData.cityName
+        && newData.countryCode == oldData.countryCode
+        && newData.cityKey == oldData.cityKey
+        && newData.categoryId == oldData.categoryId
+        && newData.caption == oldData.caption
+        && newData.hashtags == oldData.hashtags
+        && newData.mediaType == oldData.mediaType
+        && newData.needsPhotoVideoRender == oldData.needsPhotoVideoRender
+        && newData.storagePath == oldData.storagePath
+        && newData.storageContentType == oldData.storageContentType
+        && newData.fileSizeBytes == oldData.fileSizeBytes
+        && newData.storageProvider == oldData.storageProvider
+        && newData.sourceUrl == oldData.sourceUrl
+        && newData.durationMs == oldData.durationMs
+        && newData.width == oldData.width
+        && newData.height == oldData.height
+        && newData.visibility == oldData.visibility
+        && newData.musicTitle == oldData.musicTitle
+        && newData.musicStorageAudioPath == oldData.musicStorageAudioPath
+        && newData.musicStorageContentType == oldData.musicStorageContentType
+        && newData.musicFileSizeBytes == oldData.musicFileSizeBytes
+        && newData.musicDurationMs == oldData.musicDurationMs
+        && newData.musicHash == oldData.musicHash
+        && newData.soundOriginAuthorUid == oldData.soundOriginAuthorUid
+        && newData.soundOriginReelId == oldData.soundOriginReelId
+        && newData.thumbnailStoragePath == oldData.thumbnailStoragePath
+        && newData.thumbnailStorageContentType == oldData.thumbnailStorageContentType
+        && newData.thumbnailFileSizeBytes == oldData.thumbnailFileSizeBytes
+        && newData.thumbnailWidth == oldData.thumbnailWidth
+        && newData.thumbnailHeight == oldData.thumbnailHeight
+        && newData.thumbnailStorageProvider == oldData.thumbnailStorageProvider
+        && newData.thumbnailUrl == oldData.thumbnailUrl
         && newData.createdAt == oldData.createdAt
         && newData.publishedAt == oldData.publishedAt
         && newData.keys().hasOnly(reelBaseKeys());
