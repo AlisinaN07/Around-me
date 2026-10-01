@@ -1793,6 +1793,19 @@ export async function resolveReelPlaybackUrl(storagePath: string): Promise<strin
   }
 }
 
+/**
+ * Step 11D — a read-only peek at whether `resolveReelPlaybackUrl` already
+ * has this exact storagePath cached, WITHOUT triggering a resolution
+ * (unlike calling resolveReelPlaybackUrl itself, which resolves-then-
+ * caches on a miss). Used only by ReelFeedItem's own dev-only startup-
+ * latency log (see src/utils/reelPlaybackMetrics.ts) to label whether a
+ * given playback start was a genuine cache hit or a fresh resolution —
+ * never read for any real playback decision.
+ */
+export function isReelPlaybackUrlCached(storagePath: string): boolean {
+  return playbackUrlCache.has(storagePath);
+}
+
 // ---------------------------------------------------------------------------
 // Author self-delete (Step 40.1) — a trusted backend callable, not a client
 // Storage/Firestore delete: deleting a published Reel needs the exact

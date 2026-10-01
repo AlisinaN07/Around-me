@@ -18,13 +18,14 @@ import { followUser, isFollowing } from '@/services/following';
 import { fetchPublicProfile } from '@/services/publicProfile';
 import { fetchReelCommentCount, fetchReelLikeCount, isReelLiked, likeReel, unlikeReel } from '@/services/reelEngagement';
 import { trackContentInteraction, trackReelWatchSummary, trackVideoStarted } from '@/services/recommendations/interactions';
-import { resolveReelThumbnailUrl, resolveReelVideoPlaybackUrl } from '@/services/reels';
+import { isReelPlaybackUrlCached, resolveReelThumbnailUrl, resolveReelVideoPlaybackUrl } from '@/services/reels';
 import { isPostSaved, savePost, unsavePost } from '@/services/saved';
 import { fetchActiveStoriesForAuthor, hasViewedStory } from '@/services/stories';
 import type { Reel } from '@/types/reel';
 import type { RankingAttribution } from '@/types/recommendation';
 import type { PublicProfile } from '@/types/social';
 import { prefetchImageOnce } from '@/utils/imagePrefetch';
+import { recordReelPlaybackStartup } from '@/utils/reelPlaybackMetrics';
 import { buildReelShareUrl, shareReel } from '@/utils/reelShare';
 
 // How far (px) a horizontal drag has to travel before it counts as a
@@ -102,6 +103,30 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
   const [thumbnailUrl, setThumbnailUrl] = useState<string | null>(null);
   const [thumbnailFailed, setThumbnailFailed] = useState(false);
 
+  // Step 11D — dev-only startup-latency measurement (see
+  // src/utils/reelPlaybackMetrics.ts). `urlAssignedAtRef` is the
+  // timestamp of the most recent successful playbackUrl resolution
+  // below; `urlSourceRef` labels where that URL actually came from. Both
+  // are consumed (and reset to null) the first time the player reports
+  // 'readyToPlay' after them, so a later, unrelated statusChange (e.g.
+  // a brief re-buffer mid-playback) never re-logs a stale "startup."
+  // Refs, not state: this is a one-shot measurement with no UI to
+  // re-render for, and a state write here would just be extra renders
+  // this component doesn't need.
+  const urlAssignedAtRef = useRef<number | null>(null);
+  const urlSourceRef = useRef<'r2-persisted' | 'cache-hit' | 'cache-miss' | null>(null);
+  // Mirrors the `isActive` prop for the statusChange listener below,
+  // which is keyed only on `[player, isPhoto]` (re-subscribing on every
+  // isActive change would leak listeners — see that effect's own doc
+  // comment) — reading `isActive` directly there would use whatever
+  // value was captured when the listener was ORIGINALLY attached, not
+  // the current one, for a component instance that genuinely does
+  // transition active -> inactive -> active again while staying mounted.
+  const isActiveRef = useRef(isActive);
+  useEffect(() => {
+    isActiveRef.current = isActive;
+  }, [isActive]);
+
   const [isLiked, setIsLiked] = useState(false);
   const [likeCount, setLikeCount] = useState(0);
   const [commentCount, setCommentCount] = useState(0);
@@ -160,6 +185,12 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
       setUrlStatus('idle');
       setPlaybackFailed(false);
       setIsVideoReady(false);
+      // Step 11D — a pending startup measurement for a player that's
+      // about to be released is no longer meaningful (there's nothing
+      // left to report readyToPlay) — drop it rather than let a much
+      // later re-entry into the warm window log a bogus, huge "startup."
+      urlAssignedAtRef.current = null;
+      urlSourceRef.current = null;
       return;
     }
     // Resets fresh whenever the item's own reel (and therefore its
@@ -167,6 +198,13 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
     // used in ReportModal.
     setUrlStatus('loading');
     setIsVideoReady(false);
+    // Step 11D — captured BEFORE the resolve call below, which is what
+    // actually decides cache-hit vs cache-miss for a Firebase Reel (an R2
+    // Reel never touches this cache at all — see
+    // resolveReelVideoPlaybackUrl's own doc comment — so it's always
+    // labeled 'r2-persisted', never a guess). Dev-only measurement, read
+    // by the statusChange listener below.
+    urlSourceRef.current = reel.storageProvider === 'r2' ? 'r2-persisted' : isReelPlaybackUrlCached(reel.storagePath) ? 'cache-hit' : 'cache-miss';
     // Step 9A — branches on this Reel's OWN persisted storageProvider
     // (Firebase, resolved lazily via the same resolveReelPlaybackUrl
     // cache as before; or R2, already resolved at upload-confirm time) —
@@ -174,6 +212,11 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
     resolveReelVideoPlaybackUrl(reel).then((url) => {
       if (cancelled) return;
       if (url) {
+        // Step 11D — the moment a real source is about to be handed to
+        // the player (see useVideoPlayer below) — this IS "source
+        // assigned," the start of the startup-latency window the
+        // statusChange listener's own 'readyToPlay' branch measures to.
+        urlAssignedAtRef.current = Date.now();
         setPlaybackUrl(url);
         setUrlStatus('ready');
       } else {
@@ -427,6 +470,16 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
       // thumbnail (shown instead of a blank state up to now) is no
       // longer needed. See isVideoReady's own doc comment above.
       setIsVideoReady(playerStatus === 'readyToPlay');
+      // Step 11D — dev-only startup-latency log, consumed exactly once
+      // per resolved URL: urlAssignedAtRef is cleared the first time this
+      // fires after it was set, so a later re-buffer mid-playback (also
+      // reported as a fresh 'readyToPlay') never logs a second, bogus
+      // "startup." See src/utils/reelPlaybackMetrics.ts.
+      if (playerStatus === 'readyToPlay' && urlAssignedAtRef.current !== null) {
+        const startupMs = Date.now() - urlAssignedAtRef.current;
+        urlAssignedAtRef.current = null;
+        recordReelPlaybackStartup(reel.reelId, isActiveRef.current ? 'active' : 'warm', startupMs, urlSourceRef.current ?? 'cache-miss');
+      }
     });
     return () => {
       // Same native-player-already-released race as the watch-summary
@@ -634,8 +687,12 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
     setPlaybackFailed(false);
     setUrlStatus('loading');
     setIsVideoReady(false);
+    // Step 11D — same measurement capture as the main resolution effect
+    // above, so a manual retry's own startup latency is measured too.
+    urlSourceRef.current = reel.storageProvider === 'r2' ? 'r2-persisted' : isReelPlaybackUrlCached(reel.storagePath) ? 'cache-hit' : 'cache-miss';
     resolveReelVideoPlaybackUrl(reel).then((url) => {
       if (url) {
+        urlAssignedAtRef.current = Date.now();
         setPlaybackUrl(url);
         setUrlStatus('ready');
       } else {
