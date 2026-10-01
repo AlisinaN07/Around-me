@@ -60,13 +60,14 @@ import ffmpegPath from 'ffmpeg-static';
 import { buildMediaUrl } from './media/mediaUrl';
 import { reelSourceKey } from './media/objectKey';
 import { checkReelMuxEligibility, checkReelPhotoRenderEligibility } from './media/reelEligibility';
+import { cleanupReelOwnedMedia, cleanupReelOwnedMediaWithoutDocument, type ReelMediaCleanupResult } from './media/reelMediaCleanup';
 import { performReelMux, type ReelMuxFailureReason } from './media/reelMuxOrchestration';
 import {
   copyReelSourceToFirebaseStoryObject,
-  deleteReelSourceMedia,
   downloadReelSourceForMux,
   downloadReelSourceToLocalFile,
   uploadMuxedReelSourceToProvider,
+  type RawReelData,
 } from './media/reelSourceStorage';
 import { getR2Config } from './media/r2Config';
 
@@ -385,17 +386,25 @@ async function deleteOwnContent(db: Firestore, uid: string): Promise<{ deleted: 
 }
 
 // ---------------------------------------------------------------------------
-// Own Reels — subcollections, then the exact-path Storage object (never a
-// prefix/recursive delete), then the Firestore doc. Covers both
-// still-"uploading" drafts and "published" Reels through the same
-// authoritative path, unlike the client-only discardReelDraft().
+// Own Reels — subcollections, then EVERY physical media object this Reel
+// actually owns (source, thumbnail, standalone music — never a
+// prefix/recursive delete, always exact, deterministic keys), then the
+// Firestore doc. Covers both still-"uploading" drafts and "published"
+// Reels through the same authoritative path, unlike the client-only
+// discardReelDraft().
 //
 // deleteReelDocumentAndSubcollections is the shared per-document primitive
 // — same sharing rationale as deleteContentDocumentAndSubcollections above.
-// storagePath is always the caller's choice, never re-derived here, so a
-// caller that only has a reelId/authorUid pair (no Firestore doc left to
-// read a stored path from) must build the canonical path itself; see
-// removeReportedReel's storage-retry branch.
+// Step 9D — the actual media cleanup is delegated entirely to
+// cleanupReelOwnedMedia (functions/src/media/reelMediaCleanup.ts), which
+// is what fixed a real, confirmed storage leak: every video Reel's
+// separate thumbnail object (on either backend), and any still-present
+// standalone music object, were never deleted by ANY of this function's
+// three callers before Step 9D. A caller that has no Firestore doc left
+// to read media fields from at all (the one legitimate case this still
+// happens — see removeReportedReel's own missing-document branch) uses
+// the separate cleanupReelOwnedMediaWithoutDocument instead, bypassing
+// this function entirely.
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
@@ -439,15 +448,26 @@ async function deleteReelDocumentAndSubcollections(
   db: Firestore,
   bucket: ReturnType<ReturnType<typeof getStorage>['bucket']>,
   reelId: string,
-  storagePath: string | undefined,
-  storageProvider: string | undefined,
+  // The Reel's own TRUSTED author uid — always the caller's own
+  // `request.auth.uid` (deleteMyReel), the account-deletion uid
+  // (deleteOwnReels), or the report's own pinned targetUid
+  // (removeReportedReel) — NEVER read from `reelData.authorUid` itself,
+  // matching cleanupReelOwnedMedia's own doc comment on why uid is always
+  // an explicit parameter.
+  authorUid: string,
+  // The Reel document's own data, for deriving WHICH media objects exist
+  // and on which provider — `undefined` only for a caller that somehow
+  // has no document at all (none of this function's three current
+  // callers hit that; see removeReportedReel's own SEPARATE
+  // cleanupReelOwnedMediaWithoutDocument branch for that one case).
+  reelData: RawReelData | undefined,
   receivedPostLikesPolicy: ReceivedPostLikesPolicy,
   // Only ever the Reel's own `hashtags` (or [] for one that was never
   // published — see this parameter's callers) — a draft that never
   // published never incremented these counts in the first place, so
   // there's nothing to undo for it.
   hashtagsToDecrement: string[]
-): Promise<{ storageDeleted: boolean }> {
+): Promise<{ mediaCleanup: ReelMediaCleanupResult | null }> {
   // Step 41.2H.2 — every Reel is inherently a social Post (no Event/
   // Activity equivalent exists for Reels), so this paired cleanup runs
   // whenever the caller asks to actually remove received credit (see
@@ -469,44 +489,50 @@ async function deleteReelDocumentAndSubcollections(
     await decrementHashtagCounts(db, hashtagsToDecrement);
   }
 
-  const storageDeleted = storagePath ? await deleteReelSourceMedia(bucket, storagePath, storageProvider) : false;
+  // Step 9D — EVERY physical media object this Reel owns (source,
+  // thumbnail, standalone music), not just the source — see
+  // cleanupReelOwnedMedia's own doc comment for the full model this
+  // fixed a real storage leak for.
+  const mediaCleanup = reelData ? await cleanupReelOwnedMedia(bucket, reelData, authorUid, reelId) : null;
 
   await db.doc(`reels/${reelId}`).delete();
-  return { storageDeleted };
+  return { mediaCleanup };
 }
 
 async function deleteOwnReels(
   db: Firestore,
   uid: string
-): Promise<{ deleted: number; storageDeleted: number; storageAlreadyMissing: number }> {
+): Promise<{ deleted: number; storageDeleted: number; storageAlreadyMissing: number; thumbnailDeleted: number; musicDeleted: number }> {
   const bucket = getStorage().bucket();
   let deleted = 0;
   let storageDeleted = 0;
   let storageAlreadyMissing = 0;
+  let thumbnailDeleted = 0;
+  let musicDeleted = 0;
 
   for (;;) {
     const snap = await db.collection('reels').where('authorUid', '==', uid).limit(OWNED_DOC_PAGE_SIZE).get();
     if (snap.empty) break;
     for (const docSnap of snap.docs) {
       const reelData = docSnap.data();
-      const storagePath = reelData?.storagePath as string | undefined;
-      const storageProvider = reelData?.storageProvider as string | undefined;
       // Only a published Reel ever incremented these — see
       // deleteReelDocumentAndSubcollections' own `hashtagsToDecrement`
       // doc comment.
       const hashtagsToDecrement = reelData?.status === 'published' ? ((reelData?.hashtags as string[] | undefined) ?? []) : [];
       // Step 41.2H.2.1 — same reasoning as deleteOwnContent's own call
       // site: the author's account is going away entirely.
-      const result = await deleteReelDocumentAndSubcollections(db, bucket, docSnap.id, storagePath, storageProvider, 'remove', hashtagsToDecrement);
-      if (storagePath) {
-        if (result.storageDeleted) storageDeleted += 1;
+      const result = await deleteReelDocumentAndSubcollections(db, bucket, docSnap.id, uid, reelData, 'remove', hashtagsToDecrement);
+      if (result.mediaCleanup?.sourceAttempted) {
+        if (result.mediaCleanup.sourceDeleted) storageDeleted += 1;
         else storageAlreadyMissing += 1;
       }
+      if (result.mediaCleanup?.thumbnailDeleted) thumbnailDeleted += 1;
+      if (result.mediaCleanup?.musicDeleted) musicDeleted += 1;
       deleted += 1;
     }
   }
 
-  return { deleted, storageDeleted, storageAlreadyMissing };
+  return { deleted, storageDeleted, storageAlreadyMissing, thumbnailDeleted, musicDeleted };
 }
 
 // ---------------------------------------------------------------------------
@@ -1005,18 +1031,23 @@ export const removeReportedContent = onCall({ region: REGION, timeoutSeconds: 30
 });
 
 /**
- * Removes a reported Reel: its subcollections, its exact Storage source
- * object, the Firestore document, and every notification referencing it.
+ * Removes a reported Reel: its subcollections, EVERY physical media
+ * object it owns (source, thumbnail, standalone music — see Step 9D's
+ * own cleanupReelOwnedMedia doc comment for the full model), the
+ * Firestore document, and every notification referencing it.
  *
  * If the Firestore doc is already gone (e.g. a prior attempt deleted it
- * but failed before Storage cleanup), the canonical Storage path is
- * re-derived from the REPORT's own targetUid + reelId rather than given up
- * on — isValidReelReport (firestore.rules) pins targetUid to the Reel's
- * real authorUid at report-creation time, and authorUid is never mutated
- * afterward, so `reels/{targetUid}/{reelId}/source` is exactly the same
- * canonical path reelStoragePath() derives client-side
- * (src/services/reels.ts). This is what makes a Storage-only retry safe
- * without trusting anything from the request itself.
+ * but failed before storage cleanup), Step 9D replaces the old
+ * Firebase-only single-path guess with cleanupReelOwnedMediaWithoutDocument
+ * — the REPORT's own `targetUid`/`reelId` are exactly as trusted as a real
+ * document's own authorUid/id (isValidReelReport, firestore.rules, pins
+ * `targetUid` to the Reel's real authorUid at report-creation time, never
+ * mutated afterward), so every deterministic key (source/thumbnail/music,
+ * on EITHER backend) can now be attempted directly, not just a single
+ * inferred Firebase path — see that function's own doc comment for the
+ * full safety reasoning. This is what makes a storage-only retry safe
+ * without trusting anything from the request itself, and (unlike before
+ * Step 9D) actually finds and deletes an R2-sourced Reel's media too.
  */
 export const removeReportedReel = onCall({ region: REGION, timeoutSeconds: 300, memory: '256MiB', secrets: [r2AccessKeyIdSecret, r2SecretAccessKeySecret] }, async (request) => {
   requireAdmin(request);
@@ -1056,25 +1087,23 @@ export const removeReportedReel = onCall({ region: REGION, timeoutSeconds: 300, 
 
   if (reelSnap.exists) {
     const reelData = reelSnap.data();
-    const storagePath = reelData?.storagePath as string | undefined;
-    const storageProvider = reelData?.storageProvider as string | undefined;
     // Only a published Reel ever incremented these — see
     // deleteReelDocumentAndSubcollections' own `hashtagsToDecrement` doc
     // comment.
     const hashtagsToDecrement = reelData?.status === 'published' ? ((reelData?.hashtags as string[] | undefined) ?? []) : [];
     // Step 41.2H.2.1 — moderation removal never earned legitimate
-    // reputation credit to begin with.
-    await deleteReelDocumentAndSubcollections(db, bucket, reelId, storagePath, storageProvider, 'remove', hashtagsToDecrement);
+    // reputation credit to begin with. `reportedAuthorUid` (the report's
+    // own trusted targetUid) is passed rather than `reelData.authorUid` —
+    // see cleanupReelOwnedMedia's own doc comment on why uid is always an
+    // explicit parameter.
+    await deleteReelDocumentAndSubcollections(db, bucket, reelId, reportedAuthorUid, reelData, 'remove', hashtagsToDecrement);
   } else {
-    // The Reel's own Firestore document is already gone by the time a
-    // report gets here — a rare race, not the normal path. Only a
-    // best-effort Firebase-path guess is possible (no storageProvider
-    // left to consult), same limitation this branch already had before
-    // Step 9A: if that Reel's source had actually moved to R2, this
-    // guess simply finds nothing and deletes nothing, exactly as
-    // `ignoreNotFound` already tolerates for the Firebase case.
-    const inferredStoragePath = `reels/${reportedAuthorUid}/${reelId}/source`;
-    await bucket.file(inferredStoragePath).delete({ ignoreNotFound: true });
+    // Step 9D — see this callable's own doc comment above for the full
+    // reasoning this replaces Step 9A's old single-Firebase-path guess
+    // with: the report's own targetUid/reelId are trusted, every key is
+    // deterministic, and there is no unrelated object this could ever
+    // touch.
+    await cleanupReelOwnedMediaWithoutDocument(bucket, reportedAuthorUid, reelId);
   }
 
   await drainNotificationsByField(db, 'reelId', reelId);
@@ -1377,8 +1406,6 @@ export const deleteMyReel = onCall({ region: REGION, timeoutSeconds: 300, memory
   }
 
   const bucket = getStorage().bucket();
-  const storagePath = reel.storagePath as string | undefined;
-  const storageProvider = reel.storageProvider as string | undefined;
   // Only a published Reel ever incremented these — see
   // deleteReelDocumentAndSubcollections' own `hashtagsToDecrement` doc
   // comment.
@@ -1386,8 +1413,11 @@ export const deleteMyReel = onCall({ region: REGION, timeoutSeconds: 300, memory
 
   await drainNotificationsByField(db, 'reelId', reelId);
   // Step 41.2H.2.1 — voluntary author self-delete: same reasoning as
-  // deleteMyContent above — received postLikes survive.
-  await deleteReelDocumentAndSubcollections(db, bucket, reelId, storagePath, storageProvider, 'preserve', hashtagsToDecrement);
+  // deleteMyContent above — received postLikes survive. `uid` (the
+  // AUTHENTICATED caller, already verified above to equal
+  // `reel.authorUid`) is passed explicitly rather than reading
+  // `reel.authorUid` again — see cleanupReelOwnedMedia's own doc comment.
+  await deleteReelDocumentAndSubcollections(db, bucket, reelId, uid, reel, 'preserve', hashtagsToDecrement);
 
   return { reelId, deleted: true as const };
 });
