@@ -1980,15 +1980,20 @@ service cloud.firestore {
 
       allow create: if isSignedIn() && isValidStoryCreate(storyId, request.resource.data);
 
-      // The ONLY allowed transition: uploading -> published, stamping
-      // publishedAt/expiresAt. Every other field is immutable. expiresAt
-      // is bounded to a narrow window around request.time + 24h (see
-      // STORY_EXPIRY_MS in src/types/story.ts) — a client-computed value,
-      // not server-authoritative, so this caps how far it can be pushed
-      // out rather than trusting it outright.
+      // Two allowed updates: uploading -> published (stamping
+      // publishedAt/expiresAt — expiresAt is bounded to a narrow window
+      // around request.time + 24h, see STORY_EXPIRY_MS in
+      // src/types/story.ts, a client-computed value, not server-
+      // authoritative, so this caps how far it can be pushed out rather
+      // than trusting it outright), and Step 10A's own narrow, one-time
+      // "media moved to R2" flip (isValidStoryProviderUpdate) — every
+      // other field is immutable in both.
       allow update: if isSignedIn()
         && resource.data.authorUid == request.auth.uid
-        && isValidStoryPublish(request.resource.data, resource.data);
+        && (
+          isValidStoryPublish(request.resource.data, resource.data)
+          || isValidStoryProviderUpdate(request.resource.data, resource.data)
+        );
 
       // The author may delete their own Story at any time (Instagram-style
       // "delete my Story" — see deleteMyStory in src/services/stories.ts),
@@ -2037,6 +2042,7 @@ service cloud.firestore {
         'storyId', 'authorUid', 'authorDisplayName', 'authorUsername',
         'mediaType', 'storagePath', 'storageContentType', 'fileSizeBytes',
         'durationMs', 'width', 'height', 'status',
+        'storageProvider', 'mediaUrl',
         'createdAt', 'updatedAt', 'publishedAt', 'expiresAt'
       ];
     }
@@ -2051,6 +2057,13 @@ service cloud.firestore {
         && data.authorUsername == profile.username
         && data.mediaType in ['video', 'photo']
         && data.storagePath == 'stories/' + request.auth.uid + '/' + storyId + '/source'
+        // Step 10A — same "required field, fixed default at create"
+        // pattern as a Reel's own storageProvider/sourceUrl (see
+        // isValidReelCreate) — a client can never create a draft already
+        // claiming R2; only the narrow, one-time isValidStoryProviderUpdate
+        // transition below can ever flip this.
+        && data.storageProvider == 'firebase'
+        && data.mediaUrl == ''
         && (
           (
             data.mediaType == 'video'
@@ -2112,6 +2125,54 @@ service cloud.firestore {
         && newData.durationMs == oldData.durationMs
         && newData.width == oldData.width
         && newData.height == oldData.height
+        // Step 10A — the Story's own provider/URL must stay unchanged
+        // during a PUBLISH-only transition — same mutual-exclusion
+        // reasoning as isValidReelThumbnailProviderUpdate's own new
+        // storageProvider/sourceUrl equality checks for Reels. Without
+        // this, a client could piggyback a provider change through this
+        // rule the moment both fields existed in the schema.
+        && newData.storageProvider == oldData.storageProvider
+        && newData.mediaUrl == oldData.mediaUrl
+        && newData.createdAt == oldData.createdAt
+        && newData.keys().hasOnly(storyBaseKeys());
+    }
+
+    // Step 10A — a still-"uploading" Story's own media moving from
+    // Firebase to R2, once (and only once) a direct client upload to R2
+    // has actually succeeded (see
+    // functions/src/media/requestMediaUploadAuthorization.ts's own
+    // verifyStoryMediaOwnership for the server-side authorization that
+    // must happen BEFORE that upload, and src/services/stories.ts's
+    // confirmStoryMediaProvider, the only client-side caller of this
+    // path). `oldData.storageProvider == 'firebase'` is what makes this
+    // fire at most once ever per Story, exactly mirroring
+    // isValidReelSourceProviderUpdate's own one-shot guard. Every other
+    // field must stay byte-identical — same "no sneaking an unrelated
+    // change through this narrow door" reasoning as every other
+    // provider-transition rule in this file.
+    function isValidStoryProviderUpdate(newData, oldData) {
+      return oldData.status == 'uploading'
+        && newData.status == 'uploading'
+        && oldData.storageProvider == 'firebase'
+        && newData.storageProvider == 'r2'
+        && newData.mediaUrl is string
+        && newData.mediaUrl.size() > 0
+        && newData.mediaUrl.size() <= 2048
+        && newData.mediaUrl.matches('https://.*')
+        && isServerTimestamp(newData.updatedAt)
+        && newData.storyId == oldData.storyId
+        && newData.authorUid == oldData.authorUid
+        && newData.authorDisplayName == oldData.authorDisplayName
+        && newData.authorUsername == oldData.authorUsername
+        && newData.mediaType == oldData.mediaType
+        && newData.storagePath == oldData.storagePath
+        && newData.storageContentType == oldData.storageContentType
+        && newData.fileSizeBytes == oldData.fileSizeBytes
+        && newData.durationMs == oldData.durationMs
+        && newData.width == oldData.width
+        && newData.height == oldData.height
+        && newData.publishedAt == oldData.publishedAt
+        && newData.expiresAt == oldData.expiresAt
         && newData.createdAt == oldData.createdAt
         && newData.keys().hasOnly(storyBaseKeys());
     }

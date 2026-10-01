@@ -1,6 +1,6 @@
 import type { Timestamp } from 'firebase/firestore';
 
-import type { ReelMediaType } from '@/types/reel';
+import type { ReelMediaType, ReelStorageProvider } from '@/types/reel';
 
 /**
  * stories/{storyId} — a separate root collection from reels/{reelId}
@@ -22,16 +22,26 @@ import type { ReelMediaType } from '@/types/reel';
  *
  * EXPIRY: `expiresAt` is set at publish time to roughly `publishedAt +
  * STORY_EXPIRY_MS`, computed CLIENT-SIDE (see publishStory in
- * src/services/stories.ts) since there is no scheduled Cloud Function in
- * this pass to stamp it authoritatively — Firestore Rules instead bound it
- * to a narrow window around `request.time + 24h` so a client can't
- * fabricate a much longer-lived Story. Every read query filters
- * `expiresAt > now` (see fetchActiveStoriesForFollowing) so an expired
- * Story simply stops appearing anywhere in the app the moment it lapses —
- * its Firestore document and Storage object are NOT actively deleted yet;
- * real cleanup (a scheduled Cloud Function, mirroring this project's other
- * trusted backend callables in functions/src/index.ts) is a deliberate
- * follow-up, not part of this pass.
+ * src/services/stories.ts) — there is no server-stamped authoritative
+ * value — so Firestore Rules instead bound it to a narrow window around
+ * `request.time + 24h` so a client can't fabricate a much longer-lived
+ * Story. Every read query filters `expiresAt > now` (see
+ * fetchActiveStoriesForFollowing) so an expired Story stops appearing
+ * anywhere in the app the INSTANT it lapses, well before physical
+ * cleanup ever runs.
+ *
+ * Step 10A.1 — physical cleanup: a Story's Firestore document and its
+ * own Storage media (Firebase or R2 — see `storageProvider` below) are
+ * NOT deleted the moment `expiresAt` passes; they're removed by
+ * `cleanupExpiredStories`, an hourly scheduled Cloud Function (see
+ * functions/src/index.ts and its own pure orchestration,
+ * functions/src/media/storyExpiryCleanup.ts) — a deliberate,
+ * provider-aware, failure-safe design (a genuine storage-provider error
+ * retains the Firestore document for the next run rather than ever
+ * orphaning media with no remaining record of where it lives), not a
+ * same-instant delete. A Story can therefore be visibly gone from every
+ * query for up to roughly an hour before its underlying records are
+ * actually removed — an accepted, documented lag, not a bug.
  */
 export type StoryStatus = 'uploading' | 'published';
 
@@ -53,6 +63,28 @@ export type Story = {
   width: number;
   height: number;
   status: StoryStatus;
+  /**
+   * Step 10A — which backend this Story's own `storagePath` object
+   * actually lives on. 'firebase' (the fixed default at create — see
+   * isValidStoryCreate, firestore.rules) until a client-side R2 upload
+   * confirms otherwise via confirmStoryMediaProvider (src/services/stories.ts),
+   * a narrow, one-time, server-authorized Firestore transition
+   * (isValidStoryProviderUpdate) — exactly mirroring Reel.storageProvider's
+   * own model (src/types/reel.ts). A legacy Story predating this field
+   * entirely reads as missing here, defaulted to 'firebase' at every
+   * READ site via pickProviderUrl (src/services/media/providerAwareUrl.ts),
+   * never inferred from `storagePath`/`mediaUrl`'s own shape.
+   */
+  storageProvider?: ReelStorageProvider;
+  /**
+   * Step 10A — the resolved, cache-busted R2 delivery URL, set ONLY once
+   * `storageProvider` is 'r2' — `''` otherwise (the fixed create-time
+   * default, same empty-string-sentinel convention as Reel.sourceUrl).
+   * Never read directly by UI code — see resolveStoryPlaybackUrl, which
+   * branches on `storageProvider` via the shared pickProviderUrl, exactly
+   * like resolveReelVideoPlaybackUrl already does for Reels.
+   */
+  mediaUrl?: string;
   createdAt: Timestamp;
   updatedAt: Timestamp;
   publishedAt: Timestamp | null;

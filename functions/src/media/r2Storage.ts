@@ -32,7 +32,7 @@
  * read-mux-replace workflow, where bytes DO need to pass through the
  * Cloud Function itself (there is no other way to run ffmpeg on them).
  */
-import { DeleteObjectCommand, GetObjectCommand, HeadObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
+import { CopyObjectCommand, DeleteObjectCommand, GetObjectCommand, HeadObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 
 import { getR2Config } from './r2Config';
@@ -194,6 +194,41 @@ export async function putR2Object(key: string, data: Buffer, contentType: string
       Body: data,
       ContentType: contentType,
       ...(cacheControl ? { CacheControl: cacheControl } : {}),
+    })
+  );
+}
+
+/**
+ * Step 10A — an AUTHENTICATED, BUCKET-INTERNAL copy from one R2 key to
+ * another, via the S3 API's own CopyObjectCommand — Cloudflare R2
+ * implements this exactly like S3 (documented, officially supported).
+ * Used ONLY by addReelToMyStory's own R2-to-R2 case (an R2-backed Reel
+ * reshared as a Story, when R2 is the active Story provider too — see
+ * copyReelSourceToR2StoryObject in reelSourceStorage.ts): the bytes never
+ * leave R2 at all, let alone pass through this Cloud Function's own
+ * memory/disk — strictly better than the "download then re-upload"
+ * fallback that's still used for a Firebase-sourced Reel.
+ *
+ * Deliberately takes no `contentType` parameter — the default
+ * `MetadataDirective` ('COPY') carries the SOURCE object's own
+ * Content-Type over unchanged, which is already correct (the Reel source
+ * was validated/stamped at its own upload time) — there is no reason for
+ * this function to ever need to override it.
+ *
+ * `sourceKey`/`destinationKey` are passed through to `CopySource`/`Key`
+ * as-is, with no additional encoding: every key this codebase ever
+ * builds comes from objectKey.ts's own `buildKey`, which already
+ * restricts every path segment to `[A-Za-z0-9_-]` — there is no
+ * character here that AWS's own CopySource percent-encoding requirement
+ * could ever actually affect.
+ */
+export async function copyR2Object(sourceKey: string, destinationKey: string): Promise<void> {
+  const { client, bucketName } = requireR2Client();
+  await client.send(
+    new CopyObjectCommand({
+      Bucket: bucketName,
+      CopySource: `${bucketName}/${sourceKey}`,
+      Key: destinationKey,
     })
   );
 }

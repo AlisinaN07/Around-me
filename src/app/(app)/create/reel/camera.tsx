@@ -50,6 +50,7 @@ import {
   setPendingSelectedVideo,
   takePendingPreselectedSound,
 } from '@/services/reelCameraHandoff';
+import { getMediaStorageProvider } from '@/services/media';
 import { createStoryDraft, discardStoryDraft, publishStory, uploadStoryMedia, type UploadStoryMediaHandle } from '@/services/stories';
 import {
   REEL_MAX_DURATION_MS,
@@ -348,6 +349,16 @@ export default function CreateReelCameraScreen() {
   const [storyUploadProgress, setStoryUploadProgress] = useState(0);
   const storyUploadHandleRef = useRef<UploadStoryMediaHandle | null>(null);
   const storyDraftRef = useRef<Story | null>(null);
+  // Step 10A — captured ONCE, right before uploadStoryMedia dispatches,
+  // rather than read off storyDraftRef.current (which is never reassigned
+  // after a real R2 confirm — see discardStoryDraft's own call sites
+  // below): getMediaStorageProvider() is what ACTUALLY decided which
+  // upload path just ran, so it's the correct signal for every
+  // discardStoryDraft call this flow might still need to make, whether
+  // the upload/confirm itself succeeded, partially succeeded, or never
+  // got that far at all (R2's own delete is a harmless no-op either way
+  // — see deleteStoryMedia's own "best-effort" doc comment).
+  const storyUploadProviderRef = useRef<'firebase' | 'r2'>('firebase');
 
   const cameraRef = useRef<CameraView>(null);
   const elapsedTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -859,6 +870,7 @@ export default function CreateReelCameraScreen() {
       return;
     }
     storyDraftRef.current = draftResult.story;
+    storyUploadProviderRef.current = getMediaStorageProvider() === 'r2' ? 'r2' : 'firebase';
 
     storyUploadHandleRef.current = uploadStoryMedia(
       draftResult.story,
@@ -867,7 +879,7 @@ export default function CreateReelCameraScreen() {
       async (uploadResult) => {
         storyUploadHandleRef.current = null;
         if (!uploadResult.ok) {
-          await discardStoryDraft(draftResult.story.storyId, draftResult.story.storagePath);
+          await discardStoryDraft(draftResult.story.storyId, draftResult.story.storagePath, storyUploadProviderRef.current);
           storyDraftRef.current = null;
           setIsPublishingStory(false);
           setError("Couldn't upload your Story.");
@@ -878,7 +890,7 @@ export default function CreateReelCameraScreen() {
         // this author's story ring taking up to 60s to appear elsewhere.
         const publishResult = await publishStory(draftResult.story.storyId, draftResult.story.authorUid);
         if (!publishResult.ok) {
-          await discardStoryDraft(draftResult.story.storyId, draftResult.story.storagePath);
+          await discardStoryDraft(draftResult.story.storyId, draftResult.story.storagePath, storyUploadProviderRef.current);
           storyDraftRef.current = null;
           setIsPublishingStory(false);
           setError("Couldn't publish your Story.");
@@ -897,7 +909,7 @@ export default function CreateReelCameraScreen() {
     const draft = storyDraftRef.current;
     storyDraftRef.current = null;
     if (draft) {
-      await discardStoryDraft(draft.storyId, draft.storagePath);
+      await discardStoryDraft(draft.storyId, draft.storagePath, storyUploadProviderRef.current);
     }
     setIsPublishingStory(false);
     setStoryUploadProgress(0);

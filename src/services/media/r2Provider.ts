@@ -40,13 +40,14 @@ async function requestUploadAuthorization(
   contentType: string,
   fileSizeBytes: number,
   draftId?: string,
-  reelId?: string
+  reelId?: string,
+  storyId?: string
 ): Promise<MediaUploadAuthorizationResponse> {
   if (!functions) {
     throw new Error('This feature is not available right now.');
   }
   const callable = httpsCallable<
-    { mediaKind: string; contentType: string; fileSizeBytes: number; draftId?: string; reelId?: string },
+    { mediaKind: string; contentType: string; fileSizeBytes: number; draftId?: string; reelId?: string; storyId?: string },
     MediaUploadAuthorizationResponse
   >(functions, 'requestMediaUploadAuthorization');
   const result = await callable({
@@ -55,6 +56,7 @@ async function requestUploadAuthorization(
     fileSizeBytes,
     ...(draftId ? { draftId } : {}),
     ...(reelId ? { reelId } : {}),
+    ...(storyId ? { storyId } : {}),
   });
   return result.data;
 }
@@ -76,7 +78,8 @@ async function performDirectUpload(
   contentType: string,
   onProgress: MediaUploadProgressCallback,
   draftId?: string,
-  reelId?: string
+  reelId?: string,
+  storyId?: string
 ): Promise<DirectUploadOutcome> {
   let blob: Blob;
   try {
@@ -95,7 +98,7 @@ async function performDirectUpload(
 
   let authorization: MediaUploadAuthorizationResponse;
   try {
-    authorization = await requestUploadAuthorization(mediaKind, resolvedContentType, blob.size, draftId, reelId);
+    authorization = await requestUploadAuthorization(mediaKind, resolvedContentType, blob.size, draftId, reelId, storyId);
   } catch {
     return { ok: false, message: "Couldn't prepare this upload." };
   }
@@ -203,9 +206,11 @@ async function uploadDisplayableMediaToR2(
   onProgress: MediaUploadProgressCallback,
   notConfiguredMessage: string,
   draftId?: string,
-  reelId?: string
+  reelId?: string,
+  storyId?: string,
+  contentType = 'image/jpeg'
 ): Promise<DisplayableUploadResult> {
-  const outcome = await performDirectUpload(mediaKind, localUri, 'image/jpeg', onProgress, draftId, reelId);
+  const outcome = await performDirectUpload(mediaKind, localUri, contentType, onProgress, draftId, reelId, storyId);
   if (!outcome.ok) return outcome;
 
   if (!outcome.authorization.mediaUrl) {
@@ -396,4 +401,96 @@ export async function uploadReelVideoToR2(
     onProgress,
     onUploadTaskReady
   );
+}
+
+/**
+ * Step 10A — the real, production-wired Story-PHOTO upload path. Reuses
+ * the exact same authorize-then-PUT mechanics as every other image
+ * upload above (uploadDisplayableMediaToR2) — a Story photo is the same
+ * size class as a Reel photo (same REEL_PHOTO_MAX_FILE_SIZE_BYTES cap,
+ * see src/services/stories.ts's own createStoryDraft), so the plain
+ * `fetch(localUri) -> Blob -> PUT` path already used for profile/cover/
+ * thumbnail images is appropriate here too — see this function's own
+ * Part 6 "reuse the existing R2 image-upload approach" instruction.
+ *
+ * `contentType` is passed through explicitly (unlike the other
+ * uploadDisplayableMediaToR2 callers, which all hardcode 'image/jpeg')
+ * because a Story photo's real MIME type can be png/webp/heic/heif too
+ * (library-picked, same as a plain photo Reel — see
+ * mediaUploadValidation.ts's own ALLOWED_REEL_PHOTO_CONTENT_TYPES doc
+ * comment) — this must be the ACTUAL file's own type, not a guess.
+ */
+export async function uploadStoryImageToR2(
+  storyId: string,
+  localUri: string,
+  contentType: string,
+  onProgress: MediaUploadProgressCallback
+): Promise<ProfilePhotoUploadResult> {
+  return uploadDisplayableMediaToR2(
+    'storyMedia',
+    localUri,
+    onProgress,
+    'Uploaded to R2, but no public media domain is configured yet — this Story is not displayable.',
+    undefined,
+    undefined,
+    storyId,
+    contentType
+  );
+}
+
+type StoryVideoUploadResult = { ok: true; mediaUrl: string } | { ok: false; message: string };
+
+/**
+ * Step 10A — the real, production-wired Story-VIDEO upload path. Reuses
+ * the EXACT same native file-based upload architecture as
+ * uploadReelVideoToR2 (performReelVideoUpload + expo-file-system's
+ * `File.createUploadTask`) rather than the Blob-based path above — a
+ * Story video is the same size class as a Reel video (up to
+ * REEL_MAX_FILE_SIZE_BYTES, 50 MB), so the same "avoid fetch -> Blob for
+ * large video" reasoning applies identically — see uploadReelVideoToR2's
+ * own doc comment for the full investigation this reuse is based on.
+ * `performReelVideoUpload`'s own `reelId` parameter is a fully opaque
+ * identifier string passed straight through to `authorize` — it has no
+ * Reel-specific meaning at all, so passing a `storyId` through it here is
+ * not a hack, just this file's own generic orchestration doing exactly
+ * what it already does for a Reel.
+ */
+export async function uploadStoryVideoToR2(
+  storyId: string,
+  localUri: string,
+  contentType: string,
+  onProgress: MediaUploadProgressCallback,
+  onUploadTaskReady?: (cancel: () => void) => void
+): Promise<StoryVideoUploadResult> {
+  const result = await performReelVideoUpload(
+    () => {
+      const file = new File(localUri);
+      let task: ReturnType<File['createUploadTask']> | null = null;
+      return {
+        getFileSize: () => file.size,
+        start: (url, headers, onAdapterProgress) => {
+          task = file.createUploadTask(url, {
+            httpMethod: 'PUT',
+            uploadType: UploadType.BINARY_CONTENT,
+            headers,
+            onProgress: ({ bytesSent, totalBytes }) => onAdapterProgress(bytesSent, totalBytes),
+          });
+          return task.uploadAsync();
+        },
+        cancel: () => task?.cancel(),
+      };
+    },
+    (contentType, fileSizeBytes, storyId) =>
+      requestUploadAuthorization('storyMedia', contentType, fileSizeBytes, undefined, undefined, storyId).then((authorization) => ({
+        uploadUrl: authorization.uploadUrl,
+        contentType: authorization.contentType,
+        mediaUrl: authorization.mediaUrl,
+      })),
+    storyId,
+    contentType,
+    onProgress,
+    onUploadTaskReady
+  );
+  if (!result.ok) return result;
+  return { ok: true, mediaUrl: result.sourceUrl };
 }

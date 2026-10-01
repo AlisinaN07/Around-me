@@ -46,10 +46,11 @@ import { HttpsError, onCall, type CallableRequest } from 'firebase-functions/v2/
 
 import { MediaUploadValidationError, validateMediaUploadInput, type AllowedMediaKind } from './mediaUploadValidation';
 import { buildMediaUrl } from './mediaUrl';
-import { eventCoverKey, profileCoverKey, profilePhotoKey, reelSourceKey, reelThumbnailKey } from './objectKey';
+import { eventCoverKey, profileCoverKey, profilePhotoKey, reelSourceKey, reelThumbnailKey, storySourceKey } from './objectKey';
 import { getR2Config } from './r2Config';
 import { checkReelThumbnailEligibility, checkReelVideoEligibility, type RawReelData } from './reelEligibility';
 import { createPresignedUploadUrl } from './r2Storage';
+import { checkStoryMediaEligibility, type RawStoryData } from './storyEligibility';
 
 const REGION = 'europe-north1';
 
@@ -108,6 +109,15 @@ type RequestMediaUploadAuthorizationInput = {
    * verifyReelThumbnailOwnership already checks).
    */
   reelId?: string;
+  /**
+   * Required for, and used ONLY by, `mediaKind: 'storyMedia'` — same
+   * reasoning as `reelId` above: a Story draft DOES already exist in
+   * Firestore by the time this upload happens (src/services/stories.ts's
+   * createStoryDraft always runs first), so this identifies a REAL,
+   * ownership-checkable document, not a bare client-chosen slot. See
+   * verifyStoryMediaOwnership below.
+   */
+  storyId?: string;
 };
 
 /** Safe, minimal client-facing result — see src/services/media/types.ts's MediaUploadAuthorization, which this shape matches. Never includes an access key, secret key, or any other R2 credential. */
@@ -215,6 +225,24 @@ async function verifyReelVideoOwnership(reelId: string, uid: string, contentType
 }
 
 /**
+ * Step 10A — `mediaKind: 'storyMedia'`'s own ownership/eligibility gate,
+ * the Story counterpart of verifyReelVideoOwnership above. Simpler than
+ * the Reel version — a Story has no music/mux/render variant at all, so
+ * the only real decision is ownership + status + "does this content type
+ * match what this Story is actually expecting." See
+ * checkStoryMediaEligibility's own doc comment (storyEligibility.ts) for
+ * the exact, directly-unit-tested decision logic this delegates to.
+ */
+async function verifyStoryMediaOwnership(storyId: string, uid: string, contentType: string): Promise<void> {
+  const snapshot = await getFirestore().collection('stories').doc(storyId).get();
+  const story = snapshot.exists ? (snapshot.data() as RawStoryData) : null;
+  const result = checkStoryMediaEligibility(story, uid, contentType);
+  if (!result.ok) {
+    throw new HttpsError(result.code, result.message);
+  }
+}
+
+/**
  * The actual handler, exported separately from the `onCall(...)`-wrapped
  * value below specifically so it's directly callable with a fabricated
  * `CallableRequest`-shaped object in a test — without needing a live
@@ -281,6 +309,11 @@ export async function handleRequest(request: CallableRequest<unknown>): Promise<
     // explains in full.
     await verifyReelVideoOwnership(input.reelId!, request.auth.uid, input.contentType);
     path = reelSourceKey(request.auth.uid, input.reelId!);
+  } else if (input.mediaKind === 'storyMedia') {
+    // Same reasoning as the reelThumbnail/reelVideo branches above — see
+    // verifyStoryMediaOwnership's own doc comment.
+    await verifyStoryMediaOwnership(input.storyId!, request.auth.uid, input.contentType);
+    path = storySourceKey(request.auth.uid, input.storyId!);
   } else if (input.mediaKind === 'profileCover') {
     path = profileCoverKey(request.auth.uid);
   } else {

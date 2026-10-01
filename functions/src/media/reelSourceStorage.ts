@@ -19,8 +19,8 @@
  * `getStorage().bucket()` can be passed directly at every real call site
  * with no adapter/wrapper needed.
  */
-import { reelSourceKey } from './objectKey';
-import { deleteR2Object, downloadR2ObjectBuffer, putR2Object } from './r2Storage';
+import { reelSourceKey, storySourceKey } from './objectKey';
+import { copyR2Object, deleteR2Object, downloadR2ObjectBuffer, putR2Object } from './r2Storage';
 
 export type RawReelData = Record<string, unknown>;
 
@@ -141,13 +141,20 @@ export async function downloadReelSourceToLocalFile(
 
 /**
  * Step 9A — provider-aware counterpart of downloadReelSourceToLocalFile,
- * for addReelToMyStory (functions/src/index.ts): copies a PUBLISHED
- * Reel's own source into a brand-new Story object. The new Story object
- * is ALWAYS written to Firebase Storage regardless of the source Reel's
- * own provider — Stories are explicitly out of scope for this migration
- * — so a Firebase-backed Reel still takes the fast native `.copy()` path
- * (no bytes ever leave Google's own infrastructure), and only an
- * R2-backed Reel's bytes are actually fetched over HTTPS and re-uploaded.
+ * for addReelToMyStory's FIREBASE-TARGET case (functions/src/index.ts):
+ * copies a PUBLISHED Reel's own source into a brand-new Story object
+ * ALWAYS written to Firebase Storage, regardless of the source Reel's
+ * own provider — a Firebase-backed Reel takes the fast native `.copy()`
+ * path (no bytes ever leave Google's own infrastructure), and an
+ * R2-backed Reel's bytes are fetched over HTTPS and re-uploaded.
+ *
+ * Step 10A — Stories themselves became provider-aware too; this function
+ * is now used ONLY when the Story's own target provider is 'firebase'
+ * (Firebase mode, or R2 not configured) — see
+ * copyReelSourceToR2StoryObject below for the R2-target counterpart.
+ * Left completely UNCHANGED otherwise, on purpose: every one of its own
+ * Step 9A tests keeps passing unmodified, and Firebase-mode Add-to-Story
+ * behavior is byte-for-byte what it always was.
  *
  * Throws (never returns false) on failure — matching addReelToMyStory's
  * own existing try/catch-and-wrap-as-HttpsError('internal', ...) shape,
@@ -171,6 +178,76 @@ export async function copyReelSourceToFirebaseStoryObject(
     return;
   }
   await bucket.file(reel.storagePath as string).copy(bucket.file(destinationPath));
+}
+
+export interface R2StoryCopyDeps {
+  /** Defaults to the real, authenticated copyR2Object — overridden in tests with a fake in-memory R2 store's own copy function. */
+  copyObject?: (sourceKey: string, destinationKey: string) => Promise<void>;
+  /** Defaults to the real, authenticated putR2Object. */
+  putObject?: (key: string, data: Buffer, contentType: string) => Promise<void>;
+  /** Defaults to `node:fs/promises`' own `readFile`. */
+  readFileImpl?: (path: string) => Promise<Buffer>;
+}
+
+/**
+ * Step 10A — the R2-TARGET counterpart of copyReelSourceToFirebaseStoryObject
+ * above, for addReelToMyStory when the Story's own target provider is
+ * 'r2' (R2 configured with a real public media base URL — see
+ * addReelToMyStory's own doc comment in functions/src/index.ts for
+ * exactly how that decision is made). Two genuinely different paths,
+ * chosen by the SOURCE Reel's own provider:
+ *
+ *  - R2 Reel -> R2 Story: a single authenticated, BUCKET-INTERNAL
+ *    CopyObjectCommand (copyR2Object, r2Storage.ts) — the bytes never
+ *    leave R2, let alone pass through this Cloud Function's own memory.
+ *    The SOURCE key is derived from the Reel document's own
+ *    `authorUid`/`reelId` fields via reelSourceKey — safe to trust here
+ *    specifically because this is a READ-only reference into an
+ *    ALREADY-PUBLISHED, publicly-reachable Reel (not a delete/write
+ *    target), exactly the same reasoning muxReelMusic's own
+ *    downloadReelSourceForMux already established for a Reel's own
+ *    uid/reelId-derived key.
+ *  - Firebase Reel -> R2 Story: no bucket-internal equivalent exists
+ *    across providers, so this downloads the Firebase object to
+ *    `localTempPath` (the caller's own managed temp file — same
+ *    mkdtemp/cleanup pattern as muxReelMusic/renderPhotoToVideo) and
+ *    PUTs its bytes to the new Story's own deterministic R2 key.
+ *
+ * The DESTINATION key is always storySourceKey(uid, storyId) — `uid` the
+ * CALLING user's own authenticated uid (the Story's real owner), never
+ * anything read off the Reel document, and `storyId` a freshly generated
+ * Firestore document id — never a client-supplied path of any kind.
+ *
+ * Throws (never returns false) on failure — same contract as
+ * copyReelSourceToFirebaseStoryObject above.
+ */
+export async function copyReelSourceToR2StoryObject(
+  bucket: BucketLike,
+  reel: RawReelData,
+  uid: string,
+  storyId: string,
+  localTempPath: string,
+  deps: R2StoryCopyDeps = {}
+): Promise<void> {
+  const destinationKey = storySourceKey(uid, storyId);
+
+  if (reel.storageProvider === 'r2') {
+    const copyObject = deps.copyObject ?? copyR2Object;
+    const sourceKey = reelSourceKey(reel.authorUid as string, reel.reelId as string);
+    await copyObject(sourceKey, destinationKey);
+    return;
+  }
+
+  await bucket.file(reel.storagePath as string).download({ destination: localTempPath });
+  const readFileImpl =
+    deps.readFileImpl ??
+    (async (path: string) => {
+      const { readFile } = await import('node:fs/promises');
+      return readFile(path);
+    });
+  const data = await readFileImpl(localTempPath);
+  const putObject = deps.putObject ?? putR2Object;
+  await putObject(destinationKey, data, reel.storageContentType as string);
 }
 
 export interface R2ObjectDeps {

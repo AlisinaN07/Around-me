@@ -49,6 +49,8 @@ import { initializeApp } from 'firebase-admin/app';
 import { getStorage } from 'firebase-admin/storage';
 import { defineSecret } from 'firebase-functions/params';
 import { HttpsError, onCall, type CallableRequest } from 'firebase-functions/v2/https';
+import { logger } from 'firebase-functions/v2';
+import { onSchedule } from 'firebase-functions/v2/scheduler';
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
@@ -58,18 +60,21 @@ import { promisify } from 'node:util';
 import ffmpegPath from 'ffmpeg-static';
 
 import { buildMediaUrl } from './media/mediaUrl';
-import { reelSourceKey } from './media/objectKey';
+import { reelSourceKey, storySourceKey } from './media/objectKey';
 import { checkReelMuxEligibility, checkReelPhotoRenderEligibility } from './media/reelEligibility';
 import { cleanupReelOwnedMedia, cleanupReelOwnedMediaWithoutDocument, type ReelMediaCleanupResult } from './media/reelMediaCleanup';
 import { performReelMux, type ReelMuxFailureReason } from './media/reelMuxOrchestration';
 import {
   copyReelSourceToFirebaseStoryObject,
+  copyReelSourceToR2StoryObject,
   downloadReelSourceForMux,
   downloadReelSourceToLocalFile,
   uploadMuxedReelSourceToProvider,
   type RawReelData,
 } from './media/reelSourceStorage';
 import { getR2Config } from './media/r2Config';
+import { cleanupExpiredStoriesBatch } from './media/storyExpiryCleanup';
+import { cleanupStoryOwnedMedia } from './media/storyMediaCleanup';
 
 initializeApp();
 
@@ -536,6 +541,116 @@ async function deleteOwnReels(
 }
 
 // ---------------------------------------------------------------------------
+// Step 10A — own Stories. A pre-existing gap discovered during this step's
+// own audit: account deletion (deleteMyAccountData, below) never touched
+// the `stories` collection at ALL before this — a deleted user's Stories
+// (Firestore docs AND their Storage media, Firebase or R2) were left
+// behind forever. Fixed here, mirroring deleteOwnReels' own shape exactly
+// — Stories have no likes/comments/reposts/hashtags to clean up (see
+// src/types/story.ts's own doc comment), so this is just "delete the
+// media, then the doc" per Story, paginated the same way.
+// ---------------------------------------------------------------------------
+
+async function deleteOwnStories(db: Firestore, uid: string): Promise<{ deleted: number; mediaDeleted: number; mediaAlreadyMissing: number }> {
+  const bucket = getStorage().bucket();
+  let deleted = 0;
+  let mediaDeleted = 0;
+  let mediaAlreadyMissing = 0;
+
+  for (;;) {
+    const snap = await db.collection('stories').where('authorUid', '==', uid).limit(OWNED_DOC_PAGE_SIZE).get();
+    if (snap.empty) break;
+    for (const docSnap of snap.docs) {
+      const storyData = docSnap.data();
+      const result = await cleanupStoryOwnedMedia(bucket, storyData);
+      if (result.mediaAttempted) {
+        if (result.mediaDeleted) mediaDeleted += 1;
+        else mediaAlreadyMissing += 1;
+      }
+      await docSnap.ref.delete();
+      deleted += 1;
+    }
+  }
+
+  return { deleted, mediaDeleted, mediaAlreadyMissing };
+}
+
+// ---------------------------------------------------------------------------
+// Step 10A.1 — scheduled expired-Story cleanup. See
+// functions/src/media/storyExpiryCleanup.ts's own top doc comment for the
+// full "why this exists" reasoning: `expiresAt` only ever stops an
+// expired Story from being QUERIED — nothing previously deleted its
+// Firestore document or its Storage media (Firebase or R2), on any path.
+//
+// SCHEDULE_REGION — deliberately different from REGION above, same
+// reasoning as collaborative.ts's own identical constant: `onSchedule`'s
+// underlying Cloud Scheduler job has its own, smaller list of supported
+// regions than Cloud Functions v2 does, and `europe-north1` isn't on it.
+// Duplicated rather than imported — collaborative.ts doesn't export its
+// own copy, and this project's own convention is "zero coupling between
+// sibling top-level files" for a one-line constant (see REGION's own
+// history).
+//
+// SCHEDULE — "every 1 hours": Stories expire after ~24h and the user-
+// facing effect (an expired Story disappearing from every query) already
+// happens immediately and independently of this job — physical cleanup
+// can safely lag by up to an hour with zero user-visible consequence.
+// Hourly keeps both the per-run batch size and any R2/Firestore delete
+// cost small and predictable, without the operational overhead of a
+// sub-hourly cadence this app's current Story volume does nothing to
+// justify (mirrors collaborative.ts's own "every 6 hours" reasoning for
+// why a slower, cost-conscious cadence was chosen over a tighter one).
+//
+// BATCH SIZE — one bounded query per invocation, no in-function
+// pagination loop: see cleanupExpiredStoriesBatch's own doc comment
+// (storyExpiryCleanup.ts) for why any overflow beyond one batch simply
+// waits for the next hourly run — the smallest reliable implementation
+// this spec's own Part 2 asked for, not a correctness requirement to
+// drain the entire backlog in one invocation.
+// ---------------------------------------------------------------------------
+const SCHEDULE_REGION = 'europe-west1';
+const STORY_EXPIRY_CLEANUP_BATCH_SIZE = 300;
+
+export const cleanupExpiredStories = onSchedule(
+  { region: SCHEDULE_REGION, schedule: 'every 1 hours', timeoutSeconds: 540, memory: '256MiB', secrets: [r2AccessKeyIdSecret, r2SecretAccessKeySecret] },
+  async () => {
+    const db = getFirestore();
+    const bucket = getStorage().bucket();
+
+    // `expiresAt` is `null` while status is 'uploading' (see
+    // Story.expiresAt's own doc comment, src/types/story.ts) — Firestore
+    // inequality filters already exclude null/missing values on their
+    // own, so `status == 'published'` is not strictly required for
+    // correctness here, only for query-plan clarity and to match the
+    // narrow composite index this query actually uses (stories:
+    // status ASC, expiresAt ASC — see firestore.indexes.json).
+    const snap = await db
+      .collection('stories')
+      .where('status', '==', 'published')
+      .where('expiresAt', '<=', Timestamp.now())
+      .limit(STORY_EXPIRY_CLEANUP_BATCH_SIZE)
+      .get();
+
+    if (snap.empty) {
+      logger.info('[cleanupExpiredStories] No expired Stories to clean up.');
+      return;
+    }
+
+    const stories = snap.docs.map((docSnap) => ({
+      id: docSnap.id,
+      authorUid: docSnap.data().authorUid as string,
+      storageProvider: docSnap.data().storageProvider as string | undefined,
+    }));
+
+    const result = await cleanupExpiredStoriesBatch(bucket, stories, {
+      deleteStoryDocument: (id) => db.doc(`stories/${id}`).delete().then(() => undefined),
+    });
+
+    logger.info('[cleanupExpiredStories] Expired Story cleanup complete', result);
+  }
+);
+
+// ---------------------------------------------------------------------------
 // Profile documents — dependency order matters: users/{uid} is read for
 // usernameLower right up until it is the LAST document removed of any kind.
 // ---------------------------------------------------------------------------
@@ -640,6 +755,7 @@ export const deleteMyAccountData = onCall({ region: REGION, timeoutSeconds: 300,
 
   const ownContent = await deleteOwnContent(db, uid);
   const ownReels = await deleteOwnReels(db, uid);
+  const ownStories = await deleteOwnStories(db, uid);
 
   // The backend also cleans the underlying actions itself (above), so it
   // doesn't need the client-rules "paired action" pairing constraint —
@@ -664,6 +780,7 @@ export const deleteMyAccountData = onCall({ region: REGION, timeoutSeconds: 300,
     },
     ownContentDeleted: ownContent.deleted,
     ownReels,
+    ownStories,
     notifications: { asRecipientRemoved: notifRecipient.total, asActorRemoved: notifActor.total },
     // Locked policy: never deleted, never mutated, never inspected beyond
     // this fixed literal — no counts, no bodies, no reasons ever leave here.
@@ -1876,6 +1993,20 @@ export const renderPhotoToVideo = onCall(
 // not something on their own device) — only server code with Admin SDK
 // Storage access can copy one account's object into another's path.
 //
+// Step 10A — Stories became provider-aware: the new Story gets its OWN
+// media object in the Story namespace, on whichever backend is currently
+// R2-configured (never permanently referencing the Reel's own object) —
+// see copyReelSourceToR2StoryObject's own doc comment
+// (reelSourceStorage.ts) for the full 2x2 provider matrix this now
+// covers. The TARGET provider is decided HERE, server-side, by whether
+// R2 has a real public media base URL configured (getR2Config()) —
+// exactly the same "never fabricate a URL nothing can serve" signal
+// every other R2 confirm-write in this codebase already keys off of
+// (buildVersionedSourceUrl, requestMediaUploadAuthorization.ts's own
+// mediaUrl computation). When it isn't configured, this callable's
+// behavior is BYTE-FOR-BYTE what it always was — Firebase target,
+// copyReelSourceToFirebaseStoryObject, unchanged.
+//
 // 24 * 60 * 60 * 1000 mirrors STORY_EXPIRY_MS in src/types/story.ts —
 // duplicated here (this package can't import from the app's own src/)
 // rather than shared, same as every other cross-package constant in this
@@ -1884,67 +2015,106 @@ export const renderPhotoToVideo = onCall(
 
 const REPOSTED_STORY_EXPIRY_MS = 24 * 60 * 60 * 1000;
 
-export const addReelToMyStory = onCall({ region: REGION, timeoutSeconds: 120, memory: '256MiB' }, async (request) => {
-  if (!request.auth) {
-    throw new HttpsError('unauthenticated', 'Sign in required.');
+export const addReelToMyStory = onCall(
+  { region: REGION, timeoutSeconds: 120, memory: '256MiB', secrets: [r2AccessKeyIdSecret, r2SecretAccessKeySecret] },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError('unauthenticated', 'Sign in required.');
+    }
+    const reelId = parseReelIdParam(request);
+    const uid = request.auth.uid;
+
+    const db = getFirestore();
+    const reelSnap = await db.doc(`reels/${reelId}`).get();
+    if (!reelSnap.exists) {
+      throw new HttpsError('not-found', 'No Reel with that ID exists.');
+    }
+    const reel = reelSnap.data()!;
+    if (reel.status !== 'published') {
+      throw new HttpsError('failed-precondition', "This post isn't available to share to your Story.");
+    }
+
+    const profileSnap = await db.doc(`users/${uid}`).get();
+    if (!profileSnap.exists) {
+      throw new HttpsError('failed-precondition', 'Complete your profile before sharing to your Story.');
+    }
+    const profile = profileSnap.data()!;
+
+    const bucket = getStorage().bucket();
+    const storyDocRef = db.collection('stories').doc();
+    const storyId = storyDocRef.id;
+    const storagePath = `stories/${uid}/${storyId}/source`;
+
+    const publicMediaBaseUrl = getR2Config()?.publicMediaBaseUrl ?? null;
+    const targetProvider: 'firebase' | 'r2' = publicMediaBaseUrl ? 'r2' : 'firebase';
+
+    let mediaUrl = '';
+    if (targetProvider === 'r2') {
+      // Step 10A — provider-aware copy INTO R2 (see
+      // copyReelSourceToR2StoryObject's own doc comment). A Firebase-
+      // sourced Reel needs a local temp file as its own intermediate
+      // step (there is no cross-provider bucket-internal copy); an
+      // R2-sourced Reel never touches disk at all (bucket-internal
+      // CopyObjectCommand).
+      const workDir = await mkdtemp(join(tmpdir(), `add-to-story-${storyId}-`));
+      try {
+        await copyReelSourceToR2StoryObject(bucket, reel, uid, storyId, join(workDir, 'source'));
+      } catch {
+        throw new HttpsError('internal', "Couldn't share this post to your Story.");
+      } finally {
+        await rm(workDir, { recursive: true, force: true });
+      }
+      // publicMediaBaseUrl is non-null in this branch by construction
+      // (targetProvider is only 'r2' when it is) — version 1 is correct
+      // and final forever: a Story's own media, once copied, is never
+      // rewritten again (no mux/render equivalent exists for Stories).
+      // buildMediaUrl only ever returns null for a malformed base
+      // URL/path (see mediaUrl.ts) — both are server-config-derived and
+      // server-generated here, so a null here means real misconfiguration,
+      // never something a retry would fix; never fabricate/publish a
+      // Story pointing at a URL nothing can actually resolve.
+      const builtMediaUrl = buildMediaUrl(publicMediaBaseUrl!, storySourceKey(uid, storyId), 1);
+      if (!builtMediaUrl) {
+        throw new HttpsError('internal', "Couldn't share this post to your Story.");
+      }
+      mediaUrl = builtMediaUrl;
+    } else {
+      // Step 9A — unchanged Firebase-target copy (see
+      // copyReelSourceToFirebaseStoryObject's own doc comment).
+      try {
+        await copyReelSourceToFirebaseStoryObject(bucket, reel, storagePath);
+      } catch {
+        throw new HttpsError('internal', "Couldn't share this post to your Story.");
+      }
+    }
+
+    const now = Date.now();
+    await storyDocRef.set({
+      storyId,
+      authorUid: uid,
+      authorDisplayName: profile.displayName as string,
+      authorUsername: profile.username as string,
+      // Same "missing means 'video'" default as resolveOwnSoundOrigin above
+      // — a Reel published before `mediaType` existed has no such key.
+      mediaType: (reel.mediaType as string | undefined) ?? 'video',
+      storagePath,
+      storageContentType: reel.storageContentType,
+      fileSizeBytes: reel.fileSizeBytes,
+      durationMs: reel.durationMs,
+      width: reel.width,
+      height: reel.height,
+      status: 'published',
+      storageProvider: targetProvider,
+      mediaUrl,
+      createdAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
+      publishedAt: FieldValue.serverTimestamp(),
+      expiresAt: Timestamp.fromMillis(now + REPOSTED_STORY_EXPIRY_MS),
+    });
+
+    return { storyId };
   }
-  const reelId = parseReelIdParam(request);
-  const uid = request.auth.uid;
-
-  const db = getFirestore();
-  const reelSnap = await db.doc(`reels/${reelId}`).get();
-  if (!reelSnap.exists) {
-    throw new HttpsError('not-found', 'No Reel with that ID exists.');
-  }
-  const reel = reelSnap.data()!;
-  if (reel.status !== 'published') {
-    throw new HttpsError('failed-precondition', "This post isn't available to share to your Story.");
-  }
-
-  const profileSnap = await db.doc(`users/${uid}`).get();
-  if (!profileSnap.exists) {
-    throw new HttpsError('failed-precondition', 'Complete your profile before sharing to your Story.');
-  }
-  const profile = profileSnap.data()!;
-
-  const bucket = getStorage().bucket();
-  const storyDocRef = db.collection('stories').doc();
-  const storyId = storyDocRef.id;
-  const storagePath = `stories/${uid}/${storyId}/source`;
-
-  // Step 9A — provider-aware copy of the SOURCE Reel (see
-  // copyReelSourceToFirebaseStoryObject's own doc comment in
-  // functions/src/media/reelSourceStorage.ts).
-  try {
-    await copyReelSourceToFirebaseStoryObject(bucket, reel, storagePath);
-  } catch {
-    throw new HttpsError('internal', "Couldn't share this post to your Story.");
-  }
-
-  const now = Date.now();
-  await storyDocRef.set({
-    storyId,
-    authorUid: uid,
-    authorDisplayName: profile.displayName as string,
-    authorUsername: profile.username as string,
-    // Same "missing means 'video'" default as resolveOwnSoundOrigin above
-    // — a Reel published before `mediaType` existed has no such key.
-    mediaType: (reel.mediaType as string | undefined) ?? 'video',
-    storagePath,
-    storageContentType: reel.storageContentType,
-    fileSizeBytes: reel.fileSizeBytes,
-    durationMs: reel.durationMs,
-    width: reel.width,
-    height: reel.height,
-    status: 'published',
-    createdAt: FieldValue.serverTimestamp(),
-    updatedAt: FieldValue.serverTimestamp(),
-    publishedAt: FieldValue.serverTimestamp(),
-    expiresAt: Timestamp.fromMillis(now + REPOSTED_STORY_EXPIRY_MS),
-  });
-
-  return { storyId };
-});
+);
 
 // ---------------------------------------------------------------------------
 // Step — a plain video's own captured audio (musicSourceType 'none') made
@@ -2112,3 +2282,4 @@ export * from './hashtagTrends';
 // ---------------------------------------------------------------------------
 export * from './media/requestMediaUploadAuthorization';
 export * from './media/discardReelSource';
+export * from './media/deleteStoryMedia';

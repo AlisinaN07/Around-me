@@ -39,7 +39,7 @@ const {
   REEL_VIDEO_MAX_SIZE_BYTES,
   REEL_PHOTO_SOURCE_MAX_SIZE_BYTES,
 } = require('../lib/media/mediaUploadValidation.js');
-const { eventCoverKey, profileCoverKey, profilePhotoKey, reelSourceKey, reelThumbnailKey } = require('../lib/media/objectKey.js');
+const { eventCoverKey, profileCoverKey, profilePhotoKey, reelSourceKey, reelThumbnailKey, storySourceKey } = require('../lib/media/objectKey.js');
 
 const results = [];
 function check(name, fn) {
@@ -832,6 +832,102 @@ check('ignores an extra uid/authorUid field in a reelVideo payload — ownership
   assert.deepEqual(Object.keys(result).sort(), ['contentType', 'fileSizeBytes', 'mediaKind', 'reelId']);
 });
 
+// ---------------------------------------------------------------------------
+// Step 10A — 'storyMedia' media kind, reusing the EXACT same two shapes/
+// allowlists/size caps as 'reelVideo' (see mediaUploadValidation.ts's own
+// 'storyMedia' doc comment for why a Story's real MIME/size universe is
+// provably identical to a Reel's — same camera/picker code path).
+// ---------------------------------------------------------------------------
+
+check('accepts mediaKind "storyMedia" with a valid storyId and video/mp4', () => {
+  const result = validateMediaUploadInput({ mediaKind: 'storyMedia', contentType: 'video/mp4', fileSizeBytes: 1000, storyId: 'story-abc123' });
+  assert.equal(result.mediaKind, 'storyMedia');
+  assert.equal(result.storyId, 'story-abc123');
+});
+
+check('accepts mediaKind "storyMedia" with a valid storyId and image/jpeg', () => {
+  assert.doesNotThrow(() => validateMediaUploadInput({ mediaKind: 'storyMedia', contentType: 'image/jpeg', fileSizeBytes: 1000, storyId: 'story1' }));
+});
+
+check('accepts mediaKind "storyMedia" with image/heic/heif/png/webp — the same photo-shape allowlist as reelVideo', () => {
+  for (const contentType of ['image/heic', 'image/heif', 'image/png', 'image/webp']) {
+    assert.doesNotThrow(() => validateMediaUploadInput({ mediaKind: 'storyMedia', contentType, fileSizeBytes: 1000, storyId: 'story1' }));
+  }
+});
+
+check('accepts mediaKind "storyMedia" with video/quicktime/x-m4v/webm — the same video-shape allowlist as reelVideo', () => {
+  for (const contentType of ['video/quicktime', 'video/x-m4v', 'video/webm']) {
+    assert.doesNotThrow(() => validateMediaUploadInput({ mediaKind: 'storyMedia', contentType, fileSizeBytes: 1000, storyId: 'story1' }));
+  }
+});
+
+check('rejects mediaKind "storyMedia" with no storyId at all', () => {
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'storyMedia', contentType: 'video/mp4', fileSizeBytes: 1000 }),
+    MediaUploadValidationError
+  );
+});
+
+check('rejects a malformed storyId containing a slash (path-fragment injection) for storyMedia', () => {
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'storyMedia', contentType: 'video/mp4', fileSizeBytes: 1000, storyId: 'a/b' }),
+    MediaUploadValidationError
+  );
+});
+
+check('rejects a malformed storyId attempting parent-directory traversal for storyMedia', () => {
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'storyMedia', contentType: 'video/mp4', fileSizeBytes: 1000, storyId: '../other-uid' }),
+    MediaUploadValidationError
+  );
+});
+
+check('rejects audio/* and application/octet-stream for storyMedia — neither shape matches', () => {
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'storyMedia', contentType: 'audio/mp4', fileSizeBytes: 1000, storyId: 'story1' }),
+    MediaUploadValidationError
+  );
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'storyMedia', contentType: 'application/octet-stream', fileSizeBytes: 1000, storyId: 'story1' }),
+    MediaUploadValidationError
+  );
+});
+
+check('storyMedia video shape accepts exactly REEL_VIDEO_MAX_SIZE_BYTES and rejects one byte over — the SAME cap as reelVideo, not a separate Story-specific number', () => {
+  assert.doesNotThrow(() =>
+    validateMediaUploadInput({ mediaKind: 'storyMedia', contentType: 'video/mp4', fileSizeBytes: REEL_VIDEO_MAX_SIZE_BYTES, storyId: 'story1' })
+  );
+  assert.throws(
+    () => validateMediaUploadInput({ mediaKind: 'storyMedia', contentType: 'video/mp4', fileSizeBytes: REEL_VIDEO_MAX_SIZE_BYTES + 1, storyId: 'story1' }),
+    MediaUploadValidationError
+  );
+});
+
+check('storyMedia photo shape accepts exactly REEL_PHOTO_SOURCE_MAX_SIZE_BYTES and rejects one byte over — the SAME cap as reelVideo\'s own photo shape', () => {
+  assert.doesNotThrow(() =>
+    validateMediaUploadInput({ mediaKind: 'storyMedia', contentType: 'image/jpeg', fileSizeBytes: REEL_PHOTO_SOURCE_MAX_SIZE_BYTES, storyId: 'story1' })
+  );
+  assert.throws(
+    () =>
+      validateMediaUploadInput({ mediaKind: 'storyMedia', contentType: 'image/jpeg', fileSizeBytes: REEL_PHOTO_SOURCE_MAX_SIZE_BYTES + 1, storyId: 'story1' }),
+    MediaUploadValidationError
+  );
+});
+
+check('ignores an extra uid/authorUid field in a storyMedia payload — ownership is verified server-side against Firestore, never trusted from request data', () => {
+  const result = validateMediaUploadInput({
+    mediaKind: 'storyMedia',
+    contentType: 'video/mp4',
+    fileSizeBytes: 1000,
+    storyId: 'story1',
+    uid: 'some-other-uid',
+    authorUid: 'some-other-uid',
+  });
+  assert.equal('uid' in result, false);
+  assert.equal('authorUid' in result, false);
+  assert.deepEqual(Object.keys(result).sort(), ['contentType', 'fileSizeBytes', 'mediaKind', 'storyId']);
+});
+
 check('reelSourceKey is deterministic for the same uid+reelId', () => {
   assert.equal(reelSourceKey('uid-a', 'reel1'), reelSourceKey('uid-a', 'reel1'));
 });
@@ -842,6 +938,18 @@ check('reelSourceKey differs for a different uid at the same reelId — one user
 
 check('reelSourceKey matches the exact existing Firebase convention', () => {
   assert.equal(reelSourceKey('uid-a', 'reel1'), 'reels/uid-a/reel1/source');
+});
+
+check('storySourceKey is deterministic for the same uid+storyId', () => {
+  assert.equal(storySourceKey('uid-a', 'story1'), storySourceKey('uid-a', 'story1'));
+});
+
+check('storySourceKey differs for a different uid at the same storyId — one user\'s Story can never target another user\'s namespace', () => {
+  assert.notEqual(storySourceKey('uid-a', 'story1'), storySourceKey('uid-b', 'story1'));
+});
+
+check('storySourceKey matches the exact existing Firebase convention', () => {
+  assert.equal(storySourceKey('uid-a', 'story1'), 'stories/uid-a/story1/source');
 });
 
 console.log('\n=== functions/ media upload authorization logic test results ===');

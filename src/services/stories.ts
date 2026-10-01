@@ -41,6 +41,9 @@ import { TtlCache } from '@/utils/requestCache';
 import { fetchFollowingUids } from './following';
 import { firestore } from './firestore';
 import { functions } from './functions';
+import { getMediaStorageProvider } from './media';
+import { pickProviderUrl } from './media/providerAwareUrl';
+import { uploadStoryImageToR2, uploadStoryVideoToR2 } from './media/r2Provider';
 import { storage } from './storage';
 import { fetchUserProfile } from './userProfile';
 
@@ -141,6 +144,12 @@ export async function createStoryDraft(input: CreateStoryDraftInput): Promise<Cr
     width: input.width,
     height: input.height,
     status: 'uploading',
+    // Step 10A — same "required field, fixed default at create" pattern
+    // as a Reel's own storageProvider/sourceUrl (see createReelDraft in
+    // reels.ts) — only the narrow, server-authorized
+    // confirmStoryMediaProvider write can ever flip this to 'r2'.
+    storageProvider: 'firebase',
+    mediaUrl: '',
     createdAt: serverTimestamp(),
     updatedAt: serverTimestamp(),
     publishedAt: null,
@@ -169,13 +178,27 @@ export type UploadStoryMediaHandle = {
   cancel: () => void;
 };
 
-/** Same resumable-upload pattern as uploadReelVideo in reels.ts — see its own doc comment for why a Blob (not a `{ uri }` reference) is required. */
+/**
+ * Step 10A — dispatches to uploadStoryMediaViaR2 (below) when
+ * getMediaStorageProvider() is 'r2' — unlike Reel's own dispatch guards,
+ * there is no per-Story eligibility predicate to check: every Story
+ * variant (photo or video) is eligible, since a Story has no music/mux/
+ * render concept that could still need to touch this object server-side
+ * (see Story.mediaType's own doc comment, src/types/story.ts). This
+ * function's own default, Firebase-mode behavior is otherwise completely
+ * untouched — the exact same resumable-upload code that existed before
+ * Step 10A.
+ */
 export function uploadStoryMedia(
   story: Story,
   localUri: string,
   onProgress: (percent: number) => void,
   onComplete: (result: { ok: true } | { ok: false; message: string }) => void
 ): UploadStoryMediaHandle {
+  if (getMediaStorageProvider() === 'r2') {
+    return uploadStoryMediaViaR2(story, localUri, onProgress, onComplete);
+  }
+
   let cancelled = false;
   let task: UploadTask | null = null;
 
@@ -221,6 +244,98 @@ export function uploadStoryMedia(
     cancel: () => {
       cancelled = true;
       task?.cancel();
+    },
+  };
+}
+
+/**
+ * Step 10A — the one-time, server-authorized Firestore write that flips a
+ * still-"uploading" Story's media from Firebase to R2, once (and only
+ * once) the direct client PUT to R2 has actually succeeded — see
+ * firestore.rules' own isValidStoryProviderUpdate for the exact narrow
+ * shape this write must take (every field besides storageProvider/
+ * mediaUrl/updatedAt must stay byte-identical, and this can never fire a
+ * second time against the same Story). The ONLY caller is
+ * uploadStoryMediaViaR2 below.
+ */
+async function confirmStoryMediaProvider(storyId: string, mediaUrl: string): Promise<{ ok: true } | { ok: false; message: string }> {
+  if (!firestore) {
+    return { ok: false, message: 'Firestore is not available.' };
+  }
+  try {
+    await updateDoc(storyRef(storyId), {
+      storageProvider: 'r2',
+      mediaUrl,
+      updatedAt: serverTimestamp(),
+    });
+  } catch {
+    return { ok: false, message: "Couldn't finish saving this Story." };
+  }
+  return { ok: true };
+}
+
+/**
+ * Step 10A's real, end-to-end R2 upload path for a Story's own media —
+ * reached ONLY from uploadStoryMedia above, when the provider is 'r2'.
+ * Dispatches to the IMAGE path (performDirectUpload's Blob-based
+ * fetch -> PUT, via uploadStoryImageToR2) or the VIDEO path (the native
+ * file-based upload architecture reused from Reel Step 9A, via
+ * uploadStoryVideoToR2) based on `story.mediaType` — see each of those
+ * functions' own doc comments (r2Provider.ts) for why each reuses
+ * exactly the shape already proven for the equivalent Reel/profile media
+ * kind. Mirrors uploadReelVideoViaR2's own "upload, then confirm, both
+ * must succeed" structure — this function performs the follow-up
+ * confirmStoryMediaProvider write itself, since uploadStoryMedia's
+ * existing `{ok:true}|{ok:false}` contract exposes no URL to its own
+ * caller.
+ *
+ * Same orphan-risk note as uploadReelVideoViaR2: if the R2 PUT succeeds
+ * but the follow-up Firestore write then fails, the R2 object is left
+ * behind with nothing in Firestore pointing at it yet — a real user
+ * retry re-PUTs to the exact same deterministic key, overwriting it in
+ * place, so this never accumulates unbounded orphans. A genuinely
+ * abandoned draft (the user discards instead of retrying) is cleaned up
+ * server-side by discardStoryDraft's own call to the deleteStoryMedia
+ * callable below.
+ */
+function uploadStoryMediaViaR2(
+  story: Story,
+  localUri: string,
+  onProgress: (percent: number) => void,
+  onComplete: (result: { ok: true } | { ok: false; message: string }) => void
+): UploadStoryMediaHandle {
+  let cancelled = false;
+  let cancelUpload: (() => void) | null = null;
+
+  (async () => {
+    const isPhoto = story.mediaType === 'photo';
+    const uploadResult = isPhoto
+      ? await uploadStoryImageToR2(story.storyId, localUri, story.storageContentType, onProgress)
+      : await uploadStoryVideoToR2(story.storyId, localUri, story.storageContentType, onProgress, (cancel) => {
+          cancelUpload = cancel;
+        });
+    if (cancelled) return;
+
+    if (!uploadResult.ok) {
+      onComplete(uploadResult);
+      return;
+    }
+
+    const resolvedUrl = isPhoto ? (uploadResult as { ok: true; photoURL: string }).photoURL : (uploadResult as { ok: true; mediaUrl: string }).mediaUrl;
+    const confirmResult = await confirmStoryMediaProvider(story.storyId, resolvedUrl);
+    if (cancelled) return;
+
+    if (__DEV__) {
+      // eslint-disable-next-line no-console
+      console.log('[stories] R2 media upload for', story.storyId, '->', uploadResult, confirmResult);
+    }
+    onComplete(confirmResult);
+  })();
+
+  return {
+    cancel: () => {
+      cancelled = true;
+      cancelUpload?.();
     },
   };
 }
@@ -275,7 +390,17 @@ export async function publishStory(storyId: string, authorUid?: string): Promise
 // idempotent pattern as discardReelDraft in reels.ts.
 // ---------------------------------------------------------------------------
 
-export async function discardStoryDraft(storyId: string, storagePath: string): Promise<void> {
+/**
+ * Step 10A — `storageProvider` is optional, and only ever 'r2' for a
+ * Story whose media actually moved there (see uploadStoryMediaViaR2
+ * above) — undefined/'firebase' means "nothing to clean up beyond the
+ * Firebase attempt above," matching every pre-Step-10A draft's own real
+ * behavior exactly. Passed by the one caller (camera.tsx's
+ * handlePublishAsStory) straight from the draft Story's own
+ * `storageProvider` field — same convention as discardReelDraft's own
+ * `storageProvider`/`thumbnailStorageProvider` parameters in reels.ts.
+ */
+export async function discardStoryDraft(storyId: string, storagePath: string, storageProvider?: 'firebase' | 'r2'): Promise<void> {
   if (storage) {
     try {
       await deleteObject(ref(storage, storagePath));
@@ -284,6 +409,24 @@ export async function discardStoryDraft(storyId: string, storagePath: string): P
         console.warn(
           `[stories] Could not delete Storage object at "${storagePath}" while discarding Story "${storyId}" — ` +
             'it may be left orphaned and require cleanup via trusted CLI tooling. Error:',
+          error
+        );
+      }
+    }
+  }
+  // Step 10A — a Firebase Storage object this draft never actually held
+  // (because its media went to R2 instead) has no equivalent
+  // client-reachable delete path — see deleteStoryMedia's own doc
+  // comment (functions/src/media/deleteStoryMedia.ts). Best-effort, same
+  // reasoning as every Firebase delete attempt above: a cleanup failure
+  // here must never block the draft's own Firestore deletion just below.
+  if (storageProvider === 'r2' && functions) {
+    try {
+      await httpsCallable(functions, 'deleteStoryMedia')({ storyId });
+    } catch (error) {
+      if (__DEV__) {
+        console.warn(
+          `[stories] Could not clean up R2 media while discarding Story "${storyId}" — it may be left orphaned and require cleanup via trusted CLI tooling. Error:`,
           error
         );
       }
@@ -298,7 +441,14 @@ export async function discardStoryDraft(storyId: string, storagePath: string): P
   }
 }
 
-/** The author deleting their own Story early (Instagram-style "delete Story") — a plain client delete, no cascade to clean up (a Story has no likes/comments; its `views` subcollection is left as harmless orphaned data, same acceptable-orphan reasoning as elsewhere in this app). */
+/**
+ * The author deleting their own Story early (Instagram-style "delete
+ * Story") — no cascade to clean up (a Story has no likes/comments; its
+ * `views` subcollection is left as harmless orphaned data, same
+ * acceptable-orphan reasoning as elsewhere in this app). Step 10A — also
+ * cleans up the Story's own R2 media, if any, via the same
+ * deleteStoryMedia callable discardStoryDraft above uses.
+ */
 export async function deleteMyStory(storyId: string): Promise<{ ok: true } | { ok: false; message: string }> {
   if (!firestore) return { ok: false, message: 'Firestore is not available.' };
   const snapshot = await getDoc(storyRef(storyId));
@@ -317,6 +467,9 @@ export async function deleteMyStory(storyId: string): Promise<{ ok: true } | { o
   if (existing?.authorUid) activeStoriesCache.delete(existing.authorUid);
   if (storage && storagePath) {
     await deleteObject(ref(storage, storagePath)).catch(() => undefined);
+  }
+  if (existing?.storageProvider === 'r2' && functions) {
+    await httpsCallable(functions, 'deleteStoryMedia')({ storyId }).catch(() => undefined);
   }
   return { ok: true };
 }
@@ -448,7 +601,31 @@ export async function fetchActiveStoriesForAuthor(authorUid: string): Promise<St
 
 const playbackUrlCache = new Map<string, string>();
 
-export async function resolveStoryPlaybackUrl(storagePath: string): Promise<string | null> {
+/**
+ * Step 10A — now provider-aware, mirroring resolveReelVideoPlaybackUrl's
+ * own shape in reels.ts exactly (via the SAME shared pickProviderUrl —
+ * see that function's own doc comment in providerAwareUrl.ts). Branches
+ * on the Story's OWN persisted `storageProvider` (never on
+ * getMediaStorageProvider() — the CURRENT app config has nothing to do
+ * with where an EXISTING Story's media actually was uploaded), so a
+ * mixed set of some Firebase-media and some R2-media Stories resolves
+ * each one correctly regardless of the currently-configured provider.
+ *
+ * 'r2': `mediaUrl` was already resolved and persisted at upload-confirm
+ * time — returned directly, no network round-trip needed, and (unlike
+ * the Firebase branch) never cached in playbackUrlCache below — nothing
+ * to cache a second time for a value that's already a plain field read.
+ * 'firebase' (including every legacy Story missing the field entirely,
+ * defaulted by pickProviderUrl itself): unchanged, existing behavior —
+ * lazily resolved from `storagePath` via getDownloadURL, same as before
+ * Step 10A.
+ */
+export async function resolveStoryPlaybackUrl(story: Story): Promise<string | null> {
+  const resolution = pickProviderUrl(story.storageProvider, story.mediaUrl);
+  if (resolution.mode === 'r2') return resolution.url;
+  if (resolution.mode === 'r2-malformed') return null;
+
+  const storagePath = story.storagePath;
   const cached = playbackUrlCache.get(storagePath);
   if (cached) return cached;
   if (!storage) return null;

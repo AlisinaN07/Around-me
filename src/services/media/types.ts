@@ -17,12 +17,12 @@ export type MediaProvider = 'firebase' | 'r2';
 /**
  * Every kind of media Around Me's storage-provider abstraction knows how
  * to upload. 'profilePhoto' (Step 5A), 'profileCover' (Step 5C),
- * 'eventCover' (Step 5D), 'reelThumbnail' (Step 5E), and 'reelVideo'
- * (Step 9A) are the only kinds wired up end-to-end (see
- * functions/src/media/requestMediaUploadAuthorization.ts and provider.ts's
- * own MediaStorageProvider) — a Reel's own audio and all Story media
- * still upload through their own existing, untouched Firebase-direct
- * code in reels.ts/stories.ts, not through this abstraction at all.
+ * 'eventCover' (Step 5D), 'reelThumbnail' (Step 5E), 'reelVideo' (Step
+ * 9A), and 'storyMedia' (Step 10A) are the only kinds wired up
+ * end-to-end (see functions/src/media/requestMediaUploadAuthorization.ts
+ * and provider.ts's own MediaStorageProvider) — a Reel's own audio still
+ * uploads through its own existing, untouched Firebase-direct code in
+ * reels.ts, not through this abstraction at all.
  * 'reelThumbnail' is deliberately scoped to ONLY the thumbnail object of
  * a video Reel — see reels.ts's own uploadReelThumbnail/
  * resolveReelThumbnailUrl for why a photo Reel (whose thumbnail IS its
@@ -31,8 +31,12 @@ export type MediaProvider = 'firebase' | 'r2';
  * photo-to-video render — see reels.ts's own uploadReelVideo dispatch
  * guard and functions/src/media/requestMediaUploadAuthorization.ts's own
  * verifyReelVideoOwnership for exactly why those variants are excluded.
+ * 'storyMedia' covers BOTH a photo Story and a video Story — a Story has
+ * no music/render variant at all (see Story.mediaType's own doc comment,
+ * src/types/story.ts), so unlike 'reelVideo' there is no sub-case to
+ * exclude.
  */
-export type MediaKind = 'profilePhoto' | 'profileCover' | 'eventCover' | 'reelThumbnail' | 'reelVideo';
+export type MediaKind = 'profilePhoto' | 'profileCover' | 'eventCover' | 'reelThumbnail' | 'reelVideo' | 'storyMedia';
 
 /**
  * A storage-neutral pointer to one media object — the shape a Firestore

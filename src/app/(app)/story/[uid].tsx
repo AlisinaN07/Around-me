@@ -91,14 +91,14 @@ export default function StoryViewerScreen() {
     setPlaybackUrl(null);
     setProgress(0);
     if (!currentStory) return;
-    resolveStoryPlaybackUrl(currentStory.storagePath).then((url) => {
+    resolveStoryPlaybackUrl(currentStory).then((url) => {
       if (!cancelled) setPlaybackUrl(url);
     });
     return () => {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentStory?.storagePath]);
+  }, [currentStory?.storagePath, currentStory?.storageProvider, currentStory?.mediaUrl]);
 
   useEffect(() => {
     if (isVideoStory && playbackUrl) player.play();

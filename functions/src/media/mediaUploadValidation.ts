@@ -21,8 +21,8 @@
  */
 import { isSafePathSegment } from './objectKey';
 
-/** The only media kinds this callable supports — Step 5A added 'profilePhoto', Step 5C added 'profileCover', Step 5D added 'eventCover', Step 5E added 'reelThumbnail', Step 9A adds 'reelVideo'. Any other value (a Reel's own audio, Stories, or a made-up future kind) is rejected. */
-export type AllowedMediaKind = 'profilePhoto' | 'profileCover' | 'eventCover' | 'reelThumbnail' | 'reelVideo';
+/** The only media kinds this callable supports — Step 5A added 'profilePhoto', Step 5C added 'profileCover', Step 5D added 'eventCover', Step 5E added 'reelThumbnail', Step 9A adds 'reelVideo', Step 10A adds 'storyMedia'. Any other value (a Reel's own audio, or a made-up future kind) is rejected. */
+export type AllowedMediaKind = 'profilePhoto' | 'profileCover' | 'eventCover' | 'reelThumbnail' | 'reelVideo' | 'storyMedia';
 
 /** Narrowly restricted to formats the app's existing image-upload flows actually produce — no video/*, no application/*, no arbitrary MIME type. Same set for every IMAGE media kind, including reelThumbnail: every real thumbnail-generation code path observed (src/utils/reelThumbnailCandidates.ts's expo-video-thumbnails output, and camera.tsx's own SaveFormat.JPEG render for a "FOTO" cover) only ever produces JPEG, but this allowlist is kept at the same 3-format set used elsewhere rather than narrowed to jpeg-only, since narrowing further without being certain every code path is JPEG-only would risk silently breaking a legitimate upload. Never used for 'reelVideo' — see ALLOWED_VIDEO_CONTENT_TYPES below for that kind's own, separate allowlist. */
 export const ALLOWED_CONTENT_TYPES: ReadonlySet<string> = new Set(['image/jpeg', 'image/png', 'image/webp']);
@@ -156,6 +156,18 @@ export type ValidatedMediaUploadInput = {
    * this pure, Firestore-free file.
    */
   reelId?: string;
+  /**
+   * Present only for `mediaKind === 'storyMedia'` — same reasoning as
+   * `reelId` above: a Story draft already exists in Firestore by the time
+   * this upload happens (src/services/stories.ts's createStoryDraft
+   * always runs first), so this identifies an EXISTING, ownership-
+   * checkable document. Validated here only as a safe path segment —
+   * the real ownership/status/mediaType-match check is
+   * checkStoryMediaEligibility's own job (storyEligibility.ts), run in
+   * requestMediaUploadAuthorization.ts's own handleRequest against a
+   * real Firestore read, never in this pure, Firestore-free file.
+   */
+  storyId?: string;
 };
 
 /** Thrown by validateMediaUploadInput — a plain Error subclass, never an HttpsError (this file has no firebase-functions import — see this file's own top doc comment). The caller (requestMediaUploadAuthorization.ts) is responsible for translating this into a real HttpsError('invalid-argument', ...). */
@@ -169,26 +181,26 @@ export class MediaUploadValidationError extends Error {}
  * more than "this request was rejected" — no help narrowing down which
  * exact field/value tripped the check.
  *
- * Reads ONLY `mediaKind`/`contentType`/`fileSizeBytes`/`draftId`/`reelId`
- * from `data` — never a `uid`/`path`/any identity-shaped field, even if
- * a hostile payload includes one. There is no code path anywhere in this
- * function that could let a client-supplied uid or full path influence
- * anything; see requestMediaUploadAuthorization.ts's own handleRequest
- * for where the actual object key is derived (the uid segment always
- * from `request.auth.uid`, never from this validated input — `draftId`/
- * `reelId` are the one exception each, and only ever become ONE safe
- * path SEGMENT under the caller's own uid, never a full path — and for
- * `reelId` specifically, ownership is separately re-verified against a
- * real Firestore document before it's ever used, which this pure
- * function cannot do itself).
+ * Reads ONLY `mediaKind`/`contentType`/`fileSizeBytes`/`draftId`/`reelId`/
+ * `storyId` from `data` — never a `uid`/`path`/any identity-shaped field,
+ * even if a hostile payload includes one. There is no code path anywhere
+ * in this function that could let a client-supplied uid or full path
+ * influence anything; see requestMediaUploadAuthorization.ts's own
+ * handleRequest for where the actual object key is derived (the uid
+ * segment always from `request.auth.uid`, never from this validated
+ * input — `draftId`/`reelId`/`storyId` are the one exception each, and
+ * only ever become ONE safe path SEGMENT under the caller's own uid,
+ * never a full path — and for `reelId`/`storyId` specifically, ownership
+ * is separately re-verified against a real Firestore document before
+ * either is ever used, which this pure function cannot do itself).
  */
 export function validateMediaUploadInput(data: unknown): ValidatedMediaUploadInput {
   const invalid = () => new MediaUploadValidationError('This upload request is not valid.');
   if (typeof data !== 'object' || data === null) throw invalid();
 
-  const { mediaKind, contentType, fileSizeBytes, draftId, reelId } = data as Record<string, unknown>;
+  const { mediaKind, contentType, fileSizeBytes, draftId, reelId, storyId } = data as Record<string, unknown>;
 
-  // Only these five exact kinds — any other value (including a real
+  // Only these six exact kinds — any other value (including a real
   // future media kind name typed too early, or the Reel's own audio) is
   // rejected here, not silently accepted.
   if (
@@ -196,7 +208,8 @@ export function validateMediaUploadInput(data: unknown): ValidatedMediaUploadInp
     mediaKind !== 'profileCover' &&
     mediaKind !== 'eventCover' &&
     mediaKind !== 'reelThumbnail' &&
-    mediaKind !== 'reelVideo'
+    mediaKind !== 'reelVideo' &&
+    mediaKind !== 'storyMedia'
   ) {
     throw invalid();
   }
@@ -234,6 +247,39 @@ export function validateMediaUploadInput(data: unknown): ValidatedMediaUploadInp
     if (!isValidVideoShape && !isValidPhotoShape) throw invalid();
     if (typeof reelId !== 'string' || !isSafePathSegment(reelId)) throw invalid();
     return { mediaKind, contentType: contentType as string, fileSizeBytes: fileSizeBytes as number, reelId };
+  }
+
+  // Step 10A — 'storyMedia' reuses the EXACT same two shapes/allowlists/
+  // size caps as 'reelVideo' above, not a separate set: a Story is
+  // created from the exact same camera/picker code path as a Reel (see
+  // src/types/story.ts's own doc comment — camera.tsx's "Story" button
+  // shares the same `photo`/`video` capture state as the "Next" (Reel)
+  // button), so its own real MIME/size universe is provably identical,
+  // never a guess. Unlike 'reelVideo', there is no render-pending
+  // sub-case here at all — a Story is always exactly the raw camera
+  // output (no "FOTO"-with-music rendering concept — see Story.mediaType's
+  // own doc comment), so this pure layer's "which shape" ambiguity is
+  // only ever "photo Story" vs. "video Story," cross-checked against the
+  // Story's own `mediaType` by checkStoryMediaEligibility (storyEligibility.ts),
+  // exactly mirroring checkReelVideoEligibility's own contentType check.
+  if (mediaKind === 'storyMedia') {
+    const isValidVideoShape =
+      typeof contentType === 'string' &&
+      ALLOWED_VIDEO_CONTENT_TYPES.has(contentType) &&
+      typeof fileSizeBytes === 'number' &&
+      Number.isFinite(fileSizeBytes) &&
+      fileSizeBytes > 0 &&
+      fileSizeBytes <= REEL_VIDEO_MAX_SIZE_BYTES;
+    const isValidPhotoShape =
+      typeof contentType === 'string' &&
+      ALLOWED_REEL_PHOTO_CONTENT_TYPES.has(contentType) &&
+      typeof fileSizeBytes === 'number' &&
+      Number.isFinite(fileSizeBytes) &&
+      fileSizeBytes > 0 &&
+      fileSizeBytes <= REEL_PHOTO_SOURCE_MAX_SIZE_BYTES;
+    if (!isValidVideoShape && !isValidPhotoShape) throw invalid();
+    if (typeof storyId !== 'string' || !isSafePathSegment(storyId)) throw invalid();
+    return { mediaKind, contentType: contentType as string, fileSizeBytes: fileSizeBytes as number, storyId };
   }
 
   if (typeof contentType !== 'string' || !ALLOWED_CONTENT_TYPES.has(contentType)) throw invalid();
