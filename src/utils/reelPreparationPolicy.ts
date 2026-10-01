@@ -29,18 +29,15 @@
 export type ReelPreparationLevel = 'active' | 'warm' | 'light' | 'cold';
 
 /**
- * `wifi`/`cellular`/`offline` are the real OS-reported classes a future
- * network-detection library would supply; `unknown` is what every
- * caller in THIS codebase actually passes today, since NO such library
- * is installed (audited — neither `@react-native-community/netinfo` nor
- * `expo-network` appear in package.json or node_modules; adding one is
- * explicitly out of scope for this step). `unknown` is deliberately
- * treated identically to `cellular` below — the conservative choice,
- * never assuming a fast/unmetered connection when this app genuinely
- * cannot tell. The moment a real detector is added, only the one call
- * site that currently hardcodes `CURRENT_NETWORK_CLASS` needs to change
- * — every function here already reacts correctly to whichever class it's
- * given.
+ * `wifi`/`cellular`/`offline` are the real OS-reported classes —
+ * `src/utils/reelNetworkClass.ts` maps `expo-network`'s own `NetworkState`
+ * into exactly these four values, and `src/hooks/useReelNetworkClass.ts`
+ * is the one live subscription ReelFeed.tsx reads from (Step 11D.1).
+ * `unknown` is deliberately treated identically to `cellular` below — the
+ * conservative choice, used both as `DEFAULT_NETWORK_CLASS` (before the
+ * real state resolves) and for any OS-reported type this app doesn't
+ * specifically recognize — never assuming a fast/unmetered connection
+ * when this app genuinely cannot tell.
  */
 export type ReelNetworkClass = 'wifi' | 'cellular' | 'offline' | 'unknown';
 
@@ -87,12 +84,14 @@ const LIGHT_WINDOW_BY_NETWORK: Record<ReelNetworkClass, number> = {
 };
 
 /**
- * This codebase has no installed network-connectivity API (see this
- * file's own ReelNetworkClass doc comment) — this is the one honest
- * value every real call site can currently supply. Centralized here so
- * exactly one line changes if/when a real detector is added.
+ * The safe starting/fallback value — what `useReelNetworkClass()` returns
+ * before its first real read resolves, and what it falls back to if that
+ * read ever fails (see that hook's own doc comment). Never means "no
+ * network library is installed" anymore (Step 11D.1 added one) — it's
+ * simply the conservative default for the brief window before the real
+ * class is known, equivalent to `cellular` in every policy decision above.
  */
-export const CURRENT_NETWORK_CLASS: ReelNetworkClass = 'unknown';
+export const DEFAULT_NETWORK_CLASS: ReelNetworkClass = 'unknown';
 
 /** The core decision — pure function of index distance and network class. */
 export function computeReelPreparationLevel({ index, activeIndex, networkClass }: ReelPreparationPolicyInput): ReelPreparationLevel {

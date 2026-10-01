@@ -13,6 +13,7 @@ import { ReportModal } from '@/components/ReportModal';
 import { SwipeBackEdge } from '@/components/SwipeBackEdge';
 import { Colors, Radius, Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
+import { useReelNetworkClass } from '@/hooks/useReelNetworkClass';
 import { blockUser } from '@/services/blocks';
 import { trackContentInteraction } from '@/services/recommendations/interactions';
 import { deleteMyReel, resolveReelThumbnailUrl, resolveReelVideoPlaybackUrl } from '@/services/reels';
@@ -20,7 +21,6 @@ import { isPostReposted, repostPost, undoRepost } from '@/services/reposts';
 import { prefetchImageOnce } from '@/utils/imagePrefetch';
 import {
   computeReelPreparationLevel,
-  CURRENT_NETWORK_CLASS,
   isWithinWarmWindow,
   shouldWarmThumbnailAndUrl,
 } from '@/utils/reelPreparationPolicy';
@@ -123,6 +123,13 @@ export function ReelFeed({
   // so ReelFeedItem's own play/pause effect needs no change at all.
   const isScreenFocused = useIsFocused();
 
+  // Step 11D.1 — the one real network-state subscription for this whole
+  // feed screen (see useReelNetworkClass's own doc comment for why it
+  // lives here and not per-item). Starts at the same conservative
+  // 'unknown'/cellular-equivalent default Step 11D always used, and
+  // updates live as the device's actual connection changes.
+  const networkClass = useReelNetworkClass();
+
   const [optionsReel, setOptionsReel] = useState<Reel | null>(null);
   const [isOptionsReelReposted, setIsOptionsReelReposted] = useState(false);
   const [reportReel, setReportReel] = useState<Reel | null>(null);
@@ -172,6 +179,16 @@ export function ReelFeed({
   // a couple of extra, immediately-'cold' indices beyond the current
   // network class's own reach costs nothing (no fetch happens for a
   // 'cold' result).
+  //
+  // Step 11D.1 — `networkClass` is now the LIVE detected value (see
+  // useReelNetworkClass above), not a hardcoded constant, so this effect
+  // is also in the dependency array: a wifi->cellular transition shrinks
+  // which indices qualify (next run simply finds fewer 'light' results —
+  // nothing already resolved is evicted, see this step's own report for
+  // why that's an acceptable, non-"sticky/growing" trade), and a
+  // cellular->wifi transition immediately makes further indices eligible
+  // for the SAME existing cache-backed resolvers, deduping exactly as it
+  // already did before this step for repeat calls on an unchanged index.
   useEffect(() => {
     const maxReach = 3; // the widest LIGHT reach any network class uses today (wifi) — see LIGHT_WINDOW_BY_NETWORK.
     for (let offset = -maxReach; offset <= maxReach; offset += 1) {
@@ -179,7 +196,7 @@ export function ReelFeed({
       const index = activeIndex + offset;
       const reel = reels[index];
       if (!reel || reel.mediaType === 'photo') continue;
-      const level = computeReelPreparationLevel({ index, activeIndex, networkClass: CURRENT_NETWORK_CLASS });
+      const level = computeReelPreparationLevel({ index, activeIndex, networkClass });
       if (!shouldWarmThumbnailAndUrl(level)) continue;
       // Step 9A cleanup — this was still calling resolveReelPlaybackUrl
       // directly against thumbnailStoragePath (a Step 5E gap this file was
@@ -201,7 +218,7 @@ export function ReelFeed({
       // effect, nothing here needs to read it back.
       resolveReelVideoPlaybackUrl(reel);
     }
-  }, [reels, activeIndex]);
+  }, [reels, activeIndex, networkClass]);
 
   // Impression/watch-behavior tracking used to live here as a dwell-time
   // approximation across the whole list (keyed on activeIndex) — replaced
@@ -396,8 +413,11 @@ export function ReelFeed({
                 // reelPreparationPolicy.ts's own doc comment for why);
                 // now computed through the shared policy function instead
                 // of an inline literal, so this and the LIGHT-tier effect
-                // above can never silently drift apart.
-                shouldPrepare={isWithinWarmWindow(computeReelPreparationLevel({ index, activeIndex, networkClass: CURRENT_NETWORK_CLASS }))}
+                // above can never silently drift apart. Step 11D.1: still
+                // byte-identical in practice (WARM_WINDOW doesn't vary by
+                // network class), now driven by the live `networkClass`
+                // instead of a hardcoded constant for consistency.
+                shouldPrepare={isWithinWarmWindow(computeReelPreparationLevel({ index, activeIndex, networkClass }))}
                 onOpenOptions={() => setOptionsReel(item)}
                 onToast={showToast}
                 attribution={attributionByReelId?.[item.reelId]}
