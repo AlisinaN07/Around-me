@@ -957,9 +957,8 @@ export function ReelFeedItem({ reel, height, isActive, shouldPrepare, onOpenOpti
           <Text style={styles.authorName}>{reel.authorDisplayName}</Text>
         </AuthorLink>
 
-        {/* TEMP-VERIFY-ONLY: appending a test hashtag for a live rendering smoke test — reverting immediately after. */}
         {reel.caption ? (
-          <HighlightedText text={`${reel.caption} #liveTest`} style={styles.caption} hashtagStyle={styles.captionHashtag} />
+          <HighlightedText text={reel.caption} style={styles.caption} hashtagStyle={styles.captionHashtag} />
         ) : null}
 
         {categoryLabel ? (
