@@ -22,6 +22,7 @@ import {
 import { followUser, isFollowing, unfollowUser } from '@/services/following';
 import { fetchPublicProfile } from '@/services/publicProfile';
 import { trackContentInteraction } from '@/services/recommendations/interactions';
+import { isPostSaved, savePost, unsavePost } from '@/services/saved';
 import type { EventContent, EventResponse, EventResponseStatus } from '@/types/content';
 import { isBusinessAccount } from '@/utils/accountCapabilities';
 import { buildContentShareUrl, shareContent } from '@/utils/contentShare';
@@ -101,6 +102,15 @@ export function EventDetail({ content, onOptionsPress, onToast }: EventDetailPro
   // flashing "Follow" for a heartbeat before a real "Following" loads in.
   const [amFollowing, setAmFollowing] = useState<boolean | null>(null);
   const [isFollowSubmitting, setIsFollowSubmitting] = useState(false);
+  // Step 12C — "I want to keep this for later," independent of and
+  // coexisting with Interested/Going/Follow above (never mutually
+  // exclusive with any of them — see handleToggleSave's own doc
+  // comment). Same "reflect current state, never guess" pattern as
+  // amFollowing: starts false (own event/signed-out never show the
+  // button at all, same as Follow), and is only ever trusted once the
+  // real persisted state has actually loaded (see the effect below).
+  const [isSaved, setIsSaved] = useState(false);
+  const [isSaveSubmitting, setIsSaveSubmitting] = useState(false);
   // Whether the About description has been expanded past its collapsed
   // DESCRIPTION_COLLAPSED_LINES — starts collapsed every time a fresh
   // Event is shown.
@@ -181,6 +191,53 @@ export function EventDetail({ content, onOptionsPress, onToast }: EventDetailPro
     setIsFollowSubmitting(false);
     if (!result.ok) return;
     setAmFollowing(!amFollowing);
+  };
+
+  // Own event -> never shown (same "nothing to keep for later from
+  // yourself" reasoning as ReelFeedItem's own Save, which hides for
+  // isOwnReel too). Signed-out -> also nothing shown (no account to hold
+  // a save relationship). Otherwise reflects the real persisted state.
+  useEffect(() => {
+    let cancelled = false;
+    if (isOwnEvent || !user) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setIsSaved(false);
+      return;
+    }
+    isPostSaved(user.uid, 'event', content.contentId).then((saved) => {
+      if (!cancelled) setIsSaved(saved);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [content.contentId, user, isOwnEvent]);
+
+  /**
+   * Step 12C — reuses the EXISTING generic savePost/unsavePost
+   * (src/services/saved.ts), which already: (1) writes the SAME
+   * canonical `users/{uid}/saved/{savedId}` document every other saved
+   * type uses (no second storage model), with a deterministic id so a
+   * repeat save is a plain idempotent `setDoc` overwrite, never a
+   * duplicate; (2) fires the recommendation-learning signal
+   * (`event_save`/`event_unsave` for an Event specifically — see
+   * trackSaveSignal's own doc comment) fire-and-forget, same
+   * never-blocks-the-real-action pattern every other tracked interaction
+   * in this app follows. Save/Interested/Going/Follow are four
+   * INDEPENDENT booleans — this never reads or changes `myResponse`/
+   * `amFollowing`, and neither of those ever reads or changes `isSaved`.
+   */
+  const handleToggleSave = async () => {
+    if (!user || isOwnEvent || isSaveSubmitting) return;
+    const wasSaved = isSaved;
+    setIsSaveSubmitting(true);
+    const result = wasSaved ? await unsavePost(user.uid, 'event', content.contentId) : await savePost(user.uid, 'event', content.contentId);
+    setIsSaveSubmitting(false);
+    if (!result.ok) {
+      onToast(result.message);
+      return;
+    }
+    setIsSaved(!wasSaved);
+    onToast(wasSaved ? 'Removed from saved' : 'Saved');
   };
 
   // Same fallback reasoning as ReelFeedItem's own handleShare: the native
@@ -370,15 +427,34 @@ export function EventDetail({ content, onOptionsPress, onToast }: EventDetailPro
             ) : null}
           </View>
 
-          {/* Share — same curved-arrow glyph TikTok uses for its own
-              share action (Ionicons has no literal TikTok icon; this is
-              the closest match already in the app's icon set — see
-              ReelFeedItem's own share-outline for the different, iOS-box
-              style used there instead). Always shown, even on your own
-              event — sharing your own event is a normal, expected action. */}
-          <Pressable onPress={handleShare} hitSlop={8} accessibilityRole="button" accessibilityLabel="Share event">
-            <Ionicons name="arrow-redo-outline" size={22} color={Colors.text} />
-          </Pressable>
+          <View style={styles.footerActions}>
+            {/* Step 12C — same bookmark glyph ReelFeedItem's own Save
+                action already uses elsewhere in this app (reused, not a
+                new icon pattern). Hidden for your own event and while
+                signed out — see handleToggleSave's own doc comment. */}
+            {user && !isOwnEvent ? (
+              <Pressable
+                onPress={handleToggleSave}
+                disabled={isSaveSubmitting}
+                hitSlop={8}
+                accessibilityRole="button"
+                accessibilityLabel={isSaved ? 'Remove from saved' : 'Save'}
+                accessibilityState={{ selected: isSaved, disabled: isSaveSubmitting }}
+              >
+                <Ionicons name={isSaved ? 'bookmark' : 'bookmark-outline'} size={22} color={isSaved ? Colors.accent : Colors.text} />
+              </Pressable>
+            ) : null}
+
+            {/* Share — same curved-arrow glyph TikTok uses for its own
+                share action (Ionicons has no literal TikTok icon; this is
+                the closest match already in the app's icon set — see
+                ReelFeedItem's own share-outline for the different, iOS-box
+                style used there instead). Always shown, even on your own
+                event — sharing your own event is a normal, expected action. */}
+            <Pressable onPress={handleShare} hitSlop={8} accessibilityRole="button" accessibilityLabel="Share event">
+              <Ionicons name="arrow-redo-outline" size={22} color={Colors.text} />
+            </Pressable>
+          </View>
         </View>
 
         {status === 'error' ? (
@@ -604,6 +680,11 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'space-between',
     gap: Spacing.sm,
+  },
+  footerActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Spacing.md,
   },
   authorLeft: {
     flexDirection: 'row',

@@ -12,10 +12,12 @@ import { collection, deleteDoc, doc, getDoc, getDocs, limit, orderBy, query, ser
 
 import { fetchContentById } from '@/services/content';
 import { fetchReel, fetchReelsByMusicHash } from '@/services/reels';
-import type { PostContent } from '@/types/content';
+import type { EventContent, PostContent } from '@/types/content';
 import type { Reel } from '@/types/reel';
 import type { SavedPost, SavedTargetType } from '@/types/saved';
 import { TtlCache } from '@/utils/requestCache';
+import { classifySavedContent } from '@/utils/savedContentResolution';
+import { resolveSaveTrackingAction } from '@/utils/saveTrackingAction';
 
 import { firestore } from './firestore';
 import { trackContentInteraction } from './recommendations/interactions';
@@ -51,12 +53,22 @@ function savedRef(uid: string, targetType: SavedTargetType, targetId: string) {
  * Fire-and-forget — a recommendation-signal write never blocks or fails
  * the real save/unsave action. A saved 'sound' isn't a Post the
  * recommendation engine ranks (see SavedTargetType's own doc comment in
- * src/types/saved.ts), so this only tracks 'reel'/'post' targets — and
- * resolves the target document ITSELF here (savePost/unsavePost otherwise
- * never read it) purely for the categoryId/creatorId/cityKey a save
- * signal needs to be meaningful.
+ * src/types/saved.ts), so this only tracks 'reel'/'post'/'event' targets —
+ * and resolves the target document ITSELF here (savePost/unsavePost
+ * otherwise never read it) purely for the categoryId/creatorId/cityKey a
+ * save signal needs to be meaningful.
+ *
+ * Step 12C — an Event target uses the EXISTING, already-configured
+ * `event_save`/`event_unsave` actions (SIGNAL_WEIGHTS: 7/-7 in
+ * recommendationConfig.ts) rather than the generic `save`/`unsave` a Post
+ * uses — the recommendation engine's own action enum already
+ * distinguishes them (see RecommendationAction's own doc comment:
+ * Event-specific actions are prefixed wherever they carry distinct
+ * weight/semantics from their generic counterpart, which these two do).
+ * No new action, no new weight — purely selecting between two that
+ * already existed.
  */
-async function trackSaveSignal(uid: string, targetType: SavedTargetType, targetId: string, action: 'save' | 'unsave'): Promise<void> {
+async function trackSaveSignal(uid: string, targetType: SavedTargetType, targetId: string, intent: 'save' | 'unsave'): Promise<void> {
   if (targetType === 'sound') return;
   try {
     if (targetType === 'reel') {
@@ -66,7 +78,7 @@ async function trackSaveSignal(uid: string, targetType: SavedTargetType, targetI
         userId: uid,
         contentId: reel.reelId,
         contentType: 'reel',
-        action,
+        action: intent,
         categoryId: reel.categoryId,
         creatorId: reel.authorUid,
         cityKey: reel.cityKey,
@@ -80,7 +92,7 @@ async function trackSaveSignal(uid: string, targetType: SavedTargetType, targetI
         userId: uid,
         contentId: content.contentId,
         contentType: 'content',
-        action,
+        action: resolveSaveTrackingAction(content.type === 'event', intent),
         categoryId: content.categoryId,
         creatorId: content.authorUid,
         cityKey: content.cityKey,
@@ -152,6 +164,8 @@ export async function isPostSaved(uid: string, targetType: SavedTargetType, targ
 export type SavedPostItem =
   | { kind: 'reel'; savedId: string; reel: Reel }
   | { kind: 'text'; savedId: string; content: PostContent }
+  /** Step 12C — a saved Event (content/{contentId}, type=='event'). Separate from 'text' despite an identical render (both use ContentCard) so this stays type-sharp: an 'event' item's `content` is always a real EventContent, never a PostContent. */
+  | { kind: 'event'; savedId: string; content: EventContent }
   /**
    * A saved SOUND (see SavedTargetType's own doc comment in
    * src/types/saved.ts) — `originReel` is the real, currently-published
@@ -198,8 +212,10 @@ export async function fetchSavedPosts(uid: string, limitCount = DEFAULT_SAVED_LI
         return { kind: 'sound' as const, savedId: id, musicHash: data.targetId, originReel, postCount: soundReels.length };
       }
       const content = await fetchContentById(data.targetId);
-      if (!content || content.type !== 'post' || content.status !== 'published') return null;
-      return { kind: 'text' as const, savedId: id, content };
+      const resolvedKind = classifySavedContent(content);
+      if (!resolvedKind || !content) return null;
+      if (resolvedKind === 'event') return { kind: 'event' as const, savedId: id, content: content as EventContent };
+      return { kind: 'text' as const, savedId: id, content: content as PostContent };
     })
   );
 

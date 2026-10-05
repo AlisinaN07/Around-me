@@ -87,7 +87,7 @@ const EMPTY_TEXT: Record<ProfileTab, string> = {
   // without an unused optional field.
   event: 'No events yet',
   activity: 'No activities yet',
-  saved: 'No saved posts yet',
+  saved: 'Nothing saved yet',
 };
 
 /**
@@ -425,7 +425,7 @@ export default function ProfileScreen() {
                     </View>
                   )
                 ) : savedPosts.length === 0 ? (
-                  <EmptyState bare icon="bookmark-outline" title={EMPTY_TEXT.saved} body="Posts you save will appear here." />
+                  <EmptyState bare icon="bookmark-outline" title={EMPTY_TEXT.saved} body="Posts and Events you save will appear here." />
                 ) : (
                   <View style={styles.postsGrid}>
                     {savedPosts.map((item) =>
@@ -444,7 +444,12 @@ export default function ProfileScreen() {
                           </View>
                         </View>
                       ) : (
-                        <View key={`saved-text-${item.savedId}`} style={styles.fullRow}>
+                        // Step 12C — 'event' joins 'text' here: both render
+                        // identically (ContentCard already handles the
+                        // full Content union), so this one shared branch
+                        // covers whichever of the two `item` actually is
+                        // rather than duplicating the same JSX twice.
+                        <View key={`saved-${item.kind}-${item.savedId}`} style={styles.fullRow}>
                           <ContentCard item={item.content} currentUid={user?.uid ?? null} />
                         </View>
                       )

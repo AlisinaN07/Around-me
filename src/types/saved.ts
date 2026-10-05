@@ -20,7 +20,14 @@ import type { Timestamp } from 'firebase/firestore';
  * hash, since there is no separate client-readable "sound" document to
  * show details from (soundOrigins/{musicHash} is server-only).
  */
-export type SavedTargetType = 'reel' | 'post' | 'sound';
+/**
+ * Step 12C — added 'event' (content/{contentId}, type=='event'): a
+ * saved Event means "I want to keep this for later" — independent of,
+ * and coexisting with, Interested/Going (see EventDetail's own
+ * handleToggleSave for why these are three separately-toggleable
+ * states, never mutually exclusive).
+ */
+export type SavedTargetType = 'reel' | 'post' | 'event' | 'sound';
 
 export type SavedPost = {
   targetType: SavedTargetType;
