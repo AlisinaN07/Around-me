@@ -26,10 +26,14 @@ import {
 } from '@/services/content';
 import { fetchEventResponseCounts, type EventResponseCounts } from '@/services/engagement';
 import type { ActivityContent, EventContent } from '@/types/content';
-import { getWeekendWindow } from '@/utils/dateWindows';
+// Step 12A — isSectionKind/selectItems/selectComingUp moved to this pure,
+// dependency-light module (unlike this screen file, directly
+// unit-testable under plain `tsx` — see its own doc comment and
+// tests/eventsSectionHandoff.test.ts) so there is exactly one real
+// implementation, never a second copy that could drift.
+import { isSectionKind, selectItems, type SectionKind } from '@/utils/eventSectionSelection';
 
 type LoadStatus = 'loading' | 'loaded' | 'error';
-type SectionKind = 'happeningNow' | 'today' | 'comingUp';
 
 type SortBy = 'date' | 'going' | 'interested';
 const SORT_OPTIONS: { id: SortBy; label: string }[] = [
@@ -42,36 +46,6 @@ const SORT_OPTIONS: { id: SortBy; label: string }[] = [
 // SECTION_LIMIT in (tabs)/events.tsx) — "show every event" means every
 // event that screen already knows about, not a second, uncapped query.
 const SECTION_LIMIT = 15;
-
-function isSectionKind(value: string | undefined): value is SectionKind {
-  return value === 'happeningNow' || value === 'today' || value === 'comingUp';
-}
-
-/**
- * Excludes "This Weekend" items from `upcoming`, the exact same
- * client-side split (tabs)/events.tsx's own weekendSplit does — Coming Up
- * was never simply `sections.upcoming`, so this "show more" page has to
- * reapply the identical split rather than showing a wider set than the
- * teaser it was opened from.
- */
-function selectComingUp(upcoming: (ActivityContent | EventContent)[]): (ActivityContent | EventContent)[] {
-  const weekend = getWeekendWindow();
-  const weekendIds = new Set(
-    upcoming
-      .filter((item) => {
-        const startMs = item.startsAt.toMillis();
-        return startMs >= weekend.start.getTime() && startMs < weekend.end.getTime();
-      })
-      .map((item) => item.contentId)
-  );
-  return weekendIds.size > 0 ? upcoming.filter((item) => !weekendIds.has(item.contentId)) : upcoming;
-}
-
-function selectItems(sections: DiscoverySections, which: SectionKind): (ActivityContent | EventContent)[] {
-  if (which === 'happeningNow') return sections.happeningNow;
-  if (which === 'today') return sections.today;
-  return selectComingUp(sections.upcoming);
-}
 
 function titleFor(which: SectionKind, todayLabel: 'Today' | 'Tonight'): string {
   if (which === 'happeningNow') return 'Happening Now';
@@ -192,11 +166,31 @@ export default function EventsSectionScreen() {
         setTodayLabel(result.sections.todayLabel);
         setItems(selectItems(result.sections, which));
       } else {
-        // Same handoff/reuse as the Following branch above, For-You-scoped.
-        let sections: DiscoverySections | undefined = peekForYouSectionsHandoff(activeScope, SECTION_LIMIT);
+        // Step 12A — same handoff/reuse as the Following branch above,
+        // For-You-scoped, keyed by uid (see peekForYouSectionsHandoff's own
+        // doc comment) so this only ever reads back a result the SAME
+        // viewer actually saw. The common case is a cache HIT: the Events
+        // tab almost always wrote its ranked result just moments before
+        // "Show more" was tapped, well inside the 20s TTL — this is what
+        // actually fixes the "Show more reverts to chronological order"
+        // bug, since the hit path renders the EXACT ranked object the rail
+        // itself rendered, nothing recomputed.
+        //
+        // On a miss (stale >20s, or this screen reached some other way —
+        // e.g. a deep link) this intentionally falls back to a plain
+        // chronological fetchDiscoverySections, NOT a second call into
+        // rankEventSections: re-running the full ranking pipeline here
+        // would mean duplicating its homeCity/profile.interests/
+        // feedSessionId wiring into a second screen for what both the
+        // Step 12A spec and this codebase's own existing precedent (a
+        // ranking FAILURE in events.tsx's own loadForYou already falls
+        // back to the plain chronological result, never a harder error)
+        // treat as an acceptable, rare edge case — not the common path
+        // this fix is actually about.
+        let sections: DiscoverySections | undefined = peekForYouSectionsHandoff(user?.uid ?? '', activeScope, SECTION_LIMIT);
         if (!sections) {
           sections = await fetchDiscoverySections(activeScope, SECTION_LIMIT);
-          setForYouSectionsHandoff(activeScope, SECTION_LIMIT, sections);
+          setForYouSectionsHandoff(user?.uid ?? '', activeScope, SECTION_LIMIT, sections);
         }
         setTodayLabel(sections.todayLabel);
         setItems(selectItems(sections, which));

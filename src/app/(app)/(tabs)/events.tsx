@@ -134,15 +134,6 @@ export default function EventsScreen() {
       }
       try {
         const result = await fetchDiscoverySections(activeScope, SECTION_LIMIT);
-        // Phase 4 perf pass — hands this exact (unranked) result to the
-        // "Show more" screen (src/app/(app)/events/section.tsx), which
-        // otherwise re-runs this identical query the instant it opens —
-        // see setForYouSectionsHandoff's own doc comment in content.ts.
-        // Written on every real load AND every silent revalidate alike
-        // (this line runs regardless of `silent`), so this handoff never
-        // goes stale relative to whatever the Events tab itself most
-        // recently, successfully saw.
-        setForYouSectionsHandoff(activeScope, SECTION_LIMIT, result);
         // Reorders each existing time-based section by relevance (interest/
         // location/event-time/creator-affinity/freshness) — see
         // rankEventSections' own doc comment for why this keeps Events'
@@ -161,6 +152,18 @@ export default function EventsScreen() {
               feedSessionId
             ).catch(() => result)
           : result;
+        // Step 12A — hands the EXACT result this screen is about to render
+        // (ranked for a signed-in viewer, plain chronological for a
+        // signed-out one — never the pre-ranking raw fetch) to the "Show
+        // more" screen (src/app/(app)/events/section.tsx), which otherwise
+        // re-runs its own fetch the instant it opens — see
+        // setForYouSectionsHandoff's own doc comment in content.ts. Keyed
+        // by uid (empty string for signed-out) so one viewer's ranked order
+        // can never be read back by another. Written on every real load
+        // AND every silent revalidate alike (this line runs regardless of
+        // `silent`), so this handoff never goes stale relative to whatever
+        // the Events tab itself most recently, successfully rendered.
+        setForYouSectionsHandoff(user?.uid ?? '', activeScope, SECTION_LIMIT, ranked);
         setForYouSections(ranked);
         setForYouStatus('loaded');
       } catch {

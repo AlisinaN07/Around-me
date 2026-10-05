@@ -25,7 +25,8 @@ import { getDownloadURL, ref, uploadBytesResumable, type UploadTask } from 'fire
 
 import { INTERESTS } from '@/constants/interests';
 import type { ActivityContent, Content, EventContent, PostContent } from '@/types/content';
-import { browseScopeKey, type BrowseScope } from '@/types/browseScope';
+import type { BrowseScope } from '@/types/browseScope';
+import { forYouHandoffKey, followingHandoffKey } from '@/utils/eventSectionHandoffKey';
 import {
   BODY_MAX_LENGTH,
   DESCRIPTION_MAX_LENGTH,
@@ -1022,23 +1023,34 @@ const SECTION_HANDOFF_TTL_MS = 20_000;
 const forYouSectionsHandoff = new Map<string, { sections: DiscoverySections; fetchedAt: number }>();
 const followingSectionsHandoff = new Map<string, { result: FollowingDiscoverySections; fetchedAt: number }>();
 
-function forYouHandoffKey(scope: BrowseScope, limitCount: number): string {
-  return `${browseScopeKey(scope)}:${limitCount}`;
-}
-function followingHandoffKey(uid: string, scope: BrowseScope, limitCount: number): string {
-  return `${uid}:${browseScopeKey(scope)}:${limitCount}`;
-}
+/**
+ * Step 12A — `uid` joined the key the moment this cache started holding a
+ * RANKED result (see setForYouSectionsHandoff's own doc comment): the
+ * pre-Step-12A key was scope+limit only, which was correct for a plain
+ * chronological fetch (identical for every viewer in that scope) but
+ * would let one signed-in viewer's personalized ranked order leak to a
+ * different signed-in viewer who happens to open the same city's Events
+ * tab within the same 20s window. A signed-out viewer (no ranking at
+ * all — see events.tsx's own `user ? rankEventSections(...) : result`)
+ * passes `''` here, which can never collide with a real Firebase uid, so
+ * guest and signed-in entries never share a slot either.
+ */
+// Step 12A — the key-generation logic itself now lives in
+// src/utils/eventSectionHandoffKey.ts (a dependency-light module, unlike
+// this file, directly unit-testable under plain `tsx` — see that file's
+// own doc comment and tests/eventsSectionHandoff.test.ts) — imported
+// above alongside this file's other top-of-file imports.
 
 /**
  * A fresh-enough peek at the Events tab's own most recent successful
- * fetchDiscoverySections result for this exact (scope, limitCount) —
- * `undefined` on a miss or a stale entry, in which case the caller (only
- * ever the "Show more" screen — the Events tab itself never reads this
- * back) should fall back to a real fetchDiscoverySections call, then call
- * setForYouSectionsHandoff with its result.
+ * result for this exact (uid, scope, limitCount) — RANKED for a signed-in
+ * `uid` (see setForYouSectionsHandoff), plain chronological for `''`
+ * (signed-out). `undefined` on a miss or a stale entry, in which case the
+ * caller (only ever the "Show more" screen — the Events tab itself never
+ * reads this back) should fall back to its own real fetch.
  */
-export function peekForYouSectionsHandoff(scope: BrowseScope, limitCount: number): DiscoverySections | undefined {
-  const entry = forYouSectionsHandoff.get(forYouHandoffKey(scope, limitCount));
+export function peekForYouSectionsHandoff(uid: string, scope: BrowseScope, limitCount: number): DiscoverySections | undefined {
+  const entry = forYouSectionsHandoff.get(forYouHandoffKey(uid, scope, limitCount));
   if (!entry || Date.now() - entry.fetchedAt >= SECTION_HANDOFF_TTL_MS) return undefined;
   return entry.sections;
 }
@@ -1050,9 +1062,21 @@ export function peekFollowingSectionsHandoff(uid: string, scope: BrowseScope, li
   return entry.result;
 }
 
-/** Called by both the Events tab (after every real fetchDiscoverySections) and the "Show more" screen (after its own, on a miss) — see this cache's own doc comment above. */
-export function setForYouSectionsHandoff(scope: BrowseScope, limitCount: number, sections: DiscoverySections): void {
-  forYouSectionsHandoff.set(forYouHandoffKey(scope, limitCount), { sections, fetchedAt: Date.now() });
+/**
+ * Called by the Events tab after its own `rankEventSections` call
+ * resolves (or, for a signed-out viewer, after the plain chronological
+ * fetch — see events.tsx's own `loadForYou`) — `sections` here is
+ * whichever of those two the tab is actually about to RENDER, never the
+ * pre-ranking raw fetch. Step 12A fixed exactly this: before, this was
+ * called with the raw, unranked result, so "Show more" (which reads this
+ * cache) could show a different order than the ranked rail it was opened
+ * from. Also called by the "Show more" screen itself on a cache miss —
+ * see section.tsx's own doc comment for why that fallback intentionally
+ * stays unranked rather than re-running the whole ranking pipeline a
+ * second screen away.
+ */
+export function setForYouSectionsHandoff(uid: string, scope: BrowseScope, limitCount: number, sections: DiscoverySections): void {
+  forYouSectionsHandoff.set(forYouHandoffKey(uid, scope, limitCount), { sections, fetchedAt: Date.now() });
 }
 
 /** Same as setForYouSectionsHandoff, Following-scoped. */
