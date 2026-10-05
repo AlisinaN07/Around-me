@@ -80,6 +80,23 @@ export type EventContent = ContentBase & {
    * creation, and never changed afterward.
    */
   coverPhotoURL?: string;
+  /**
+   * Step 12D — every "#token" this Event's own `description` contains at
+   * creation time, normalized (see src/utils/hashtags.ts's
+   * extractHashtags — the exact same function/semantics a Reel's caption
+   * already uses; no second hashtag system). OPTIONAL, not required like
+   * Reel.hashtags, specifically because every Event created BEFORE this
+   * step has no such field at all — every read site must treat a missing
+   * value as `[]` (never `undefined` propagating into a ranking/learning
+   * call), same "absent key, not a blank value" convention
+   * coverPhotoURL above already established for exactly this "added
+   * later, old docs don't have it" reason. Content documents are
+   * immutable after publish for every OTHER field (no edit UI — see this
+   * type's own coverPhotoURL doc comment), so this is set once, at
+   * creation, from the description as originally typed, and never
+   * changed afterward either.
+   */
+  hashtags?: string[];
 };
 
 /** content/{contentId} — the unified root collection for all city content. */

@@ -41,6 +41,7 @@ import { getTodayOrTonightWindow, getUpcomingWindow } from '@/utils/dateWindows'
 import { fetchFollowingUids } from './following';
 import { firestore } from './firestore';
 import { functions } from './functions';
+import { extractHashtags, incrementHashtagCounts } from './hashtags';
 import { getMediaStorageProvider } from './media';
 import { uploadEventCoverToR2 } from './media/r2Provider';
 import { storage } from './storage';
@@ -516,6 +517,14 @@ export async function createEvent(input: CreateEventInput): Promise<CreateConten
     return placeLink;
   }
 
+  // Step 12D — computed once, here, from the exact description this
+  // Event is about to store (never re-derived later — this field is
+  // immutable after creation, same as every other Event field — see
+  // EventContent.hashtags' own doc comment). Same extraction function a
+  // Reel's own caption already uses (src/utils/hashtags.ts) — no second
+  // hashtag system, no Event-specific normalization.
+  const hashtags = extractHashtags(validated.description);
+
   const contentRef = doc(collection(firestore, CONTENT_COLLECTION));
   const data = {
     contentId: contentRef.id,
@@ -530,6 +539,7 @@ export async function createEvent(input: CreateEventInput): Promise<CreateConten
     placeId: placeLink.placeId,
     startsAt: Timestamp.fromDate(input.startsAt),
     endsAt: Timestamp.fromDate(input.endsAt),
+    hashtags,
     // Step 36 — omitted entirely when absent, same "absent key, not a
     // blank value" convention placeName already uses on Post above; never
     // trusts a raw string the caller could hand-type (this must already
@@ -543,6 +553,19 @@ export async function createEvent(input: CreateEventInput): Promise<CreateConten
     await setDoc(contentRef, data);
   } catch {
     return { ok: false, error: 'unknown', message: 'Something went wrong creating your event.' };
+  }
+
+  // Step 12D — best-effort, same "a hashtag-count hiccup shouldn't turn a
+  // successful publish into a reported failure" reasoning as a Reel's own
+  // post-publish incrementHashtagCounts call (reels.ts) — this Event is
+  // already genuinely created at this point (the setDoc above succeeded).
+  try {
+    await incrementHashtagCounts(hashtags);
+  } catch {
+    if (__DEV__) {
+      // eslint-disable-next-line no-console
+      console.warn(`[content] Couldn't update hashtag counts for Event "${contentRef.id}" — creation itself still succeeded.`);
+    }
   }
 
   const created = await fetchContentById(contentRef.id);

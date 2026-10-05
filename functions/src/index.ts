@@ -360,9 +360,24 @@ async function deleteContentDocumentAndSubcollections(
   // historical Likes predating Step 41.2H.1) are still removed by that
   // generic pass either way.
   const contentSnap = await db.doc(`content/${contentId}`).get();
-  const contentType = contentSnap.exists ? (contentSnap.data()?.type as string | undefined) : undefined;
+  const contentData = contentSnap.exists ? contentSnap.data() : undefined;
+  const contentType = contentData?.type as string | undefined;
   if (contentType === 'post' && receivedPostLikesPolicy === 'remove') {
     await drainPairedPostLikesForTarget(db, 'post', contentId);
+  }
+  // Step 12D — the Event-deletion counterpart of
+  // deleteReelDocumentAndSubcollections' own decrementHashtagCounts call:
+  // an Event is the only content type that stores a `hashtags` field
+  // (Posts/Activities never do — see EventContent.hashtags' own doc
+  // comment in src/types/content.ts), and this is the one place that
+  // actually removes an Event document (both the explicit deleteMyContent
+  // callable and the deleteOwnContent/account-deletion cascade share this
+  // same function) — so it's the one place that needs to undo
+  // createEvent's own earlier incrementHashtagCounts call. Reuses the
+  // `contentData` already read above — no extra Firestore read.
+  const eventHashtags = contentType === 'event' ? ((contentData?.hashtags as string[] | undefined) ?? []) : [];
+  if (eventHashtags.length > 0) {
+    await decrementHashtagCounts(db, eventHashtags);
   }
 
   await drainCollection(db, `content/${contentId}/likes`);

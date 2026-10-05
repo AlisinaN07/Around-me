@@ -8,6 +8,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { Avatar } from '@/components/Avatar';
 import { AuthorLink } from '@/components/AuthorLink';
 import { DetailHero } from '@/components/DetailHero';
+import { HighlightedText } from '@/components/HighlightedText';
 import { ProfileTabBar } from '@/components/ProfileTabBar';
 import { SwipeBackEdge } from '@/components/SwipeBackEdge';
 import { Colors, Layout, Radius, Spacing } from '@/constants/theme';
@@ -257,6 +258,10 @@ export function EventDetail({ content, onOptionsPress, onToast }: EventDetailPro
         creatorId: content.authorUid,
         cityKey: content.cityKey,
         countryCode: content.countryCode,
+        // Step 12D — `share` was already a GENERIC hashtag-interest
+        // signal (HASHTAG_INTEREST_WEIGHTS.share, pre-existing) — this is
+        // the first time an Event ever supplies real hashtags to it.
+        hashtags: content.hashtags ?? [],
       }).catch(() => {});
     }
     if (!result.ok && !/cancel/i.test(result.message)) {
@@ -358,9 +363,20 @@ export function EventDetail({ content, onOptionsPress, onToast }: EventDetailPro
                 >
                   {content.description}
                 </Text>
-                <Text style={styles.description} numberOfLines={isDescriptionExpanded ? undefined : DESCRIPTION_COLLAPSED_LINES}>
-                  {content.description}
-                </Text>
+                {/* Step 12D — same HighlightedText component a Reel's own
+                    caption already uses for clickable hashtag spans (see
+                    ReelFeedItem.tsx) — reused as-is, not a second
+                    implementation. Only this REAL, visible copy switches;
+                    the invisible measuring Text just above stays a plain
+                    Text (nested hashtag spans could measure a hair
+                    differently and risk a height mismatch for no benefit,
+                    since nothing about it is ever shown). */}
+                <HighlightedText
+                  text={content.description}
+                  style={styles.description}
+                  hashtagStyle={styles.descriptionHashtag}
+                  numberOfLines={isDescriptionExpanded ? undefined : DESCRIPTION_COLLAPSED_LINES}
+                />
                 {isDescriptionLong ? (
                   <Pressable
                     onPress={() => setIsDescriptionExpanded((expanded) => !expanded)}
@@ -628,6 +644,11 @@ const styles = StyleSheet.create({
     color: Colors.textSecondary,
     fontSize: 15,
     lineHeight: DESCRIPTION_LINE_HEIGHT,
+  },
+  // Same accent-color convention ReelFeedItem's own captionHashtag style uses.
+  descriptionHashtag: {
+    color: Colors.accent,
+    fontWeight: '700',
   },
   descriptionWrap: {
     gap: 4,

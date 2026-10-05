@@ -20,6 +20,7 @@ import type { ActivityContent, EventContent } from '@/types/content';
 import type { ContentEngagementStats } from '@/types/engagementStats';
 import type { Reel } from '@/types/reel';
 import type { RankedItem, RecommendationProfile } from '@/types/recommendation';
+import { resolveEventHashtagsForScoring } from '@/utils/eventHashtagsForScoring';
 
 import { bucketAndSort, classifyBucket, type BucketableEntry } from './bucketing';
 import { deriveSourceTags } from './attribution';
@@ -495,10 +496,19 @@ export async function rankEventSections(
   sessionSeed = 'default'
 ): Promise<DiscoverySections> {
   const nowMs = Date.now();
-  const [profile, collaborativeProfile, blockedUids] = await Promise.all([
+  // Step 12D — hashtagInterests joins the same batch read as
+  // getForYouReels' own identical call (recommendationEngine.ts) — one
+  // bounded read per ranking batch, never per-event. Previously absent
+  // here entirely, which is exactly why every Event's own hashtagRelevance
+  // always scored a flat 0 regardless of its hashtags: with no
+  // hashtagInterests map supplied, computeItemScore's own
+  // `context.hashtagInterests ?? EMPTY_HASHTAG_INTEREST_MAP` fallback was
+  // the ONLY thing ever reached.
+  const [profile, collaborativeProfile, blockedUids, hashtagInterests] = await Promise.all([
     getCachedInterestProfile(uid, onboardingInterestIds),
     getCachedCollaborativeProfile(uid),
     fetchMyBlockedUserIds(uid),
+    getCachedHashtagInterestMap(uid),
   ]);
   const blocked = new Set(blockedUids);
   const excluded = new Set(profile.excludedContentIds);
@@ -551,6 +561,13 @@ export async function rankEventSections(
           // Second pass, Step 8 — deprioritize (not exclude) an event the
           // viewer already responded to, so it stops dominating discovery.
           hasRespondedToEvent: profile.respondedEventIds.includes(event.contentId),
+          // Step 12D — real hashtags, replacing the previous permanent []
+          // placeholder (see scoreHashtagRelevance's own call site in
+          // ranking.ts — "Events have no hashtags field at all" is no
+          // longer true). See resolveEventHashtagsForScoring's own doc
+          // comment for the Activity/legacy-Event fallback reasoning.
+          reelHashtags: resolveEventHashtagsForScoring(event),
+          hashtagInterests,
         },
         profile,
         scope,

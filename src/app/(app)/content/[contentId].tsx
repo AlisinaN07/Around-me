@@ -192,6 +192,12 @@ function SingleContentScreen() {
       creatorId: content.authorUid,
       cityKey: content.cityKey,
       countryCode: content.countryCode,
+      // Step 12D — `not_interested` was already a GENERIC hashtag-
+      // interest signal (HASHTAG_INTEREST_WEIGHTS.not_interested = -0.35,
+      // pre-existing) — weakens affinity for this Event's own hashtags
+      // too now, bounded the same way every other hashtag ever is (never
+      // a permanent ban — see hashtagInterestLogic.ts).
+      hashtags: content.hashtags ?? [],
     }).catch(() => {});
     removeContentIdFromForYouSectionsHandoffForUser(user.uid, content.contentId);
     showToast("We'll show you less like this");
@@ -502,6 +508,7 @@ function EventFeedScreen({ events, initialIndex }: EventFeedScreenProps) {
         creatorId: target.authorUid,
         cityKey: target.cityKey,
         countryCode: target.countryCode,
+        hashtags: target.hashtags ?? [],
       }).catch(() => {});
       removeContentIdFromForYouSectionsHandoffForUser(user.uid, target.contentId);
       showToast("We'll show you less like this");

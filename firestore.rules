@@ -793,11 +793,25 @@ service cloud.firestore {
           && data.startsAt is timestamp
           && data.endsAt is timestamp
           && data.startsAt < data.endsAt
-          && data.keys().hasAll(baseContentKeys().concat(['title', 'description', 'startsAt', 'endsAt', 'placeName']))
+          // Step 12D — every "#token" this Event's own description
+          // contains, normalized — see src/utils/hashtags.ts's
+          // extractHashtags, the single source of truth for what a
+          // hashtag actually is, and REQUIRED (not optional) here the
+          // same way reels/{reelId}'s own isValidReelCreate already
+          // requires `hashtags` on every new Reel (every NEW Event going
+          // forward always supplies it, even as `[]` — only documents
+          // that predate this step lack it at all, and this rule only
+          // ever gates a CREATE, never a read of an old doc). Same
+          // bound (<= 30) as Reels, same "bound the SHAPE, not re-parse
+          // the text char-by-char" scope Reel's own rule already limits
+          // itself to.
+          && data.hashtags is list
+          && data.hashtags.size() <= 30
+          && data.keys().hasAll(baseContentKeys().concat(['title', 'description', 'startsAt', 'endsAt', 'placeName', 'hashtags']))
           // Step 36 — coverPhotoURL is OPTIONAL (an organizer may skip it),
           // same "absent key, not a blank value" pattern isValidPostShape
           // already uses for placeName above.
-          && data.keys().hasOnly(baseContentKeys().concat(['title', 'description', 'startsAt', 'endsAt', 'placeName', 'coverPhotoURL']))
+          && data.keys().hasOnly(baseContentKeys().concat(['title', 'description', 'startsAt', 'endsAt', 'placeName', 'hashtags', 'coverPhotoURL']))
           && (!('coverPhotoURL' in data) || (data.coverPhotoURL is string && data.coverPhotoURL.size() > 0 && data.coverPhotoURL.size() <= 2048));
       }
 
