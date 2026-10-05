@@ -27,6 +27,7 @@ import { INTERESTS } from '@/constants/interests';
 import type { ActivityContent, Content, EventContent, PostContent } from '@/types/content';
 import type { BrowseScope } from '@/types/browseScope';
 import { forYouHandoffKey, followingHandoffKey } from '@/utils/eventSectionHandoffKey';
+import { removeContentIdFromSections } from '@/utils/eventSectionHandoffCorrection';
 import {
   BODY_MAX_LENGTH,
   DESCRIPTION_MAX_LENGTH,
@@ -1077,6 +1078,32 @@ export function peekFollowingSectionsHandoff(uid: string, scope: BrowseScope, li
  */
 export function setForYouSectionsHandoff(uid: string, scope: BrowseScope, limitCount: number, sections: DiscoverySections): void {
   forYouSectionsHandoff.set(forYouHandoffKey(uid, scope, limitCount), { sections, fetchedAt: Date.now() });
+}
+
+/**
+ * Step 12B — surgically removes one Event the viewer just marked "Not
+ * interested" from EVERY cached For-You handoff entry that belongs to
+ * them (every scope they've recently viewed, in case they switched
+ * scopes within this cache's own short TTL), WITHOUT clearing the entry
+ * entirely. This is deliberately a CORRECTION of the already-ranked data
+ * in place, not an invalidation that forces a refetch: a refetch on a
+ * miss falls back to the plain chronological result (see
+ * setForYouSectionsHandoff's own doc comment on why section.tsx's miss
+ * path intentionally never re-runs ranking) — wiping the cache here
+ * would silently trade a correctly-ranked-minus-one-item list for an
+ * unranked one, undoing Step 12A's own guarantee for no good reason.
+ * Correcting in place also preserves the entry's original `fetchedAt`
+ * (its TTL countdown is unaffected — this is a fix to existing data, not
+ * a fresh fetch), and never touches Following's own separate handoff Map
+ * at all (Not Interested is a For-You-only concept — see this step's own
+ * report for the full reasoning).
+ */
+export function removeContentIdFromForYouSectionsHandoffForUser(uid: string, contentId: string): void {
+  const prefix = `${uid}:`;
+  for (const [key, entry] of forYouSectionsHandoff) {
+    if (!key.startsWith(prefix)) continue;
+    forYouSectionsHandoff.set(key, { sections: removeContentIdFromSections(entry.sections, contentId), fetchedAt: entry.fetchedAt });
+  }
 }
 
 /** Same as setForYouSectionsHandoff, Following-scoped. */

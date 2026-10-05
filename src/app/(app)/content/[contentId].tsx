@@ -17,7 +17,7 @@ import { ReportModal } from '@/components/ReportModal';
 import { SwipeBackEdge } from '@/components/SwipeBackEdge';
 import { Colors, Layout, Radius, Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
-import { deleteMyContent, fetchContentById, peekEventFeedHandoff } from '@/services/content';
+import { deleteMyContent, fetchContentById, peekEventFeedHandoff, removeContentIdFromForYouSectionsHandoffForUser } from '@/services/content';
 import { trackContentInteraction } from '@/services/recommendations/interactions';
 import { isPostReposted, repostPost, undoRepost } from '@/services/reposts';
 import { isPostSaved, savePost, unsavePost } from '@/services/saved';
@@ -168,18 +168,53 @@ function SingleContentScreen() {
     showToast(wasReposted ? 'Undid repost' : 'Reposted');
   };
 
+  // Step 12B — Events' own negative-feedback action. Reuses the EXACT
+  // same generic trackContentInteraction/'not_interested' mechanism
+  // Reels already use (see ReelFeed.tsx's own handleNotInterested) —
+  // applyInteractionToProfile never reads contentType at all, so the
+  // category/creator/city deltas and the exact-content exclusion work
+  // identically here with zero new learning code. Corrects the For-You
+  // handoff cache in place (never Following's own separate cache — see
+  // this step's own report for why Not Interested is For-You-only), then
+  // leaves this screen: there's nothing useful left to show once the
+  // viewer has just said they don't want to see this Event. Gated behind
+  // `user` so a signed-out viewer never even sees this option (matches
+  // Reels' own `if (!user) return` auth gate, applied one step earlier
+  // here since this is a menu ENTRY, not just a handler body check).
+  const handleNotInterestedEvent = useCallback(() => {
+    if (!user || !content || content.type !== 'event') return;
+    trackContentInteraction({
+      userId: user.uid,
+      contentId: content.contentId,
+      contentType: 'content',
+      action: 'not_interested',
+      categoryId: content.categoryId,
+      creatorId: content.authorUid,
+      cityKey: content.cityKey,
+      countryCode: content.countryCode,
+    }).catch(() => {});
+    removeContentIdFromForYouSectionsHandoffForUser(user.uid, content.contentId);
+    showToast("We'll show you less like this");
+    if (router.canGoBack()) router.back();
+    else router.replace('/events');
+  }, [user, content, showToast]);
+
   const isOwnContent = !!user && !!content && content.authorUid === user.uid;
   const canSaveContent = !isOwnContent && content?.type === 'post';
+  const canMarkNotInterested = !isOwnContent && !!user && content?.type === 'event';
 
   const optionsMenuOptions = isOwnContent
     ? [{ label: 'Delete', destructive: true, onPress: () => setIsDeleteConfirmOpen(true) }]
-    : canSaveContent
-      ? [
-          { label: isSaved ? 'Remove from saved' : 'Save', onPress: handleToggleSave },
-          { label: isReposted ? 'Undo repost' : 'Repost', onPress: handleToggleRepost },
-          { label: 'Report', onPress: () => setIsReportOpen(true) },
-        ]
-      : [{ label: 'Report', onPress: () => setIsReportOpen(true) }];
+    : [
+        ...(canSaveContent
+          ? [
+              { label: isSaved ? 'Remove from saved' : 'Save', onPress: handleToggleSave },
+              { label: isReposted ? 'Undo repost' : 'Repost', onPress: handleToggleRepost },
+            ]
+          : []),
+        ...(canMarkNotInterested ? [{ label: 'Not interested', onPress: handleNotInterestedEvent }] : []),
+        { label: 'Report', onPress: () => setIsReportOpen(true) },
+      ];
 
   // Permanent — no recycle bin, no restore (locked Step 40.1 policy). The
   // backend independently re-verifies content.authorUid == request.auth.uid
@@ -447,12 +482,46 @@ function EventFeedScreen({ events, initialIndex }: EventFeedScreenProps) {
     if (firstVisible && typeof firstVisible.index === 'number') setActiveIndex(firstVisible.index);
   }, []);
 
+  // Step 12B — same Event negative-feedback action as SingleContentScreen's
+  // own handleNotInterestedEvent above, adapted to this screen's own
+  // `optionsTarget` (whichever page's "..." was actually tapped — not
+  // necessarily the currently-active/visible one). Leaves the WHOLE
+  // swipeable feed (same as this screen's own handleConfirmDelete
+  // already does) rather than attempting to remove just one page from an
+  // in-progress FlatList session — see that function's own doc comment
+  // for the identical reasoning.
+  const handleNotInterestedEvent = useCallback(
+    (target: EventContent) => {
+      if (!user) return;
+      trackContentInteraction({
+        userId: user.uid,
+        contentId: target.contentId,
+        contentType: 'content',
+        action: 'not_interested',
+        categoryId: target.categoryId,
+        creatorId: target.authorUid,
+        cityKey: target.cityKey,
+        countryCode: target.countryCode,
+      }).catch(() => {});
+      removeContentIdFromForYouSectionsHandoffForUser(user.uid, target.contentId);
+      showToast("We'll show you less like this");
+      if (router.canGoBack()) router.back();
+      else router.replace('/events');
+    },
+    [user, showToast]
+  );
+
   const optionsMenuOptions =
     optionsTarget && user && user.uid === optionsTarget.authorUid
       ? [{ label: 'Delete', destructive: true, onPress: () => setDeleteTarget(optionsTarget) }]
-      : optionsTarget
-        ? [{ label: 'Report', onPress: () => setReportTarget(optionsTarget) }]
-        : [];
+      : optionsTarget && user
+        ? [
+            { label: 'Not interested', onPress: () => handleNotInterestedEvent(optionsTarget) },
+            { label: 'Report', onPress: () => setReportTarget(optionsTarget) },
+          ]
+        : optionsTarget
+          ? [{ label: 'Report', onPress: () => setReportTarget(optionsTarget) }]
+          : [];
 
   // Same permanent, no-recycle-bin policy as SingleContentScreen's own
   // delete — deleting the currently-open Event out of a swipeable feed

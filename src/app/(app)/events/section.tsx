@@ -1,5 +1,5 @@
 import { Ionicons } from '@expo/vector-icons';
-import { useLocalSearchParams } from 'expo-router';
+import { useFocusEffect, useLocalSearchParams } from 'expo-router';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Modal, Pressable, StyleSheet, Text, View } from 'react-native';
 
@@ -25,6 +25,7 @@ import {
   type FollowingDiscoverySections,
 } from '@/services/content';
 import { fetchEventResponseCounts, type EventResponseCounts } from '@/services/engagement';
+import { browseScopeKey } from '@/types/browseScope';
 import type { ActivityContent, EventContent } from '@/types/content';
 // Step 12A — isSectionKind/selectItems/selectComingUp moved to this pure,
 // dependency-light module (unlike this screen file, directly
@@ -138,9 +139,22 @@ export default function EventsSectionScreen() {
   const [dateFilter, setDateFilter] = useState<DateFilterSelection | null>(null);
   const [isDateFilterOpen, setIsDateFilterOpen] = useState(false);
 
-  const load = useCallback(async () => {
+  // Step 12B — `silent` mirrors (tabs)/events.tsx's own identical option:
+  // a real load (first visit to this exact mode/which/scope) still blanks
+  // to the loading skeleton; a silent revalidate (this screen regaining
+  // focus with nothing structural changed — e.g. the viewer went to an
+  // Event's detail, marked it Not Interested, and came back) must never
+  // flash a loading state over a list that was already showing correctly
+  // a moment ago. This is what actually makes Not Interested's effect
+  // visible here: removeContentIdFromForYouSectionsHandoffForUser (see
+  // content.ts) corrects the cached handoff IN PLACE the instant the
+  // action is taken, so a silent re-read on refocus picks up the
+  // corrected (still ranked) list via the same cache-hit path this
+  // screen already had — no re-ranking, no new infrastructure.
+  const load = useCallback(async (options?: { silent?: boolean }) => {
     if (!isCityReady) return;
-    setStatus('loading');
+    const silent = options?.silent ?? false;
+    if (!silent) setStatus('loading');
     try {
       if (mode === 'following') {
         if (!user) {
@@ -197,16 +211,37 @@ export default function EventsSectionScreen() {
       }
       setStatus('loaded');
     } catch {
-      setStatus('error');
+      // Silent revalidate failure: leave whatever's already rendered
+      // untouched, same "a background refresh going wrong is never
+      // grounds to blank working content" rule (tabs)/events.tsx's own
+      // loadForYou already follows. A non-silent failure still shows the
+      // real error state, unchanged from before this option existed.
+      if (!silent) setStatus('error');
     }
   }, [mode, which, user, activeScope, isCityReady]);
 
-  useEffect(() => {
-    // load() awaits before its first setState call, same reasoning as
-    // every other one-shot-load screen in this app.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    load();
-  }, [load]);
+  // Step 12B — same real-load-vs-silent-revalidate key-comparison pattern
+  // as (tabs)/events.tsx's own useFocusEffect: the FIRST time this exact
+  // (mode, which, uid, scope) combination is seen, do a real load (blanks
+  // to the skeleton); every LATER refocus with that same key unchanged —
+  // most commonly: the viewer opened one of this screen's own items,
+  // acted on it, and came straight back — silently revalidates instead,
+  // so a quick look at an Event's detail and back never causes a visible
+  // loading flash for the common "nothing happened" case either.
+  const loadedKeyRef = useRef<string | null>(null);
+  useFocusEffect(
+    useCallback(() => {
+      if (!isCityReady) return;
+      const key = `${mode}:${which}:${user?.uid ?? ''}:${browseScopeKey(activeScope)}`;
+      if (loadedKeyRef.current === key) {
+        load({ silent: true });
+      } else {
+        loadedKeyRef.current = key;
+        load();
+      }
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [mode, which, user, activeScope, isCityReady])
+  );
 
   const filteredItems = useMemo(() => {
     const dateWindow = dateFilter ? dateFilterWindow(dateFilter) : null;
