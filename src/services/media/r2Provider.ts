@@ -169,8 +169,21 @@ export const r2MediaProvider: MediaStorageProvider = {
     return null;
   },
 
-  async delete(): Promise<void> {
-    throw new Error('R2 delete is not implemented yet — only the upload+display path is proven so far.');
+  /**
+   * Calls the trusted `deleteOwnMedia` Cloud Function — R2 has no
+   * client-reachable delete path of its own (credentials never leave the
+   * backend, see functions/src/media/r2Config.ts's own doc comment), so
+   * this can never delete anything directly. The server independently
+   * re-verifies `path` belongs to the caller before deleting anything —
+   * see deleteOwnMedia.ts's own doc comment — so passing an unexpected
+   * path here fails safely (a rejected call), never a wrong deletion.
+   */
+  async delete(path: string): Promise<void> {
+    if (!functions) {
+      throw new Error('This feature is not available right now.');
+    }
+    const callable = httpsCallable<{ path: string }, { path: string; attempted: boolean }>(functions, 'deleteOwnMedia');
+    await callable({ path });
   },
 };
 

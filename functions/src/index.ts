@@ -87,6 +87,7 @@ import {
 import { performStoryVideoFinalization, type StoryVideoFinalizationFailureReason } from './media/storyVideoFinalization';
 import { cleanupExpiredStoriesBatch } from './media/storyExpiryCleanup';
 import { cleanupStoryOwnedMedia } from './media/storyMediaCleanup';
+import { cleanupProfileOwnedMedia } from './media/profileMediaCleanup';
 
 initializeApp();
 
@@ -690,7 +691,20 @@ async function deleteProfileDocuments(db: Firestore, uid: string) {
     usernameReservationMismatch: false,
     savedRelationshipsDeleted: 0,
     userDocDeleted: false,
+    profileMedia: {
+      photoFirebaseDeleted: false,
+      photoR2Attempted: false,
+      coverFirebaseDeleted: false,
+      coverR2Attempted: false,
+    },
   };
+
+  // Fills a real, confirmed gap: profilePhotos/{uid}/photo and
+  // profileCovers/{uid}/photo were never deleted on account deletion, on
+  // either backend — see cleanupProfileOwnedMedia's own doc comment.
+  // Best-effort, like every other media cleanup in this function: a
+  // storage hiccup here never blocks the rest of this account's deletion.
+  result.profileMedia = await cleanupProfileOwnedMedia(getStorage().bucket(), uid);
 
   await db.doc(`privacySettings/${uid}`).delete().catch(() => undefined);
   result.privacySettingsDeleted = true;
@@ -2658,3 +2672,12 @@ export * from './hashtagTrends';
 export * from './media/requestMediaUploadAuthorization';
 export * from './media/discardReelSource';
 export * from './media/deleteStoryMedia';
+// Step — the real, server-authorized delete behind
+// src/services/media/r2Provider.ts's own r2MediaProvider.delete (the
+// generic MediaStorageProvider interface's R2 implementation, previously
+// an unconditional throw — see that file's own doc comment). Same narrow,
+// validated, secret-bound pattern as discardReelSource/deleteStoryMedia
+// above: the client sends only a path, and the server independently
+// verifies it matches one of the caller's own deterministic keys before
+// ever calling deleteR2Object — see deleteOwnMedia.ts's own doc comment.
+export * from './media/deleteOwnMedia';
