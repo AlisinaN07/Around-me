@@ -88,6 +88,7 @@ import { performStoryVideoFinalization, type StoryVideoFinalizationFailureReason
 import { cleanupExpiredStoriesBatch } from './media/storyExpiryCleanup';
 import { cleanupStoryOwnedMedia } from './media/storyMediaCleanup';
 import { cleanupProfileOwnedMedia } from './media/profileMediaCleanup';
+import { cleanupEventOwnedMedia } from './media/eventMediaCleanup';
 
 initializeApp();
 
@@ -348,7 +349,8 @@ type ReceivedPostLikesPolicy = 'preserve' | 'remove';
 async function deleteContentDocumentAndSubcollections(
   db: Firestore,
   contentId: string,
-  receivedPostLikesPolicy: ReceivedPostLikesPolicy
+  receivedPostLikesPolicy: ReceivedPostLikesPolicy,
+  bucket: ReturnType<ReturnType<typeof getStorage>['bucket']>
 ): Promise<void> {
   // Step 41.2H.2 — postLikes/{likeId} only ever exists for a legacy text
   // Post (never Event/Activity — see firestore.rules' isValidPostLikeCreate,
@@ -380,6 +382,16 @@ async function deleteContentDocumentAndSubcollections(
   if (eventHashtags.length > 0) {
     await decrementHashtagCounts(db, eventHashtags);
   }
+  // The Event-cover counterpart of the hashtag decrement above — the one
+  // place that actually removes an Event document, across all three real
+  // deletion routes. Reuses the same `contentData` read above; a no-op
+  // (coverAttempted: false) for any non-Event content, any Event with no
+  // cover, and any legacy Event predating coverStoragePath — see
+  // cleanupEventOwnedMedia's own doc comment for why that last case is
+  // never guessed at.
+  if (contentType === 'event' && contentData) {
+    await cleanupEventOwnedMedia(bucket, contentData);
+  }
 
   await drainCollection(db, `content/${contentId}/likes`);
   await drainCollection(db, `content/${contentId}/comments`);
@@ -404,6 +416,7 @@ async function deleteContentDocumentAndSubcollections(
 
 async function deleteOwnContent(db: Firestore, uid: string): Promise<{ deleted: number }> {
   let deleted = 0;
+  const bucket = getStorage().bucket();
   for (;;) {
     const snap = await db.collection('content').where('authorUid', '==', uid).limit(OWNED_DOC_PAGE_SIZE).get();
     if (snap.empty) break;
@@ -411,7 +424,7 @@ async function deleteOwnContent(db: Firestore, uid: string): Promise<{ deleted: 
       // Step 41.2H.2.1 — this is the author's own ACCOUNT being deleted;
       // their Profile is going away entirely, so there is no lifetime
       // value left to preserve credit for.
-      await deleteContentDocumentAndSubcollections(db, docSnap.id, 'remove');
+      await deleteContentDocumentAndSubcollections(db, docSnap.id, 'remove', bucket);
       deleted += 1;
     }
   }
@@ -1139,7 +1152,11 @@ async function drainNotificationsByField(db: Firestore, field: 'contentId' | 're
  * read) plus every notification referencing it. Never touches any other
  * content the same author owns.
  */
-export const removeReportedContent = onCall({ region: REGION, timeoutSeconds: 300, memory: '256MiB' }, async (request) => {
+// R2 secrets added: moderation removal of an Event can now delete an
+// R2-backed cover image via deleteContentDocumentAndSubcollections' own
+// cleanupEventOwnedMedia call — previously unneeded since Events never
+// persisted a deletable storage key at all.
+export const removeReportedContent = onCall({ region: REGION, timeoutSeconds: 300, memory: '256MiB', secrets: [r2AccessKeyIdSecret, r2SecretAccessKeySecret] }, async (request) => {
   requireAdmin(request);
   const reportId = parseReportId(request);
   const adminUid = request.auth!.uid;
@@ -1174,7 +1191,7 @@ export const removeReportedContent = onCall({ region: REGION, timeoutSeconds: 30
   if (contentSnap.exists) {
     // Step 41.2H.2.1 — moderation removal, unlike voluntary self-delete,
     // never earned legitimate reputation credit to begin with.
-    await deleteContentDocumentAndSubcollections(db, contentId, 'remove');
+    await deleteContentDocumentAndSubcollections(db, contentId, 'remove', getStorage().bucket());
   }
   await drainNotificationsByField(db, 'contentId', contentId);
   await resolveReport(db, reportId, adminUid);
@@ -1517,7 +1534,11 @@ function parseStoryIdParam(request: CallableRequest): string {
  * touches any other document the same author owns — the target is the
  * one exact contentId given, nothing derived from an authorUid query.
  */
-export const deleteMyContent = onCall({ region: REGION, timeoutSeconds: 300, memory: '256MiB' }, async (request) => {
+// R2 secrets added: self-deleting an Event can now delete an R2-backed
+// cover image via deleteContentDocumentAndSubcollections' own
+// cleanupEventOwnedMedia call — same reasoning as removeReportedContent
+// above.
+export const deleteMyContent = onCall({ region: REGION, timeoutSeconds: 300, memory: '256MiB', secrets: [r2AccessKeyIdSecret, r2SecretAccessKeySecret] }, async (request) => {
   if (!request.auth) {
     throw new HttpsError('unauthenticated', 'Sign in required.');
   }
@@ -1542,7 +1563,7 @@ export const deleteMyContent = onCall({ region: REGION, timeoutSeconds: 300, mem
   // Step 41.2H.2.1 — voluntary author self-delete: Liked is a lifetime-
   // earned reputation value, so received postLikes on this Post survive
   // even though the Post itself, and its real nested Like docs, do not.
-  await deleteContentDocumentAndSubcollections(db, contentId, 'preserve');
+  await deleteContentDocumentAndSubcollections(db, contentId, 'preserve', getStorage().bucket());
 
   return { contentId, type, deleted: true as const };
 });

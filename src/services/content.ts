@@ -37,6 +37,7 @@ import {
   TITLE_MAX_LENGTH,
 } from '@/types/content';
 import { getTodayOrTonightWindow, getUpcomingWindow } from '@/utils/dateWindows';
+import { resolveEventCoverStorageFields } from '@/utils/eventCoverStorageFields';
 
 import { fetchFollowingUids } from './following';
 import { firestore } from './firestore';
@@ -323,6 +324,19 @@ export async function createActivity(input: CreateActivityInput): Promise<Create
 
 export type CreateEventInput = {
   uid: string;
+  /**
+   * Step 2B — the Event's own real, final `contentId` (see
+   * generateEventId below), generated ONCE, upfront, by the Create Event
+   * screen, BEFORE any cover upload happens — the SAME id that upload
+   * was addressed to (if any) and the SAME id this function now creates
+   * the `content/{contentId}` document under. There is only ever ONE id
+   * for one Event; this parameter existing at all is what makes that
+   * true (see this field's own former absence — before Step 2B,
+   * createEvent generated its OWN separate id here, independent of
+   * whatever id the cover upload used, which was the exact gap Step 2B
+   * closes).
+   */
+  contentId: string;
   title: string;
   description: string;
   categoryId: string;
@@ -339,24 +353,49 @@ export type CreateEventInput = {
    * immutable after creation and there is no later "attach a photo" edit.
    */
   coverPhotoURL?: string;
+  /**
+   * Step 2B — which backend the upload behind `coverPhotoURL` actually
+   * used. The matching `coverStoragePath` is deliberately NOT accepted as
+   * an input here at all — see resolveEventCoverStorageFields
+   * (src/utils/eventCoverStorageFields.ts), which this function calls:
+   * the path is always DERIVED from `uid` + `contentId`, never trusted as
+   * a free-form string from the caller, closing the exact gap Step 2B
+   * fixes (a client could otherwise claim ANY path under its own
+   * namespace, including one belonging to a different, already-published
+   * Event of the same author's).
+   */
+  coverStorageProvider?: 'firebase' | 'r2';
 };
 
 /**
- * Step 36 — a fresh, random, purely-local identifier reserved by the
- * Create Event screen BEFORE any Storage upload happens, and held for
- * that screen's lifetime (see its own `useState(() => generateEventDraftId())`
- * lazy initializer). It has no meaning in Firestore at all — content
- * documents are created in one atomic setDoc (see createEvent below), not
- * a multi-stage draft the way Reels/Stories are — its ONLY job is to keep
- * each Create Event attempt's cover photo at its own distinct Storage
- * path (eventCovers/{authorUid}/{draftId}/photo), so a LATER event by the
- * same author can never overwrite, and thereby silently change the
- * displayed cover of, an EARLIER already-published one. Reuses Firestore's
- * own random-ID generator purely for convenience (same trick
- * createReelDraft/createStoryDraft use) — no document is ever created at
- * this path.
+ * Step 2B — the Event's own real, permanent `contentId`, generated ONCE,
+ * upfront, by the Create Event screen, before any Storage upload happens
+ * (see its own `useState(() => generateEventId())` lazy initializer) —
+ * and reused as BOTH the cover photo's own Storage path
+ * (`eventCovers/{authorUid}/{contentId}/photo`) AND the eventual
+ * `content/{contentId}` document's own id (see createEvent below's
+ * `doc(firestore, CONTENT_COLLECTION, input.contentId)`). There is only
+ * ever ONE id per Event.
+ *
+ * Before this step, the cover upload used a SEPARATE, independently
+ * generated `draftId` that bore no provable relationship to the Event's
+ * eventual `contentId` — which is exactly why a cover's storage path
+ * could never be verified as belonging to one SPECIFIC Event (only to
+ * "some Event by this same author"). Generating the real id upfront and
+ * never generating a second one anywhere in this flow is the fix: both
+ * firestore.rules (write time) and eventMediaCleanup.ts (delete time) can
+ * now check `coverStoragePath` against this document's own `contentId`
+ * by exact string equality, which a NEW Event's `contentId` can never
+ * collide with a PRE-EXISTING Event's own id (Firestore's own create/
+ * update semantics guarantee a `create` can only ever target a path with
+ * no prior document — see firestore.rules' own `allow create`/
+ * `allow update: if false` for content/{contentId}).
+ *
+ * Reuses Firestore's own random-ID generator purely for convenience
+ * (same trick createReelDraft/createStoryDraft use) — no document is
+ * ever created at this path before createEvent's own setDoc runs.
  */
-export function generateEventDraftId(): string {
+export function generateEventId(): string {
   if (!firestore) {
     return `local-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   }
@@ -366,16 +405,17 @@ export function generateEventDraftId(): string {
 export type UploadEventCoverPhotoHandle = { cancel: () => void };
 
 /**
- * Uploads a locally-picked cover image for an in-progress Event draft to
- * eventCovers/{uid}/{draftId}/photo (see generateEventDraftId's own doc
- * comment for why the path is keyed by a throwaway draftId rather than a
- * real contentId). Mutable in place for the SAME draftId — the organizer
- * may pick, then re-pick, a different image before ever publishing — but
- * a fresh draftId is generated per Create Event screen visit, so this
- * never touches any other draft's or any published Event's own image.
- * Does NOT touch Firestore itself — call createEvent with the resolved
- * coverPhotoURL once onComplete reports success, same division of
- * responsibility as uploadProfileCoverPhoto/updateMyProfileCoverPhoto in
+ * Uploads a locally-picked cover image for an in-progress Event to
+ * eventCovers/{uid}/{contentId}/photo, where `contentId` is the Event's
+ * own real, final id (see generateEventId's own doc comment) — never a
+ * throwaway draft identifier unrelated to the eventual document. Mutable
+ * in place for the SAME contentId — the organizer may pick, then re-pick,
+ * a different image before ever publishing — but a fresh contentId is
+ * generated per Create Event screen visit, so this never touches any
+ * other Event's own image. Does NOT touch Firestore itself — call
+ * createEvent with the resolved coverPhotoURL once onComplete reports
+ * success, same division of responsibility as
+ * uploadProfileCoverPhoto/updateMyProfileCoverPhoto in
  * src/services/userProfile.ts.
  *
  * Step 5D — dispatches on getMediaStorageProvider() (see
@@ -386,16 +426,26 @@ export type UploadEventCoverPhotoHandle = { cancel: () => void };
  * 'r2' branch (uploadEventCoverViaR2, right below) is a SEPARATE
  * function, reached only when a developer explicitly sets
  * EXPO_PUBLIC_MEDIA_STORAGE_PROVIDER=r2 for controlled testing.
+ *
+ * Step 2B — deliberately returns `coverStorageProvider` only, never a
+ * `coverStoragePath` — the caller (createEvent) always DERIVES that path
+ * itself from `uid` + `contentId` (resolveEventCoverStorageFields), so
+ * there is nothing for this function to report that could ever disagree
+ * with what createEvent actually persists.
  */
+export type EventCoverUploadResult =
+  | { ok: true; coverPhotoURL: string; coverStorageProvider: 'firebase' | 'r2' }
+  | { ok: false; message: string };
+
 export function uploadEventCoverPhoto(
   uid: string,
-  draftId: string,
+  contentId: string,
   localUri: string,
   onProgress: (percent: number) => void,
-  onComplete: (result: { ok: true; coverPhotoURL: string } | { ok: false; message: string }) => void
+  onComplete: (result: EventCoverUploadResult) => void
 ): UploadEventCoverPhotoHandle {
   if (getMediaStorageProvider() === 'r2') {
-    return uploadEventCoverViaR2(draftId, localUri, onProgress, onComplete);
+    return uploadEventCoverViaR2(contentId, localUri, onProgress, onComplete);
   }
 
   let cancelled = false;
@@ -422,7 +472,7 @@ export function uploadEventCoverPhoto(
       return;
     }
 
-    const objectRef = ref(storage, `eventCovers/${uid}/${draftId}/photo`);
+    const objectRef = ref(storage, `eventCovers/${uid}/${contentId}/photo`);
     task = uploadBytesResumable(objectRef, blob, { contentType: blob.type || 'image/jpeg' });
 
     task.on(
@@ -441,7 +491,7 @@ export function uploadEventCoverPhoto(
       async () => {
         try {
           const coverPhotoURL = await getDownloadURL(objectRef);
-          onComplete({ ok: true, coverPhotoURL });
+          onComplete({ ok: true, coverPhotoURL, coverStorageProvider: 'firebase' });
         } catch {
           onComplete({ ok: false, message: "Uploaded, but couldn't finish saving your cover photo." });
         }
@@ -464,31 +514,32 @@ export function uploadEventCoverPhoto(
  * to uploadEventCoverToR2 (src/services/media/r2Provider.ts), the exact
  * same proven authorize-then-PUT mechanics as
  * uploadProfilePhotoViaR2/uploadProfileCoverViaR2, just for the
- * `eventCover` media kind and its own `eventCovers/{uid}/{draftId}/photo`
- * object key — `draftId` is passed straight through, unchanged, to the
- * authorization request (see requestMediaUploadAuthorization.ts's own
- * doc comment on why this one media kind needs it). Returns the SAME
- * shape uploadEventCoverPhoto's own Firebase branch above already
- * returns, so the Create Event screen's own upload handler needs no
- * changes at all.
+ * `eventCover` media kind and its own
+ * `eventCovers/{uid}/{contentId}/photo` object key — `contentId` (the
+ * Event's own real, final id — see generateEventId's own doc comment) is
+ * passed straight through, unchanged, to the authorization request (see
+ * requestMediaUploadAuthorization.ts's own doc comment on why this one
+ * media kind needs it). Returns the SAME shape uploadEventCoverPhoto's
+ * own Firebase branch above already returns, so the Create Event
+ * screen's own upload handler needs no changes at all.
  */
 function uploadEventCoverViaR2(
-  draftId: string,
+  contentId: string,
   localUri: string,
   onProgress: (percent: number) => void,
-  onComplete: (result: { ok: true; coverPhotoURL: string } | { ok: false; message: string }) => void
+  onComplete: (result: EventCoverUploadResult) => void
 ): UploadEventCoverPhotoHandle {
   let cancelled = false;
 
   (async () => {
-    const result = await uploadEventCoverToR2(draftId, localUri, onProgress);
+    const result = await uploadEventCoverToR2(contentId, localUri, onProgress);
     if (cancelled) return;
 
     if (__DEV__) {
       // eslint-disable-next-line no-console
-      console.log('[content] R2 Event cover upload for draft', draftId, '->', result);
+      console.log('[content] R2 Event cover upload for Event', contentId, '->', result);
     }
-    onComplete(result.ok ? { ok: true, coverPhotoURL: result.photoURL } : result);
+    onComplete(result.ok ? { ok: true, coverPhotoURL: result.photoURL, coverStorageProvider: 'r2' } : result);
   })();
 
   return {
@@ -525,9 +576,18 @@ export async function createEvent(input: CreateEventInput): Promise<CreateConten
   // hashtag system, no Event-specific normalization.
   const hashtags = extractHashtags(validated.description);
 
-  const contentRef = doc(collection(firestore, CONTENT_COLLECTION));
+  // Step 2B — the Event is created AT its own pre-generated contentId
+  // (input.contentId, from generateEventId — see that function's own doc
+  // comment), never a fresh id generated here. This is a Firestore
+  // `create` operation specifically because no document has ever existed
+  // at this exact path before (content documents are never updated — see
+  // firestore.rules' own `allow update: if false`) — which is also
+  // exactly why a cover's storage path, once tied to THIS contentId by
+  // exact equality, can never collide with any other, already-existing
+  // Event's own cover.
+  const contentRef = doc(firestore, CONTENT_COLLECTION, input.contentId);
   const data = {
-    contentId: contentRef.id,
+    contentId: input.contentId,
     type: 'event',
     ...trusted.fields,
     categoryId: input.categoryId,
@@ -540,11 +600,19 @@ export async function createEvent(input: CreateEventInput): Promise<CreateConten
     startsAt: Timestamp.fromDate(input.startsAt),
     endsAt: Timestamp.fromDate(input.endsAt),
     hashtags,
-    // Step 36 — omitted entirely when absent, same "absent key, not a
-    // blank value" convention placeName already uses on Post above; never
-    // trusts a raw string the caller could hand-type (this must already
-    // be a resolved download URL from uploadEventCoverPhoto).
-    ...(input.coverPhotoURL ? { coverPhotoURL: input.coverPhotoURL } : {}),
+    // Step 36/2B — omitted entirely when absent, same "absent key, not a
+    // blank value" convention placeName already uses on Post above.
+    // coverStoragePath is NEVER accepted as a free-form input (see
+    // CreateEventInput's own doc comment) — resolveEventCoverStorageFields
+    // derives it itself from input.uid + input.contentId (this Event's
+    // own real, final id, created above), so there is no string here a
+    // caller could hand-type to claim a DIFFERENT Event's cover.
+    ...resolveEventCoverStorageFields({
+      uid: input.uid,
+      contentId: input.contentId,
+      coverPhotoURL: input.coverPhotoURL,
+      coverStorageProvider: input.coverStorageProvider,
+    }),
     createdAt: serverTimestamp(),
     updatedAt: serverTimestamp(),
   } satisfies WithFieldValue<EventContent>;

@@ -81,6 +81,37 @@ export type EventContent = ContentBase & {
    */
   coverPhotoURL?: string;
   /**
+   * The real storage object `coverPhotoURL` was resolved from — ALWAYS
+   * exactly `eventCovers/{authorUid}/{contentId}/photo`, where
+   * `contentId` is THIS SAME document's own id (see generateEventId's own
+   * doc comment in src/services/content.ts). Set together with
+   * `coverStorageProvider`, NEVER independently, and NEVER accepted as a
+   * free-form caller-supplied string — `createEvent`'s own single writer
+   * (resolveEventCoverStorageFields, src/utils/eventCoverStorageFields.ts)
+   * always DERIVES this from `authorUid` + `contentId`, never trusts a
+   * reported path. This exact-contentId tie is what stops a client from
+   * ever claiming a DIFFERENT Event's cover (even its own, earlier Event)
+   * — a bare "same uid" namespace check alone is NOT sufficient for that,
+   * since two Events by the same author share the same uid; `contentId`
+   * is what's actually unique per Event. Exists purely so server-side
+   * deletion (functions/src/media/eventMediaCleanup.ts) has a reliable,
+   * Event-scoped key to delete on removal — it is never read for
+   * display; `coverPhotoURL` remains the only field any UI uses.
+   *
+   * OPTIONAL and omitted for: an Event with no cover at all, AND every
+   * Event created before this field existed (which includes every Event
+   * created under the brief prior scheme that tied this to an
+   * independently-generated `draftId` rather than `contentId` — that
+   * value can essentially never equal this document's own `contentId` by
+   * chance, so it is correctly treated as untrusted/legacy too, never
+   * guessed at). See eventMediaCleanup.ts's own doc comment for why a
+   * legacy Event's cover, if it has one, is simply never cleaned up
+   * rather than guessed.
+   */
+  coverStoragePath?: string;
+  /** Which backend `coverStoragePath` lives in. Always present together with `coverStoragePath` — see that field's own doc comment. */
+  coverStorageProvider?: 'firebase' | 'r2';
+  /**
    * Step 12D — every "#token" this Event's own `description` contains at
    * creation time, normalized (see src/utils/hashtags.ts's
    * extractHashtags — the exact same function/semantics a Reel's caption

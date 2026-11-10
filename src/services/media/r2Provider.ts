@@ -255,18 +255,22 @@ export async function uploadProfileCoverToR2(localUri: string, onProgress: Media
 /**
  * The real, production-wired Event-cover upload path — see
  * uploadDisplayableMediaToR2's own doc comment for the shared upload
- * behavior. `draftId` is REQUIRED here (unlike profile photo/cover,
+ * behavior. `contentId` is REQUIRED here (unlike profile photo/cover,
  * which need no client-supplied identifier at all) — see
  * requestMediaUploadAuthorization.ts's own doc comment on why an Event
- * cover, uploaded before the real Event document exists, needs one;
- * this must be the exact same draftId content.ts's existing
- * generateEventDraftId() already produces for the Create Event screen's
- * own lifetime, so a later createEvent call's own object identity stays
- * consistent within one creation session — exactly mirroring the
- * existing Firebase `eventCovers/{uid}/{draftId}/photo` behavior.
+ * cover, uploaded before the real Event document is WRITTEN, still needs
+ * one. This must be the Event's own real, final `contentId` (see
+ * content.ts's `generateEventId()`), the SAME id createEvent later
+ * writes its `content/{contentId}` document under — never a separate,
+ * independently-generated draft identifier. Tying the upload path to
+ * this one real id (rather than an arbitrary throwaway string) is what
+ * lets firestore.rules and eventMediaCleanup.ts both verify, by exact
+ * string equality, that a cover belongs to ONE specific Event and no
+ * other — see EventContent.coverStoragePath's own doc comment
+ * (src/types/content.ts) for the full reasoning this closes.
  */
 export async function uploadEventCoverToR2(
-  draftId: string,
+  contentId: string,
   localUri: string,
   onProgress: MediaUploadProgressCallback
 ): Promise<ProfilePhotoUploadResult> {
@@ -275,7 +279,7 @@ export async function uploadEventCoverToR2(
     localUri,
     onProgress,
     'Uploaded to R2, but no public media domain is configured yet — this cover photo is not displayable.',
-    draftId
+    contentId
   );
 }
 

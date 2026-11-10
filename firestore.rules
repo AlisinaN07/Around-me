@@ -810,9 +810,41 @@ service cloud.firestore {
           && data.keys().hasAll(baseContentKeys().concat(['title', 'description', 'startsAt', 'endsAt', 'placeName', 'hashtags']))
           // Step 36 — coverPhotoURL is OPTIONAL (an organizer may skip it),
           // same "absent key, not a blank value" pattern isValidPostShape
-          // already uses for placeName above.
-          && data.keys().hasOnly(baseContentKeys().concat(['title', 'description', 'startsAt', 'endsAt', 'placeName', 'hashtags', 'coverPhotoURL']))
-          && (!('coverPhotoURL' in data) || (data.coverPhotoURL is string && data.coverPhotoURL.size() > 0 && data.coverPhotoURL.size() <= 2048));
+          // already uses for placeName above. coverStoragePath/
+          // coverStorageProvider are the Event-cover deletion keys (see
+          // eventMediaCleanup.ts) — equally optional, for the same reason.
+          && data.keys().hasOnly(baseContentKeys().concat(['title', 'description', 'startsAt', 'endsAt', 'placeName', 'hashtags', 'coverPhotoURL', 'coverStoragePath', 'coverStorageProvider']))
+          && (!('coverPhotoURL' in data) || (data.coverPhotoURL is string && data.coverPhotoURL.size() > 0 && data.coverPhotoURL.size() <= 2048))
+          // coverStoragePath and coverStorageProvider are written together
+          // or not at all — never one without the other (a lone path with
+          // no known provider, or a provider with no path, is meaningless
+          // and would just be dead weight on the document).
+          && (('coverStoragePath' in data) == ('coverStorageProvider' in data))
+          && (!('coverStorageProvider' in data) || data.coverStorageProvider == 'firebase' || data.coverStorageProvider == 'r2')
+          // Step 2B — the real security property this field needs is
+          // EXACT Event ownership, not just namespace ownership. A bare
+          // "starts with my own eventCovers/{authorUid}/" check (this
+          // rule's own prior version) still let a client claim ANY
+          // draftId under its own namespace — including one belonging to
+          // a DIFFERENT, already-published Event of the SAME author's,
+          // since two Events by one author share the same uid but never
+          // the same contentId. Requiring an EXACT match against THIS
+          // document's own `contentId` (not just a same-uid prefix with
+          // an arbitrary trailing segment) closes that: `data.contentId`
+          // is already pinned to the real, freshly-created document path
+          // by isValidContentCreate's own `data.contentId == contentId`
+          // check below, and `data.authorUid` is already pinned to
+          // request.auth.uid the same way — so this transitively ties the
+          // key to BOTH the real caller AND this one specific Event,
+          // never a client-asserted value for either. Exact mirror of
+          // storage.rules' own `eventCovers/{authorUid}/{draftId}/photo`
+          // path-is-the-authorization model for the upload side of this
+          // same object — see that file's own comment on why the upload
+          // step itself cannot additionally verify this (the Event
+          // document doesn't exist yet at upload time).
+          && (!('coverStoragePath' in data)
+            || (data.coverStoragePath is string
+              && data.coverStoragePath == 'eventCovers/' + data.authorUid + '/' + data.contentId + '/photo'));
       }
 
       // If placeId is set, the linked place must exist, be active, be in

@@ -14,7 +14,7 @@ import { PlaceSelector, type PlaceSelectorValue } from '@/components/PlaceSelect
 import { Colors, Radius, Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
 import { useProfile } from '@/hooks/useProfile';
-import { createEvent, generateEventDraftId, uploadEventCoverPhoto } from '@/services/content';
+import { createEvent, generateEventId, uploadEventCoverPhoto } from '@/services/content';
 import { DESCRIPTION_MAX_LENGTH, PLACE_NAME_MAX_LENGTH, TITLE_MAX_LENGTH } from '@/types/content';
 import { canCreateEvent } from '@/utils/accountCapabilities';
 import { addHours, roundUpToNextHalfHour } from '@/utils/timeFormat';
@@ -40,11 +40,23 @@ export default function CreateEventScreen() {
   const [formError, setFormError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
-  // Step 36 — a fresh draft id reserved once for this screen's whole
-  // lifetime (lazy initializer — see generateEventDraftId's own doc
-  // comment for why this exists and why it's never regenerated mid-draft).
-  const [draftId] = useState(() => generateEventDraftId());
+  // Step 2B — this Event's own real, final id, reserved ONCE for this
+  // screen's whole lifetime (lazy initializer — see generateEventId's own
+  // doc comment for why this exists and why it's never regenerated
+  // mid-draft): the SAME id both the cover upload below and the eventual
+  // createEvent call use — never two independently-generated ids for one
+  // Event.
+  const [eventId] = useState(() => generateEventId());
   const [coverPhotoURL, setCoverPhotoURL] = useState('');
+  // Tracked alongside coverPhotoURL so createEvent can derive a real,
+  // deletable storage key for this cover — see
+  // EventContent.coverStoragePath's own doc comment (src/types/content.ts)
+  // for why. Always set together with coverPhotoURL by
+  // handleChangeCoverPhoto below, never independently. (Unlike
+  // coverPhotoURL, there is no separate coverStoragePath state here —
+  // createEvent derives that itself from eventId, never from a
+  // caller-reported string.)
+  const [coverStorageProvider, setCoverStorageProvider] = useState<'firebase' | 'r2' | undefined>(undefined);
   const [isUploadingCover, setIsUploadingCover] = useState(false);
   const [coverError, setCoverError] = useState<string | null>(null);
 
@@ -77,7 +89,7 @@ export default function CreateEventScreen() {
     setIsUploadingCover(true);
 
     await new Promise<void>((resolve) => {
-      uploadEventCoverPhoto(user.uid, draftId, asset.uri, () => {}, (uploadResult) => {
+      uploadEventCoverPhoto(user.uid, eventId, asset.uri, () => {}, (uploadResult) => {
         setIsUploadingCover(false);
         if (!uploadResult.ok) {
           setCoverError(uploadResult.message);
@@ -85,6 +97,7 @@ export default function CreateEventScreen() {
           return;
         }
         setCoverPhotoURL(uploadResult.coverPhotoURL);
+        setCoverStorageProvider(uploadResult.coverStorageProvider);
         resolve();
       });
     });
@@ -141,6 +154,7 @@ export default function CreateEventScreen() {
 
     const result = await createEvent({
       uid: user.uid,
+      contentId: eventId,
       title: trimmedTitle,
       description: trimmedDescription,
       categoryId: categoryId!,
@@ -148,7 +162,7 @@ export default function CreateEventScreen() {
       placeId: place.placeId,
       startsAt,
       endsAt,
-      ...(coverPhotoURL ? { coverPhotoURL } : {}),
+      ...(coverPhotoURL ? { coverPhotoURL, coverStorageProvider } : {}),
     });
 
     setIsSubmitting(false);
