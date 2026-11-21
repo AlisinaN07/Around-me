@@ -12,6 +12,7 @@ import { useAuth } from '@/hooks/useAuth';
 import { useProfile } from '@/hooks/useProfile';
 import { fetchMyBlockedUserIds } from '@/services/blocks';
 import { fetchMyNewMessagesFrom } from '@/services/privacySettings';
+import { removeCurrentDevicePushToken } from '@/services/pushTokens';
 import { NEW_MESSAGES_FROM_OPTIONS } from '@/types/privacy';
 import { isBusinessAccount } from '@/utils/accountCapabilities';
 
@@ -56,6 +57,18 @@ export default function SettingsScreen() {
     if (isSigningOut) return;
     setIsSigningOut(true);
     try {
+      // Step 3B/3C — this device's own push-token registration (if any) is
+      // explicitly a per-ACCOUNT-SESSION thing, not a per-install thing: a
+      // different user signing in on this same device afterward must
+      // never inherit it. Must run BEFORE signOut() below, while
+      // request.auth.uid still resolves to this user (the Firestore rule
+      // this relies on is owner-only). Retries internally and marks a
+      // durable local marker on failure for a later retry — see
+      // src/services/pushTokens.ts's own doc comment — but never throws,
+      // so a failure here still never blocks signing out.
+      if (user) {
+        await removeCurrentDevicePushToken(user.uid);
+      }
       await signOut();
     } catch {
       setIsSigningOut(false);

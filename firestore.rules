@@ -17,6 +17,32 @@ service cloud.firestore {
       return value == request.time;
     }
 
+    // Step 3B — users/{uid}/pushTokens/{deviceId}'s own shape, shared by
+    // both its create and update rules below. Ownership itself is NOT
+    // part of this check — it's already fully established by the
+    // document's own PATH (nested under users/{uid}, gated by isOwner(uid)
+    // at that match level) before either rule below ever calls this.
+    // There is deliberately no recipientUid-style field on this document
+    // at all — unlike notifications/{id} (a shared root collection that
+    // genuinely needs one), a token living under its owner's own uid
+    // subtree has nothing on the document itself a client could ever
+    // manipulate to make it resolve to a different recipient.
+    // Step 3C — accepts BOTH documented Expo push-token variants
+    // (`ExponentPushToken[...]` and `ExpoPushToken[...]`), not just one
+    // hardcoded literal prefix — see src/utils/expoPushTokenFormat.ts's
+    // own doc comment, the pure client-side mirror of this exact check.
+    function isValidExpoPushTokenFormat(value) {
+      return value is string && value.size() > 0 && value.size() <= 400
+        && value.matches('^Expo(nent)?PushToken\\[.+\\]$');
+    }
+
+    function isValidPushTokenShape(data) {
+      return data.deviceId is string && data.deviceId.size() > 0 && data.deviceId.size() <= 200
+        && isValidExpoPushTokenFormat(data.expoPushToken)
+        && (data.platform == 'ios' || data.platform == 'android')
+        && data.keys().hasOnly(['deviceId', 'expoPushToken', 'platform', 'createdAt', 'updatedAt']);
+    }
+
     // users/{uid} — private profile, readable and creatable only by its
     // own owner. Step 33 adds a narrow owner-only update for Edit Profile
     // (see below) — every other field stays immutable after create.
@@ -151,6 +177,48 @@ service cloud.firestore {
         allow delete: if isOwner(uid);
       }
 
+      // Step 3B — users/{uid}/pushTokens/{deviceId}. A device-token
+      // registration (see src/services/pushTokens.ts) — ONLY the owner
+      // may ever read, create, update, or delete their own. Never
+      // readable by anyone else: push tokens are not stored in
+      // publicProfiles (confirmed — isValidPublicProfileCreate/Update
+      // below never references this field) and never surfaced via any
+      // other collection. `deviceId` is validated as EQUAL to its own
+      // path segment (same "document ID matches a real field" pairing
+      // this ruleset already uses elsewhere, e.g. isValidContentCreate's
+      // own `data.contentId == contentId`) — purely a consistency/
+      // defense-in-depth check, since ownership itself never depends on
+      // this field at all (the PATH already proves it).
+      match /pushTokens/{deviceId} {
+        allow read: if isOwner(uid);
+
+        allow create: if isOwner(uid)
+          && request.resource.data.deviceId == deviceId
+          && isValidPushTokenShape(request.resource.data)
+          && isServerTimestamp(request.resource.data.createdAt)
+          && isServerTimestamp(request.resource.data.updatedAt);
+
+        // Token rotation (Step 3B's own explicit requirement) — the SAME
+        // device re-registering with a new token value, or just a fresh
+        // updatedAt. deviceId and createdAt are both pinned to their
+        // EXISTING values (same "preserve across update" pattern as
+        // users/{uid}'s own Edit Profile rule's createdAt check) — an
+        // update can change `expoPushToken`/`platform`/`updatedAt` only,
+        // never re-parent this document to a different deviceId or
+        // fabricate a different creation time.
+        allow update: if isOwner(uid)
+          && request.resource.data.deviceId == deviceId
+          && request.resource.data.deviceId == resource.data.deviceId
+          && request.resource.data.createdAt == resource.data.createdAt
+          && isValidPushTokenShape(request.resource.data)
+          && isServerTimestamp(request.resource.data.updatedAt);
+
+        // Logout cleanup and account deletion (the latter via the
+        // trusted Admin SDK, which bypasses this rule entirely) both rely
+        // on this.
+        allow delete: if isOwner(uid);
+      }
+
       // users/{uid}/recommendationEvents/{eventId} — the "For You"
       // recommendation engine's own append-only interaction log (see
       // src/types/recommendation.ts). ONLY the owner may ever read or
@@ -253,6 +321,65 @@ service cloud.firestore {
 
         allow delete: if false;
       }
+    }
+
+    // Step 3C — pushTokenOwners/{expoPushToken}, keyed by the literal
+    // Expo push token value itself (never the per-user deviceId) — the
+    // cross-account privacy guarantee src/services/pushTokens.ts's own
+    // top doc comment depends on. Deliberately a SEPARATE top-level
+    // collection from users/{uid}/pushTokens: that collection records
+    // "which devices THIS uid has registered"; this one records "which
+    // uid currently, legitimately owns THIS physical token" — the second
+    // question is the one a future send-process actually needs answered
+    // before ever delivering to a token, since a stale/undeleted
+    // users/{uid}/pushTokens document surviving a failed logout must
+    // never be mistaken for "this uid can still receive pushes here."
+    //
+    // Deliberately no client read at all — no legitimate client need
+    // ever reads this collection (only a future trusted backend would,
+    // via the Admin SDK, which bypasses Rules entirely regardless of
+    // what `allow read` says here).
+    //
+    // `allow update` intentionally does NOT require
+    // `resource.data.uid == request.auth.uid` — unlike a normal owner-
+    // only update elsewhere in this file, REASSIGNING this record away
+    // from whoever held it before is the entire point: whoever most
+    // recently, legitimately registered this physical token (proven by
+    // being a real signed-in Firebase user claiming their OWN uid, never
+    // an arbitrary client-supplied one) is its current owner. The
+    // residual risk this accepts — a signed-in user claiming ownership
+    // of a token value they don't actually possess, to grief its real
+    // owner into missing pushes — only ever causes a DROPPED delivery
+    // for the real owner, never unauthorized access to anyone's content,
+    // since this record is only ever consulted as a gate ("should a push
+    // meant for uid X go to this token"), never as a routing table.
+    //
+    // `allow delete` DOES require `resource.data.uid == request.auth.uid`
+    // — a departing user may only ever release a claim that is still
+    // actually theirs; this is why removeCurrentDevicePushToken attempts
+    // this release as a SEPARATE operation from deleting its own
+    // users/{uid}/pushTokens document, not in the same atomic batch — a
+    // denied release (because a newer registration already reassigned
+    // it) must never block the always-safe per-user deletion.
+    function isValidPushTokenOwnerShape(data) {
+      return data.uid is string && data.uid.size() > 0
+        && data.keys().hasOnly(['uid', 'updatedAt']);
+    }
+
+    match /pushTokenOwners/{expoPushToken} {
+      allow read: if false;
+
+      allow create: if isSignedIn()
+        && request.resource.data.uid == request.auth.uid
+        && isValidPushTokenOwnerShape(request.resource.data)
+        && isServerTimestamp(request.resource.data.updatedAt);
+
+      allow update: if isSignedIn()
+        && request.resource.data.uid == request.auth.uid
+        && isValidPushTokenOwnerShape(request.resource.data)
+        && isServerTimestamp(request.resource.data.updatedAt);
+
+      allow delete: if isSignedIn() && resource.data.uid == request.auth.uid;
     }
 
     // Recommendation Engine — Step 6 — recommendationMetrics/{docId}

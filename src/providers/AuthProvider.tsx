@@ -12,6 +12,7 @@ import {
 import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from 'react';
 
 import { auth } from '@/services/auth';
+import { retryPendingPushTokenCleanup } from '@/services/pushTokens';
 import { getAuthErrorMessage } from '@/utils/authErrors';
 
 type AuthContextValue = {
@@ -62,6 +63,18 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return onAuthStateChanged(auth, (firebaseUser) => {
       setUser(firebaseUser);
       setIsLoading(false);
+      // Step 3C — resolves a logout's own push-token cleanup that was
+      // marked pending but never confirmed (e.g. the app was killed
+      // between the cleanup attempt and signOut() itself completing, so
+      // this SAME uid's session is still the one Firebase restores here).
+      // A no-op, single cheap AsyncStorage read for the overwhelming
+      // majority of sessions, which have no pending marker at all. See
+      // src/services/pushTokens.ts's own top doc comment for why this is
+      // defense in depth, not the mechanism the actual cross-account
+      // privacy guarantee depends on.
+      if (firebaseUser) {
+        retryPendingPushTokenCleanup(firebaseUser.uid).catch(() => {});
+      }
     });
   }, []);
 

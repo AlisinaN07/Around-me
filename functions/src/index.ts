@@ -696,6 +696,52 @@ export const cleanupExpiredStories = onSchedule(
 // usernameLower right up until it is the LAST document removed of any kind.
 // ---------------------------------------------------------------------------
 
+/**
+ * Step 3C — releases this uid's current ownership claim (if any) on
+ * every physical token it ever registered, THEN deletes the per-user
+ * pushTokens document itself. drainCollection alone only deletes — it
+ * never reads a field first — so this needs its own small loop to read
+ * each document's `expoPushToken` before removing it.
+ *
+ * Each release is independently conditional on
+ * `pushTokenOwners/{token}.uid` STILL equaling this uid — exactly
+ * mirroring the client-side release's own same condition
+ * (removeCurrentDevicePushToken, src/services/pushTokens.ts) — never
+ * unconditionally deleting a registry entry a NEWER registration (a
+ * different, still-active user on the same physical device) may have
+ * already, legitimately reassigned to itself. The Admin SDK bypasses
+ * Firestore Rules entirely, so this check must be enforced here in
+ * code; Rules cannot do it for a trusted backend call.
+ *
+ * Purely a hygiene cleanup, not a security requirement on its own — the
+ * ACTUAL cross-account privacy guarantee already holds regardless of
+ * whether this ever runs, because the next REAL registration on that
+ * physical device reassigns the registry correctly either way (see
+ * pushTokens.ts's own top doc comment). This exists so a deleted
+ * account doesn't leave its uid sitting in the registry indefinitely
+ * for a token nobody will ever re-register.
+ */
+async function releaseOwnedPushTokensAndDrain(db: Firestore, uid: string): Promise<number> {
+  let deleted = 0;
+  for (;;) {
+    const snap = await db.collection(`users/${uid}/pushTokens`).limit(OWNED_DOC_PAGE_SIZE).get();
+    if (snap.empty) break;
+    for (const docSnap of snap.docs) {
+      const expoPushToken = docSnap.data()?.expoPushToken as string | undefined;
+      if (expoPushToken) {
+        const ownerRef = db.doc(`pushTokenOwners/${expoPushToken}`);
+        const ownerSnap = await ownerRef.get().catch(() => null);
+        if (ownerSnap?.exists && ownerSnap.data()?.uid === uid) {
+          await ownerRef.delete().catch(() => undefined);
+        }
+      }
+      await docSnap.ref.delete().catch(() => undefined);
+      deleted += 1;
+    }
+  }
+  return deleted;
+}
+
 async function deleteProfileDocuments(db: Firestore, uid: string) {
   const result = {
     privacySettingsDeleted: false,
@@ -703,6 +749,7 @@ async function deleteProfileDocuments(db: Firestore, uid: string) {
     usernameReservationDeleted: false,
     usernameReservationMismatch: false,
     savedRelationshipsDeleted: 0,
+    pushTokensDeleted: 0,
     userDocDeleted: false,
     profileMedia: {
       photoFirebaseDeleted: false,
@@ -733,6 +780,16 @@ async function deleteProfileDocuments(db: Firestore, uid: string) {
   // all this needs — same primitive already used for every other owned
   // subcollection in this file.
   result.savedRelationshipsDeleted = await drainCollection(db, `users/${uid}/saved`);
+
+  // Step 3B/3C — users/{uid}/pushTokens, same "subcollections never
+  // cascade-delete with their parent" reasoning as saved above. Also
+  // releases this uid's own entries in the separate pushTokenOwners
+  // registry (see releaseOwnedPushTokensAndDrain's own doc comment) —
+  // there is no corresponding Expo-side token to revoke beyond this
+  // app's own Firestore bookkeeping (Expo tokens aren't individually
+  // "deleted," only naturally become invalid once this app is
+  // uninstalled or stops being used).
+  result.pushTokensDeleted = await releaseOwnedPushTokensAndDrain(db, uid);
 
   const userRef = db.doc(`users/${uid}`);
   const userSnap = await userRef.get();
