@@ -12,7 +12,7 @@ import {
 import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from 'react';
 
 import { auth } from '@/services/auth';
-import { retryPendingPushTokenCleanup } from '@/services/pushTokens';
+import { clearPushTokenSessionTracking, syncPushTokenForAuthenticatedSession } from '@/services/pushTokens';
 import { getAuthErrorMessage } from '@/utils/authErrors';
 
 type AuthContextValue = {
@@ -63,17 +63,22 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return onAuthStateChanged(auth, (firebaseUser) => {
       setUser(firebaseUser);
       setIsLoading(false);
-      // Step 3C — resolves a logout's own push-token cleanup that was
-      // marked pending but never confirmed (e.g. the app was killed
-      // between the cleanup attempt and signOut() itself completing, so
-      // this SAME uid's session is still the one Firebase restores here).
-      // A no-op, single cheap AsyncStorage read for the overwhelming
-      // majority of sessions, which have no pending marker at all. See
-      // src/services/pushTokens.ts's own top doc comment for why this is
-      // defense in depth, not the mechanism the actual cross-account
-      // privacy guarantee depends on.
+      // Step 3C/3E — resolves a logout's own interrupted push-token
+      // cleanup, then silently registers this device IF AND ONLY IF OS
+      // notification permission was ALREADY granted (e.g. via the
+      // Settings screen in an earlier session) — NEVER shows a
+      // permission prompt here, see
+      // syncPushTokenForAuthenticatedSession's own doc comment
+      // (src/services/pushTokens.ts) for the full behavior, including
+      // the stale-registration-after-quick-logout race this guards
+      // against. A no-op for the overwhelming majority of sessions
+      // (nothing pending, permission never granted, or the token
+      // hasn't changed), in which case this is one cheap AsyncStorage
+      // read plus one Firestore read and nothing else.
       if (firebaseUser) {
-        retryPendingPushTokenCleanup(firebaseUser.uid).catch(() => {});
+        syncPushTokenForAuthenticatedSession(firebaseUser.uid).catch(() => {});
+      } else {
+        clearPushTokenSessionTracking();
       }
     });
   }, []);

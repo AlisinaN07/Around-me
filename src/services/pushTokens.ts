@@ -76,10 +76,10 @@ import { getOrCreateDeviceId } from '@/utils/deviceId';
 import { hasPushTokenChanged, isTokenRotation, type StoredPushTokenRecord } from '@/utils/pushTokenChangeDetection';
 import { shouldRequestPermissionPrompt, type PushPermissionStatus } from '@/utils/pushPermissionPolicy';
 import { markPushTokenCleanupPending, clearPushTokenCleanupPending, isPushTokenCleanupPending } from '@/utils/pendingPushTokenCleanup';
+import { shouldStartRegistrationAttempt, isRegistrationResultStale } from '@/utils/pushTokenSessionGuard';
+import { resolvePushTokenPlatform, type PushTokenPlatform } from '@/utils/pushTokenPlatformSupport';
 
 import { firestore } from './firestore';
-
-type PushTokenPlatform = 'ios' | 'android';
 
 type PushTokenDocument = {
   deviceId: string;
@@ -102,11 +102,9 @@ function pushTokenOwnerRef(expoPushToken: string) {
   return doc(firestore!, 'pushTokenOwners', expoPushToken);
 }
 
-/** `null` on web (never supported — see currentPlatform's own callers) or any platform this app doesn't build push support for. */
+/** `null` on web or any platform this app doesn't build push support for — see resolvePushTokenPlatform's own doc comment (the actual pure mapping, extracted there for direct testability). */
 function currentPlatform(): PushTokenPlatform | null {
-  if (Platform.OS === 'ios') return 'ios';
-  if (Platform.OS === 'android') return 'android';
-  return null;
+  return resolvePushTokenPlatform(Platform.OS);
 }
 
 function delay(ms: number): Promise<void> {
@@ -384,4 +382,84 @@ export async function retryPendingPushTokenCleanup(uid: string): Promise<void> {
   const pending = await isPushTokenCleanupPending(uid);
   if (!pending) return;
   await removeCurrentDevicePushToken(uid);
+}
+
+// Module-level session tracking for syncPushTokenForAuthenticatedSession
+// below — deliberately NOT component state (AuthProvider has no reason
+// to re-render on these), and deliberately NOT per-uid persisted state
+// (this only ever needs to reflect what's true for THIS running app
+// instance, right now).
+let currentSessionUid: string | null = null;
+let registrationInFlightForUid: string | null = null;
+
+/**
+ * Call once per auth-state change, for whichever uid is now the
+ * authenticated user — the recommended integration point is
+ * AuthProvider's own onAuthStateChanged (see this change's own final
+ * report). Does TWO things, in order, for `uid`:
+ *
+ * 1. retryPendingPushTokenCleanup(uid) — resolves an interrupted
+ *    logout's own cleanup, if one is still pending for this exact uid.
+ * 2. ensurePushTokenRegistered(uid) — silently registers this device
+ *    IF AND ONLY IF OS notification permission is already granted.
+ *    NEVER shows a permission prompt — see ensurePushTokenRegistered's
+ *    own doc comment. A user who has never granted (or who declined)
+ *    simply gets skipped here, every time, with no UI effect at all.
+ *
+ * Guards against TWO real races surfaced by this step's own
+ * investigation (see pushTokenSessionGuard.ts's own doc comment for the
+ * full reasoning):
+ *  - DUPLICATE calls for the same uid (e.g. onAuthStateChanged firing
+ *    more than once in quick succession — a token refresh, a Fast
+ *    Refresh in development) are collapsed to one in-flight attempt.
+ *  - A STALE resolve — this uid is no longer the current session by the
+ *    time registration finishes (e.g. the user signed out again before
+ *    this write landed) — is compensated for immediately by re-running
+ *    the exact same cleanup a normal logout would have performed,
+ *    rather than silently leaving a freshly-written, now-stale
+ *    registration behind for an account that is no longer signed in.
+ *
+ * Never throws. Call clearPushTokenSessionTracking() on sign-out so a
+ * LATER stale resolve correctly detects "no longer current" rather than
+ * comparing against a stale uid that was never cleared.
+ */
+export async function syncPushTokenForAuthenticatedSession(uid: string): Promise<void> {
+  currentSessionUid = uid;
+
+  await retryPendingPushTokenCleanup(uid).catch(() => {});
+
+  if (!shouldStartRegistrationAttempt(registrationInFlightForUid, uid)) {
+    return;
+  }
+  registrationInFlightForUid = uid;
+
+  try {
+    const result = await ensurePushTokenRegistered(uid);
+
+    if (isRegistrationResultStale(currentSessionUid, uid)) {
+      // See this function's own doc comment — compensate rather than
+      // leave a stale registration behind.
+      await removeCurrentDevicePushToken(uid).catch(() => {});
+      return;
+    }
+
+    if (!result.ok) {
+      // eslint-disable-next-line no-console
+      console.warn(`[pushTokens] Authenticated-session registration failed for uid "${uid}":`, result.message);
+    }
+  } finally {
+    if (registrationInFlightForUid === uid) {
+      registrationInFlightForUid = null;
+    }
+  }
+}
+
+/**
+ * Call on sign-out (e.g. AuthProvider's own onAuthStateChanged, the
+ * `firebaseUser === null` branch) so a later-resolving, now-stale
+ * registration attempt correctly detects it is no longer current — see
+ * syncPushTokenForAuthenticatedSession's own doc comment.
+ */
+export function clearPushTokenSessionTracking(): void {
+  currentSessionUid = null;
 }
