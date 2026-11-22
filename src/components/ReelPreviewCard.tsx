@@ -5,7 +5,7 @@ import { Pressable, StyleSheet, Text, View, type StyleProp, type ViewStyle } fro
 
 import { MediaCard } from '@/components/MediaCard';
 import { Colors, Radius, Spacing } from '@/constants/theme';
-import { resolveReelPlaybackUrl } from '@/services/reels';
+import { resolveReelThumbnailUrl } from '@/services/reels';
 import type { Reel } from '@/types/reel';
 import { formatTimeAgo } from '@/utils/timeFormat';
 
@@ -40,14 +40,18 @@ export function ReelPreviewCard({ reel, style, onPress }: { reel: Reel; style?: 
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setThumbnailUrl(null);
     if (reel.thumbnailStoragePath) {
-      resolveReelPlaybackUrl(reel.thumbnailStoragePath).then((url) => {
+      // Step 5E — see resolveReelThumbnailUrl's own doc comment: branches
+      // on this Reel's OWN persisted thumbnailStorageProvider, not on the
+      // app's current config, so a mixed feed of Firebase- and
+      // R2-backed thumbnails both resolve correctly here.
+      resolveReelThumbnailUrl(reel).then((url) => {
         if (!cancelled) setThumbnailUrl(url);
       });
     }
     return () => {
       cancelled = true;
     };
-  }, [reel.thumbnailStoragePath]);
+  }, [reel.thumbnailStoragePath, reel.thumbnailStorageProvider, reel.thumbnailUrl]);
 
   return (
     <Pressable

@@ -47,7 +47,10 @@ import {
 } from 'firebase-admin/firestore';
 import { initializeApp } from 'firebase-admin/app';
 import { getStorage } from 'firebase-admin/storage';
+import { defineSecret } from 'firebase-functions/params';
 import { HttpsError, onCall, type CallableRequest } from 'firebase-functions/v2/https';
+import { logger } from 'firebase-functions/v2';
+import { onSchedule } from 'firebase-functions/v2/scheduler';
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
@@ -56,7 +59,56 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 import ffmpegPath from 'ffmpeg-static';
 
+import { buildMediaUrl } from './media/mediaUrl';
+import { reelSourceKey, storySourceKey } from './media/objectKey';
+import { checkReelMuxEligibility, checkReelPhotoRenderEligibility, checkReelVideoFinalizationEligibility } from './media/reelEligibility';
+import { cleanupReelOwnedMedia, cleanupReelOwnedMediaWithoutDocument, type ReelMediaCleanupResult } from './media/reelMediaCleanup';
+import { performReelMux, type ReelMuxFailureReason } from './media/reelMuxOrchestration';
+import { performReelVideoFinalization, type ReelVideoFinalizationFailureReason } from './media/reelVideoFinalization';
+import { buildVideoEncodeArgs, computeVideoOutputDimensions } from './media/videoNormalizationProfile';
+import {
+  copyReelSourceToFirebaseStoryObject,
+  copyReelSourceToR2StoryObject,
+  downloadReelSourceForMux,
+  downloadReelSourceToLocalFile,
+  readReelCanonicalSourceState,
+  uploadMuxedReelSourceToProvider,
+  type RawReelData,
+} from './media/reelSourceStorage';
+import { getR2Config } from './media/r2Config';
+import { deleteReelMusic, downloadReelMusicToLocalFile } from './media/reelMusicStorage';
+import { checkStoryVideoFinalizationEligibility } from './media/storyEligibility';
+import {
+  deriveCopiedStorySourceNormalized,
+  downloadStorySourceForFinalization,
+  readStoryCanonicalSourceState,
+  uploadNormalizedStorySourceToProvider,
+} from './media/storySourceStorage';
+import { performStoryVideoFinalization, type StoryVideoFinalizationFailureReason } from './media/storyVideoFinalization';
+import { cleanupExpiredStoriesBatch } from './media/storyExpiryCleanup';
+import { cleanupStoryOwnedMedia } from './media/storyMediaCleanup';
+import { cleanupProfileOwnedMedia } from './media/profileMediaCleanup';
+import { cleanupEventOwnedMedia } from './media/eventMediaCleanup';
+
 initializeApp();
+
+// Step 9A — bound only onto the specific callables below that actually
+// need to delete an R2 object as part of Reel-source cleanup
+// (deleteMyReel, deleteMyAccountData, removeReportedReel) — see
+// r2Storage.ts's own doc comment on why binding a secret per-callable,
+// not just having it exist in Secret Manager, is what actually populates
+// `process.env.R2_ACCESS_KEY_ID`/`R2_SECRET_ACCESS_KEY` for a given
+// function's execution environment. Every OTHER callable in this file
+// that reads/writes a Reel's `storagePath` (muxReelMusic,
+// renderPhotoToVideo, resolveOwnSoundOrigin, addReelToMyStory) never
+// needs an R2 credential at all: the two mux/render functions are
+// scoped away from ever seeing an R2-backed Reel in the first place
+// (see requestMediaUploadAuthorization.ts's own verifyReelVideoOwnership
+// for why), and resolveOwnSoundOrigin/addReelToMyStory only ever need to
+// GET the Reel's own already-PUBLIC `sourceUrl` — an ordinary HTTPS
+// fetch, not an authenticated R2 API call.
+const r2AccessKeyIdSecret = defineSecret('R2_ACCESS_KEY_ID');
+const r2SecretAccessKeySecret = defineSecret('R2_SECRET_ACCESS_KEY');
 
 // europe-north1 (Finland) — see Step 34.1: the closest Cloud Functions
 // 2nd-gen-supported region to this project's Firestore location,
@@ -297,7 +349,8 @@ type ReceivedPostLikesPolicy = 'preserve' | 'remove';
 async function deleteContentDocumentAndSubcollections(
   db: Firestore,
   contentId: string,
-  receivedPostLikesPolicy: ReceivedPostLikesPolicy
+  receivedPostLikesPolicy: ReceivedPostLikesPolicy,
+  bucket: ReturnType<ReturnType<typeof getStorage>['bucket']>
 ): Promise<void> {
   // Step 41.2H.2 — postLikes/{likeId} only ever exists for a legacy text
   // Post (never Event/Activity — see firestore.rules' isValidPostLikeCreate,
@@ -310,9 +363,34 @@ async function deleteContentDocumentAndSubcollections(
   // historical Likes predating Step 41.2H.1) are still removed by that
   // generic pass either way.
   const contentSnap = await db.doc(`content/${contentId}`).get();
-  const contentType = contentSnap.exists ? (contentSnap.data()?.type as string | undefined) : undefined;
+  const contentData = contentSnap.exists ? contentSnap.data() : undefined;
+  const contentType = contentData?.type as string | undefined;
   if (contentType === 'post' && receivedPostLikesPolicy === 'remove') {
     await drainPairedPostLikesForTarget(db, 'post', contentId);
+  }
+  // Step 12D — the Event-deletion counterpart of
+  // deleteReelDocumentAndSubcollections' own decrementHashtagCounts call:
+  // an Event is the only content type that stores a `hashtags` field
+  // (Posts/Activities never do — see EventContent.hashtags' own doc
+  // comment in src/types/content.ts), and this is the one place that
+  // actually removes an Event document (both the explicit deleteMyContent
+  // callable and the deleteOwnContent/account-deletion cascade share this
+  // same function) — so it's the one place that needs to undo
+  // createEvent's own earlier incrementHashtagCounts call. Reuses the
+  // `contentData` already read above — no extra Firestore read.
+  const eventHashtags = contentType === 'event' ? ((contentData?.hashtags as string[] | undefined) ?? []) : [];
+  if (eventHashtags.length > 0) {
+    await decrementHashtagCounts(db, eventHashtags);
+  }
+  // The Event-cover counterpart of the hashtag decrement above — the one
+  // place that actually removes an Event document, across all three real
+  // deletion routes. Reuses the same `contentData` read above; a no-op
+  // (coverAttempted: false) for any non-Event content, any Event with no
+  // cover, and any legacy Event predating coverStoragePath — see
+  // cleanupEventOwnedMedia's own doc comment for why that last case is
+  // never guessed at.
+  if (contentType === 'event' && contentData) {
+    await cleanupEventOwnedMedia(bucket, contentData);
   }
 
   await drainCollection(db, `content/${contentId}/likes`);
@@ -338,6 +416,7 @@ async function deleteContentDocumentAndSubcollections(
 
 async function deleteOwnContent(db: Firestore, uid: string): Promise<{ deleted: number }> {
   let deleted = 0;
+  const bucket = getStorage().bucket();
   for (;;) {
     const snap = await db.collection('content').where('authorUid', '==', uid).limit(OWNED_DOC_PAGE_SIZE).get();
     if (snap.empty) break;
@@ -345,7 +424,7 @@ async function deleteOwnContent(db: Firestore, uid: string): Promise<{ deleted: 
       // Step 41.2H.2.1 — this is the author's own ACCOUNT being deleted;
       // their Profile is going away entirely, so there is no lifetime
       // value left to preserve credit for.
-      await deleteContentDocumentAndSubcollections(db, docSnap.id, 'remove');
+      await deleteContentDocumentAndSubcollections(db, docSnap.id, 'remove', bucket);
       deleted += 1;
     }
   }
@@ -353,26 +432,88 @@ async function deleteOwnContent(db: Firestore, uid: string): Promise<{ deleted: 
 }
 
 // ---------------------------------------------------------------------------
-// Own Reels — subcollections, then the exact-path Storage object (never a
-// prefix/recursive delete), then the Firestore doc. Covers both
-// still-"uploading" drafts and "published" Reels through the same
-// authoritative path, unlike the client-only discardReelDraft().
+// Own Reels — subcollections, then EVERY physical media object this Reel
+// actually owns (source, thumbnail, standalone music — never a
+// prefix/recursive delete, always exact, deterministic keys), then the
+// Firestore doc. Covers both still-"uploading" drafts and "published"
+// Reels through the same authoritative path, unlike the client-only
+// discardReelDraft().
 //
 // deleteReelDocumentAndSubcollections is the shared per-document primitive
 // — same sharing rationale as deleteContentDocumentAndSubcollections above.
-// storagePath is always the caller's choice, never re-derived here, so a
-// caller that only has a reelId/authorUid pair (no Firestore doc left to
-// read a stored path from) must build the canonical path itself; see
-// removeReportedReel's storage-retry branch.
+// Step 9D — the actual media cleanup is delegated entirely to
+// cleanupReelOwnedMedia (functions/src/media/reelMediaCleanup.ts), which
+// is what fixed a real, confirmed storage leak: every video Reel's
+// separate thumbnail object (on either backend), and any still-present
+// standalone music object, were never deleted by ANY of this function's
+// three callers before Step 9D. A caller that has no Firestore doc left
+// to read media fields from at all (the one legitimate case this still
+// happens — see removeReportedReel's own missing-document branch) uses
+// the separate cleanupReelOwnedMediaWithoutDocument instead, bypassing
+// this function entirely.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Hashtag counts — the DECREMENT half of the hashtag foundation (see
+// src/services/hashtags.ts for the increment half, which runs client-side
+// at publish time, and src/types/hashtag.ts for the collection shape).
+// Decrementing is deliberately NEVER a client-writable operation at all —
+// firestore.rules' `match /hashtags/{hashtagId}` only ever allows a
+// client to CREATE a hashtag doc or INCREMENT an existing one by exactly
+// 1; this Admin-SDK path (bypassing those Rules entirely) is the only way
+// postCount ever goes down. A transaction per hashtag (read current
+// value, floor the decrement at 0, write it back) rather than a bare
+// negative increment — same reasoning src/services/hashtags.ts's own
+// incrementHashtagCounts doc comment gives for using a transaction over a
+// FieldValue sentinel, plus the explicit "never below 0" requirement a
+// plain increment(-1) can't enforce by itself. A hashtag doc that's
+// somehow already missing (shouldn't happen — every hashtag here was
+// necessarily incremented into existence at publish time) is silently
+// skipped rather than treated as an error, matching this file's own
+// "missing document = already handled" idempotency convention.
+// ---------------------------------------------------------------------------
+
+async function decrementHashtagCounts(db: Firestore, hashtags: string[]): Promise<void> {
+  for (const name of hashtags) {
+    const ref = db.doc(`hashtags/${name}`);
+    await db.runTransaction(async (tx) => {
+      const snap = await tx.get(ref);
+      if (!snap.exists) return;
+      const current = typeof snap.data()?.postCount === 'number' ? (snap.data()!.postCount as number) : 0;
+      tx.update(ref, { postCount: Math.max(0, current - 1), updatedAt: FieldValue.serverTimestamp() });
+    });
+  }
+}
+
+// deleteReelSourceMedia now lives in functions/src/media/reelSourceStorage.ts
+// (imported above) — extracted there specifically so its Firebase/R2
+// branching is directly unit-testable with a fake bucket and a delete spy,
+// instead of only reachable via a real deployed callable.
 
 async function deleteReelDocumentAndSubcollections(
   db: Firestore,
   bucket: ReturnType<ReturnType<typeof getStorage>['bucket']>,
   reelId: string,
-  storagePath: string | undefined,
-  receivedPostLikesPolicy: ReceivedPostLikesPolicy
-): Promise<{ storageDeleted: boolean }> {
+  // The Reel's own TRUSTED author uid — always the caller's own
+  // `request.auth.uid` (deleteMyReel), the account-deletion uid
+  // (deleteOwnReels), or the report's own pinned targetUid
+  // (removeReportedReel) — NEVER read from `reelData.authorUid` itself,
+  // matching cleanupReelOwnedMedia's own doc comment on why uid is always
+  // an explicit parameter.
+  authorUid: string,
+  // The Reel document's own data, for deriving WHICH media objects exist
+  // and on which provider — `undefined` only for a caller that somehow
+  // has no document at all (none of this function's three current
+  // callers hit that; see removeReportedReel's own SEPARATE
+  // cleanupReelOwnedMediaWithoutDocument branch for that one case).
+  reelData: RawReelData | undefined,
+  receivedPostLikesPolicy: ReceivedPostLikesPolicy,
+  // Only ever the Reel's own `hashtags` (or [] for one that was never
+  // published — see this parameter's callers) — a draft that never
+  // published never incremented these counts in the first place, so
+  // there's nothing to undo for it.
+  hashtagsToDecrement: string[]
+): Promise<{ mediaCleanup: ReelMediaCleanupResult | null }> {
   // Step 41.2H.2 — every Reel is inherently a social Post (no Event/
   // Activity equivalent exists for Reels), so this paired cleanup runs
   // whenever the caller asks to actually remove received credit (see
@@ -390,50 +531,216 @@ async function deleteReelDocumentAndSubcollections(
   // to exactly the reposts of this one Reel.
   await drainQuery(db, () => db.collection('reposts').where('targetType', '==', 'reel').where('targetId', '==', reelId));
 
-  let storageDeleted = false;
-  if (storagePath) {
-    const file = bucket.file(storagePath);
-    const [existedBefore] = await file.exists();
-    await file.delete({ ignoreNotFound: true });
-    storageDeleted = existedBefore;
+  if (hashtagsToDecrement.length > 0) {
+    await decrementHashtagCounts(db, hashtagsToDecrement);
   }
 
+  // Step 9D — EVERY physical media object this Reel owns (source,
+  // thumbnail, standalone music), not just the source — see
+  // cleanupReelOwnedMedia's own doc comment for the full model this
+  // fixed a real storage leak for.
+  const mediaCleanup = reelData ? await cleanupReelOwnedMedia(bucket, reelData, authorUid, reelId) : null;
+
   await db.doc(`reels/${reelId}`).delete();
-  return { storageDeleted };
+  return { mediaCleanup };
 }
 
 async function deleteOwnReels(
   db: Firestore,
   uid: string
-): Promise<{ deleted: number; storageDeleted: number; storageAlreadyMissing: number }> {
+): Promise<{ deleted: number; storageDeleted: number; storageAlreadyMissing: number; thumbnailDeleted: number; musicDeleted: number }> {
   const bucket = getStorage().bucket();
   let deleted = 0;
   let storageDeleted = 0;
   let storageAlreadyMissing = 0;
+  let thumbnailDeleted = 0;
+  let musicDeleted = 0;
 
   for (;;) {
     const snap = await db.collection('reels').where('authorUid', '==', uid).limit(OWNED_DOC_PAGE_SIZE).get();
     if (snap.empty) break;
     for (const docSnap of snap.docs) {
-      const storagePath = docSnap.data()?.storagePath as string | undefined;
+      const reelData = docSnap.data();
+      // Only a published Reel ever incremented these — see
+      // deleteReelDocumentAndSubcollections' own `hashtagsToDecrement`
+      // doc comment.
+      const hashtagsToDecrement = reelData?.status === 'published' ? ((reelData?.hashtags as string[] | undefined) ?? []) : [];
       // Step 41.2H.2.1 — same reasoning as deleteOwnContent's own call
       // site: the author's account is going away entirely.
-      const result = await deleteReelDocumentAndSubcollections(db, bucket, docSnap.id, storagePath, 'remove');
-      if (storagePath) {
-        if (result.storageDeleted) storageDeleted += 1;
+      const result = await deleteReelDocumentAndSubcollections(db, bucket, docSnap.id, uid, reelData, 'remove', hashtagsToDecrement);
+      if (result.mediaCleanup?.sourceAttempted) {
+        if (result.mediaCleanup.sourceDeleted) storageDeleted += 1;
         else storageAlreadyMissing += 1;
       }
+      if (result.mediaCleanup?.thumbnailDeleted) thumbnailDeleted += 1;
+      if (result.mediaCleanup?.musicDeleted) musicDeleted += 1;
       deleted += 1;
     }
   }
 
-  return { deleted, storageDeleted, storageAlreadyMissing };
+  return { deleted, storageDeleted, storageAlreadyMissing, thumbnailDeleted, musicDeleted };
 }
+
+// ---------------------------------------------------------------------------
+// Step 10A — own Stories. A pre-existing gap discovered during this step's
+// own audit: account deletion (deleteMyAccountData, below) never touched
+// the `stories` collection at ALL before this — a deleted user's Stories
+// (Firestore docs AND their Storage media, Firebase or R2) were left
+// behind forever. Fixed here, mirroring deleteOwnReels' own shape exactly
+// — Stories have no likes/comments/reposts/hashtags to clean up (see
+// src/types/story.ts's own doc comment), so this is just "delete the
+// media, then the doc" per Story, paginated the same way.
+// ---------------------------------------------------------------------------
+
+async function deleteOwnStories(db: Firestore, uid: string): Promise<{ deleted: number; mediaDeleted: number; mediaAlreadyMissing: number }> {
+  const bucket = getStorage().bucket();
+  let deleted = 0;
+  let mediaDeleted = 0;
+  let mediaAlreadyMissing = 0;
+
+  for (;;) {
+    const snap = await db.collection('stories').where('authorUid', '==', uid).limit(OWNED_DOC_PAGE_SIZE).get();
+    if (snap.empty) break;
+    for (const docSnap of snap.docs) {
+      const storyData = docSnap.data();
+      const result = await cleanupStoryOwnedMedia(bucket, storyData);
+      if (result.mediaAttempted) {
+        if (result.mediaDeleted) mediaDeleted += 1;
+        else mediaAlreadyMissing += 1;
+      }
+      await docSnap.ref.delete();
+      deleted += 1;
+    }
+  }
+
+  return { deleted, mediaDeleted, mediaAlreadyMissing };
+}
+
+// ---------------------------------------------------------------------------
+// Step 10A.1 — scheduled expired-Story cleanup. See
+// functions/src/media/storyExpiryCleanup.ts's own top doc comment for the
+// full "why this exists" reasoning: `expiresAt` only ever stops an
+// expired Story from being QUERIED — nothing previously deleted its
+// Firestore document or its Storage media (Firebase or R2), on any path.
+//
+// SCHEDULE_REGION — deliberately different from REGION above, same
+// reasoning as collaborative.ts's own identical constant: `onSchedule`'s
+// underlying Cloud Scheduler job has its own, smaller list of supported
+// regions than Cloud Functions v2 does, and `europe-north1` isn't on it.
+// Duplicated rather than imported — collaborative.ts doesn't export its
+// own copy, and this project's own convention is "zero coupling between
+// sibling top-level files" for a one-line constant (see REGION's own
+// history).
+//
+// SCHEDULE — "every 1 hours": Stories expire after ~24h and the user-
+// facing effect (an expired Story disappearing from every query) already
+// happens immediately and independently of this job — physical cleanup
+// can safely lag by up to an hour with zero user-visible consequence.
+// Hourly keeps both the per-run batch size and any R2/Firestore delete
+// cost small and predictable, without the operational overhead of a
+// sub-hourly cadence this app's current Story volume does nothing to
+// justify (mirrors collaborative.ts's own "every 6 hours" reasoning for
+// why a slower, cost-conscious cadence was chosen over a tighter one).
+//
+// BATCH SIZE — one bounded query per invocation, no in-function
+// pagination loop: see cleanupExpiredStoriesBatch's own doc comment
+// (storyExpiryCleanup.ts) for why any overflow beyond one batch simply
+// waits for the next hourly run — the smallest reliable implementation
+// this spec's own Part 2 asked for, not a correctness requirement to
+// drain the entire backlog in one invocation.
+// ---------------------------------------------------------------------------
+const SCHEDULE_REGION = 'europe-west1';
+const STORY_EXPIRY_CLEANUP_BATCH_SIZE = 300;
+
+export const cleanupExpiredStories = onSchedule(
+  { region: SCHEDULE_REGION, schedule: 'every 1 hours', timeoutSeconds: 540, memory: '256MiB', secrets: [r2AccessKeyIdSecret, r2SecretAccessKeySecret] },
+  async () => {
+    const db = getFirestore();
+    const bucket = getStorage().bucket();
+
+    // `expiresAt` is `null` while status is 'uploading' (see
+    // Story.expiresAt's own doc comment, src/types/story.ts) — Firestore
+    // inequality filters already exclude null/missing values on their
+    // own, so `status == 'published'` is not strictly required for
+    // correctness here, only for query-plan clarity and to match the
+    // narrow composite index this query actually uses (stories:
+    // status ASC, expiresAt ASC — see firestore.indexes.json).
+    const snap = await db
+      .collection('stories')
+      .where('status', '==', 'published')
+      .where('expiresAt', '<=', Timestamp.now())
+      .limit(STORY_EXPIRY_CLEANUP_BATCH_SIZE)
+      .get();
+
+    if (snap.empty) {
+      logger.info('[cleanupExpiredStories] No expired Stories to clean up.');
+      return;
+    }
+
+    const stories = snap.docs.map((docSnap) => ({
+      id: docSnap.id,
+      authorUid: docSnap.data().authorUid as string,
+      storageProvider: docSnap.data().storageProvider as string | undefined,
+    }));
+
+    const result = await cleanupExpiredStoriesBatch(bucket, stories, {
+      deleteStoryDocument: (id) => db.doc(`stories/${id}`).delete().then(() => undefined),
+    });
+
+    logger.info('[cleanupExpiredStories] Expired Story cleanup complete', result);
+  }
+);
 
 // ---------------------------------------------------------------------------
 // Profile documents — dependency order matters: users/{uid} is read for
 // usernameLower right up until it is the LAST document removed of any kind.
 // ---------------------------------------------------------------------------
+
+/**
+ * Step 3C — releases this uid's current ownership claim (if any) on
+ * every physical token it ever registered, THEN deletes the per-user
+ * pushTokens document itself. drainCollection alone only deletes — it
+ * never reads a field first — so this needs its own small loop to read
+ * each document's `expoPushToken` before removing it.
+ *
+ * Each release is independently conditional on
+ * `pushTokenOwners/{token}.uid` STILL equaling this uid — exactly
+ * mirroring the client-side release's own same condition
+ * (removeCurrentDevicePushToken, src/services/pushTokens.ts) — never
+ * unconditionally deleting a registry entry a NEWER registration (a
+ * different, still-active user on the same physical device) may have
+ * already, legitimately reassigned to itself. The Admin SDK bypasses
+ * Firestore Rules entirely, so this check must be enforced here in
+ * code; Rules cannot do it for a trusted backend call.
+ *
+ * Purely a hygiene cleanup, not a security requirement on its own — the
+ * ACTUAL cross-account privacy guarantee already holds regardless of
+ * whether this ever runs, because the next REAL registration on that
+ * physical device reassigns the registry correctly either way (see
+ * pushTokens.ts's own top doc comment). This exists so a deleted
+ * account doesn't leave its uid sitting in the registry indefinitely
+ * for a token nobody will ever re-register.
+ */
+async function releaseOwnedPushTokensAndDrain(db: Firestore, uid: string): Promise<number> {
+  let deleted = 0;
+  for (;;) {
+    const snap = await db.collection(`users/${uid}/pushTokens`).limit(OWNED_DOC_PAGE_SIZE).get();
+    if (snap.empty) break;
+    for (const docSnap of snap.docs) {
+      const expoPushToken = docSnap.data()?.expoPushToken as string | undefined;
+      if (expoPushToken) {
+        const ownerRef = db.doc(`pushTokenOwners/${expoPushToken}`);
+        const ownerSnap = await ownerRef.get().catch(() => null);
+        if (ownerSnap?.exists && ownerSnap.data()?.uid === uid) {
+          await ownerRef.delete().catch(() => undefined);
+        }
+      }
+      await docSnap.ref.delete().catch(() => undefined);
+      deleted += 1;
+    }
+  }
+  return deleted;
+}
 
 async function deleteProfileDocuments(db: Firestore, uid: string) {
   const result = {
@@ -442,8 +749,22 @@ async function deleteProfileDocuments(db: Firestore, uid: string) {
     usernameReservationDeleted: false,
     usernameReservationMismatch: false,
     savedRelationshipsDeleted: 0,
+    pushTokensDeleted: 0,
     userDocDeleted: false,
+    profileMedia: {
+      photoFirebaseDeleted: false,
+      photoR2Attempted: false,
+      coverFirebaseDeleted: false,
+      coverR2Attempted: false,
+    },
   };
+
+  // Fills a real, confirmed gap: profilePhotos/{uid}/photo and
+  // profileCovers/{uid}/photo were never deleted on account deletion, on
+  // either backend — see cleanupProfileOwnedMedia's own doc comment.
+  // Best-effort, like every other media cleanup in this function: a
+  // storage hiccup here never blocks the rest of this account's deletion.
+  result.profileMedia = await cleanupProfileOwnedMedia(getStorage().bucket(), uid);
 
   await db.doc(`privacySettings/${uid}`).delete().catch(() => undefined);
   result.privacySettingsDeleted = true;
@@ -459,6 +780,16 @@ async function deleteProfileDocuments(db: Firestore, uid: string) {
   // all this needs — same primitive already used for every other owned
   // subcollection in this file.
   result.savedRelationshipsDeleted = await drainCollection(db, `users/${uid}/saved`);
+
+  // Step 3B/3C — users/{uid}/pushTokens, same "subcollections never
+  // cascade-delete with their parent" reasoning as saved above. Also
+  // releases this uid's own entries in the separate pushTokenOwners
+  // registry (see releaseOwnedPushTokensAndDrain's own doc comment) —
+  // there is no corresponding Expo-side token to revoke beyond this
+  // app's own Firestore bookkeeping (Expo tokens aren't individually
+  // "deleted," only naturally become invalid once this app is
+  // uninstalled or stops being used).
+  result.pushTokensDeleted = await releaseOwnedPushTokensAndDrain(db, uid);
 
   const userRef = db.doc(`users/${uid}`);
   const userSnap = await userRef.get();
@@ -490,7 +821,7 @@ async function deleteProfileDocuments(db: Firestore, uid: string) {
 // The callable itself.
 // ---------------------------------------------------------------------------
 
-export const deleteMyAccountData = onCall({ region: REGION, timeoutSeconds: 300, memory: '256MiB' }, async (request) => {
+export const deleteMyAccountData = onCall({ region: REGION, timeoutSeconds: 300, memory: '256MiB', secrets: [r2AccessKeyIdSecret, r2SecretAccessKeySecret] }, async (request) => {
   if (!request.auth) {
     throw new HttpsError('unauthenticated', 'Sign in required.');
   }
@@ -535,6 +866,7 @@ export const deleteMyAccountData = onCall({ region: REGION, timeoutSeconds: 300,
 
   const ownContent = await deleteOwnContent(db, uid);
   const ownReels = await deleteOwnReels(db, uid);
+  const ownStories = await deleteOwnStories(db, uid);
 
   // The backend also cleans the underlying actions itself (above), so it
   // doesn't need the client-rules "paired action" pairing constraint —
@@ -559,6 +891,7 @@ export const deleteMyAccountData = onCall({ region: REGION, timeoutSeconds: 300,
     },
     ownContentDeleted: ownContent.deleted,
     ownReels,
+    ownStories,
     notifications: { asRecipientRemoved: notifRecipient.total, asActorRemoved: notifActor.total },
     // Locked policy: never deleted, never mutated, never inspected beyond
     // this fixed literal — no counts, no bodies, no reasons ever leave here.
@@ -876,7 +1209,11 @@ async function drainNotificationsByField(db: Firestore, field: 'contentId' | 're
  * read) plus every notification referencing it. Never touches any other
  * content the same author owns.
  */
-export const removeReportedContent = onCall({ region: REGION, timeoutSeconds: 300, memory: '256MiB' }, async (request) => {
+// R2 secrets added: moderation removal of an Event can now delete an
+// R2-backed cover image via deleteContentDocumentAndSubcollections' own
+// cleanupEventOwnedMedia call — previously unneeded since Events never
+// persisted a deletable storage key at all.
+export const removeReportedContent = onCall({ region: REGION, timeoutSeconds: 300, memory: '256MiB', secrets: [r2AccessKeyIdSecret, r2SecretAccessKeySecret] }, async (request) => {
   requireAdmin(request);
   const reportId = parseReportId(request);
   const adminUid = request.auth!.uid;
@@ -911,7 +1248,7 @@ export const removeReportedContent = onCall({ region: REGION, timeoutSeconds: 30
   if (contentSnap.exists) {
     // Step 41.2H.2.1 — moderation removal, unlike voluntary self-delete,
     // never earned legitimate reputation credit to begin with.
-    await deleteContentDocumentAndSubcollections(db, contentId, 'remove');
+    await deleteContentDocumentAndSubcollections(db, contentId, 'remove', getStorage().bucket());
   }
   await drainNotificationsByField(db, 'contentId', contentId);
   await resolveReport(db, reportId, adminUid);
@@ -926,20 +1263,25 @@ export const removeReportedContent = onCall({ region: REGION, timeoutSeconds: 30
 });
 
 /**
- * Removes a reported Reel: its subcollections, its exact Storage source
- * object, the Firestore document, and every notification referencing it.
+ * Removes a reported Reel: its subcollections, EVERY physical media
+ * object it owns (source, thumbnail, standalone music — see Step 9D's
+ * own cleanupReelOwnedMedia doc comment for the full model), the
+ * Firestore document, and every notification referencing it.
  *
  * If the Firestore doc is already gone (e.g. a prior attempt deleted it
- * but failed before Storage cleanup), the canonical Storage path is
- * re-derived from the REPORT's own targetUid + reelId rather than given up
- * on — isValidReelReport (firestore.rules) pins targetUid to the Reel's
- * real authorUid at report-creation time, and authorUid is never mutated
- * afterward, so `reels/{targetUid}/{reelId}/source` is exactly the same
- * canonical path reelStoragePath() derives client-side
- * (src/services/reels.ts). This is what makes a Storage-only retry safe
- * without trusting anything from the request itself.
+ * but failed before storage cleanup), Step 9D replaces the old
+ * Firebase-only single-path guess with cleanupReelOwnedMediaWithoutDocument
+ * — the REPORT's own `targetUid`/`reelId` are exactly as trusted as a real
+ * document's own authorUid/id (isValidReelReport, firestore.rules, pins
+ * `targetUid` to the Reel's real authorUid at report-creation time, never
+ * mutated afterward), so every deterministic key (source/thumbnail/music,
+ * on EITHER backend) can now be attempted directly, not just a single
+ * inferred Firebase path — see that function's own doc comment for the
+ * full safety reasoning. This is what makes a storage-only retry safe
+ * without trusting anything from the request itself, and (unlike before
+ * Step 9D) actually finds and deletes an R2-sourced Reel's media too.
  */
-export const removeReportedReel = onCall({ region: REGION, timeoutSeconds: 300, memory: '256MiB' }, async (request) => {
+export const removeReportedReel = onCall({ region: REGION, timeoutSeconds: 300, memory: '256MiB', secrets: [r2AccessKeyIdSecret, r2SecretAccessKeySecret] }, async (request) => {
   requireAdmin(request);
   const reportId = parseReportId(request);
   const adminUid = request.auth!.uid;
@@ -976,13 +1318,24 @@ export const removeReportedReel = onCall({ region: REGION, timeoutSeconds: 300, 
   const targetAlreadyMissing = !reelSnap.exists;
 
   if (reelSnap.exists) {
-    const storagePath = reelSnap.data()?.storagePath as string | undefined;
+    const reelData = reelSnap.data();
+    // Only a published Reel ever incremented these — see
+    // deleteReelDocumentAndSubcollections' own `hashtagsToDecrement` doc
+    // comment.
+    const hashtagsToDecrement = reelData?.status === 'published' ? ((reelData?.hashtags as string[] | undefined) ?? []) : [];
     // Step 41.2H.2.1 — moderation removal never earned legitimate
-    // reputation credit to begin with.
-    await deleteReelDocumentAndSubcollections(db, bucket, reelId, storagePath, 'remove');
+    // reputation credit to begin with. `reportedAuthorUid` (the report's
+    // own trusted targetUid) is passed rather than `reelData.authorUid` —
+    // see cleanupReelOwnedMedia's own doc comment on why uid is always an
+    // explicit parameter.
+    await deleteReelDocumentAndSubcollections(db, bucket, reelId, reportedAuthorUid, reelData, 'remove', hashtagsToDecrement);
   } else {
-    const inferredStoragePath = `reels/${reportedAuthorUid}/${reelId}/source`;
-    await bucket.file(inferredStoragePath).delete({ ignoreNotFound: true });
+    // Step 9D — see this callable's own doc comment above for the full
+    // reasoning this replaces Step 9A's old single-Firebase-path guess
+    // with: the report's own targetUid/reelId are trusted, every key is
+    // deterministic, and there is no unrelated object this could ever
+    // touch.
+    await cleanupReelOwnedMediaWithoutDocument(bucket, reportedAuthorUid, reelId);
   }
 
   await drainNotificationsByField(db, 'reelId', reelId);
@@ -1224,12 +1577,25 @@ function parseReelIdParam(request: CallableRequest): string {
   return reelId;
 }
 
+/** Step 11C — same shape/convention as parseReelIdParam above, for finalizeStoryVideo's own `storyId` param. */
+function parseStoryIdParam(request: CallableRequest): string {
+  const storyId = request.data?.storyId;
+  if (typeof storyId !== 'string' || storyId.length === 0 || storyId.length > MAX_REPORT_ID_LENGTH) {
+    throw new HttpsError('invalid-argument', 'storyId must be a non-empty string.');
+  }
+  return storyId;
+}
+
 /**
  * Deletes exactly one Post/Activity/Event the caller authored. Never
  * touches any other document the same author owns — the target is the
  * one exact contentId given, nothing derived from an authorUid query.
  */
-export const deleteMyContent = onCall({ region: REGION, timeoutSeconds: 300, memory: '256MiB' }, async (request) => {
+// R2 secrets added: self-deleting an Event can now delete an R2-backed
+// cover image via deleteContentDocumentAndSubcollections' own
+// cleanupEventOwnedMedia call — same reasoning as removeReportedContent
+// above.
+export const deleteMyContent = onCall({ region: REGION, timeoutSeconds: 300, memory: '256MiB', secrets: [r2AccessKeyIdSecret, r2SecretAccessKeySecret] }, async (request) => {
   if (!request.auth) {
     throw new HttpsError('unauthenticated', 'Sign in required.');
   }
@@ -1254,7 +1620,7 @@ export const deleteMyContent = onCall({ region: REGION, timeoutSeconds: 300, mem
   // Step 41.2H.2.1 — voluntary author self-delete: Liked is a lifetime-
   // earned reputation value, so received postLikes on this Post survive
   // even though the Post itself, and its real nested Like docs, do not.
-  await deleteContentDocumentAndSubcollections(db, contentId, 'preserve');
+  await deleteContentDocumentAndSubcollections(db, contentId, 'preserve', getStorage().bucket());
 
   return { contentId, type, deleted: true as const };
 });
@@ -1267,7 +1633,7 @@ export const deleteMyContent = onCall({ region: REGION, timeoutSeconds: 300, mem
  * regardless of status, reusing the same per-document primitive
  * moderation already relies on).
  */
-export const deleteMyReel = onCall({ region: REGION, timeoutSeconds: 300, memory: '256MiB' }, async (request) => {
+export const deleteMyReel = onCall({ region: REGION, timeoutSeconds: 300, memory: '256MiB', secrets: [r2AccessKeyIdSecret, r2SecretAccessKeySecret] }, async (request) => {
   if (!request.auth) {
     throw new HttpsError('unauthenticated', 'Sign in required.');
   }
@@ -1285,12 +1651,18 @@ export const deleteMyReel = onCall({ region: REGION, timeoutSeconds: 300, memory
   }
 
   const bucket = getStorage().bucket();
-  const storagePath = reel.storagePath as string | undefined;
+  // Only a published Reel ever incremented these — see
+  // deleteReelDocumentAndSubcollections' own `hashtagsToDecrement` doc
+  // comment.
+  const hashtagsToDecrement = reel.status === 'published' ? ((reel.hashtags as string[] | undefined) ?? []) : [];
 
   await drainNotificationsByField(db, 'reelId', reelId);
   // Step 41.2H.2.1 — voluntary author self-delete: same reasoning as
-  // deleteMyContent above — received postLikes survive.
-  await deleteReelDocumentAndSubcollections(db, bucket, reelId, storagePath, 'preserve');
+  // deleteMyContent above — received postLikes survive. `uid` (the
+  // AUTHENTICATED caller, already verified above to equal
+  // `reel.authorUid`) is passed explicitly rather than reading
+  // `reel.authorUid` again — see cleanupReelOwnedMedia's own doc comment.
+  await deleteReelDocumentAndSubcollections(db, bucket, reelId, uid, reel, 'preserve', hashtagsToDecrement);
 
   return { reelId, deleted: true as const };
 });
@@ -1332,6 +1704,32 @@ export const deleteMyReel = onCall({ region: REGION, timeoutSeconds: 300, memory
 // ---------------------------------------------------------------------------
 
 const execFileAsync = promisify(execFile);
+
+// ---------------------------------------------------------------------------
+// Step 9A/9B/9C — provider-aware Reel-SOURCE read. muxReelMusic (Step 9B)
+// and renderPhotoToVideo (Step 9C) below are BOTH now provider-aware —
+// see downloadReelSourceForMux/uploadMuxedReelSourceToProvider's own doc
+// comments in reelSourceStorage.ts, reused unchanged by both callables:
+// neither cares whether the "primary object" they read/replace is a
+// video or a still photo, only its bytes/contentType/cache-control,
+// keyed by this Reel's own deterministic reelSourceKey(uid, reelId).
+// resolveOwnSoundOrigin and addReelToMyStory read the same way, for an
+// already-PUBLISHED plain video Reel (no server-side rewrite pending).
+//
+// For 'r2', `reel.sourceUrl` is already a resolved, PUBLIC delivery URL
+// (see requestMediaUploadAuthorization.ts's own mediaUrl computation) —
+// an ordinary HTTPS GET, no R2 credential of any kind needed, which is
+// exactly why neither of those two callables needs an R2 secret bound
+// (see this file's own top doc comment on r2AccessKeyIdSecret). Buffering
+// the whole response in memory before writing it is safe specifically
+// because REEL_VIDEO_MAX_SIZE_BYTES already caps a Reel source at 50 MB —
+// both callables already run at 1GiB memory for their own ffmpeg step,
+// so a single 50 MB buffer is a rounding error next to that.
+// See functions/src/media/reelSourceStorage.ts's own doc comment for the
+// full implementation — extracted there specifically so its Firebase/R2
+// branching is directly unit-testable with a fake bucket and a local HTTP
+// test server, instead of only reachable via a real deployed callable.
+// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Sound attribution — see Reel.musicHash's own doc comment in
@@ -1385,151 +1783,220 @@ async function resolveSoundOrigin(
   });
 }
 
-export const muxReelMusic = onCall({ region: REGION, timeoutSeconds: 300, memory: '1GiB' }, async (request) => {
-  if (!request.auth) {
-    throw new HttpsError('unauthenticated', 'Sign in required.');
+/**
+ * Step 9B — Cache-Control for the muxed video replacement, R2 only (see
+ * putR2Object's own doc comment in r2Storage.ts for the full reasoning):
+ * once this object is reachable ONLY via a fresh, version-stamped URL
+ * (see the `buildVersionedSourceUrl` callback passed to performReelMux
+ * below), marking the response long-lived+immutable is safe — a future
+ * content change would need a NEW upload+mux cycle entirely (this Reel's
+ * source becomes immutable the moment it's published), which this
+ * codebase's design never does anyway. `undefined` for Firebase — that
+ * branch of uploadMuxedReelSourceToProvider ignores this parameter
+ * entirely, and Firebase Storage's own caching is unrelated to this
+ * step's scope.
+ */
+function muxedVideoCacheControl(videoProvider: string): string | undefined {
+  return videoProvider === 'r2' ? 'public, max-age=31536000, immutable' : undefined;
+}
+
+/**
+ * Step 9B — maps a performReelMux failure `reason` to the exact same
+ * HttpsError shape this callable already threw for the equivalent
+ * pre-Step-9B failure, so no client-visible behavior changes for a
+ * Firebase-sourced Reel — see reelMuxOrchestration.ts's own doc comment
+ * for the full workflow this backs.
+ */
+function muxFailureMessage(reason: ReelMuxFailureReason): string {
+  switch (reason) {
+    case 'video-unavailable':
+    case 'music-unavailable':
+      return 'Both the video and music must finish uploading before merging.';
+    default:
+      return "Couldn't process this post's music.";
   }
-  const reelId = parseReelIdParam(request);
-  const uid = request.auth.uid;
+}
 
-  const db = getFirestore();
-  const reelDocRef = db.doc(`reels/${reelId}`);
-  const reelSnap = await reelDocRef.get();
-  if (!reelSnap.exists) {
-    throw new HttpsError('not-found', 'No Reel with that ID exists.');
+/**
+ * Step 9C — renderPhotoToVideo's own equivalent of muxFailureMessage
+ * above, mapping the SAME performReelMux failure `reason`s to this
+ * callable's own pre-existing error wording (this function's
+ * `downloadVideo` slot is actually downloading the ORIGINAL PHOTO — see
+ * performReelMux's own generic "video" naming, unchanged since it has no
+ * reason to know which media kind it's really moving).
+ */
+function photoRenderFailureMessage(reason: ReelMuxFailureReason): string {
+  switch (reason) {
+    case 'video-unavailable':
+    case 'music-unavailable':
+      return 'Both the photo and music must finish uploading before rendering.';
+    default:
+      return "Couldn't process this post's photo.";
   }
-  const reel = reelSnap.data()!;
-  if (reel.authorUid !== uid) {
-    throw new HttpsError('permission-denied', 'You can only merge music into your own post.');
-  }
-  if (reel.status !== 'uploading') {
-    throw new HttpsError('failed-precondition', 'This post is not awaiting a music merge.');
-  }
-  if (reel.musicSourceType !== 'device') {
-    throw new HttpsError('failed-precondition', 'This post has no music to merge.');
-  }
-  if (!ffmpegPath) {
-    // Genuinely unexpected (ffmpeg-static failed to resolve a binary for
-    // this runtime) — never silently skip the merge and publish a silent
-    // video as if it had music.
-    throw new HttpsError('internal', "Couldn't process this post's music.");
-  }
+}
 
-  const bucket = getStorage().bucket();
-  const videoStoragePath = reel.storagePath as string;
-  const musicStoragePath = reel.musicStorageAudioPath as string;
-  const videoFile = bucket.file(videoStoragePath);
-  const musicFile = bucket.file(musicStoragePath);
+export const muxReelMusic = onCall(
+  { region: REGION, timeoutSeconds: 300, memory: '1GiB', secrets: [r2AccessKeyIdSecret, r2SecretAccessKeySecret] },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError('unauthenticated', 'Sign in required.');
+    }
+    const reelId = parseReelIdParam(request);
+    const uid = request.auth.uid;
 
-  const [[videoExists], [musicExists]] = await Promise.all([videoFile.exists(), musicFile.exists()]);
-  if (!videoExists || !musicExists) {
-    throw new HttpsError('failed-precondition', 'Both the video and music must finish uploading before merging.');
-  }
+    const db = getFirestore();
+    const reelDocRef = db.doc(`reels/${reelId}`);
+    const reelSnap = await reelDocRef.get();
+    const reel = reelSnap.exists ? (reelSnap.data() as Record<string, unknown>) : null;
+    const eligibility = checkReelMuxEligibility(reel, uid);
+    if (!eligibility.ok) {
+      throw new HttpsError(eligibility.code, eligibility.message);
+    }
+    // eligibility.ok guarantees `reel` is non-null.
+    const reelData = reel as Record<string, unknown>;
 
-  const workDir = await mkdtemp(join(tmpdir(), `reel-mux-${reelId}-`));
-  const localVideoPath = join(workDir, 'input-video');
-  const localMusicPath = join(workDir, 'input-music');
-  const localOutputPath = join(workDir, 'output.mp4');
-
-  try {
-    await Promise.all([videoFile.download({ destination: localVideoPath }), musicFile.download({ destination: localMusicPath })]);
-
-    // Hashed from the exact bytes just downloaded, BEFORE the standalone
-    // music object is deleted below — see this file's own "Sound
-    // attribution" section header for the full model.
-    const musicHash = await computeSha256Hex(localMusicPath);
-    const soundOrigin = await resolveSoundOrigin(db, musicHash, reel.authorUid as string, reelId);
-
-    await execFileAsync(
-      ffmpegPath,
-      [
-        '-y',
-        '-i', localVideoPath,
-        '-stream_loop', '-1',
-        '-i', localMusicPath,
-        '-map', '0:v:0',
-        '-map', '1:a:0',
-        '-c:v', 'copy',
-        '-c:a', 'aac',
-        '-b:a', '192k',
-        '-shortest',
-        localOutputPath,
-      ],
-      { timeout: 240_000 }
-    );
-
-    const outputStat = await stat(localOutputPath);
-    if (outputStat.size <= 0) {
+    if (!ffmpegPath) {
+      // Genuinely unexpected (ffmpeg-static failed to resolve a binary for
+      // this runtime) — never silently skip the merge and publish a silent
+      // video as if it had music.
       throw new HttpsError('internal', "Couldn't process this post's music.");
     }
 
-    await bucket.upload(localOutputPath, { destination: videoStoragePath, metadata: { contentType: 'video/mp4' } });
+    const bucket = getStorage().bucket();
+    // Step 9B — provider-aware: this Reel's video source may be on
+    // Firebase or R2 (see downloadReelSourceForMux/
+    // uploadMuxedReelSourceToProvider's own doc comments in
+    // reelSourceStorage.ts). `undefined` (a legacy Reel predating
+    // storageProvider) defaults to 'firebase', same convention as
+    // everywhere else this field is read.
+    const videoProvider = (reelData.storageProvider as string | undefined) ?? 'firebase';
 
-    // The FIRST time this exact sound is ever seen, its audio bytes are
-    // kept permanently at a stable, hash-keyed path — see
-    // soundOriginAudioStoragePath's own doc comment — before the
-    // per-Reel standalone copy below is deleted as redundant. Every
-    // LATER Reel reusing the same sound skips this: the canonical copy
-    // already exists.
-    if (soundOrigin.isNewOrigin) {
-      await bucket.upload(localMusicPath, {
-        destination: soundOriginAudioStoragePath(musicHash),
-        metadata: { contentType: reel.musicStorageContentType as string },
-      });
+    const workDir = await mkdtemp(join(tmpdir(), `reel-mux-${reelId}-`));
+    const paths = {
+      localVideoPath: join(workDir, 'input-video'),
+      localMusicPath: join(workDir, 'input-music'),
+      localOutputPath: join(workDir, 'output.mp4'),
+    };
+
+    try {
+      const outcome = await performReelMux(paths, {
+        // Step 11B — true idempotency: see reelMuxOrchestration.ts's own
+        // top doc comment for why this check runs before anything else.
+        readCanonicalSourceState: () => readReelCanonicalSourceState(bucket, reelData, uid, reelId),
+        downloadVideo: (destination) => downloadReelSourceForMux(bucket, reelData, uid, reelId, destination),
+        // Step 10B — provider-aware (see reelMusicStorage.ts's own doc
+        // comment): this Reel's own standalone music may now be on
+        // Firebase or R2.
+        downloadMusic: (destination) => downloadReelMusicToLocalFile(bucket, reelData, uid, reelId, destination),
+        // Step 11B — ONE encode pass does the music merge AND the
+        // universal delivery normalization together (see
+        // videoNormalizationProfile.ts's own doc comment for why this is the
+        // shared ffmpeg output profile every finalization pipeline uses)
+        // — replacing the pre-11B `-c:v copy` passthrough, which left a
+        // music Reel's own video stream completely untouched (original
+        // resolution/fps/codec/bitrate, whatever the device produced).
+        // Dimensions come from this Reel's own already-persisted
+        // width/height (see computeVideoOutputDimensions's own doc
+        // comment for why no ffprobe step is needed).
+        runFfmpegMux: (localVideoPath, localMusicPath, localOutputPath) =>
+          execFileAsync(
+            ffmpegPath!,
+            [
+              '-y',
+              '-i', localVideoPath,
+              '-stream_loop', '-1',
+              '-i', localMusicPath,
+              '-map', '0:v:0',
+              '-map', '1:a:0',
+              '-shortest',
+              ...buildVideoEncodeArgs(computeVideoOutputDimensions(reelData.width as number, reelData.height as number)),
+              localOutputPath,
+            ],
+            { timeout: 240_000 }
+          ).then(() => undefined),
+        statFileSize: async (path) => (await stat(path)).size,
+        computeSha256: computeSha256Hex,
+        resolveSoundOrigin: (musicHash) => resolveSoundOrigin(db, musicHash, reelData.authorUid as string, reelId),
+        uploadMuxedVideo: (localOutputPath) => uploadMuxedReelSourceToProvider(bucket, reelData, uid, reelId, localOutputPath, 'video/mp4', muxedVideoCacheControl(videoProvider)),
+        uploadSoundOriginCopy: (localMusicPath, musicHash) =>
+          bucket
+            .upload(localMusicPath, {
+              destination: soundOriginAudioStoragePath(musicHash),
+              metadata: { contentType: reelData.musicStorageContentType as string },
+            })
+            .then(() => undefined),
+        // Step 10B — provider-aware (see reelMusicStorage.ts's own doc
+        // comment). Unchanged ordering: still called ONLY after
+        // updateReelDocument succeeds below — Step 9B's own critical fix.
+        deleteStandaloneMusic: () => deleteReelMusic(bucket, reelData, uid, reelId),
+        updateReelDocument: (fields) => reelDocRef.update({ ...fields, updatedAt: FieldValue.serverTimestamp() }).then(() => undefined),
+        buildVersionedSourceUrl: () => {
+          if (videoProvider !== 'r2') return null;
+          const publicMediaBaseUrl = getR2Config()?.publicMediaBaseUrl ?? null;
+          if (!publicMediaBaseUrl) return null;
+          return buildMediaUrl(publicMediaBaseUrl, reelSourceKey(uid, reelId), Date.now());
+        },
+      },
+      // Step 11B — the mux encode pass ALREADY applies the shared
+      // VIDEO_DELIVERY_PROFILE above, so this Reel's video is just as
+      // "finalized" as one that went through finalizeReelVideo —
+      // recorded in the exact same atomic confirm-write, via the same
+      // extraConfirmFields mechanism renderPhotoToVideo already uses
+      // below, so no reader can ever see a published music Reel with
+      // `sourceNormalized` still false.
+      { sourceNormalized: true });
+
+      if (!outcome.ok) {
+        throw new HttpsError(outcome.reason === 'video-unavailable' || outcome.reason === 'music-unavailable' ? 'failed-precondition' : 'internal', muxFailureMessage(outcome.reason));
+      }
+    } catch (error) {
+      if (error instanceof HttpsError) throw error;
+      throw new HttpsError('internal', "Couldn't process this post's music.");
+    } finally {
+      await rm(workDir, { recursive: true, force: true });
     }
 
-    // The standalone music object is now redundant — the merged video is
-    // the only copy of the sound from here on. Best-effort: a failure here
-    // leaves an orphaned object, never a broken post (same reasoning as
-    // discardReelDraft's own Storage cleanup on the client).
-    await musicFile.delete({ ignoreNotFound: true }).catch(() => undefined);
-
-    await reelDocRef.update({
-      storageContentType: 'video/mp4',
-      fileSizeBytes: outputStat.size,
-      musicHash,
-      soundOriginAuthorUid: soundOrigin.originAuthorUid,
-      soundOriginReelId: soundOrigin.originReelId,
-      updatedAt: FieldValue.serverTimestamp(),
-    });
-  } catch (error) {
-    if (error instanceof HttpsError) throw error;
-    throw new HttpsError('internal', "Couldn't process this post's music.");
-  } finally {
-    await rm(workDir, { recursive: true, force: true });
+    return { reelId, merged: true as const };
   }
-
-  return { reelId, merged: true as const };
-});
+);
 
 // ---------------------------------------------------------------------------
-// Step — "FOTO" mode photo taken WITH music, rendered into a real video.
+// Step 9C — "FOTO" mode photo taken WITH music, rendered into a real
+// video. Now PROVIDER-AWARE for both its input (the original photo) and
+// its output (the rendered video), reusing performReelMux — the exact
+// same orchestration muxReelMusic already runs — via its new
+// `extraConfirmFields` parameter, rather than a second, duplicated
+// download->ffmpeg->upload->confirm->cleanup implementation.
 //
-// Different operation from muxReelMusic above: that one merges an audio
-// track into an EXISTING video. This one generates the video itself — the
-// client only ever has a still photo plus a separate music file, and
-// nothing in this project's managed Expo toolchain can turn "one image +
-// one audio file" into a real video on-device (same reasoning as
-// muxReelMusic's own file-header comment for why this has to be a trusted
-// backend callable running real ffmpeg).
+// Different SOURCE operation from muxReelMusic above: that one merges an
+// audio track into an EXISTING video. This one generates the video
+// itself — the client only ever has a still photo plus a separate music
+// file, and nothing in this project's managed Expo toolchain can turn
+// "one image + one audio file" into a real video on-device (same
+// reasoning as muxReelMusic's own file-header comment for why this has
+// to be a trusted backend callable running real ffmpeg). Everything
+// AFTER ffmpeg — provider-aware upload, sound attribution, confirm-write
+// ordering, best-effort music cleanup — is identical, which is exactly
+// what makes sharing performReelMux correct rather than coincidental.
 //
 // Only ever called for a draft created with mediaType: 'video' AND
 // needsPhotoVideoRender: true (see CreateReelDraftInput.photoRenderPending
 // and Reel.needsPhotoVideoRender's own doc comments in
 // src/services/reels.ts / src/types/reel.ts) — at that point
-// reel.storagePath actually still holds the ORIGINAL PHOTO (an image
-// upload was allowed there specifically because needsPhotoVideoRender was
-// true at create time — see storage.rules), and reel.musicStorageAudioPath
-// holds the chosen track. This downloads both, uses ffmpeg to hold the
-// still image for exactly REEL_PHOTO_DURATION_MS with the music (looped,
-// then cut to that same fixed length) as its audio track, and overwrites
-// reel.storagePath with the result — the same "overwrite in place, update
-// storageContentType/fileSizeBytes" pattern muxReelMusic already uses,
-// plus flipping needsPhotoVideoRender back to false so
-// firestore.rules' isValidReelPublish will actually allow publishing it.
-// The now-redundant standalone music object is deleted afterward, exactly
-// like muxReelMusic does — the rendered video is the only copy of the
-// sound from this point on.
+// reel.storagePath/reel.sourceUrl actually still hold the ORIGINAL PHOTO
+// (an image upload was allowed there specifically because
+// needsPhotoVideoRender was true at create time/authorization — see
+// checkReelVideoEligibility's own doc comment), on EITHER backend. This
+// downloads both the photo and the music, uses ffmpeg to hold the still
+// image for exactly REEL_PHOTO_RENDER_DURATION_SECONDS with the music
+// (looped, then cut to that same fixed length) as its audio track, and
+// overwrites the Reel's own source object with the result — on whichever
+// backend that Reel actually uses — via performReelMux's own confirm-write,
+// which ALSO flips `needsPhotoVideoRender` back to `false` in the exact
+// same atomic write that records the render succeeded (via
+// `extraConfirmFields`) — never a state where a reader could observe
+// `needsPhotoVideoRender: false` while the object is still the
+// un-rendered photo, or vice versa.
 //
 // "-loop 1" makes the still image an infinite-length video input;
 // "-stream_loop -1" does the same for the audio (reproducing exactly what
@@ -1537,132 +2004,436 @@ export const muxReelMusic = onCall({ region: REGION, timeoutSeconds: 300, memory
 // as long as needed); with BOTH inputs already infinite, "-t" (not
 // "-shortest", which only means anything when at least one input has a
 // real finite length) is what actually bounds the output to exactly
-// REEL_PHOTO_DURATION_MS. The scale filter forces even width/height —
-// libx264 requires it, and a photo's native dimensions aren't guaranteed
-// to already be even.
+// REEL_PHOTO_RENDER_DURATION_SECONDS. The scale filter forces even
+// width/height — libx264 requires it, and a photo's native dimensions
+// aren't guaranteed to already be even.
 // ---------------------------------------------------------------------------
 
 const REEL_PHOTO_RENDER_DURATION_SECONDS = 15;
 
-export const renderPhotoToVideo = onCall({ region: REGION, timeoutSeconds: 300, memory: '1GiB' }, async (request) => {
-  if (!request.auth) {
-    throw new HttpsError('unauthenticated', 'Sign in required.');
-  }
-  const reelId = parseReelIdParam(request);
-  const uid = request.auth.uid;
+export const renderPhotoToVideo = onCall(
+  { region: REGION, timeoutSeconds: 300, memory: '1GiB', secrets: [r2AccessKeyIdSecret, r2SecretAccessKeySecret] },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError('unauthenticated', 'Sign in required.');
+    }
+    const reelId = parseReelIdParam(request);
+    const uid = request.auth.uid;
 
-  const db = getFirestore();
-  const reelDocRef = db.doc(`reels/${reelId}`);
-  const reelSnap = await reelDocRef.get();
-  if (!reelSnap.exists) {
-    throw new HttpsError('not-found', 'No Reel with that ID exists.');
-  }
-  const reel = reelSnap.data()!;
-  if (reel.authorUid !== uid) {
-    throw new HttpsError('permission-denied', 'You can only process your own post.');
-  }
-  if (reel.status !== 'uploading') {
-    throw new HttpsError('failed-precondition', 'This post is not awaiting photo processing.');
-  }
-  if (reel.mediaType !== 'video' || reel.needsPhotoVideoRender !== true) {
-    throw new HttpsError('failed-precondition', 'This post does not need photo-to-video rendering.');
-  }
-  if (reel.musicSourceType !== 'device') {
-    throw new HttpsError('failed-precondition', 'This post has no music to render with.');
-  }
-  if (!ffmpegPath) {
-    // Genuinely unexpected (ffmpeg-static failed to resolve a binary for
-    // this runtime) — never silently skip rendering and publish the raw
-    // photo as if it were a real video.
-    throw new HttpsError('internal', "Couldn't process this post's photo.");
-  }
+    const db = getFirestore();
+    const reelDocRef = db.doc(`reels/${reelId}`);
+    const reelSnap = await reelDocRef.get();
+    const reel = reelSnap.exists ? (reelSnap.data() as Record<string, unknown>) : null;
+    const eligibility = checkReelPhotoRenderEligibility(reel, uid);
+    if (!eligibility.ok) {
+      throw new HttpsError(eligibility.code, eligibility.message);
+    }
+    // eligibility.ok guarantees `reel` is non-null.
+    const reelData = reel as Record<string, unknown>;
 
-  const bucket = getStorage().bucket();
-  const photoStoragePath = reel.storagePath as string;
-  const musicStoragePath = reel.musicStorageAudioPath as string;
-  const photoFile = bucket.file(photoStoragePath);
-  const musicFile = bucket.file(musicStoragePath);
-
-  const [[photoExists], [musicExists]] = await Promise.all([photoFile.exists(), musicFile.exists()]);
-  if (!photoExists || !musicExists) {
-    throw new HttpsError('failed-precondition', 'Both the photo and music must finish uploading before rendering.');
-  }
-
-  const workDir = await mkdtemp(join(tmpdir(), `reel-photo-render-${reelId}-`));
-  const localPhotoPath = join(workDir, 'input-photo');
-  const localMusicPath = join(workDir, 'input-music');
-  const localOutputPath = join(workDir, 'output.mp4');
-
-  try {
-    await Promise.all([photoFile.download({ destination: localPhotoPath }), musicFile.download({ destination: localMusicPath })]);
-
-    // Same sound-attribution step as muxReelMusic — see this file's own
-    // "Sound attribution" section header above.
-    const musicHash = await computeSha256Hex(localMusicPath);
-    const soundOrigin = await resolveSoundOrigin(db, musicHash, reel.authorUid as string, reelId);
-
-    await execFileAsync(
-      ffmpegPath,
-      [
-        '-y',
-        '-loop', '1',
-        '-i', localPhotoPath,
-        '-stream_loop', '-1',
-        '-i', localMusicPath,
-        '-map', '0:v:0',
-        '-map', '1:a:0',
-        '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
-        '-c:v', 'libx264',
-        '-tune', 'stillimage',
-        '-pix_fmt', 'yuv420p',
-        '-c:a', 'aac',
-        '-b:a', '192k',
-        '-t', String(REEL_PHOTO_RENDER_DURATION_SECONDS),
-        localOutputPath,
-      ],
-      { timeout: 240_000 }
-    );
-
-    const outputStat = await stat(localOutputPath);
-    if (outputStat.size <= 0) {
+    if (!ffmpegPath) {
+      // Genuinely unexpected (ffmpeg-static failed to resolve a binary for
+      // this runtime) — never silently skip rendering and publish the raw
+      // photo as if it were a real video.
       throw new HttpsError('internal', "Couldn't process this post's photo.");
     }
 
-    await bucket.upload(localOutputPath, { destination: photoStoragePath, metadata: { contentType: 'video/mp4' } });
+    const bucket = getStorage().bucket();
+    // Provider-aware, same convention as muxReelMusic above: `undefined`
+    // (a legacy Reel predating storageProvider) defaults to 'firebase'.
+    const photoProvider = (reelData.storageProvider as string | undefined) ?? 'firebase';
 
-    // Same one-time permanent-copy step as muxReelMusic — see
-    // soundOriginAudioStoragePath's own doc comment.
-    if (soundOrigin.isNewOrigin) {
-      await bucket.upload(localMusicPath, {
-        destination: soundOriginAudioStoragePath(musicHash),
-        metadata: { contentType: reel.musicStorageContentType as string },
-      });
+    const workDir = await mkdtemp(join(tmpdir(), `reel-photo-render-${reelId}-`));
+    const paths = {
+      localVideoPath: join(workDir, 'input-photo'),
+      localMusicPath: join(workDir, 'input-music'),
+      localOutputPath: join(workDir, 'output.mp4'),
+    };
+
+    try {
+      const outcome = await performReelMux(
+        paths,
+        {
+          // Step 11B — true idempotency: see reelMuxOrchestration.ts's
+          // own top doc comment for why this check runs before anything
+          // else — never re-render an already-normalized photo video.
+          readCanonicalSourceState: () => readReelCanonicalSourceState(bucket, reelData, uid, reelId),
+          // performReelMux's own `downloadVideo` slot — here downloading
+          // the ORIGINAL PHOTO, provider-aware exactly like muxReelMusic's
+          // own video download (see reelSourceStorage.ts: this helper
+          // only cares about bytes/key, never the media kind).
+          downloadVideo: (destination) => downloadReelSourceForMux(bucket, reelData, uid, reelId, destination),
+          // Step 10B — provider-aware (see reelMusicStorage.ts's own doc
+          // comment).
+          downloadMusic: (destination) => downloadReelMusicToLocalFile(bucket, reelData, uid, reelId, destination),
+          // Step 11B — reuses the exact same shared encode profile as
+          // muxReelMusic and finalizeReelVideo (see videoNormalizationProfile.ts's
+          // own doc comment) instead of this workflow's own separate,
+          // looser settings (no resolution cap, implicit CRF, no
+          // faststart, 192k audio) — this render itself now produces the
+          // FINAL normalized delivery asset directly, with no second
+          // transcode needed afterward. `-tune stillimage` is kept as an
+          // ADDITION on top of the shared profile, not part of it: x264's
+          // own tuning for genuinely static source content, which applies
+          // ONLY here (a true `-loop 1` still image) and would be wrong
+          // for muxReelMusic's/finalizeReelVideo's own real motion video
+          // inputs. Dimensions come from this Reel's own already-
+          // persisted width/height — the ORIGINAL PHOTO's dimensions,
+          // same field read elsewhere for this exact Reel variant.
+          runFfmpegMux: (localPhotoPath, localMusicPath, localOutputPath) =>
+            execFileAsync(
+              ffmpegPath!,
+              [
+                '-y',
+                '-loop', '1',
+                '-i', localPhotoPath,
+                '-stream_loop', '-1',
+                '-i', localMusicPath,
+                '-map', '0:v:0',
+                '-map', '1:a:0',
+                '-t', String(REEL_PHOTO_RENDER_DURATION_SECONDS),
+                '-tune', 'stillimage',
+                ...buildVideoEncodeArgs(computeVideoOutputDimensions(reelData.width as number, reelData.height as number)),
+                localOutputPath,
+              ],
+              { timeout: 240_000 }
+            ).then(() => undefined),
+          statFileSize: async (path) => (await stat(path)).size,
+          computeSha256: computeSha256Hex,
+          resolveSoundOrigin: (musicHash) => resolveSoundOrigin(db, musicHash, reelData.authorUid as string, reelId),
+          uploadMuxedVideo: (localOutputPath) =>
+            uploadMuxedReelSourceToProvider(bucket, reelData, uid, reelId, localOutputPath, 'video/mp4', muxedVideoCacheControl(photoProvider)),
+          uploadSoundOriginCopy: (localMusicPath, musicHash) =>
+            bucket
+              .upload(localMusicPath, {
+                destination: soundOriginAudioStoragePath(musicHash),
+                metadata: { contentType: reelData.musicStorageContentType as string },
+              })
+              .then(() => undefined),
+          // Step 10B — provider-aware. Unchanged ordering: still called
+          // ONLY after updateReelDocument succeeds below.
+          deleteStandaloneMusic: () => deleteReelMusic(bucket, reelData, uid, reelId),
+          updateReelDocument: (fields) => reelDocRef.update({ ...fields, updatedAt: FieldValue.serverTimestamp() }).then(() => undefined),
+          buildVersionedSourceUrl: () => {
+            if (photoProvider !== 'r2') return null;
+            const publicMediaBaseUrl = getR2Config()?.publicMediaBaseUrl ?? null;
+            if (!publicMediaBaseUrl) return null;
+            return buildMediaUrl(publicMediaBaseUrl, reelSourceKey(uid, reelId), Date.now());
+          },
+        },
+        // The extra fields this workflow needs, atomically, in the
+        // SAME confirm-write that records the render succeeded — see
+        // this function's own top doc comment. sourceNormalized: true
+        // (Step 11B) — the render's own ffmpeg pass already applies the
+        // shared VIDEO_DELIVERY_PROFILE above, so a rendered Reel is exactly
+        // as "finalized" as a plain video that went through
+        // finalizeReelVideo or a music Reel muxReelMusic already
+        // finalized the same way.
+        { needsPhotoVideoRender: false, sourceNormalized: true }
+      );
+
+      if (!outcome.ok) {
+        throw new HttpsError(outcome.reason === 'video-unavailable' || outcome.reason === 'music-unavailable' ? 'failed-precondition' : 'internal', photoRenderFailureMessage(outcome.reason));
+      }
+    } catch (error) {
+      if (error instanceof HttpsError) throw error;
+      throw new HttpsError('internal', "Couldn't process this post's photo.");
+    } finally {
+      await rm(workDir, { recursive: true, force: true });
     }
 
-    await reelDocRef.update({
-      storageContentType: 'video/mp4',
-      fileSizeBytes: outputStat.size,
-      needsPhotoVideoRender: false,
-      musicHash,
-      soundOriginAuthorUid: soundOrigin.originAuthorUid,
-      soundOriginReelId: soundOrigin.originReelId,
-      updatedAt: FieldValue.serverTimestamp(),
-    });
-
-    // The standalone music object is now redundant — the rendered video is
-    // the only copy of the sound from here on. Best-effort: a failure here
-    // leaves an orphaned object, never a broken post (same reasoning as
-    // discardReelDraft's own Storage cleanup on the client).
-    await musicFile.delete({ ignoreNotFound: true }).catch(() => undefined);
-  } catch (error) {
-    if (error instanceof HttpsError) throw error;
-    throw new HttpsError('internal', "Couldn't process this post's photo.");
-  } finally {
-    await rm(workDir, { recursive: true, force: true });
+    return { reelId, rendered: true as const };
   }
+);
 
-  return { reelId, rendered: true as const };
-});
+/**
+ * Step 11B — maps a performReelVideoFinalization failure `reason` to a
+ * user-facing message, same convention as muxFailureMessage/
+ * photoRenderFailureMessage above.
+ */
+function reelVideoFinalizationFailureMessage(reason: ReelVideoFinalizationFailureReason): string {
+  switch (reason) {
+    case 'video-unavailable':
+      return 'Your video must finish uploading before it can be processed.';
+    default:
+      return "Couldn't finish processing this post's video.";
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Step 11B — UNIVERSAL REEL VIDEO NORMALIZATION, the plain-video branch:
+// closes the biggest pre-11B gap, where a Reel with NO music and NO
+// pending photo-render (checkReelVideoFinalizationEligibility's own exact
+// scope — see reelEligibility.ts) could reach publishReel having never
+// touched ffmpeg at all, leaving its video exactly whatever the device
+// camera/library produced (up to 4K/60fps/HEVC/high-bitrate/non-faststart
+// — see this step's own audit). A video+music Reel is finalized by
+// muxReelMusic above (same encode pass that merges the music in); a
+// render-pending Reel is finalized by renderPhotoToVideo above (same
+// encode pass that renders it); a plain photo Reel never reaches ffmpeg
+// at all (Part 9 of this step's spec — it is not a video). This callable
+// is the ONLY one of the three that exists purely to add normalization
+// where NOTHING else in the pipeline already produces a real encode.
+//
+// Called from src/app/(app)/create/reel/index.tsx's own plain-video
+// publish path, between the thumbnail upload finishing and publishReel —
+// publishReel itself additionally REFUSES to run at all for a video Reel
+// whose `sourceNormalized` isn't already `true` (see firestore.rules'
+// own isValidReelPublish), so this is a real server-enforced invariant,
+// not just client-side call-ordering discipline.
+//
+// IDEMPOTENT: a Reel whose `sourceNormalized` is already `true` (a retry
+// after this callable's own confirm-write already succeeded, but some
+// LATER step — e.g. publishReel itself — failed) short-circuits here with
+// no download/ffmpeg/upload at all, per Part 13 of this step's spec.
+// ---------------------------------------------------------------------------
+
+export const finalizeReelVideo = onCall(
+  { region: REGION, timeoutSeconds: 300, memory: '1GiB', secrets: [r2AccessKeyIdSecret, r2SecretAccessKeySecret] },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError('unauthenticated', 'Sign in required.');
+    }
+    const reelId = parseReelIdParam(request);
+    const uid = request.auth.uid;
+
+    const db = getFirestore();
+    const reelDocRef = db.doc(`reels/${reelId}`);
+    const reelSnap = await reelDocRef.get();
+    const reel = reelSnap.exists ? (reelSnap.data() as Record<string, unknown>) : null;
+    const eligibility = checkReelVideoFinalizationEligibility(reel, uid);
+    if (!eligibility.ok) {
+      throw new HttpsError(eligibility.code, eligibility.message);
+    }
+    // eligibility.ok guarantees `reel` is non-null.
+    const reelData = reel as Record<string, unknown>;
+
+    // Idempotency short-circuit — see this function's own top doc
+    // comment. Deliberately checked HERE, not inside
+    // checkReelVideoFinalizationEligibility: "already normalized" is a
+    // legitimate different OUTCOME (a no-op success), never a rejection.
+    if (reelData.sourceNormalized === true) {
+      return { reelId, finalized: true as const, alreadyNormalized: true as const };
+    }
+
+    if (!ffmpegPath) {
+      // Genuinely unexpected (ffmpeg-static failed to resolve a binary for
+      // this runtime) — never silently skip normalization and publish the
+      // raw, un-processed upload as if it were already finalized.
+      throw new HttpsError('internal', "Couldn't process this post's video.");
+    }
+
+    const bucket = getStorage().bucket();
+    // Provider-aware, same convention as muxReelMusic/renderPhotoToVideo
+    // above: `undefined` (a legacy Reel predating storageProvider)
+    // defaults to 'firebase'.
+    const videoProvider = (reelData.storageProvider as string | undefined) ?? 'firebase';
+
+    const workDir = await mkdtemp(join(tmpdir(), `reel-finalize-${reelId}-`));
+    const paths = {
+      localVideoPath: join(workDir, 'input-video'),
+      localOutputPath: join(workDir, 'output.mp4'),
+    };
+
+    try {
+      const outcome = await performReelVideoFinalization(paths, {
+        // Step 11B — true idempotency: see reelVideoFinalization.ts's own
+        // top doc comment for why this check runs before anything else.
+        readCanonicalSourceState: () => readReelCanonicalSourceState(bucket, reelData, uid, reelId),
+        downloadVideo: (destination) => downloadReelSourceForMux(bucket, reelData, uid, reelId, destination),
+        // Step 11B — the single shared encode profile (see
+        // videoNormalizationProfile.ts's own doc comment) — the ONE ffmpeg input
+        // is this Reel's own current video source; no second input, no
+        // mapping needed (ffmpeg's own default stream selection already
+        // picks the first video+audio stream of a single-file input,
+        // which re-encodes the device's own embedded audio track to AAC
+        // too, exactly as intended).
+        runFfmpegNormalize: (localVideoPath, localOutputPath) =>
+          execFileAsync(
+            ffmpegPath!,
+            [
+              '-y',
+              '-i', localVideoPath,
+              ...buildVideoEncodeArgs(computeVideoOutputDimensions(reelData.width as number, reelData.height as number)),
+              localOutputPath,
+            ],
+            { timeout: 240_000 }
+          ).then(() => undefined),
+        statFileSize: async (path) => (await stat(path)).size,
+        uploadNormalizedVideo: (localOutputPath) =>
+          uploadMuxedReelSourceToProvider(bucket, reelData, uid, reelId, localOutputPath, 'video/mp4', muxedVideoCacheControl(videoProvider)),
+        updateReelDocument: (fields) => reelDocRef.update({ ...fields, updatedAt: FieldValue.serverTimestamp() }).then(() => undefined),
+        buildVersionedSourceUrl: () => {
+          if (videoProvider !== 'r2') return null;
+          const publicMediaBaseUrl = getR2Config()?.publicMediaBaseUrl ?? null;
+          if (!publicMediaBaseUrl) return null;
+          return buildMediaUrl(publicMediaBaseUrl, reelSourceKey(uid, reelId), Date.now());
+        },
+      });
+
+      if (!outcome.ok) {
+        throw new HttpsError(
+          outcome.reason === 'video-unavailable' ? 'failed-precondition' : 'internal',
+          reelVideoFinalizationFailureMessage(outcome.reason)
+        );
+      }
+    } catch (error) {
+      if (error instanceof HttpsError) throw error;
+      throw new HttpsError('internal', "Couldn't process this post's video.");
+    } finally {
+      await rm(workDir, { recursive: true, force: true });
+    }
+
+    return { reelId, finalized: true as const, alreadyNormalized: false as const };
+  }
+);
+
+/**
+ * Step 11C — maps a performStoryVideoFinalization failure `reason` to a
+ * user-facing message, same convention as reelVideoFinalizationFailureMessage
+ * above.
+ */
+function storyVideoFinalizationFailureMessage(reason: StoryVideoFinalizationFailureReason): string {
+  switch (reason) {
+    case 'video-unavailable':
+      return 'Your video must finish uploading before it can be processed.';
+    default:
+      return "Couldn't finish processing this Story's video.";
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Step 11C — UNIVERSAL STORY VIDEO NORMALIZATION, the direct-capture
+// branch: a direct video Story (createStoryDraft -> uploadStoryMedia ->
+// publishStory, see src/services/stories.ts) previously reached
+// publishStory having never touched ffmpeg at all — exactly the same gap
+// Step 11B closed for a plain video Reel (finalizeReelVideo above),
+// mirrored here field-for-field: same shared VIDEO_DELIVERY_PROFILE (see
+// videoNormalizationProfile.ts), same idempotency marker/metadata-check
+// architecture (storySourceStorage.ts's readStoryCanonicalSourceState),
+// same ordering guarantee (the confirm-write is the one trusted write
+// that both stamps `sourceNormalized: true` AND is independently required
+// by firestore.rules' own isValidStoryPublish before a video Story can
+// ever publish).
+//
+// Called ONLY for mediaType === 'video' (checkStoryVideoFinalizationEligibility's
+// own exact scope) — a photo Story never reaches ffmpeg at all (Part 4 of
+// this step's spec), and a Story copied from an already-published Reel
+// (addReelToMyStory below) never needs this either: that Reel's own
+// video was already normalized before IT could publish, and
+// addReelToMyStory carries that trusted `sourceNormalized` value forward
+// directly rather than re-encoding — see that callable's own doc comment.
+//
+// Called from src/app/(app)/create/reel/camera.tsx's own
+// handlePublishAsStory, between the upload finishing and publishStory,
+// ONLY for a direct video Story.
+//
+// IDEMPOTENT: a Story whose `sourceNormalized` is already `true` (a retry
+// after this callable's own confirm-write already succeeded, but some
+// LATER step — e.g. publishStory itself — failed) short-circuits here
+// with no download/ffmpeg/upload at all; and even on a genuine
+// confirm-write-failure retry, performStoryVideoFinalization's own
+// readCanonicalSourceState check (see storyVideoFinalization.ts) detects
+// the already-stamped storage marker and skips ffmpeg entirely, never
+// re-encoding an already-normalized asset.
+// ---------------------------------------------------------------------------
+
+export const finalizeStoryVideo = onCall(
+  { region: REGION, timeoutSeconds: 300, memory: '1GiB', secrets: [r2AccessKeyIdSecret, r2SecretAccessKeySecret] },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError('unauthenticated', 'Sign in required.');
+    }
+    const storyId = parseStoryIdParam(request);
+    const uid = request.auth.uid;
+
+    const db = getFirestore();
+    const storyDocRef = db.doc(`stories/${storyId}`);
+    const storySnap = await storyDocRef.get();
+    const story = storySnap.exists ? (storySnap.data() as Record<string, unknown>) : null;
+    const eligibility = checkStoryVideoFinalizationEligibility(story, uid);
+    if (!eligibility.ok) {
+      throw new HttpsError(eligibility.code, eligibility.message);
+    }
+    // eligibility.ok guarantees `story` is non-null.
+    const storyData = story as Record<string, unknown>;
+
+    // Idempotency short-circuit — see this function's own top doc
+    // comment. Deliberately checked HERE, not inside
+    // checkStoryVideoFinalizationEligibility: "already normalized" is a
+    // legitimate different OUTCOME (a no-op success), never a rejection.
+    if (storyData.sourceNormalized === true) {
+      return { storyId, finalized: true as const, alreadyNormalized: true as const };
+    }
+
+    if (!ffmpegPath) {
+      // Genuinely unexpected (ffmpeg-static failed to resolve a binary for
+      // this runtime) — never silently skip normalization and publish the
+      // raw, un-processed upload as if it were already finalized.
+      throw new HttpsError('internal', "Couldn't process this Story's video.");
+    }
+
+    const bucket = getStorage().bucket();
+    // Provider-aware, same convention as finalizeReelVideo above:
+    // `undefined` (a legacy Story predating storageProvider) defaults to
+    // 'firebase'.
+    const videoProvider = (storyData.storageProvider as string | undefined) ?? 'firebase';
+
+    const workDir = await mkdtemp(join(tmpdir(), `story-finalize-${storyId}-`));
+    const paths = {
+      localVideoPath: join(workDir, 'input-video'),
+      localOutputPath: join(workDir, 'output.mp4'),
+    };
+
+    try {
+      const outcome = await performStoryVideoFinalization(paths, {
+        // Step 11C — true idempotency, built in from the start (see
+        // storyVideoFinalization.ts's own top doc comment).
+        readCanonicalSourceState: () => readStoryCanonicalSourceState(bucket, storyData, uid, storyId),
+        downloadVideo: (destination) => downloadStorySourceForFinalization(bucket, storyData, uid, storyId, destination),
+        // Step 11C — the same shared encode profile Reel's own
+        // finalization uses (see videoNormalizationProfile.ts's own doc
+        // comment) — the ONE ffmpeg input is this Story's own current
+        // video source; no second input, no mapping needed.
+        runFfmpegNormalize: (localVideoPath, localOutputPath) =>
+          execFileAsync(
+            ffmpegPath!,
+            [
+              '-y',
+              '-i', localVideoPath,
+              ...buildVideoEncodeArgs(computeVideoOutputDimensions(storyData.width as number, storyData.height as number)),
+              localOutputPath,
+            ],
+            { timeout: 240_000 }
+          ).then(() => undefined),
+        statFileSize: async (path) => (await stat(path)).size,
+        uploadNormalizedVideo: (localOutputPath) =>
+          uploadNormalizedStorySourceToProvider(bucket, storyData, uid, storyId, localOutputPath, 'video/mp4', muxedVideoCacheControl(videoProvider)),
+        updateStoryDocument: (fields) => storyDocRef.update({ ...fields, updatedAt: FieldValue.serverTimestamp() }).then(() => undefined),
+        buildVersionedSourceUrl: () => {
+          if (videoProvider !== 'r2') return null;
+          const publicMediaBaseUrl = getR2Config()?.publicMediaBaseUrl ?? null;
+          if (!publicMediaBaseUrl) return null;
+          return buildMediaUrl(publicMediaBaseUrl, storySourceKey(uid, storyId), Date.now());
+        },
+      });
+
+      if (!outcome.ok) {
+        throw new HttpsError(
+          outcome.reason === 'video-unavailable' ? 'failed-precondition' : 'internal',
+          storyVideoFinalizationFailureMessage(outcome.reason)
+        );
+      }
+    } catch (error) {
+      if (error instanceof HttpsError) throw error;
+      throw new HttpsError('internal', "Couldn't process this Story's video.");
+    } finally {
+      await rm(workDir, { recursive: true, force: true });
+    }
+
+    return { storyId, finalized: true as const, alreadyNormalized: false as const };
+  }
+);
 
 // ---------------------------------------------------------------------------
 // Step — "Add to Story": reshares an existing published Reel as the
@@ -1673,6 +2444,20 @@ export const renderPhotoToVideo = onCall({ region: REGION, timeoutSeconds: 300, 
 // not something on their own device) — only server code with Admin SDK
 // Storage access can copy one account's object into another's path.
 //
+// Step 10A — Stories became provider-aware: the new Story gets its OWN
+// media object in the Story namespace, on whichever backend is currently
+// R2-configured (never permanently referencing the Reel's own object) —
+// see copyReelSourceToR2StoryObject's own doc comment
+// (reelSourceStorage.ts) for the full 2x2 provider matrix this now
+// covers. The TARGET provider is decided HERE, server-side, by whether
+// R2 has a real public media base URL configured (getR2Config()) —
+// exactly the same "never fabricate a URL nothing can serve" signal
+// every other R2 confirm-write in this codebase already keys off of
+// (buildVersionedSourceUrl, requestMediaUploadAuthorization.ts's own
+// mediaUrl computation). When it isn't configured, this callable's
+// behavior is BYTE-FOR-BYTE what it always was — Firebase target,
+// copyReelSourceToFirebaseStoryObject, unchanged.
+//
 // 24 * 60 * 60 * 1000 mirrors STORY_EXPIRY_MS in src/types/story.ts —
 // duplicated here (this package can't import from the app's own src/)
 // rather than shared, same as every other cross-package constant in this
@@ -1681,64 +2466,122 @@ export const renderPhotoToVideo = onCall({ region: REGION, timeoutSeconds: 300, 
 
 const REPOSTED_STORY_EXPIRY_MS = 24 * 60 * 60 * 1000;
 
-export const addReelToMyStory = onCall({ region: REGION, timeoutSeconds: 120, memory: '256MiB' }, async (request) => {
-  if (!request.auth) {
-    throw new HttpsError('unauthenticated', 'Sign in required.');
+export const addReelToMyStory = onCall(
+  { region: REGION, timeoutSeconds: 120, memory: '256MiB', secrets: [r2AccessKeyIdSecret, r2SecretAccessKeySecret] },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError('unauthenticated', 'Sign in required.');
+    }
+    const reelId = parseReelIdParam(request);
+    const uid = request.auth.uid;
+
+    const db = getFirestore();
+    const reelSnap = await db.doc(`reels/${reelId}`).get();
+    if (!reelSnap.exists) {
+      throw new HttpsError('not-found', 'No Reel with that ID exists.');
+    }
+    const reel = reelSnap.data()!;
+    if (reel.status !== 'published') {
+      throw new HttpsError('failed-precondition', "This post isn't available to share to your Story.");
+    }
+
+    const profileSnap = await db.doc(`users/${uid}`).get();
+    if (!profileSnap.exists) {
+      throw new HttpsError('failed-precondition', 'Complete your profile before sharing to your Story.');
+    }
+    const profile = profileSnap.data()!;
+
+    const bucket = getStorage().bucket();
+    const storyDocRef = db.collection('stories').doc();
+    const storyId = storyDocRef.id;
+    const storagePath = `stories/${uid}/${storyId}/source`;
+
+    const publicMediaBaseUrl = getR2Config()?.publicMediaBaseUrl ?? null;
+    const targetProvider: 'firebase' | 'r2' = publicMediaBaseUrl ? 'r2' : 'firebase';
+
+    let mediaUrl = '';
+    if (targetProvider === 'r2') {
+      // Step 10A — provider-aware copy INTO R2 (see
+      // copyReelSourceToR2StoryObject's own doc comment). A Firebase-
+      // sourced Reel needs a local temp file as its own intermediate
+      // step (there is no cross-provider bucket-internal copy); an
+      // R2-sourced Reel never touches disk at all (bucket-internal
+      // CopyObjectCommand).
+      const workDir = await mkdtemp(join(tmpdir(), `add-to-story-${storyId}-`));
+      try {
+        await copyReelSourceToR2StoryObject(bucket, reel, uid, storyId, join(workDir, 'source'));
+      } catch {
+        throw new HttpsError('internal', "Couldn't share this post to your Story.");
+      } finally {
+        await rm(workDir, { recursive: true, force: true });
+      }
+      // publicMediaBaseUrl is non-null in this branch by construction
+      // (targetProvider is only 'r2' when it is) — version 1 is correct
+      // and final forever: a Story's own media, once copied, is never
+      // rewritten again (no mux/render equivalent exists for Stories).
+      // buildMediaUrl only ever returns null for a malformed base
+      // URL/path (see mediaUrl.ts) — both are server-config-derived and
+      // server-generated here, so a null here means real misconfiguration,
+      // never something a retry would fix; never fabricate/publish a
+      // Story pointing at a URL nothing can actually resolve.
+      const builtMediaUrl = buildMediaUrl(publicMediaBaseUrl!, storySourceKey(uid, storyId), 1);
+      if (!builtMediaUrl) {
+        throw new HttpsError('internal', "Couldn't share this post to your Story.");
+      }
+      mediaUrl = builtMediaUrl;
+    } else {
+      // Step 9A — unchanged Firebase-target copy (see
+      // copyReelSourceToFirebaseStoryObject's own doc comment).
+      try {
+        await copyReelSourceToFirebaseStoryObject(bucket, reel, storagePath);
+      } catch {
+        throw new HttpsError('internal', "Couldn't share this post to your Story.");
+      }
+    }
+
+    const now = Date.now();
+    await storyDocRef.set({
+      storyId,
+      authorUid: uid,
+      authorDisplayName: profile.displayName as string,
+      authorUsername: profile.username as string,
+      // Same "missing means 'video'" default as resolveOwnSoundOrigin above
+      // — a Reel published before `mediaType` existed has no such key.
+      mediaType: (reel.mediaType as string | undefined) ?? 'video',
+      storagePath,
+      storageContentType: reel.storageContentType,
+      fileSizeBytes: reel.fileSizeBytes,
+      durationMs: reel.durationMs,
+      width: reel.width,
+      height: reel.height,
+      status: 'published',
+      storageProvider: targetProvider,
+      mediaUrl,
+      // Step 11C — this Story's media is a COPY of an already-published
+      // Reel's own source — that Reel could only reach `published` with
+      // its OWN sourceNormalized already true for a video (see
+      // firestore.rules' own isValidReelPublish); a photo Reel's
+      // sourceNormalized is always false, which is exactly correct here
+      // too (a photo Story is exempt from the normalization gate
+      // entirely — see isValidStoryPublish). Carrying this TRUSTED value
+      // forward is what makes this copy safe WITHOUT re-running ffmpeg or
+      // depending on whether the R2 CopyObjectCommand above happens to
+      // preserve custom object metadata (audited, not assumed — S3's own
+      // default CopyObjectCommand behavior is MetadataDirective: 'COPY',
+      // so it likely would anyway, but this doesn't rely on that at all).
+      // `=== true` rather than a bare truthy check: a legacy Reel
+      // predating this field reads as `undefined` here, which must NOT
+      // be treated as normalized.
+      sourceNormalized: deriveCopiedStorySourceNormalized(reel),
+      createdAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
+      publishedAt: FieldValue.serverTimestamp(),
+      expiresAt: Timestamp.fromMillis(now + REPOSTED_STORY_EXPIRY_MS),
+    });
+
+    return { storyId };
   }
-  const reelId = parseReelIdParam(request);
-  const uid = request.auth.uid;
-
-  const db = getFirestore();
-  const reelSnap = await db.doc(`reels/${reelId}`).get();
-  if (!reelSnap.exists) {
-    throw new HttpsError('not-found', 'No Reel with that ID exists.');
-  }
-  const reel = reelSnap.data()!;
-  if (reel.status !== 'published') {
-    throw new HttpsError('failed-precondition', "This post isn't available to share to your Story.");
-  }
-
-  const profileSnap = await db.doc(`users/${uid}`).get();
-  if (!profileSnap.exists) {
-    throw new HttpsError('failed-precondition', 'Complete your profile before sharing to your Story.');
-  }
-  const profile = profileSnap.data()!;
-
-  const bucket = getStorage().bucket();
-  const storyDocRef = db.collection('stories').doc();
-  const storyId = storyDocRef.id;
-  const storagePath = `stories/${uid}/${storyId}/source`;
-
-  try {
-    await bucket.file(reel.storagePath as string).copy(bucket.file(storagePath));
-  } catch {
-    throw new HttpsError('internal', "Couldn't share this post to your Story.");
-  }
-
-  const now = Date.now();
-  await storyDocRef.set({
-    storyId,
-    authorUid: uid,
-    authorDisplayName: profile.displayName as string,
-    authorUsername: profile.username as string,
-    // Same "missing means 'video'" default as resolveOwnSoundOrigin above
-    // — a Reel published before `mediaType` existed has no such key.
-    mediaType: (reel.mediaType as string | undefined) ?? 'video',
-    storagePath,
-    storageContentType: reel.storageContentType,
-    fileSizeBytes: reel.fileSizeBytes,
-    durationMs: reel.durationMs,
-    width: reel.width,
-    height: reel.height,
-    status: 'published',
-    createdAt: FieldValue.serverTimestamp(),
-    updatedAt: FieldValue.serverTimestamp(),
-    publishedAt: FieldValue.serverTimestamp(),
-    expiresAt: Timestamp.fromMillis(now + REPOSTED_STORY_EXPIRY_MS),
-  });
-
-  return { storyId };
-});
+);
 
 // ---------------------------------------------------------------------------
 // Step — a plain video's own captured audio (musicSourceType 'none') made
@@ -1803,18 +2646,20 @@ export const resolveOwnSoundOrigin = onCall({ region: REGION, timeoutSeconds: 18
   }
 
   const bucket = getStorage().bucket();
-  const videoFile = bucket.file(reel.storagePath as string);
-  const [videoExists] = await videoFile.exists();
-  if (!videoExists) {
-    throw new HttpsError('failed-precondition', "This post's video isn't available.");
-  }
 
   const workDir = await mkdtemp(join(tmpdir(), `reel-own-sound-${reelId}-`));
   const localVideoPath = join(workDir, 'input-video');
   const localAudioPath = join(workDir, 'output-audio.m4a');
 
   try {
-    await videoFile.download({ destination: localVideoPath });
+    // Step 9A — provider-aware: this Reel's source may be on Firebase or
+    // R2 (see downloadReelSourceToLocalFile's own doc comment above) —
+    // either way, the check happens INSIDE the try so its own temp
+    // workDir is still cleaned up in `finally` on failure.
+    const downloaded = await downloadReelSourceToLocalFile(bucket, reel, localVideoPath);
+    if (!downloaded) {
+      throw new HttpsError('failed-precondition', "This post's video isn't available.");
+    }
 
     // "-vn" drops the video stream entirely, keeping only audio, re-encoded
     // to a consistent AAC stream regardless of whatever codec the source
@@ -1880,3 +2725,37 @@ export * from './collaborative';
 // file for the same reason as engagementStats.ts.
 // ---------------------------------------------------------------------------
 export * from './metrics';
+
+// ---------------------------------------------------------------------------
+// Trending Hashtags by City and Time Window — own file for the same
+// reason as engagementStats.ts.
+// ---------------------------------------------------------------------------
+export * from './hashtagTrends';
+
+// ---------------------------------------------------------------------------
+// Step 5A — Cloudflare R2 media foundation. requestMediaUploadAuthorization
+// is the ONE deliberate, narrow, secret-bound production entry point this
+// step adds (profilePhoto/profileCover/eventCover/reelThumbnail/reelVideo
+// upload authorization — see its own file's top doc comment). Step 9A adds
+// a second, equally narrow entry point, discardReelSource (see its own
+// file's top doc comment) — a trusted server-authorized delete for the R2
+// objects a still-uploading Reel draft may hold, since (unlike Firebase
+// Storage) a client has no direct delete path of its own onto an R2
+// object. The lower-level R2 client/config modules both are built on
+// (functions/src/media/r2Storage.ts, r2Config.ts) remain intentionally
+// UNEXPORTED here, same as Step 4 left them — every exported function in
+// r2Storage.ts is now reached, but only ever through one of these two
+// narrow, validated, secret-bound callables, never directly.
+// ---------------------------------------------------------------------------
+export * from './media/requestMediaUploadAuthorization';
+export * from './media/discardReelSource';
+export * from './media/deleteStoryMedia';
+// Step — the real, server-authorized delete behind
+// src/services/media/r2Provider.ts's own r2MediaProvider.delete (the
+// generic MediaStorageProvider interface's R2 implementation, previously
+// an unconditional throw — see that file's own doc comment). Same narrow,
+// validated, secret-bound pattern as discardReelSource/deleteStoryMedia
+// above: the client sends only a path, and the server independently
+// verifies it matches one of the caller's own deterministic keys before
+// ever calling deleteR2Object — see deleteOwnMedia.ts's own doc comment.
+export * from './media/deleteOwnMedia';

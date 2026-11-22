@@ -3,7 +3,9 @@
  * `trackContentInteraction({...})` call from the spec, adapted to this
  * app's real field names. This is the ONE place UI/service code should
  * call to record a recommendation signal; everything downstream
- * (recommendationEvents log + recommendationProfile update) happens here.
+ * (recommendationEvents log + recommendationProfile update, and — when
+ * `input.hashtags` is present — the hashtag-interest profile update, see
+ * hashtagInterestProfile.ts) happens here.
  *
  * Fire-and-forget by design — a tracking write failing (offline, rules
  * rejection, etc.) must never block or surface an error for the real user
@@ -17,6 +19,8 @@ import { collection, doc, serverTimestamp, setDoc, type WithFieldValue } from 'f
 import type { RecommendationEvent, TrackInteractionInput } from '@/types/recommendation';
 
 import { firestore } from '../firestore';
+import { invalidateHashtagInterestCache } from './hashtagInterestCache';
+import { applyHashtagInterestSignals } from './hashtagInterestProfile';
 import { applyInteractionAndPersist } from './interestProfile';
 import { invalidateInterestProfileCache } from './profileCache';
 import { ANALYTICS_ONLY_ACTIONS, deriveWatchAction, SIGNAL_WEIGHTS } from './recommendationConfig';
@@ -98,7 +102,20 @@ export async function trackContentInteraction(input: TrackInteractionInput): Pro
           invalidateInterestProfileCache(input.userId)
         );
 
-    await Promise.all([setDoc(ref, event), profileMutation]);
+    // Hashtag interest profile — a SEPARATE queued task on this SAME
+    // uid's own interaction queue (reliability.ts), so it's serialized
+    // consistently with the category/creator/city profile mutation above
+    // without needing to touch that mutation's own code path at all. A
+    // true no-op (no read, no transaction) whenever `input.hashtags` is
+    // empty/omitted or `action` isn't one HASHTAG_INTEREST_WEIGHTS lists
+    // — see applyHashtagInterestSignals' own doc comment.
+    const hashtagMutation = input.hashtags?.length
+      ? enqueueRecommendationInteraction(input.userId, () => applyHashtagInterestSignals(input.userId, input.hashtags!, input.action)).then(() =>
+          invalidateHashtagInterestCache(input.userId)
+        )
+      : Promise.resolve();
+
+    await Promise.all([setDoc(ref, event), profileMutation, hashtagMutation]);
   } catch (error) {
     if (__DEV__) {
       // eslint-disable-next-line no-console

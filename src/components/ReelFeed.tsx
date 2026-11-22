@@ -13,11 +13,17 @@ import { ReportModal } from '@/components/ReportModal';
 import { SwipeBackEdge } from '@/components/SwipeBackEdge';
 import { Colors, Radius, Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/useAuth';
+import { useReelNetworkClass } from '@/hooks/useReelNetworkClass';
 import { blockUser } from '@/services/blocks';
 import { trackContentInteraction } from '@/services/recommendations/interactions';
-import { deleteMyReel, resolveReelPlaybackUrl } from '@/services/reels';
+import { deleteMyReel, resolveReelThumbnailUrl, resolveReelVideoPlaybackUrl } from '@/services/reels';
 import { isPostReposted, repostPost, undoRepost } from '@/services/reposts';
 import { prefetchImageOnce } from '@/utils/imagePrefetch';
+import {
+  computeReelPreparationLevel,
+  isWithinWarmWindow,
+  shouldWarmThumbnailAndUrl,
+} from '@/utils/reelPreparationPolicy';
 import { buildReelShareUrl } from '@/utils/reelShare';
 import type { Reel } from '@/types/reel';
 import type { RankingAttribution } from '@/types/recommendation';
@@ -117,6 +123,13 @@ export function ReelFeed({
   // so ReelFeedItem's own play/pause effect needs no change at all.
   const isScreenFocused = useIsFocused();
 
+  // Step 11D.1 — the one real network-state subscription for this whole
+  // feed screen (see useReelNetworkClass's own doc comment for why it
+  // lives here and not per-item). Starts at the same conservative
+  // 'unknown'/cellular-equivalent default Step 11D always used, and
+  // updates live as the device's actual connection changes.
+  const networkClass = useReelNetworkClass();
+
   const [optionsReel, setOptionsReel] = useState<Reel | null>(null);
   const [isOptionsReelReposted, setIsOptionsReelReposted] = useState(false);
   const [reportReel, setReportReel] = useState<Reel | null>(null);
@@ -151,35 +164,61 @@ export function ReelFeed({
     }
   }, []);
 
-  // Phase 3 perf pass — thumbnail-only image prefetch, deliberately
-  // SEPARATE from `shouldPrepare` below (still exactly `Math.abs(index -
-  // activeIndex) <= 1`, completely unchanged — this never widens the real
-  // video preload window). ReelFeedItem's own thumbnail-resolving effect
-  // (gated on that same shouldPrepare) already resolves+prefetches a
-  // thumbnail for the active Reel and its immediate neighbor on each
-  // side — this only needs to reach ONE step further, the item at
-  // activeIndex + 2, which is never "prepared" and so never resolves its
-  // own thumbnail otherwise. Deliberately NOT activeIndex/activeIndex + 1
-  // too: resolveReelPlaybackUrl's own cache (reels.ts) only dedupes AFTER
-  // a call resolves, not concurrent in-flight calls for the same key —
-  // calling it here for those already-covered indices raced with
-  // ReelFeedItem's own call for the SAME storagePath and produced two
-  // real Storage getDownloadURL requests instead of one (confirmed live
-  // in a browser preview). Restricting this to the one index
-  // ReelFeedItem never touches avoids that race entirely rather than
-  // adding request-level dedup to a widely-shared function. A still cover
-  // frame is a tiny image, not a video, so reaching one step past the
-  // real preload window is safe: `reels` is already the full loaded page
-  // (never fetches another page just for this), and this never touches
-  // video bytes at all. prefetchImageOnce's own in-session Set is what
-  // keeps scrolling back and forth from re-issuing the same request.
+  // Step 11D — LIGHT-tier warmup: thumbnail + playback-URL only, NEVER a
+  // real video player and NEVER video bytes — see
+  // src/utils/reelPreparationPolicy.ts for the full level/network-class
+  // design this replaces the pre-11D, forward-only (`activeIndex + 2`
+  // literal), thumbnail-only version with. `computeReelPreparationLevel`
+  // is what now decides exactly which indices qualify, so this never
+  // touches the ACTIVE/WARM range (shouldPrepare below) — avoiding the
+  // original effect's own documented race (two concurrent
+  // getDownloadURL calls for the same key) by construction, not by a
+  // hand-picked offset. `maxReach` only bounds how far this loop SCANS;
+  // the real per-network reach is whatever shouldWarmThumbnailAndUrl/
+  // computeReelPreparationLevel actually decide for each index — scanning
+  // a couple of extra, immediately-'cold' indices beyond the current
+  // network class's own reach costs nothing (no fetch happens for a
+  // 'cold' result).
+  //
+  // Step 11D.1 — `networkClass` is now the LIVE detected value (see
+  // useReelNetworkClass above), not a hardcoded constant, so this effect
+  // is also in the dependency array: a wifi->cellular transition shrinks
+  // which indices qualify (next run simply finds fewer 'light' results —
+  // nothing already resolved is evicted, see this step's own report for
+  // why that's an acceptable, non-"sticky/growing" trade), and a
+  // cellular->wifi transition immediately makes further indices eligible
+  // for the SAME existing cache-backed resolvers, deduping exactly as it
+  // already did before this step for repeat calls on an unchanged index.
   useEffect(() => {
-    const reel = reels[activeIndex + 2];
-    if (!reel || reel.mediaType === 'photo') return;
-    resolveReelPlaybackUrl(reel.thumbnailStoragePath).then((url) => {
-      if (url) prefetchImageOnce(url);
-    });
-  }, [reels, activeIndex]);
+    const maxReach = 3; // the widest LIGHT reach any network class uses today (wifi) — see LIGHT_WINDOW_BY_NETWORK.
+    for (let offset = -maxReach; offset <= maxReach; offset += 1) {
+      if (offset === 0) continue;
+      const index = activeIndex + offset;
+      const reel = reels[index];
+      if (!reel || reel.mediaType === 'photo') continue;
+      const level = computeReelPreparationLevel({ index, activeIndex, networkClass });
+      if (!shouldWarmThumbnailAndUrl(level)) continue;
+      // Step 9A cleanup — this was still calling resolveReelPlaybackUrl
+      // directly against thumbnailStoragePath (a Step 5E gap this file was
+      // missed for) — resolveReelThumbnailUrl is the provider-aware
+      // version every other thumbnail call site already uses.
+      resolveReelThumbnailUrl(reel).then((url) => {
+        if (url) prefetchImageOnce(url);
+      });
+      // Step 11D — new: also warms the PLAYBACK URL itself (not just the
+      // thumbnail), so the eventual transition into the WARM window
+      // (when the user actually scrolls this far) starts from an
+      // already-resolved URL instead of a fresh one. A complete no-op
+      // for an R2 Reel (its URL is already persisted — see
+      // resolveReelVideoPlaybackUrl's own doc comment, no network call
+      // happens at all) and a cheap, cached-after-first-call Storage
+      // metadata read for a Firebase Reel — never a video byte download.
+      // Fire-and-forget like every other prefetch call in this file: the
+      // result populates reels.ts's own playbackUrlCache as a side
+      // effect, nothing here needs to read it back.
+      resolveReelVideoPlaybackUrl(reel);
+    }
+  }, [reels, activeIndex, networkClass]);
 
   // Impression/watch-behavior tracking used to live here as a dwell-time
   // approximation across the whole list (keyed on activeIndex) — replaced
@@ -266,6 +305,7 @@ export function ReelFeed({
         creatorId: reel.authorUid,
         cityKey: reel.cityKey,
         countryCode: reel.countryCode,
+        hashtags: reel.hashtags,
         attribution: attributionByReelId?.[reel.reelId],
         feedSessionId,
       }).catch(() => {});
@@ -362,18 +402,36 @@ export function ReelFeed({
             // both scrolled-to and marked active/playing from the start,
             // not just scrolled-to.
             initialScrollIndex={initialIndex != null ? Math.min(Math.max(initialIndex, 0), reels.length - 1) : undefined}
-            renderItem={({ item, index }) => (
-              <ReelFeedItem
-                reel={item}
-                height={containerHeight}
-                isActive={index === activeIndex && isScreenFocused}
-                shouldPrepare={Math.abs(index - activeIndex) <= 1}
-                onOpenOptions={() => setOptionsReel(item)}
-                onToast={showToast}
-                attribution={attributionByReelId?.[item.reelId]}
-                feedSessionId={feedSessionId}
-              />
-            )}
+            renderItem={({ item, index }) => {
+              // Step 11D — byte-identical to the pre-11D
+              // `Math.abs(index - activeIndex) <= 1` for every network
+              // class (WARM_WINDOW is still 1 unconditionally — see
+              // reelPreparationPolicy.ts's own doc comment for why); now
+              // computed through the shared policy function instead of an
+              // inline literal, so this and the LIGHT-tier effect above
+              // can never silently drift apart. Step 11D.1: driven by the
+              // live `networkClass` instead of a hardcoded constant.
+              // Step 11E — computed once per item per render and passed
+              // down as `preparationLevel` too (dev-measurement context
+              // only — see ReelFeedItem's own doc comment for that prop;
+              // `shouldPrepare` below remains the only thing that affects
+              // real player/URL behavior, unchanged).
+              const preparationLevel = computeReelPreparationLevel({ index, activeIndex, networkClass });
+              return (
+                <ReelFeedItem
+                  reel={item}
+                  height={containerHeight}
+                  isActive={index === activeIndex && isScreenFocused}
+                  shouldPrepare={isWithinWarmWindow(preparationLevel)}
+                  preparationLevel={preparationLevel}
+                  networkClass={networkClass}
+                  onOpenOptions={() => setOptionsReel(item)}
+                  onToast={showToast}
+                  attribution={attributionByReelId?.[item.reelId]}
+                  feedSessionId={feedSessionId}
+                />
+              );
+            }}
             pagingEnabled
             showsVerticalScrollIndicator={false}
             decelerationRate="fast"

@@ -14,10 +14,20 @@ type HeaderScreenLayoutProps = {
   children: ReactNode;
   /** Replaces the default right-side spacer — e.g. a small overflow/options button. Falls back to a plain spacer (keeping the title centered) when omitted. */
   headerRight?: ReactNode;
+  /**
+   * Renders directly below the header row, OUTSIDE the scrolling body —
+   * pinned in place while `children` scrolls underneath it. Per explicit
+   * request for the Events "Show more" screen's Sort/Filter controls row
+   * (src/app/(app)/events/section.tsx), which needed to stay visible while
+   * the list scrolls rather than scrolling away with it. Optional and
+   * additive — every existing caller (the Create screens) omits it and is
+   * unaffected.
+   */
+  stickyBelowHeader?: ReactNode;
 };
 
 /** Shared chrome for the Post/Activity/Event creation screens: back button, title, keyboard-avoiding scroll body. */
-export function HeaderScreenLayout({ title, subtitle, children, headerRight }: HeaderScreenLayoutProps) {
+export function HeaderScreenLayout({ title, subtitle, children, headerRight, stickyBelowHeader }: HeaderScreenLayoutProps) {
   return (
     <SafeAreaView style={styles.safeArea} edges={['top', 'bottom']}>
       {/* Same handler as the back button below. */}
@@ -35,6 +45,7 @@ export function HeaderScreenLayout({ title, subtitle, children, headerRight }: H
         <Text style={styles.title}>{title}</Text>
         {headerRight ?? <View style={styles.headerSpacer} />}
       </View>
+      {stickyBelowHeader ? <View style={styles.stickyContent}>{stickyBelowHeader}</View> : null}
       <KeyboardAvoidingView style={styles.flex} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
         <ScrollView
           contentContainerStyle={styles.scrollContent}
@@ -86,6 +97,16 @@ const styles = StyleSheet.create({
     color: Colors.textSecondary,
     ...Typography.body,
     marginTop: -Spacing.sm,
+  },
+  // Mirrors `content`'s own width/centering/horizontal padding below, so a
+  // sticky block lines up exactly with the scrollable content underneath
+  // it rather than sitting at a different inset.
+  stickyContent: {
+    width: '100%',
+    maxWidth: Layout.maxContentWidth,
+    alignSelf: 'center',
+    paddingHorizontal: Spacing.xl,
+    paddingBottom: Spacing.sm,
   },
   scrollContent: {
     flexGrow: 1,

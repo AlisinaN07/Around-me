@@ -26,6 +26,8 @@ import { getDownloadURL, ref, uploadBytesResumable, type UploadTask } from 'fire
 import { INTERESTS } from '@/constants/interests';
 import type { ActivityContent, Content, EventContent, PostContent } from '@/types/content';
 import type { BrowseScope } from '@/types/browseScope';
+import { forYouHandoffKey, followingHandoffKey } from '@/utils/eventSectionHandoffKey';
+import { removeContentIdFromSections } from '@/utils/eventSectionHandoffCorrection';
 import {
   BODY_MAX_LENGTH,
   DESCRIPTION_MAX_LENGTH,
@@ -35,10 +37,14 @@ import {
   TITLE_MAX_LENGTH,
 } from '@/types/content';
 import { getTodayOrTonightWindow, getUpcomingWindow } from '@/utils/dateWindows';
+import { resolveEventCoverStorageFields } from '@/utils/eventCoverStorageFields';
 
 import { fetchFollowingUids } from './following';
 import { firestore } from './firestore';
 import { functions } from './functions';
+import { extractHashtags, incrementHashtagCounts } from './hashtags';
+import { getMediaStorageProvider } from './media';
+import { uploadEventCoverToR2 } from './media/r2Provider';
 import { storage } from './storage';
 import { fetchUserProfile } from './userProfile';
 
@@ -318,6 +324,19 @@ export async function createActivity(input: CreateActivityInput): Promise<Create
 
 export type CreateEventInput = {
   uid: string;
+  /**
+   * Step 2B — the Event's own real, final `contentId` (see
+   * generateEventId below), generated ONCE, upfront, by the Create Event
+   * screen, BEFORE any cover upload happens — the SAME id that upload
+   * was addressed to (if any) and the SAME id this function now creates
+   * the `content/{contentId}` document under. There is only ever ONE id
+   * for one Event; this parameter existing at all is what makes that
+   * true (see this field's own former absence — before Step 2B,
+   * createEvent generated its OWN separate id here, independent of
+   * whatever id the cover upload used, which was the exact gap Step 2B
+   * closes).
+   */
+  contentId: string;
   title: string;
   description: string;
   categoryId: string;
@@ -334,24 +353,49 @@ export type CreateEventInput = {
    * immutable after creation and there is no later "attach a photo" edit.
    */
   coverPhotoURL?: string;
+  /**
+   * Step 2B — which backend the upload behind `coverPhotoURL` actually
+   * used. The matching `coverStoragePath` is deliberately NOT accepted as
+   * an input here at all — see resolveEventCoverStorageFields
+   * (src/utils/eventCoverStorageFields.ts), which this function calls:
+   * the path is always DERIVED from `uid` + `contentId`, never trusted as
+   * a free-form string from the caller, closing the exact gap Step 2B
+   * fixes (a client could otherwise claim ANY path under its own
+   * namespace, including one belonging to a different, already-published
+   * Event of the same author's).
+   */
+  coverStorageProvider?: 'firebase' | 'r2';
 };
 
 /**
- * Step 36 — a fresh, random, purely-local identifier reserved by the
- * Create Event screen BEFORE any Storage upload happens, and held for
- * that screen's lifetime (see its own `useState(() => generateEventDraftId())`
- * lazy initializer). It has no meaning in Firestore at all — content
- * documents are created in one atomic setDoc (see createEvent below), not
- * a multi-stage draft the way Reels/Stories are — its ONLY job is to keep
- * each Create Event attempt's cover photo at its own distinct Storage
- * path (eventCovers/{authorUid}/{draftId}/photo), so a LATER event by the
- * same author can never overwrite, and thereby silently change the
- * displayed cover of, an EARLIER already-published one. Reuses Firestore's
- * own random-ID generator purely for convenience (same trick
- * createReelDraft/createStoryDraft use) — no document is ever created at
- * this path.
+ * Step 2B — the Event's own real, permanent `contentId`, generated ONCE,
+ * upfront, by the Create Event screen, before any Storage upload happens
+ * (see its own `useState(() => generateEventId())` lazy initializer) —
+ * and reused as BOTH the cover photo's own Storage path
+ * (`eventCovers/{authorUid}/{contentId}/photo`) AND the eventual
+ * `content/{contentId}` document's own id (see createEvent below's
+ * `doc(firestore, CONTENT_COLLECTION, input.contentId)`). There is only
+ * ever ONE id per Event.
+ *
+ * Before this step, the cover upload used a SEPARATE, independently
+ * generated `draftId` that bore no provable relationship to the Event's
+ * eventual `contentId` — which is exactly why a cover's storage path
+ * could never be verified as belonging to one SPECIFIC Event (only to
+ * "some Event by this same author"). Generating the real id upfront and
+ * never generating a second one anywhere in this flow is the fix: both
+ * firestore.rules (write time) and eventMediaCleanup.ts (delete time) can
+ * now check `coverStoragePath` against this document's own `contentId`
+ * by exact string equality, which a NEW Event's `contentId` can never
+ * collide with a PRE-EXISTING Event's own id (Firestore's own create/
+ * update semantics guarantee a `create` can only ever target a path with
+ * no prior document — see firestore.rules' own `allow create`/
+ * `allow update: if false` for content/{contentId}).
+ *
+ * Reuses Firestore's own random-ID generator purely for convenience
+ * (same trick createReelDraft/createStoryDraft use) — no document is
+ * ever created at this path before createEvent's own setDoc runs.
  */
-export function generateEventDraftId(): string {
+export function generateEventId(): string {
   if (!firestore) {
     return `local-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   }
@@ -361,25 +405,49 @@ export function generateEventDraftId(): string {
 export type UploadEventCoverPhotoHandle = { cancel: () => void };
 
 /**
- * Uploads a locally-picked cover image for an in-progress Event draft to
- * eventCovers/{uid}/{draftId}/photo (see generateEventDraftId's own doc
- * comment for why the path is keyed by a throwaway draftId rather than a
- * real contentId). Mutable in place for the SAME draftId — the organizer
- * may pick, then re-pick, a different image before ever publishing — but
- * a fresh draftId is generated per Create Event screen visit, so this
- * never touches any other draft's or any published Event's own image.
- * Does NOT touch Firestore itself — call createEvent with the resolved
- * coverPhotoURL once onComplete reports success, same division of
- * responsibility as uploadProfileCoverPhoto/updateMyProfileCoverPhoto in
+ * Uploads a locally-picked cover image for an in-progress Event to
+ * eventCovers/{uid}/{contentId}/photo, where `contentId` is the Event's
+ * own real, final id (see generateEventId's own doc comment) — never a
+ * throwaway draft identifier unrelated to the eventual document. Mutable
+ * in place for the SAME contentId — the organizer may pick, then re-pick,
+ * a different image before ever publishing — but a fresh contentId is
+ * generated per Create Event screen visit, so this never touches any
+ * other Event's own image. Does NOT touch Firestore itself — call
+ * createEvent with the resolved coverPhotoURL once onComplete reports
+ * success, same division of responsibility as
+ * uploadProfileCoverPhoto/updateMyProfileCoverPhoto in
  * src/services/userProfile.ts.
+ *
+ * Step 5D — dispatches on getMediaStorageProvider() (see
+ * src/services/media/config.ts), same pattern as userProfile.ts's own
+ * uploadProfilePhoto/uploadProfileCoverPhoto. This function's own
+ * behavior for the default, production value ('firebase') is completely
+ * untouched below — the exact same code that existed before Step 5D. The
+ * 'r2' branch (uploadEventCoverViaR2, right below) is a SEPARATE
+ * function, reached only when a developer explicitly sets
+ * EXPO_PUBLIC_MEDIA_STORAGE_PROVIDER=r2 for controlled testing.
+ *
+ * Step 2B — deliberately returns `coverStorageProvider` only, never a
+ * `coverStoragePath` — the caller (createEvent) always DERIVES that path
+ * itself from `uid` + `contentId` (resolveEventCoverStorageFields), so
+ * there is nothing for this function to report that could ever disagree
+ * with what createEvent actually persists.
  */
+export type EventCoverUploadResult =
+  | { ok: true; coverPhotoURL: string; coverStorageProvider: 'firebase' | 'r2' }
+  | { ok: false; message: string };
+
 export function uploadEventCoverPhoto(
   uid: string,
-  draftId: string,
+  contentId: string,
   localUri: string,
   onProgress: (percent: number) => void,
-  onComplete: (result: { ok: true; coverPhotoURL: string } | { ok: false; message: string }) => void
+  onComplete: (result: EventCoverUploadResult) => void
 ): UploadEventCoverPhotoHandle {
+  if (getMediaStorageProvider() === 'r2') {
+    return uploadEventCoverViaR2(contentId, localUri, onProgress, onComplete);
+  }
+
   let cancelled = false;
   let task: UploadTask | null = null;
 
@@ -404,7 +472,7 @@ export function uploadEventCoverPhoto(
       return;
     }
 
-    const objectRef = ref(storage, `eventCovers/${uid}/${draftId}/photo`);
+    const objectRef = ref(storage, `eventCovers/${uid}/${contentId}/photo`);
     task = uploadBytesResumable(objectRef, blob, { contentType: blob.type || 'image/jpeg' });
 
     task.on(
@@ -423,7 +491,7 @@ export function uploadEventCoverPhoto(
       async () => {
         try {
           const coverPhotoURL = await getDownloadURL(objectRef);
-          onComplete({ ok: true, coverPhotoURL });
+          onComplete({ ok: true, coverPhotoURL, coverStorageProvider: 'firebase' });
         } catch {
           onComplete({ ok: false, message: "Uploaded, but couldn't finish saving your cover photo." });
         }
@@ -435,6 +503,48 @@ export function uploadEventCoverPhoto(
     cancel: () => {
       cancelled = true;
       task?.cancel();
+    },
+  };
+}
+
+/**
+ * Step 5D's real, end-to-end R2 upload+display path for Event covers —
+ * reached ONLY when getMediaStorageProvider() returns 'r2' (never in a
+ * default build; see uploadEventCoverPhoto's own doc comment). Delegates
+ * to uploadEventCoverToR2 (src/services/media/r2Provider.ts), the exact
+ * same proven authorize-then-PUT mechanics as
+ * uploadProfilePhotoViaR2/uploadProfileCoverViaR2, just for the
+ * `eventCover` media kind and its own
+ * `eventCovers/{uid}/{contentId}/photo` object key — `contentId` (the
+ * Event's own real, final id — see generateEventId's own doc comment) is
+ * passed straight through, unchanged, to the authorization request (see
+ * requestMediaUploadAuthorization.ts's own doc comment on why this one
+ * media kind needs it). Returns the SAME shape uploadEventCoverPhoto's
+ * own Firebase branch above already returns, so the Create Event
+ * screen's own upload handler needs no changes at all.
+ */
+function uploadEventCoverViaR2(
+  contentId: string,
+  localUri: string,
+  onProgress: (percent: number) => void,
+  onComplete: (result: EventCoverUploadResult) => void
+): UploadEventCoverPhotoHandle {
+  let cancelled = false;
+
+  (async () => {
+    const result = await uploadEventCoverToR2(contentId, localUri, onProgress);
+    if (cancelled) return;
+
+    if (__DEV__) {
+      // eslint-disable-next-line no-console
+      console.log('[content] R2 Event cover upload for Event', contentId, '->', result);
+    }
+    onComplete(result.ok ? { ok: true, coverPhotoURL: result.photoURL, coverStorageProvider: 'r2' } : result);
+  })();
+
+  return {
+    cancel: () => {
+      cancelled = true;
     },
   };
 }
@@ -458,9 +568,26 @@ export async function createEvent(input: CreateEventInput): Promise<CreateConten
     return placeLink;
   }
 
-  const contentRef = doc(collection(firestore, CONTENT_COLLECTION));
+  // Step 12D — computed once, here, from the exact description this
+  // Event is about to store (never re-derived later — this field is
+  // immutable after creation, same as every other Event field — see
+  // EventContent.hashtags' own doc comment). Same extraction function a
+  // Reel's own caption already uses (src/utils/hashtags.ts) — no second
+  // hashtag system, no Event-specific normalization.
+  const hashtags = extractHashtags(validated.description);
+
+  // Step 2B — the Event is created AT its own pre-generated contentId
+  // (input.contentId, from generateEventId — see that function's own doc
+  // comment), never a fresh id generated here. This is a Firestore
+  // `create` operation specifically because no document has ever existed
+  // at this exact path before (content documents are never updated — see
+  // firestore.rules' own `allow update: if false`) — which is also
+  // exactly why a cover's storage path, once tied to THIS contentId by
+  // exact equality, can never collide with any other, already-existing
+  // Event's own cover.
+  const contentRef = doc(firestore, CONTENT_COLLECTION, input.contentId);
   const data = {
-    contentId: contentRef.id,
+    contentId: input.contentId,
     type: 'event',
     ...trusted.fields,
     categoryId: input.categoryId,
@@ -472,11 +599,20 @@ export async function createEvent(input: CreateEventInput): Promise<CreateConten
     placeId: placeLink.placeId,
     startsAt: Timestamp.fromDate(input.startsAt),
     endsAt: Timestamp.fromDate(input.endsAt),
-    // Step 36 — omitted entirely when absent, same "absent key, not a
-    // blank value" convention placeName already uses on Post above; never
-    // trusts a raw string the caller could hand-type (this must already
-    // be a resolved download URL from uploadEventCoverPhoto).
-    ...(input.coverPhotoURL ? { coverPhotoURL: input.coverPhotoURL } : {}),
+    hashtags,
+    // Step 36/2B — omitted entirely when absent, same "absent key, not a
+    // blank value" convention placeName already uses on Post above.
+    // coverStoragePath is NEVER accepted as a free-form input (see
+    // CreateEventInput's own doc comment) — resolveEventCoverStorageFields
+    // derives it itself from input.uid + input.contentId (this Event's
+    // own real, final id, created above), so there is no string here a
+    // caller could hand-type to claim a DIFFERENT Event's cover.
+    ...resolveEventCoverStorageFields({
+      uid: input.uid,
+      contentId: input.contentId,
+      coverPhotoURL: input.coverPhotoURL,
+      coverStorageProvider: input.coverStorageProvider,
+    }),
     createdAt: serverTimestamp(),
     updatedAt: serverTimestamp(),
   } satisfies WithFieldValue<EventContent>;
@@ -485,6 +621,19 @@ export async function createEvent(input: CreateEventInput): Promise<CreateConten
     await setDoc(contentRef, data);
   } catch {
     return { ok: false, error: 'unknown', message: 'Something went wrong creating your event.' };
+  }
+
+  // Step 12D — best-effort, same "a hashtag-count hiccup shouldn't turn a
+  // successful publish into a reported failure" reasoning as a Reel's own
+  // post-publish incrementHashtagCounts call (reels.ts) — this Event is
+  // already genuinely created at this point (the setDoc above succeeded).
+  try {
+    await incrementHashtagCounts(hashtags);
+  } catch {
+    if (__DEV__) {
+      // eslint-disable-next-line no-console
+      console.warn(`[content] Couldn't update hashtag counts for Event "${contentRef.id}" — creation itself still succeeded.`);
+    }
   }
 
   const created = await fetchContentById(contentRef.id);
@@ -685,19 +834,23 @@ export function fetchUpcomingActivities(cityKey: string, limitCount = DEFAULT_FE
 async function fetchByStartsAtWindowByType<T extends ActivityContent | EventContent>(
   type: 'activity' | 'event',
   scope: BrowseScope,
-  window: { start: Date; end: Date },
+  window: { start: Date; end?: Date },
   limitCount: number
 ): Promise<T[]> {
   if (!firestore) {
     return [];
   }
+  // `end` is optional — omitted entirely for "Upcoming" (see
+  // getUpcomingWindow's own doc comment: deliberately open-ended, capped
+  // only by `limitCount` below, never a second date cutoff), still
+  // required for a genuinely bounded window like Today/Tonight.
   const windowQuery = query(
     collection(firestore, CONTENT_COLLECTION),
     where('type', '==', type),
     ...scopeWhereClause(scope),
     where('status', '==', 'published'),
     where('startsAt', '>=', Timestamp.fromDate(window.start)),
-    where('startsAt', '<', Timestamp.fromDate(window.end)),
+    ...(window.end ? [where('startsAt', '<', Timestamp.fromDate(window.end))] : []),
     orderBy('startsAt', 'asc'),
     limit(limitCount)
   );
@@ -707,7 +860,7 @@ async function fetchByStartsAtWindowByType<T extends ActivityContent | EventCont
 
 async function fetchByStartsAtWindow(
   scope: BrowseScope,
-  window: { start: Date; end: Date },
+  window: { start: Date; end?: Date },
   limitCount: number
 ): Promise<(ActivityContent | EventContent)[]> {
   const [events, activities] = await Promise.all([
@@ -835,7 +988,7 @@ async function fetchFollowingHappeningNowEvents(authorUidChunks: string[][], sco
 async function fetchFollowingEventsByStartsAtWindow(
   authorUidChunks: string[][],
   scope: BrowseScope,
-  window: { start: Date; end: Date },
+  window: { start: Date; end?: Date },
   limitCount: number
 ): Promise<EventContent[]> {
   if (!firestore || authorUidChunks.length === 0) return [];
@@ -852,7 +1005,9 @@ async function fetchFollowingEventsByStartsAtWindow(
             where('status', '==', 'published'),
             where('authorUid', 'in', chunk),
             where('startsAt', '>=', Timestamp.fromDate(window.start)),
-            where('startsAt', '<', Timestamp.fromDate(window.end)),
+            // `end` optional — see fetchByStartsAtWindowByType's own doc
+            // comment for why (getUpcomingWindow is now open-ended).
+            ...(window.end ? [where('startsAt', '<', Timestamp.fromDate(window.end))] : []),
             orderBy('startsAt', 'asc'),
             limit(limitCount)
           )
@@ -922,6 +1077,160 @@ export async function fetchFollowingDiscoverySections(
     sections: { happeningNow, todayLabel: todayWindow.label, today, upcoming },
     followsAnyone: true,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4 perf pass — a small, short-lived HANDOFF cache from the Events
+// tab's own already-fetched DiscoverySections to its "Show more" screen
+// (src/app/(app)/events/section.tsx), which today re-runs the exact same
+// fetchDiscoverySections/fetchFollowingDiscoverySections call (same scope,
+// same SECTION_LIMIT) the instant it opens, even though the Events tab
+// almost always already has that exact result in memory. The Events tab
+// writes into this on every one of ITS OWN successful real fetches (see
+// (tabs)/events.tsx's own loadForYou/loadFollowing) — a real load, an
+// explicit retry, AND a silent revalidate alike — so this always reflects
+// exactly what the tab itself most recently, successfully saw. The
+// Section screen reads it FIRST and only falls back to a real fetch of
+// its own on a miss/stale entry, in which case it ALSO writes back here
+// (so a second "Show more" tap for a different rail in the same visit
+// benefits too, even if the Events tab itself was never revisited).
+//
+// Deliberately NOT built by wrapping fetchDiscoverySections/
+// fetchFollowingDiscoverySections themselves in a cache the way Phase 2
+// wrapped fetchPublicProfile: those two functions are also exactly what
+// the Events tab's OWN silent-revalidate calls on every refocus (see
+// events.tsx's own stale-while-revalidate doc comment) — if a cache lived
+// INSIDE them, that revalidate could itself become a same-TTL cache hit
+// and silently do nothing, masking real staleness (e.g. right after
+// creating a new event) on the Events tab itself, not just on the Section
+// screen. This handoff cache is intentionally external to both functions
+// and much shorter-lived than Phase 2's own 45-60s convention, so it only
+// ever serves the "the tab JUST fetched this, and Show more was tapped
+// moments later" case — never a stand-in for the tab's own revalidation
+// policy, which keeps calling the real functions directly, completely
+// unchanged by this cache's existence.
+// ---------------------------------------------------------------------------
+
+const SECTION_HANDOFF_TTL_MS = 20_000;
+const forYouSectionsHandoff = new Map<string, { sections: DiscoverySections; fetchedAt: number }>();
+const followingSectionsHandoff = new Map<string, { result: FollowingDiscoverySections; fetchedAt: number }>();
+
+/**
+ * Step 12A — `uid` joined the key the moment this cache started holding a
+ * RANKED result (see setForYouSectionsHandoff's own doc comment): the
+ * pre-Step-12A key was scope+limit only, which was correct for a plain
+ * chronological fetch (identical for every viewer in that scope) but
+ * would let one signed-in viewer's personalized ranked order leak to a
+ * different signed-in viewer who happens to open the same city's Events
+ * tab within the same 20s window. A signed-out viewer (no ranking at
+ * all — see events.tsx's own `user ? rankEventSections(...) : result`)
+ * passes `''` here, which can never collide with a real Firebase uid, so
+ * guest and signed-in entries never share a slot either.
+ */
+// Step 12A — the key-generation logic itself now lives in
+// src/utils/eventSectionHandoffKey.ts (a dependency-light module, unlike
+// this file, directly unit-testable under plain `tsx` — see that file's
+// own doc comment and tests/eventsSectionHandoff.test.ts) — imported
+// above alongside this file's other top-of-file imports.
+
+/**
+ * A fresh-enough peek at the Events tab's own most recent successful
+ * result for this exact (uid, scope, limitCount) — RANKED for a signed-in
+ * `uid` (see setForYouSectionsHandoff), plain chronological for `''`
+ * (signed-out). `undefined` on a miss or a stale entry, in which case the
+ * caller (only ever the "Show more" screen — the Events tab itself never
+ * reads this back) should fall back to its own real fetch.
+ */
+export function peekForYouSectionsHandoff(uid: string, scope: BrowseScope, limitCount: number): DiscoverySections | undefined {
+  const entry = forYouSectionsHandoff.get(forYouHandoffKey(uid, scope, limitCount));
+  if (!entry || Date.now() - entry.fetchedAt >= SECTION_HANDOFF_TTL_MS) return undefined;
+  return entry.sections;
+}
+
+/** Same as peekForYouSectionsHandoff, Following-scoped (also keyed by uid — see followingHandoffKey). */
+export function peekFollowingSectionsHandoff(uid: string, scope: BrowseScope, limitCount: number): FollowingDiscoverySections | undefined {
+  const entry = followingSectionsHandoff.get(followingHandoffKey(uid, scope, limitCount));
+  if (!entry || Date.now() - entry.fetchedAt >= SECTION_HANDOFF_TTL_MS) return undefined;
+  return entry.result;
+}
+
+/**
+ * Called by the Events tab after its own `rankEventSections` call
+ * resolves (or, for a signed-out viewer, after the plain chronological
+ * fetch — see events.tsx's own `loadForYou`) — `sections` here is
+ * whichever of those two the tab is actually about to RENDER, never the
+ * pre-ranking raw fetch. Step 12A fixed exactly this: before, this was
+ * called with the raw, unranked result, so "Show more" (which reads this
+ * cache) could show a different order than the ranked rail it was opened
+ * from. Also called by the "Show more" screen itself on a cache miss —
+ * see section.tsx's own doc comment for why that fallback intentionally
+ * stays unranked rather than re-running the whole ranking pipeline a
+ * second screen away.
+ */
+export function setForYouSectionsHandoff(uid: string, scope: BrowseScope, limitCount: number, sections: DiscoverySections): void {
+  forYouSectionsHandoff.set(forYouHandoffKey(uid, scope, limitCount), { sections, fetchedAt: Date.now() });
+}
+
+/**
+ * Step 12B — surgically removes one Event the viewer just marked "Not
+ * interested" from EVERY cached For-You handoff entry that belongs to
+ * them (every scope they've recently viewed, in case they switched
+ * scopes within this cache's own short TTL), WITHOUT clearing the entry
+ * entirely. This is deliberately a CORRECTION of the already-ranked data
+ * in place, not an invalidation that forces a refetch: a refetch on a
+ * miss falls back to the plain chronological result (see
+ * setForYouSectionsHandoff's own doc comment on why section.tsx's miss
+ * path intentionally never re-runs ranking) — wiping the cache here
+ * would silently trade a correctly-ranked-minus-one-item list for an
+ * unranked one, undoing Step 12A's own guarantee for no good reason.
+ * Correcting in place also preserves the entry's original `fetchedAt`
+ * (its TTL countdown is unaffected — this is a fix to existing data, not
+ * a fresh fetch), and never touches Following's own separate handoff Map
+ * at all (Not Interested is a For-You-only concept — see this step's own
+ * report for the full reasoning).
+ */
+export function removeContentIdFromForYouSectionsHandoffForUser(uid: string, contentId: string): void {
+  const prefix = `${uid}:`;
+  for (const [key, entry] of forYouSectionsHandoff) {
+    if (!key.startsWith(prefix)) continue;
+    forYouSectionsHandoff.set(key, { sections: removeContentIdFromSections(entry.sections, contentId), fetchedAt: entry.fetchedAt });
+  }
+}
+
+/** Same as setForYouSectionsHandoff, Following-scoped. */
+export function setFollowingSectionsHandoff(uid: string, scope: BrowseScope, limitCount: number, result: FollowingDiscoverySections): void {
+  followingSectionsHandoff.set(followingHandoffKey(uid, scope, limitCount), { result, fetchedAt: Date.now() });
+}
+
+// ---------------------------------------------------------------------------
+// Swipe-to-next-Event handoff — a small in-memory peek, same shape and
+// same reasoning as the Sections handoff just above (an in-memory,
+// short-TTL, "the caller already has this exact list in hand" pass-
+// through — never a URL param, since Content items carry Firestore
+// Timestamp fields that don't survive URL serialization, same note
+// events/section.tsx's own doc comment already makes). Written by any
+// screen whose own already-loaded, already-fetched EventContent list is
+// what a swipe-through should page through right before it navigates
+// into one of its own items — today that's Profile's own Live/Upcoming/
+// Past Events tabs and the Events tab's own rails (see their own call
+// sites) — and read once by content/[contentId].tsx on mount to decide
+// whether to show a plain single Event (a share link, search result, or
+// any other entry point that never wrote this) or a full swipeable feed
+// through this exact list. A stale/missing entry, or one that doesn't
+// actually contain the Event just navigated to, always falls back to the
+// single-Event behavior — never a crash, never the wrong list.
+const EVENT_FEED_HANDOFF_TTL_MS = 20_000;
+let eventFeedHandoff: { events: EventContent[]; fetchedAt: number } | null = null;
+
+/** Call right before navigating into one of `events`' own items — see this handoff's own doc comment above. */
+export function setEventFeedHandoff(events: EventContent[]): void {
+  eventFeedHandoff = { events, fetchedAt: Date.now() };
+}
+
+/** `undefined` on a miss or a stale entry — see this handoff's own doc comment above for what the caller should do then (fall back to a single Event). */
+export function peekEventFeedHandoff(): EventContent[] | undefined {
+  if (!eventFeedHandoff || Date.now() - eventFeedHandoff.fetchedAt >= EVENT_FEED_HANDOFF_TTL_MS) return undefined;
+  return eventFeedHandoff.events;
 }
 
 /**

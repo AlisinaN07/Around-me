@@ -50,9 +50,11 @@ import {
   setPendingSelectedVideo,
   takePendingPreselectedSound,
 } from '@/services/reelCameraHandoff';
-import { createStoryDraft, discardStoryDraft, publishStory, uploadStoryMedia, type UploadStoryMediaHandle } from '@/services/stories';
+import { getMediaStorageProvider } from '@/services/media';
+import { createStoryDraft, discardStoryDraft, finalizeStoryVideo, publishStory, uploadStoryMedia, type UploadStoryMediaHandle } from '@/services/stories';
 import {
   REEL_MAX_DURATION_MS,
+  REEL_PHOTO_MAX_FILE_SIZE_BYTES,
   type ReelMediaType,
   type SelectedReelMusic,
   type SelectedReelPhoto,
@@ -345,8 +347,24 @@ export default function CreateReelCameraScreen() {
   // here, with its own small inline progress overlay below.
   const [isPublishingStory, setIsPublishingStory] = useState(false);
   const [storyUploadProgress, setStoryUploadProgress] = useState(0);
+  // Step 11C — true only during the server-side finalizeStoryVideo call
+  // (direct video Stories only), between the upload finishing and
+  // publishStory starting — distinct label, same reasoning as the Reel
+  // publish flow's own 'finalizing' stage (src/app/(app)/create/reel/
+  // index.tsx).
+  const [isFinalizingStoryVideo, setIsFinalizingStoryVideo] = useState(false);
   const storyUploadHandleRef = useRef<UploadStoryMediaHandle | null>(null);
   const storyDraftRef = useRef<Story | null>(null);
+  // Step 10A — captured ONCE, right before uploadStoryMedia dispatches,
+  // rather than read off storyDraftRef.current (which is never reassigned
+  // after a real R2 confirm — see discardStoryDraft's own call sites
+  // below): getMediaStorageProvider() is what ACTUALLY decided which
+  // upload path just ran, so it's the correct signal for every
+  // discardStoryDraft call this flow might still need to make, whether
+  // the upload/confirm itself succeeded, partially succeeded, or never
+  // got that far at all (R2's own delete is a harmless no-op either way
+  // — see deleteStoryMedia's own "best-effort" doc comment).
+  const storyUploadProviderRef = useRef<'firebase' | 'r2'>('firebase');
 
   const cameraRef = useRef<CameraView>(null);
   const elapsedTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -571,6 +589,7 @@ export default function CreateReelCameraScreen() {
       }
       setPhoto({
         uri: result.uri,
+        source: 'camera',
         fileSizeBytes: new File(result.uri).size || null,
         width: result.width || null,
         height: result.height || null,
@@ -615,25 +634,64 @@ export default function CreateReelCameraScreen() {
     // A library-picked video already has its own audio track — music is
     // only ever meaningful for a fresh camera recording (see `music`'s own
     // doc comment above), so any prior pick is cleared here rather than
-    // left as confusing latent state.
+    // left as confusing latent state. A library-picked PHOTO never had
+    // music to begin with, so this is harmless there too.
     setMusic(null);
-    // Requested only when the user explicitly chooses a video — never on
-    // screen mount (see the Step 18 spec's minimum-permissions rule).
+    // Requested only when the user explicitly chooses something from their
+    // library — never on screen mount (see the Step 18 spec's minimum-
+    // permissions rule).
     const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
     if (!permission.granted) {
-      setError('Around Me needs access to your photo library to choose a video.');
+      setError('Around Me needs access to your photo library to choose a photo or video.');
       return;
     }
 
+    // Per explicit request: the library picker offers BOTH photos and
+    // videos (previously videos only) — matching what "FOTO" mode's own
+    // camera capture already lets a user post (a single still, see
+    // handleTakePicture above). Whichever the user actually picks decides
+    // which branch below runs; there's no separate UI for choosing a type
+    // up front, same as the system picker itself doesn't ask.
     const result = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: ['videos'],
+      mediaTypes: ['images', 'videos'],
       quality: 1,
     });
     if (result.canceled || result.assets.length === 0) return;
 
     const asset = result.assets[0];
-    if (asset.type && asset.type !== 'video') {
-      setError('Choose a video, not a photo.');
+
+    if (asset.type === 'image') {
+      const candidate: SelectedReelPhoto = {
+        uri: asset.uri,
+        source: 'library',
+        fileSizeBytes: asset.fileSize && asset.fileSize > 0 ? asset.fileSize : null,
+        width: asset.width || null,
+        height: asset.height || null,
+        mimeType: asset.mimeType ?? null,
+      };
+      // Same fields/limits reels.ts's own createReelDraft independently
+      // re-validates server-side (see REEL_PHOTO_MAX_FILE_SIZE_BYTES) —
+      // this just rejects an unusable pick before ever attempting an
+      // upload, the same role validateSelectedReelVideo plays for a
+      // library video just below.
+      if (!candidate.mimeType || !candidate.mimeType.startsWith('image/')) {
+        setError('That file type is not a supported photo.');
+        return;
+      }
+      if (candidate.fileSizeBytes === null || candidate.fileSizeBytes <= 0) {
+        setError("Couldn't determine this photo's file size — try a different photo.");
+        return;
+      }
+      if (candidate.fileSizeBytes > REEL_PHOTO_MAX_FILE_SIZE_BYTES) {
+        setError('Photo must be under 10 MB.');
+        return;
+      }
+      if (!candidate.width || !candidate.height) {
+        setError("Couldn't read this photo's dimensions — try a different photo.");
+        return;
+      }
+      setPhoto(candidate);
+      setStage('preview');
       return;
     }
 
@@ -818,6 +876,7 @@ export default function CreateReelCameraScreen() {
       return;
     }
     storyDraftRef.current = draftResult.story;
+    storyUploadProviderRef.current = getMediaStorageProvider() === 'r2' ? 'r2' : 'firebase';
 
     storyUploadHandleRef.current = uploadStoryMedia(
       draftResult.story,
@@ -826,18 +885,38 @@ export default function CreateReelCameraScreen() {
       async (uploadResult) => {
         storyUploadHandleRef.current = null;
         if (!uploadResult.ok) {
-          await discardStoryDraft(draftResult.story.storyId, draftResult.story.storagePath);
+          await discardStoryDraft(draftResult.story.storyId, draftResult.story.storagePath, storyUploadProviderRef.current);
           storyDraftRef.current = null;
           setIsPublishingStory(false);
           setError("Couldn't upload your Story.");
           return;
+        }
+        // Step 11C — a direct VIDEO Story must be server-normalized
+        // before it can publish — firestore.rules' own isValidStoryPublish
+        // independently refuses to publish one whose sourceNormalized
+        // isn't already true, so this is enforced server-side too, not
+        // just by this call ordering. A photo Story skips this entirely
+        // (mediaType === 'photo' is never eligible for finalization —
+        // see checkStoryVideoFinalizationEligibility, functions/src/media/
+        // storyEligibility.ts).
+        if (mediaType === 'video') {
+          setIsFinalizingStoryVideo(true);
+          const finalizeResult = await finalizeStoryVideo(draftResult.story.storyId);
+          setIsFinalizingStoryVideo(false);
+          if (!finalizeResult.ok) {
+            await discardStoryDraft(draftResult.story.storyId, draftResult.story.storagePath, storyUploadProviderRef.current);
+            storyDraftRef.current = null;
+            setIsPublishingStory(false);
+            setError("Couldn't finish processing your Story's video.");
+            return;
+          }
         }
         // authorUid passed through so publishStory can invalidate its own
         // active-story cache immediately (Phase 2 perf pass) instead of
         // this author's story ring taking up to 60s to appear elsewhere.
         const publishResult = await publishStory(draftResult.story.storyId, draftResult.story.authorUid);
         if (!publishResult.ok) {
-          await discardStoryDraft(draftResult.story.storyId, draftResult.story.storagePath);
+          await discardStoryDraft(draftResult.story.storyId, draftResult.story.storagePath, storyUploadProviderRef.current);
           storyDraftRef.current = null;
           setIsPublishingStory(false);
           setError("Couldn't publish your Story.");
@@ -856,10 +935,11 @@ export default function CreateReelCameraScreen() {
     const draft = storyDraftRef.current;
     storyDraftRef.current = null;
     if (draft) {
-      await discardStoryDraft(draft.storyId, draft.storagePath);
+      await discardStoryDraft(draft.storyId, draft.storagePath, storyUploadProviderRef.current);
     }
     setIsPublishingStory(false);
     setStoryUploadProgress(0);
+    setIsFinalizingStoryVideo(false);
   };
 
   const bothGranted = !!cameraPermission?.granted && !!microphonePermission?.granted;
@@ -911,7 +991,12 @@ export default function CreateReelCameraScreen() {
           <View style={styles.previewBottomRow}>
             <Pressable style={styles.retakeButton} onPress={handleRetake} accessibilityRole="button">
               <Ionicons name="refresh" size={16} color={Colors.text} />
-              <Text style={styles.retakeText}>{photo || video?.source === 'camera' ? 'Retake' : 'Choose another'}</Text>
+              <Text style={styles.retakeText}>
+                {/* A camera-shot photo/video says "Retake" (you can shoot
+                    it again); a library pick — photo or video — says
+                    "Choose another" instead. */}
+                {photo?.source === 'camera' || video?.source === 'camera' ? 'Retake' : 'Choose another'}
+              </Text>
             </Pressable>
             <View style={styles.previewActionsRight}>
               {/* Publishes this exact video/photo directly as an ephemeral
@@ -931,7 +1016,9 @@ export default function CreateReelCameraScreen() {
         {isPublishingStory ? (
           <View style={[StyleSheet.absoluteFill, styles.storyPublishOverlay]} pointerEvents="auto">
             <ActivityIndicator size="large" color={Colors.text} />
-            <Text style={styles.storyPublishText}>Publishing Story… {storyUploadProgress}%</Text>
+            <Text style={styles.storyPublishText}>
+              {isFinalizingStoryVideo ? 'Processing video…' : `Publishing Story… ${storyUploadProgress}%`}
+            </Text>
             <Pressable onPress={handleCancelStoryUpload} accessibilityRole="button" hitSlop={12}>
               <Text style={styles.storyPublishCancel}>Cancel</Text>
             </Pressable>
@@ -965,8 +1052,12 @@ export default function CreateReelCameraScreen() {
           </Pressable>
         </View>
         <View style={styles.centered}>
-          <Ionicons name="videocam-outline" size={40} color={Colors.textSecondary} />
-          <Text style={styles.deniedTitle}>Choose a video to share.</Text>
+          {/* "images-outline" (not "videocam-outline") — the same generic
+              library icon the native capture screen's own Library button
+              uses below — since this button now accepts either a photo or
+              a video, per explicit request. */}
+          <Ionicons name="images-outline" size={40} color={Colors.textSecondary} />
+          <Text style={styles.deniedTitle}>Choose a photo or video to share.</Text>
           {error ? <Text style={styles.errorText}>{error}</Text> : null}
           <View style={styles.deniedActions}>
             <Button label="Choose from library" onPress={handleChooseFromLibrary} />

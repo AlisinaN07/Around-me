@@ -1,6 +1,14 @@
 {
   "indexes": [
     {
+      "collectionGroup": "cityHashtagTrends",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "cityId", "order": "ASCENDING" },
+        { "fieldPath": "lastActivityAt", "order": "DESCENDING" }
+      ]
+    },
+    {
       "collectionGroup": "content",
       "queryScope": "COLLECTION",
       "fields": [
@@ -205,10 +213,27 @@
       ]
     },
     {
+      "collectionGroup": "reels",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "hashtags", "arrayConfig": "CONTAINS" },
+        { "fieldPath": "status", "order": "ASCENDING" },
+        { "fieldPath": "publishedAt", "order": "DESCENDING" }
+      ]
+    },
+    {
       "collectionGroup": "stories",
       "queryScope": "COLLECTION",
       "fields": [
         { "fieldPath": "authorUid", "order": "ASCENDING" },
+        { "fieldPath": "status", "order": "ASCENDING" },
+        { "fieldPath": "expiresAt", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "stories",
+      "queryScope": "COLLECTION",
+      "fields": [
         { "fieldPath": "status", "order": "ASCENDING" },
         { "fieldPath": "expiresAt", "order": "ASCENDING" }
       ]

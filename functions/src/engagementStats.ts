@@ -214,12 +214,27 @@ export const onContentCommentDeleted = onDocumentDeleted({ region: REGION, docum
 
 type SavedDocLike = { targetType?: unknown; targetId?: unknown };
 
-function resolveSaveTarget(data: SavedDocLike): { kind: 'reel' | 'content'; id: string } | null {
+/**
+ * Step 12C — added `'event'`, mapping to the same `kind: 'content'` as
+ * `'post'` already does (both live in the `content` collection and share
+ * the exact same `content/{id}/stats/engagement` path — see
+ * statsPathFor). This closes a genuine gap found by direct audit:
+ * `scoreEventQuality` (src/services/recommendations/ranking.ts) has
+ * always read `stats.saves` as one of its weighted quality components,
+ * but nothing ever incremented it for an Event before this — the save
+ * DOCUMENT itself (`users/{uid}/saved/{savedId}`) was always written
+ * correctly (src/services/saved.ts's own generic savePost/unsavePost),
+ * only this trigger's own target-resolution never recognized the
+ * `'event'` targetType, silently treating it the same as `'sound'`
+ * (never a content/Reel save) instead. Exported for
+ * scripts/test-stats-logic.cjs.
+ */
+export function resolveSaveTarget(data: SavedDocLike): { kind: 'reel' | 'content'; id: string } | null {
   const targetType = data.targetType;
   const targetId = data.targetId;
   if (typeof targetId !== 'string' || targetId.length === 0) return null;
   if (targetType === 'reel') return { kind: 'reel', id: targetId };
-  if (targetType === 'post') return { kind: 'content', id: targetId };
+  if (targetType === 'post' || targetType === 'event') return { kind: 'content', id: targetId };
   return null; // 'sound' (or anything unrecognized) — never a content/Reel save.
 }
 

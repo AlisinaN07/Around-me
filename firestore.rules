@@ -17,6 +17,32 @@ service cloud.firestore {
       return value == request.time;
     }
 
+    // Step 3B — users/{uid}/pushTokens/{deviceId}'s own shape, shared by
+    // both its create and update rules below. Ownership itself is NOT
+    // part of this check — it's already fully established by the
+    // document's own PATH (nested under users/{uid}, gated by isOwner(uid)
+    // at that match level) before either rule below ever calls this.
+    // There is deliberately no recipientUid-style field on this document
+    // at all — unlike notifications/{id} (a shared root collection that
+    // genuinely needs one), a token living under its owner's own uid
+    // subtree has nothing on the document itself a client could ever
+    // manipulate to make it resolve to a different recipient.
+    // Step 3C — accepts BOTH documented Expo push-token variants
+    // (`ExponentPushToken[...]` and `ExpoPushToken[...]`), not just one
+    // hardcoded literal prefix — see src/utils/expoPushTokenFormat.ts's
+    // own doc comment, the pure client-side mirror of this exact check.
+    function isValidExpoPushTokenFormat(value) {
+      return value is string && value.size() > 0 && value.size() <= 400
+        && value.matches('^Expo(nent)?PushToken\\[.+\\]$');
+    }
+
+    function isValidPushTokenShape(data) {
+      return data.deviceId is string && data.deviceId.size() > 0 && data.deviceId.size() <= 200
+        && isValidExpoPushTokenFormat(data.expoPushToken)
+        && (data.platform == 'ios' || data.platform == 'android')
+        && data.keys().hasOnly(['deviceId', 'expoPushToken', 'platform', 'createdAt', 'updatedAt']);
+    }
+
     // users/{uid} — private profile, readable and creatable only by its
     // own owner. Step 33 adds a narrow owner-only update for Edit Profile
     // (see below) — every other field stays immutable after create.
@@ -151,6 +177,48 @@ service cloud.firestore {
         allow delete: if isOwner(uid);
       }
 
+      // Step 3B — users/{uid}/pushTokens/{deviceId}. A device-token
+      // registration (see src/services/pushTokens.ts) — ONLY the owner
+      // may ever read, create, update, or delete their own. Never
+      // readable by anyone else: push tokens are not stored in
+      // publicProfiles (confirmed — isValidPublicProfileCreate/Update
+      // below never references this field) and never surfaced via any
+      // other collection. `deviceId` is validated as EQUAL to its own
+      // path segment (same "document ID matches a real field" pairing
+      // this ruleset already uses elsewhere, e.g. isValidContentCreate's
+      // own `data.contentId == contentId`) — purely a consistency/
+      // defense-in-depth check, since ownership itself never depends on
+      // this field at all (the PATH already proves it).
+      match /pushTokens/{deviceId} {
+        allow read: if isOwner(uid);
+
+        allow create: if isOwner(uid)
+          && request.resource.data.deviceId == deviceId
+          && isValidPushTokenShape(request.resource.data)
+          && isServerTimestamp(request.resource.data.createdAt)
+          && isServerTimestamp(request.resource.data.updatedAt);
+
+        // Token rotation (Step 3B's own explicit requirement) — the SAME
+        // device re-registering with a new token value, or just a fresh
+        // updatedAt. deviceId and createdAt are both pinned to their
+        // EXISTING values (same "preserve across update" pattern as
+        // users/{uid}'s own Edit Profile rule's createdAt check) — an
+        // update can change `expoPushToken`/`platform`/`updatedAt` only,
+        // never re-parent this document to a different deviceId or
+        // fabricate a different creation time.
+        allow update: if isOwner(uid)
+          && request.resource.data.deviceId == deviceId
+          && request.resource.data.deviceId == resource.data.deviceId
+          && request.resource.data.createdAt == resource.data.createdAt
+          && isValidPushTokenShape(request.resource.data)
+          && isServerTimestamp(request.resource.data.updatedAt);
+
+        // Logout cleanup and account deletion (the latter via the
+        // trusted Admin SDK, which bypasses this rule entirely) both rely
+        // on this.
+        allow delete: if isOwner(uid);
+      }
+
       // users/{uid}/recommendationEvents/{eventId} — the "For You"
       // recommendation engine's own append-only interaction log (see
       // src/types/recommendation.ts). ONLY the owner may ever read or
@@ -200,6 +268,41 @@ service cloud.firestore {
         allow delete: if false;
       }
 
+      // Recommendation Engine — hashtag interest profile —
+      // users/{uid}/hashtagInterests/{hashtag}: per-user, per-hashtag
+      // interest scores (see src/types/hashtagInterest.ts). A separate
+      // SUBCOLLECTION rather than a map field on recommendationProfile/
+      // main above — hashtag cardinality is unbounded (unlike the ~18-
+      // entry category catalog categoryScores already covers), so it can
+      // never be folded into that one bounded document the way
+      // categoryScores/creatorScores/cityScores are.
+      //
+      // Owner-only, same as recommendationProfile/main just above — a
+      // user can only ever read/corrupt THEIR OWN future recommendation
+      // inputs this way (once a later step actually uses this for
+      // ranking), never another user's data. Rules validates the SHAPE
+      // and numeric BOUNDS (score clamped to [0,1], counts non-negative
+      // integers, hashtag == this doc's own ID), not that a write exactly
+      // replays the client's own bounded-delta math — impractical to
+      // re-derive in Rules language, and unnecessary for the exact same
+      // reason recommendationProfile/main just above already accepts this
+      // same limitation (see isValidRecommendationProfileWrite's own doc
+      // comment: this is a self-harm-only risk, not a cross-user one).
+      // `allow delete` (unlike recommendationProfile/main's permanent
+      // `false`) is real here — the client's own low-score cleanup
+      // (hashtagInterestProfile.ts) deletes a hashtag whose score decayed/
+      // dropped to negligible rather than keeping a near-zero record
+      // forever.
+      match /hashtagInterests/{hashtag} {
+        allow read: if isOwner(uid);
+
+        allow create: if isOwner(uid) && isValidHashtagInterestWrite(hashtag, request.resource.data);
+
+        allow update: if isOwner(uid) && isValidHashtagInterestWrite(hashtag, request.resource.data);
+
+        allow delete: if isOwner(uid);
+      }
+
       // Recommendation Engine — Step 6 — users/{uid}/feedSessions/{sessionId}:
       // the trusted, backend-only-maintained per-session evaluation
       // summary (see functions/src/metrics.ts — built incrementally from
@@ -218,6 +321,65 @@ service cloud.firestore {
 
         allow delete: if false;
       }
+    }
+
+    // Step 3C — pushTokenOwners/{expoPushToken}, keyed by the literal
+    // Expo push token value itself (never the per-user deviceId) — the
+    // cross-account privacy guarantee src/services/pushTokens.ts's own
+    // top doc comment depends on. Deliberately a SEPARATE top-level
+    // collection from users/{uid}/pushTokens: that collection records
+    // "which devices THIS uid has registered"; this one records "which
+    // uid currently, legitimately owns THIS physical token" — the second
+    // question is the one a future send-process actually needs answered
+    // before ever delivering to a token, since a stale/undeleted
+    // users/{uid}/pushTokens document surviving a failed logout must
+    // never be mistaken for "this uid can still receive pushes here."
+    //
+    // Deliberately no client read at all — no legitimate client need
+    // ever reads this collection (only a future trusted backend would,
+    // via the Admin SDK, which bypasses Rules entirely regardless of
+    // what `allow read` says here).
+    //
+    // `allow update` intentionally does NOT require
+    // `resource.data.uid == request.auth.uid` — unlike a normal owner-
+    // only update elsewhere in this file, REASSIGNING this record away
+    // from whoever held it before is the entire point: whoever most
+    // recently, legitimately registered this physical token (proven by
+    // being a real signed-in Firebase user claiming their OWN uid, never
+    // an arbitrary client-supplied one) is its current owner. The
+    // residual risk this accepts — a signed-in user claiming ownership
+    // of a token value they don't actually possess, to grief its real
+    // owner into missing pushes — only ever causes a DROPPED delivery
+    // for the real owner, never unauthorized access to anyone's content,
+    // since this record is only ever consulted as a gate ("should a push
+    // meant for uid X go to this token"), never as a routing table.
+    //
+    // `allow delete` DOES require `resource.data.uid == request.auth.uid`
+    // — a departing user may only ever release a claim that is still
+    // actually theirs; this is why removeCurrentDevicePushToken attempts
+    // this release as a SEPARATE operation from deleting its own
+    // users/{uid}/pushTokens document, not in the same atomic batch — a
+    // denied release (because a newer registration already reassigned
+    // it) must never block the always-safe per-user deletion.
+    function isValidPushTokenOwnerShape(data) {
+      return data.uid is string && data.uid.size() > 0
+        && data.keys().hasOnly(['uid', 'updatedAt']);
+    }
+
+    match /pushTokenOwners/{expoPushToken} {
+      allow read: if false;
+
+      allow create: if isSignedIn()
+        && request.resource.data.uid == request.auth.uid
+        && isValidPushTokenOwnerShape(request.resource.data)
+        && isServerTimestamp(request.resource.data.updatedAt);
+
+      allow update: if isSignedIn()
+        && request.resource.data.uid == request.auth.uid
+        && isValidPushTokenOwnerShape(request.resource.data)
+        && isServerTimestamp(request.resource.data.updatedAt);
+
+      allow delete: if isSignedIn() && resource.data.uid == request.auth.uid;
     }
 
     // Recommendation Engine — Step 6 — recommendationMetrics/{docId}
@@ -306,6 +468,23 @@ service cloud.firestore {
           'categoryScores', 'creatorScores', 'cityScores', 'excludedContentIds', 'recentImpressions',
           'stronglyEngagedContentIds', 'respondedEventIds', 'interactionCount', 'lastDecayAt', 'updatedAt'
         ]);
+    }
+
+    // Recommendation Engine — hashtag interest profile — see
+    // `match /hashtagInterests/{hashtag}` above for the full reasoning.
+    // `hashtagId` is this document's own ID (the path segment), matching
+    // the same "hashtag == doc ID, never a capitalization-variant
+    // duplicate" convention the global `hashtags/{hashtagId}` collection
+    // already uses (see that collection's own isValidHashtagShape,
+    // further down in this file).
+    function isValidHashtagInterestWrite(hashtagId, data) {
+      return data.hashtag == hashtagId
+        && data.score is number && data.score >= 0 && data.score <= 1
+        && data.positiveSignalCount is int && data.positiveSignalCount >= 0
+        && data.negativeSignalCount is int && data.negativeSignalCount >= 0
+        && isServerTimestamp(data.lastInteractionAt)
+        && isServerTimestamp(data.updatedAt)
+        && data.keys().hasOnly(['hashtag', 'score', 'positiveSignalCount', 'negativeSignalCount', 'lastInteractionAt', 'updatedAt']);
     }
 
     // Step 41.2E — target validation for a new Saved relationship. Rejects:
@@ -741,12 +920,58 @@ service cloud.firestore {
           && data.startsAt is timestamp
           && data.endsAt is timestamp
           && data.startsAt < data.endsAt
-          && data.keys().hasAll(baseContentKeys().concat(['title', 'description', 'startsAt', 'endsAt', 'placeName']))
+          // Step 12D — every "#token" this Event's own description
+          // contains, normalized — see src/utils/hashtags.ts's
+          // extractHashtags, the single source of truth for what a
+          // hashtag actually is, and REQUIRED (not optional) here the
+          // same way reels/{reelId}'s own isValidReelCreate already
+          // requires `hashtags` on every new Reel (every NEW Event going
+          // forward always supplies it, even as `[]` — only documents
+          // that predate this step lack it at all, and this rule only
+          // ever gates a CREATE, never a read of an old doc). Same
+          // bound (<= 30) as Reels, same "bound the SHAPE, not re-parse
+          // the text char-by-char" scope Reel's own rule already limits
+          // itself to.
+          && data.hashtags is list
+          && data.hashtags.size() <= 30
+          && data.keys().hasAll(baseContentKeys().concat(['title', 'description', 'startsAt', 'endsAt', 'placeName', 'hashtags']))
           // Step 36 — coverPhotoURL is OPTIONAL (an organizer may skip it),
           // same "absent key, not a blank value" pattern isValidPostShape
-          // already uses for placeName above.
-          && data.keys().hasOnly(baseContentKeys().concat(['title', 'description', 'startsAt', 'endsAt', 'placeName', 'coverPhotoURL']))
-          && (!('coverPhotoURL' in data) || (data.coverPhotoURL is string && data.coverPhotoURL.size() > 0 && data.coverPhotoURL.size() <= 2048));
+          // already uses for placeName above. coverStoragePath/
+          // coverStorageProvider are the Event-cover deletion keys (see
+          // eventMediaCleanup.ts) — equally optional, for the same reason.
+          && data.keys().hasOnly(baseContentKeys().concat(['title', 'description', 'startsAt', 'endsAt', 'placeName', 'hashtags', 'coverPhotoURL', 'coverStoragePath', 'coverStorageProvider']))
+          && (!('coverPhotoURL' in data) || (data.coverPhotoURL is string && data.coverPhotoURL.size() > 0 && data.coverPhotoURL.size() <= 2048))
+          // coverStoragePath and coverStorageProvider are written together
+          // or not at all — never one without the other (a lone path with
+          // no known provider, or a provider with no path, is meaningless
+          // and would just be dead weight on the document).
+          && (('coverStoragePath' in data) == ('coverStorageProvider' in data))
+          && (!('coverStorageProvider' in data) || data.coverStorageProvider == 'firebase' || data.coverStorageProvider == 'r2')
+          // Step 2B — the real security property this field needs is
+          // EXACT Event ownership, not just namespace ownership. A bare
+          // "starts with my own eventCovers/{authorUid}/" check (this
+          // rule's own prior version) still let a client claim ANY
+          // draftId under its own namespace — including one belonging to
+          // a DIFFERENT, already-published Event of the SAME author's,
+          // since two Events by one author share the same uid but never
+          // the same contentId. Requiring an EXACT match against THIS
+          // document's own `contentId` (not just a same-uid prefix with
+          // an arbitrary trailing segment) closes that: `data.contentId`
+          // is already pinned to the real, freshly-created document path
+          // by isValidContentCreate's own `data.contentId == contentId`
+          // check below, and `data.authorUid` is already pinned to
+          // request.auth.uid the same way — so this transitively ties the
+          // key to BOTH the real caller AND this one specific Event,
+          // never a client-asserted value for either. Exact mirror of
+          // storage.rules' own `eventCovers/{authorUid}/{draftId}/photo`
+          // path-is-the-authorization model for the upload side of this
+          // same object — see that file's own comment on why the upload
+          // step itself cannot additionally verify this (the Event
+          // document doesn't exist yet at upload time).
+          && (!('coverStoragePath' in data)
+            || (data.coverStoragePath is string
+              && data.coverStoragePath == 'eventCovers/' + data.authorUid + '/' + data.contentId + '/photo'));
       }
 
       // If placeId is set, the linked place must exist, be active, be in
@@ -1137,15 +1362,30 @@ service cloud.firestore {
 
       allow create: if isSignedIn() && isValidReelCreate(reelId, request.resource.data);
 
-      // The ONLY allowed transition: uploading -> published. Every other
-      // field is immutable — no caption editing, no city changing, no
-      // storage path changing, no author changing, and once published,
-      // this rule can never fire again (oldData.status == 'uploading' is
-      // required, so a second update attempt against a published Reel is
-      // always denied here).
+      // Five allowed updates, and only these: uploading -> published
+      // (the original, still overwhelmingly common case), Step 5E's
+      // narrow, one-time "thumbnail moved to R2" flip, Step 9A/9B's
+      // equally narrow, one-time "video source moved to R2" flip, Step
+      // 9C's own lockstep "photo source+thumbnail moved to R2 together"
+      // flip, and Step 10B's own narrow, one-time "music moved to R2"
+      // flip — all only while still "uploading" — see
+      // isValidReelPublish/isValidReelThumbnailProviderUpdate/
+      // isValidReelSourceProviderUpdate/isValidReelPhotoSourceProviderUpdate/
+      // isValidReelMusicProviderUpdate's own doc comments for the full
+      // "every other field is immutable" reasoning each one separately
+      // enforces (including each other's own provider fields — a client
+      // can never piggyback a source-provider change through the
+      // thumbnail-update rule, or a music-provider change through any of
+      // the others, or vice versa).
       allow update: if isSignedIn()
         && resource.data.authorUid == request.auth.uid
-        && isValidReelPublish(request.resource.data, resource.data);
+        && (
+          isValidReelPublish(request.resource.data, resource.data)
+          || isValidReelThumbnailProviderUpdate(request.resource.data, resource.data)
+          || isValidReelSourceProviderUpdate(request.resource.data, resource.data)
+          || isValidReelPhotoSourceProviderUpdate(request.resource.data, resource.data)
+          || isValidReelMusicProviderUpdate(request.resource.data, resource.data)
+        );
 
       // Only a still-uploading draft may be deleted, by its own author —
       // for failed/cancelled-upload cleanup (see discardReelDraft). A
@@ -1329,14 +1569,16 @@ service cloud.firestore {
     function reelBaseKeys() {
       return [
         'reelId', 'authorUid', 'authorDisplayName', 'authorUsername',
-        'cityName', 'countryCode', 'cityKey', 'categoryId', 'caption',
+        'cityName', 'countryCode', 'cityKey', 'categoryId', 'caption', 'hashtags',
         'mediaType', 'needsPhotoVideoRender', 'storagePath', 'storageContentType', 'fileSizeBytes', 'durationMs',
+        'storageProvider', 'sourceUrl', 'sourceNormalized',
         'width', 'height', 'status', 'visibility',
-        'musicSourceType', 'musicTitle', 'musicStorageAudioPath',
+        'musicSourceType', 'musicTitle', 'musicStorageAudioPath', 'musicStorageProvider',
         'musicStorageContentType', 'musicFileSizeBytes', 'musicDurationMs',
         'musicHash', 'soundOriginAuthorUid', 'soundOriginReelId',
         'thumbnailStoragePath', 'thumbnailStorageContentType',
         'thumbnailFileSizeBytes', 'thumbnailWidth', 'thumbnailHeight',
+        'thumbnailStorageProvider', 'thumbnailUrl',
         'createdAt', 'updatedAt', 'publishedAt'
       ];
     }
@@ -1417,7 +1659,18 @@ service cloud.firestore {
         && data.categoryId is string
         && data.categoryId.size() > 0
         && data.caption is string
-        && data.caption.size() <= 500
+        && data.caption.size() <= 5000
+        // Every "#token" this Reel's own caption contains, normalized —
+        // see src/utils/hashtags.ts's extractHashtags, the single source
+        // of truth for what a hashtag actually is. Deliberately NOT
+        // re-parsed/re-validated against `data.caption` here char-by-char
+        // (Firestore Rules has no practical way to run that same
+        // Unicode-aware regex) — this only bounds the SHAPE (a real list
+        // of reasonably-sized lowercase strings) against abuse, the same
+        // scope firestore.rules already limits itself to for every other
+        // client-declared value.
+        && data.hashtags is list
+        && data.hashtags.size() <= 30
         && data.mediaType in ['video', 'photo']
         && data.needsPhotoVideoRender is bool
         // Only a 'video' draft can ever be pending photo-to-video
@@ -1426,6 +1679,27 @@ service cloud.firestore {
         // transient state.
         && (data.mediaType == 'video' || data.needsPhotoVideoRender == false)
         && data.storagePath == 'reels/' + request.auth.uid + '/' + reelId + '/source'
+        // Step 9A — same "required field, fixed default at create"
+        // pattern as thumbnailStorageProvider below, for the Reel's own
+        // video source this time. Only a trusted, one-time
+        // server-authorized update (see isValidReelSourceProviderUpdate
+        // below) can ever flip this to 'r2' — a client can never create
+        // a draft already claiming R2, regardless of mediaType/music.
+        && data.storageProvider == 'firebase'
+        && data.sourceUrl == ''
+        // Step 11B — every draft is created not-yet-normalized, same
+        // "required field, fixed default at create" pattern as
+        // storageProvider above, applied uniformly regardless of
+        // mediaType (a plain photo Reel never gets this flipped to true —
+        // see isValidReelPublish below, which exempts photo Reels from
+        // the gate entirely — but it still defaults the same way as
+        // every other Reel field, never conditionally omitted). Only a
+        // trusted Cloud Function (finalizeReelVideo/muxReelMusic/
+        // renderPhotoToVideo, via the Admin SDK) can ever flip this to
+        // true — there is no client-facing transition rule for it at
+        // all, unlike storageProvider/musicStorageProvider, because no
+        // client ever writes this field directly.
+        && data.sourceNormalized == false
         && (
           (
             data.mediaType == 'video'
@@ -1489,6 +1763,23 @@ service cloud.firestore {
         && data.musicHash == ''
         && data.soundOriginAuthorUid == ''
         && data.soundOriginReelId == ''
+        // Step 5E — a draft is always created with its thumbnail still on
+        // Firebase, same "required field, fixed default at create" pattern
+        // as musicHash/soundOriginAuthorUid/soundOriginReelId above. Only a
+        // trusted, one-time server-authorized update (see
+        // isValidReelThumbnailProviderUpdate below) can ever flip this to
+        // 'r2' — a client can never create a draft already claiming R2.
+        && data.thumbnailStorageProvider == 'firebase'
+        && data.thumbnailUrl == ''
+        // Step 10B — same "required field, fixed default at create"
+        // pattern as storageProvider/thumbnailStorageProvider above, for
+        // the Reel's own standalone music this time — ALWAYS present and
+        // 'firebase', regardless of musicSourceType (same always-present
+        // sentinel convention isValidReelMusic already applies to every
+        // other music field). Only a trusted, one-time server-authorized
+        // update (see isValidReelMusicProviderUpdate below) can ever flip
+        // this to 'r2'.
+        && data.musicStorageProvider == 'firebase'
         && isValidReelMusic(reelId, request.auth.uid, data)
         && isValidReelThumbnail(reelId, request.auth.uid, data)
         && isServerTimestamp(data.createdAt)
@@ -1517,6 +1808,7 @@ service cloud.firestore {
         && newData.cityKey == oldData.cityKey
         && newData.categoryId == oldData.categoryId
         && newData.caption == oldData.caption
+        && newData.hashtags == oldData.hashtags
         && newData.mediaType == oldData.mediaType
         // A Reel still awaiting photo-to-video rendering (see
         // Reel.needsPhotoVideoRender's own doc comment) can never publish —
@@ -1528,6 +1820,274 @@ service cloud.firestore {
         // as if it were a real video.
         && oldData.needsPhotoVideoRender == false
         && newData.needsPhotoVideoRender == false
+        // Step 11B — a VIDEO Reel can never publish until its source has
+        // actually been through one of the three finalization pipelines
+        // (finalizeReelVideo/muxReelMusic/renderPhotoToVideo, all of
+        // which stamp sourceNormalized: true in their own Admin-SDK
+        // confirm-write, bypassing these Rules entirely — see each
+        // function's own doc comment in functions/src/index.ts). A plain
+        // PHOTO Reel is exempt: it is never transcoded at all (Part 9 of
+        // the Step 11B spec), so it would otherwise be stuck at
+        // sourceNormalized: false forever. This is a REAL server-enforced
+        // invariant, not just client call-ordering discipline — a
+        // modified or buggy client calling publishReel too early is
+        // rejected here regardless of what it intended to do first.
+        && (oldData.mediaType == 'photo' || oldData.sourceNormalized == true)
+        && newData.sourceNormalized == oldData.sourceNormalized
+        && newData.storagePath == oldData.storagePath
+        && newData.storageContentType == oldData.storageContentType
+        && newData.fileSizeBytes == oldData.fileSizeBytes
+        && newData.storageProvider == oldData.storageProvider
+        && newData.sourceUrl == oldData.sourceUrl
+        && newData.durationMs == oldData.durationMs
+        && newData.width == oldData.width
+        && newData.height == oldData.height
+        && newData.visibility == oldData.visibility
+        && newData.musicSourceType == oldData.musicSourceType
+        && newData.musicTitle == oldData.musicTitle
+        && newData.musicStorageAudioPath == oldData.musicStorageAudioPath
+        && newData.musicStorageProvider == oldData.musicStorageProvider
+        && newData.musicStorageContentType == oldData.musicStorageContentType
+        && newData.musicFileSizeBytes == oldData.musicFileSizeBytes
+        && newData.musicDurationMs == oldData.musicDurationMs
+        && newData.musicHash == oldData.musicHash
+        && newData.soundOriginAuthorUid == oldData.soundOriginAuthorUid
+        && newData.soundOriginReelId == oldData.soundOriginReelId
+        && newData.thumbnailStoragePath == oldData.thumbnailStoragePath
+        && newData.thumbnailStorageContentType == oldData.thumbnailStorageContentType
+        && newData.thumbnailFileSizeBytes == oldData.thumbnailFileSizeBytes
+        && newData.thumbnailWidth == oldData.thumbnailWidth
+        && newData.thumbnailHeight == oldData.thumbnailHeight
+        && newData.thumbnailStorageProvider == oldData.thumbnailStorageProvider
+        && newData.thumbnailUrl == oldData.thumbnailUrl
+        && newData.createdAt == oldData.createdAt
+        && newData.keys().hasOnly(reelBaseKeys());
+    }
+
+    // Step 5E — the ONE other allowed update besides publish: a still-
+    // "uploading" video Reel's thumbnail moving from Firebase to R2, once
+    // (and only once) a direct client upload to R2 has actually succeeded
+    // (see functions/src/media/requestMediaUploadAuthorization.ts's own
+    // verifyReelThumbnailOwnership for the server-side authorization that
+    // must happen BEFORE that upload, and src/services/reels.ts's
+    // confirmReelThumbnailProvider, the only client-side caller of this
+    // path). `oldData.thumbnailStorageProvider == 'firebase'` is what
+    // makes this fire at most once ever per Reel — a second attempt to
+    // call this against a Reel that's already 'r2' is always denied here,
+    // exactly mirroring isValidReelPublish's own
+    // `oldData.status == 'uploading'` one-shot guard above. Every field
+    // besides thumbnailStorageProvider/thumbnailUrl/updatedAt must stay
+    // byte-identical — same "no sneaking an unrelated change through this
+    // narrow door" reasoning as isValidReelPublish.
+    function isValidReelThumbnailProviderUpdate(newData, oldData) {
+      return oldData.status == 'uploading'
+        && newData.status == 'uploading'
+        // Only a real video Reel has a separate thumbnail object to begin
+        // with — a 'photo' Reel's thumbnail IS its own storagePath (see
+        // isValidReelThumbnail above) and must never reach this path (also
+        // independently enforced server-side, before any R2 upload is
+        // even authorized — see verifyReelThumbnailOwnership).
+        && oldData.mediaType == 'video'
+        && newData.mediaType == 'video'
+        && oldData.thumbnailStorageProvider == 'firebase'
+        && newData.thumbnailStorageProvider == 'r2'
+        && newData.thumbnailUrl is string
+        && newData.thumbnailUrl.size() > 0
+        && newData.thumbnailUrl.size() <= 2048
+        && newData.thumbnailUrl.matches('https://.*')
+        && isServerTimestamp(newData.updatedAt)
+        && newData.reelId == oldData.reelId
+        && newData.authorUid == oldData.authorUid
+        && newData.authorDisplayName == oldData.authorDisplayName
+        && newData.authorUsername == oldData.authorUsername
+        && newData.cityName == oldData.cityName
+        && newData.countryCode == oldData.countryCode
+        && newData.cityKey == oldData.cityKey
+        && newData.categoryId == oldData.categoryId
+        && newData.caption == oldData.caption
+        && newData.hashtags == oldData.hashtags
+        && newData.needsPhotoVideoRender == oldData.needsPhotoVideoRender
+        && newData.storagePath == oldData.storagePath
+        && newData.storageContentType == oldData.storageContentType
+        && newData.fileSizeBytes == oldData.fileSizeBytes
+        // Step 9A — the video source's own provider/URL must stay
+        // unchanged during a THUMBNAIL-only transition (see this
+        // function's own doc comment on why the two are never coupled).
+        // Without this, a client could piggyback a source-provider
+        // change through this rule the moment both fields existed in the
+        // schema, since hasOnly(reelBaseKeys()) alone permits the keys
+        // without constraining their values.
+        && newData.storageProvider == oldData.storageProvider
+        && newData.sourceUrl == oldData.sourceUrl
+        && newData.durationMs == oldData.durationMs
+        && newData.width == oldData.width
+        && newData.height == oldData.height
+        && newData.visibility == oldData.visibility
+        && newData.musicSourceType == oldData.musicSourceType
+        && newData.musicTitle == oldData.musicTitle
+        && newData.musicStorageAudioPath == oldData.musicStorageAudioPath
+        && newData.musicStorageProvider == oldData.musicStorageProvider
+        && newData.sourceNormalized == oldData.sourceNormalized
+        && newData.musicStorageContentType == oldData.musicStorageContentType
+        && newData.musicFileSizeBytes == oldData.musicFileSizeBytes
+        && newData.musicDurationMs == oldData.musicDurationMs
+        && newData.musicHash == oldData.musicHash
+        && newData.soundOriginAuthorUid == oldData.soundOriginAuthorUid
+        && newData.soundOriginReelId == oldData.soundOriginReelId
+        && newData.thumbnailStoragePath == oldData.thumbnailStoragePath
+        && newData.thumbnailStorageContentType == oldData.thumbnailStorageContentType
+        && newData.thumbnailFileSizeBytes == oldData.thumbnailFileSizeBytes
+        && newData.thumbnailWidth == oldData.thumbnailWidth
+        && newData.thumbnailHeight == oldData.thumbnailHeight
+        && newData.createdAt == oldData.createdAt
+        && newData.publishedAt == oldData.publishedAt
+        && newData.keys().hasOnly(reelBaseKeys());
+    }
+
+    // Step 9A/9B — the video-source counterpart to
+    // isValidReelThumbnailProviderUpdate above: a still-"uploading" video
+    // Reel's own source moving from Firebase to R2, once (and only once)
+    // a direct client upload to R2 has actually succeeded (see
+    // functions/src/media/requestMediaUploadAuthorization.ts's own
+    // verifyReelVideoOwnership for the server-side authorization that
+    // must happen BEFORE that upload, and src/services/reels.ts's
+    // confirmReelVideoProvider, the only client-side caller of this
+    // path). `oldData.storageProvider == 'firebase'` is what makes this
+    // fire at most once ever per Reel, exactly mirroring
+    // isValidReelThumbnailProviderUpdate's own one-shot guard.
+    //
+    // `oldData.musicSourceType == newData.musicSourceType` (unchanged
+    // during THIS transition either way — music state itself never
+    // changes here, only confirmed to already be an allowed value) plus
+    // `oldData.needsPhotoVideoRender == newData.needsPhotoVideoRender`
+    // (also required to stay unchanged, alongside every other field,
+    // since only mediaType/status/storageProvider/sourceUrl are
+    // permitted to differ at all) is DEFENSE IN DEPTH mirroring
+    // checkReelVideoEligibility's own eligibility check — even though the
+    // authorization callable already refuses to hand out a presigned URL
+    // for an unsupported-music Reel, this rule independently refuses to
+    // ever confirm one as 'r2' either, so a confirm-write alone (without
+    // ever having passed authorization) could never move an ineligible
+    // Reel's source off Firebase. Step 9B relaxed the ALLOWED music
+    // values from `'none'`-only to `'none' or 'device'` — muxReelMusic
+    // now knows how to read/replace this exact object on either backend
+    // before publish (see reelMuxOrchestration.ts) — but a Reel with any
+    // OTHER music state is still rejected here, same
+    // allowlist-not-blocklist posture as the server-side eligibility
+    // check it mirrors. Step 9C relaxed `needsPhotoVideoRender` from a
+    // fixed `false` on both sides to "stays whatever it already was" —
+    // `true` is now also allowed (a photo-pending-render Reel, already
+    // separately gated by `mediaType == 'video'` below — see
+    // checkReelVideoEligibility's own doc comment in
+    // functions/src/media/reelEligibility.ts) since renderPhotoToVideo is
+    // now provider-aware too (Step 9C) and can read/replace this exact
+    // object on either backend before it runs; `false` (a plain video
+    // Reel) is unaffected.
+    function isValidReelSourceProviderUpdate(newData, oldData) {
+      return oldData.status == 'uploading'
+        && newData.status == 'uploading'
+        && oldData.mediaType == 'video'
+        && newData.mediaType == 'video'
+        && (oldData.musicSourceType == 'none' || oldData.musicSourceType == 'device')
+        && newData.musicSourceType == oldData.musicSourceType
+        && newData.needsPhotoVideoRender == oldData.needsPhotoVideoRender
+        && oldData.storageProvider == 'firebase'
+        && newData.storageProvider == 'r2'
+        && newData.sourceUrl is string
+        && newData.sourceUrl.size() > 0
+        && newData.sourceUrl.size() <= 2048
+        && newData.sourceUrl.matches('https://.*')
+        && isServerTimestamp(newData.updatedAt)
+        && newData.reelId == oldData.reelId
+        && newData.authorUid == oldData.authorUid
+        && newData.authorDisplayName == oldData.authorDisplayName
+        && newData.authorUsername == oldData.authorUsername
+        && newData.cityName == oldData.cityName
+        && newData.countryCode == oldData.countryCode
+        && newData.cityKey == oldData.cityKey
+        && newData.categoryId == oldData.categoryId
+        && newData.caption == oldData.caption
+        && newData.hashtags == oldData.hashtags
+        && newData.storagePath == oldData.storagePath
+        && newData.storageContentType == oldData.storageContentType
+        && newData.fileSizeBytes == oldData.fileSizeBytes
+        && newData.durationMs == oldData.durationMs
+        && newData.width == oldData.width
+        && newData.height == oldData.height
+        && newData.visibility == oldData.visibility
+        && newData.musicTitle == oldData.musicTitle
+        && newData.musicStorageAudioPath == oldData.musicStorageAudioPath
+        && newData.musicStorageProvider == oldData.musicStorageProvider
+        && newData.sourceNormalized == oldData.sourceNormalized
+        && newData.musicStorageContentType == oldData.musicStorageContentType
+        && newData.musicFileSizeBytes == oldData.musicFileSizeBytes
+        && newData.musicDurationMs == oldData.musicDurationMs
+        && newData.musicHash == oldData.musicHash
+        && newData.soundOriginAuthorUid == oldData.soundOriginAuthorUid
+        && newData.soundOriginReelId == oldData.soundOriginReelId
+        && newData.thumbnailStoragePath == oldData.thumbnailStoragePath
+        && newData.thumbnailStorageContentType == oldData.thumbnailStorageContentType
+        && newData.thumbnailFileSizeBytes == oldData.thumbnailFileSizeBytes
+        && newData.thumbnailWidth == oldData.thumbnailWidth
+        && newData.thumbnailHeight == oldData.thumbnailHeight
+        // Step 9A — the thumbnail's own provider/URL must stay unchanged
+        // during a SOURCE-only transition — same mutual-exclusion
+        // reasoning as isValidReelThumbnailProviderUpdate's own new
+        // storageProvider/sourceUrl equality checks above.
+        && newData.thumbnailStorageProvider == oldData.thumbnailStorageProvider
+        && newData.thumbnailUrl == oldData.thumbnailUrl
+        && newData.createdAt == oldData.createdAt
+        && newData.publishedAt == oldData.publishedAt
+        && newData.keys().hasOnly(reelBaseKeys());
+    }
+
+    // Step 9C — the LOCKSTEP counterpart of isValidReelThumbnailProviderUpdate
+    // and isValidReelSourceProviderUpdate above, for a PLAIN PHOTO Reel
+    // only (`mediaType == 'photo'` on both sides). A photo Reel has no
+    // separate thumbnail object at all — its source and thumbnail are the
+    // exact same object (see isValidReelThumbnail's own doc comment) — so
+    // unlike a video Reel, where the two provider pairs are deliberately
+    // kept independent (see isValidReelSourceProviderUpdate's own doc
+    // comment on why they're never coupled there), a photo Reel's
+    // storageProvider/sourceUrl and thumbnailStorageProvider/thumbnailUrl
+    // must transition TOGETHER, in one write, to the SAME url — otherwise
+    // a client could confirm the source as 'r2' while the thumbnail pair
+    // stayed stuck at its 'firebase' default forever (there is no
+    // separate client upload step that would ever set it — see
+    // src/services/reels.ts's confirmReelPhotoSourceProvider, the only
+    // caller of this path). `oldData.storageProvider == 'firebase'` is
+    // what makes this fire at most once ever per Reel, same one-shot
+    // guard as the two functions above.
+    function isValidReelPhotoSourceProviderUpdate(newData, oldData) {
+      return oldData.status == 'uploading'
+        && newData.status == 'uploading'
+        && oldData.mediaType == 'photo'
+        && newData.mediaType == 'photo'
+        && oldData.storageProvider == 'firebase'
+        && newData.storageProvider == 'r2'
+        && oldData.thumbnailStorageProvider == 'firebase'
+        && newData.thumbnailStorageProvider == 'r2'
+        && newData.sourceUrl is string
+        && newData.sourceUrl.size() > 0
+        && newData.sourceUrl.size() <= 2048
+        && newData.sourceUrl.matches('https://.*')
+        // The defining constraint of this transition — see this
+        // function's own doc comment: a photo Reel's source and
+        // thumbnail are literally the same object, so their confirmed
+        // delivery URLs must be identical too.
+        && newData.thumbnailUrl == newData.sourceUrl
+        && isServerTimestamp(newData.updatedAt)
+        && newData.reelId == oldData.reelId
+        && newData.authorUid == oldData.authorUid
+        && newData.authorDisplayName == oldData.authorDisplayName
+        && newData.authorUsername == oldData.authorUsername
+        && newData.cityName == oldData.cityName
+        && newData.countryCode == oldData.countryCode
+        && newData.cityKey == oldData.cityKey
+        && newData.categoryId == oldData.categoryId
+        && newData.caption == oldData.caption
+        && newData.hashtags == oldData.hashtags
+        && newData.needsPhotoVideoRender == oldData.needsPhotoVideoRender
         && newData.storagePath == oldData.storagePath
         && newData.storageContentType == oldData.storageContentType
         && newData.fileSizeBytes == oldData.fileSizeBytes
@@ -1536,6 +2096,74 @@ service cloud.firestore {
         && newData.height == oldData.height
         && newData.visibility == oldData.visibility
         && newData.musicSourceType == oldData.musicSourceType
+        && newData.musicTitle == oldData.musicTitle
+        && newData.musicStorageAudioPath == oldData.musicStorageAudioPath
+        && newData.musicStorageProvider == oldData.musicStorageProvider
+        && newData.sourceNormalized == oldData.sourceNormalized
+        && newData.musicStorageContentType == oldData.musicStorageContentType
+        && newData.musicFileSizeBytes == oldData.musicFileSizeBytes
+        && newData.musicDurationMs == oldData.musicDurationMs
+        && newData.musicHash == oldData.musicHash
+        && newData.soundOriginAuthorUid == oldData.soundOriginAuthorUid
+        && newData.soundOriginReelId == oldData.soundOriginReelId
+        && newData.thumbnailStoragePath == oldData.thumbnailStoragePath
+        && newData.thumbnailStorageContentType == oldData.thumbnailStorageContentType
+        && newData.thumbnailFileSizeBytes == oldData.thumbnailFileSizeBytes
+        && newData.thumbnailWidth == oldData.thumbnailWidth
+        && newData.thumbnailHeight == oldData.thumbnailHeight
+        && newData.createdAt == oldData.createdAt
+        && newData.publishedAt == oldData.publishedAt
+        && newData.keys().hasOnly(reelBaseKeys());
+    }
+
+    // Step 10B — a still-"uploading" Reel's own standalone music moving
+    // from Firebase to R2, once (and only once) a direct client upload to
+    // R2 has actually succeeded (see
+    // functions/src/media/requestMediaUploadAuthorization.ts's own
+    // verifyReelMusicOwnership for the server-side authorization that
+    // must happen BEFORE that upload, and src/services/reels.ts's
+    // confirmReelMusicProvider, the only client-side caller of this
+    // path). `oldData.musicStorageProvider == 'firebase'` is what makes
+    // this fire at most once ever per Reel, exactly mirroring every other
+    // provider-transition rule's own one-shot guard. Unlike the video
+    // source/thumbnail transitions, there is NO url field to validate at
+    // all — a Reel's music object has no public-URL concept (see
+    // Reel.musicStorageProvider's own doc comment, src/types/reel.ts) —
+    // making this the simplest of the four provider transitions.
+    // `oldData.musicSourceType == 'device'` (required, not just an
+    // unchanged-either-way check) mirrors checkReelMusicUploadEligibility's
+    // own server-side gate — a no-music Reel could never legitimately
+    // reach this transition in the first place.
+    function isValidReelMusicProviderUpdate(newData, oldData) {
+      return oldData.status == 'uploading'
+        && newData.status == 'uploading'
+        && oldData.musicSourceType == 'device'
+        && newData.musicSourceType == 'device'
+        && oldData.musicStorageProvider == 'firebase'
+        && newData.musicStorageProvider == 'r2'
+        && isServerTimestamp(newData.updatedAt)
+        && newData.reelId == oldData.reelId
+        && newData.authorUid == oldData.authorUid
+        && newData.authorDisplayName == oldData.authorDisplayName
+        && newData.authorUsername == oldData.authorUsername
+        && newData.cityName == oldData.cityName
+        && newData.countryCode == oldData.countryCode
+        && newData.cityKey == oldData.cityKey
+        && newData.categoryId == oldData.categoryId
+        && newData.caption == oldData.caption
+        && newData.hashtags == oldData.hashtags
+        && newData.mediaType == oldData.mediaType
+        && newData.needsPhotoVideoRender == oldData.needsPhotoVideoRender
+        && newData.storagePath == oldData.storagePath
+        && newData.storageContentType == oldData.storageContentType
+        && newData.fileSizeBytes == oldData.fileSizeBytes
+        && newData.storageProvider == oldData.storageProvider
+        && newData.sourceUrl == oldData.sourceUrl
+        && newData.sourceNormalized == oldData.sourceNormalized
+        && newData.durationMs == oldData.durationMs
+        && newData.width == oldData.width
+        && newData.height == oldData.height
+        && newData.visibility == oldData.visibility
         && newData.musicTitle == oldData.musicTitle
         && newData.musicStorageAudioPath == oldData.musicStorageAudioPath
         && newData.musicStorageContentType == oldData.musicStorageContentType
@@ -1549,8 +2177,77 @@ service cloud.firestore {
         && newData.thumbnailFileSizeBytes == oldData.thumbnailFileSizeBytes
         && newData.thumbnailWidth == oldData.thumbnailWidth
         && newData.thumbnailHeight == oldData.thumbnailHeight
+        && newData.thumbnailStorageProvider == oldData.thumbnailStorageProvider
+        && newData.thumbnailUrl == oldData.thumbnailUrl
         && newData.createdAt == oldData.createdAt
+        && newData.publishedAt == oldData.publishedAt
         && newData.keys().hasOnly(reelBaseKeys());
+    }
+
+    // hashtags/{hashtagId} — global counter per unique, normalized hashtag
+    // (see src/types/hashtag.ts). `hashtagId` IS `name` — a client
+    // publishing a Reel with hashtags creates/increments these directly
+    // (see src/services/hashtags.ts's incrementHashtagCounts, called from
+    // publishReel), exactly like the existing content/{contentId}/
+    // stats/activity `participantCount` pattern above: a client may only
+    // ever CREATE with postCount == 1, or INCREMENT an existing doc by
+    // exactly 1 — never set an arbitrary value, and never decrement.
+    // Decrementing (a post carrying this hashtag being deleted) is NEVER
+    // client-writable at all — only the trusted Cloud Functions delete
+    // backend (Admin SDK, bypassing these Rules — see
+    // functions/src/index.ts's decrementHashtagCounts) can lower it,
+    // same trust boundary as reels/{reelId}/stats/engagement above being
+    // entirely non-client-writable in either direction.
+    match /hashtags/{hashtagId} {
+      function isValidHashtagShape(data) {
+        return data.name is string
+          && data.name == hashtagId
+          && data.postCount is int
+          && data.postCount >= 0
+          && isServerTimestamp(data.updatedAt)
+          && data.keys().hasOnly(['name', 'postCount', 'createdAt', 'updatedAt']);
+      }
+
+      allow read: if isSignedIn();
+
+      // The first published Reel ever to use this exact hashtag.
+      allow create: if isSignedIn()
+        && isValidHashtagShape(request.resource.data)
+        && request.resource.data.postCount == 1
+        && isServerTimestamp(request.resource.data.createdAt);
+
+      // Every later Reel publish (+1) adding this same hashtag.
+      // `createdAt` must stay byte-identical — only a fresh document's
+      // OWN create (above) may ever set it.
+      allow update: if isSignedIn()
+        && isValidHashtagShape(request.resource.data)
+        && request.resource.data.createdAt == resource.data.createdAt
+        && request.resource.data.postCount == resource.data.postCount + 1;
+
+      allow delete: if false;
+    }
+
+    // Trending Hashtags by City and Time Window —
+    // cityHashtagTrends/{cityId}__{hashtag}: trusted, server-aggregated
+    // per-(city,hashtag) recent activity (see
+    // functions/src/hashtagTrends.ts). Deliberately GIVEN NO client write
+    // path at all, unlike hashtags/{hashtagId} just above (which the
+    // client DOES write via a constrained +1 transaction): every field
+    // here (`recentPosts`/`recentEngagement` arrays, `lastActivityAt`) is
+    // derived from trusted Cloud Functions triggers reacting to a Reel's
+    // own publish/delete/engagement-stats changes — there is no
+    // analogous "one clearly-bounded client operation" to safely carve
+    // out the way hashtags/{hashtagId}'s exact `postCount + 1` is. This
+    // is discovery/public-app data for any authenticated Around Me user
+    // (Step 34) — same `isSignedIn()`-only read bar as hashtags/
+    // {hashtagId} above; no per-user scoping, since a trend is
+    // inherently about a city, not a viewer.
+    match /cityHashtagTrends/{docId} {
+      allow read: if isSignedIn();
+
+      allow create: if false;
+      allow update: if false;
+      allow delete: if false;
     }
 
     // stories/{storyId} — a separate root collection from reels/{reelId}
@@ -1570,15 +2267,20 @@ service cloud.firestore {
 
       allow create: if isSignedIn() && isValidStoryCreate(storyId, request.resource.data);
 
-      // The ONLY allowed transition: uploading -> published, stamping
-      // publishedAt/expiresAt. Every other field is immutable. expiresAt
-      // is bounded to a narrow window around request.time + 24h (see
-      // STORY_EXPIRY_MS in src/types/story.ts) — a client-computed value,
-      // not server-authoritative, so this caps how far it can be pushed
-      // out rather than trusting it outright.
+      // Two allowed updates: uploading -> published (stamping
+      // publishedAt/expiresAt — expiresAt is bounded to a narrow window
+      // around request.time + 24h, see STORY_EXPIRY_MS in
+      // src/types/story.ts, a client-computed value, not server-
+      // authoritative, so this caps how far it can be pushed out rather
+      // than trusting it outright), and Step 10A's own narrow, one-time
+      // "media moved to R2" flip (isValidStoryProviderUpdate) — every
+      // other field is immutable in both.
       allow update: if isSignedIn()
         && resource.data.authorUid == request.auth.uid
-        && isValidStoryPublish(request.resource.data, resource.data);
+        && (
+          isValidStoryPublish(request.resource.data, resource.data)
+          || isValidStoryProviderUpdate(request.resource.data, resource.data)
+        );
 
       // The author may delete their own Story at any time (Instagram-style
       // "delete my Story" — see deleteMyStory in src/services/stories.ts),
@@ -1627,6 +2329,7 @@ service cloud.firestore {
         'storyId', 'authorUid', 'authorDisplayName', 'authorUsername',
         'mediaType', 'storagePath', 'storageContentType', 'fileSizeBytes',
         'durationMs', 'width', 'height', 'status',
+        'storageProvider', 'mediaUrl', 'sourceNormalized',
         'createdAt', 'updatedAt', 'publishedAt', 'expiresAt'
       ];
     }
@@ -1641,6 +2344,25 @@ service cloud.firestore {
         && data.authorUsername == profile.username
         && data.mediaType in ['video', 'photo']
         && data.storagePath == 'stories/' + request.auth.uid + '/' + storyId + '/source'
+        // Step 10A — same "required field, fixed default at create"
+        // pattern as a Reel's own storageProvider/sourceUrl (see
+        // isValidReelCreate) — a client can never create a draft already
+        // claiming R2; only the narrow, one-time isValidStoryProviderUpdate
+        // transition below can ever flip this.
+        && data.storageProvider == 'firebase'
+        && data.mediaUrl == ''
+        // Step 11C — every draft is created not-yet-normalized, same
+        // "required field, fixed default at create" pattern as a Reel's
+        // own sourceNormalized (see isValidReelCreate) — applied
+        // uniformly regardless of mediaType (a photo Story never gets
+        // this flipped to true — see isValidStoryPublish below, which
+        // exempts photo Stories from the gate entirely). Only a trusted
+        // Cloud Function (finalizeStoryVideo, via the Admin SDK) can ever
+        // flip this to true for a direct video Story; addReelToMyStory
+        // (also Admin SDK) may set it true directly at CREATE time for a
+        // Reel->Story copy, since that write bypasses this predicate
+        // entirely (allow create only governs CLIENT writes).
+        && data.sourceNormalized == false
         && (
           (
             data.mediaType == 'video'
@@ -1696,12 +2418,73 @@ service cloud.firestore {
         && newData.authorDisplayName == oldData.authorDisplayName
         && newData.authorUsername == oldData.authorUsername
         && newData.mediaType == oldData.mediaType
+        // Step 11C — a VIDEO Story can never publish until its source has
+        // actually been through finalizeStoryVideo (which stamps
+        // sourceNormalized: true in its own Admin-SDK confirm-write,
+        // bypassing these Rules entirely). A plain PHOTO Story is exempt:
+        // it is never transcoded at all (Part 4 of the Step 11C spec) —
+        // same exemption pattern as isValidReelPublish's own
+        // `mediaType == 'photo'` carve-out. A REEL-COPIED Story
+        // (addReelToMyStory) is created ALREADY published — it never
+        // reaches this transition at all, so this gate only ever governs
+        // a direct capture/picker Story's own client-driven publish.
+        && (oldData.mediaType == 'photo' || oldData.sourceNormalized == true)
+        && newData.sourceNormalized == oldData.sourceNormalized
         && newData.storagePath == oldData.storagePath
         && newData.storageContentType == oldData.storageContentType
         && newData.fileSizeBytes == oldData.fileSizeBytes
         && newData.durationMs == oldData.durationMs
         && newData.width == oldData.width
         && newData.height == oldData.height
+        // Step 10A — the Story's own provider/URL must stay unchanged
+        // during a PUBLISH-only transition — same mutual-exclusion
+        // reasoning as isValidReelThumbnailProviderUpdate's own new
+        // storageProvider/sourceUrl equality checks for Reels. Without
+        // this, a client could piggyback a provider change through this
+        // rule the moment both fields existed in the schema.
+        && newData.storageProvider == oldData.storageProvider
+        && newData.mediaUrl == oldData.mediaUrl
+        && newData.createdAt == oldData.createdAt
+        && newData.keys().hasOnly(storyBaseKeys());
+    }
+
+    // Step 10A — a still-"uploading" Story's own media moving from
+    // Firebase to R2, once (and only once) a direct client upload to R2
+    // has actually succeeded (see
+    // functions/src/media/requestMediaUploadAuthorization.ts's own
+    // verifyStoryMediaOwnership for the server-side authorization that
+    // must happen BEFORE that upload, and src/services/stories.ts's
+    // confirmStoryMediaProvider, the only client-side caller of this
+    // path). `oldData.storageProvider == 'firebase'` is what makes this
+    // fire at most once ever per Story, exactly mirroring
+    // isValidReelSourceProviderUpdate's own one-shot guard. Every other
+    // field must stay byte-identical — same "no sneaking an unrelated
+    // change through this narrow door" reasoning as every other
+    // provider-transition rule in this file.
+    function isValidStoryProviderUpdate(newData, oldData) {
+      return oldData.status == 'uploading'
+        && newData.status == 'uploading'
+        && oldData.storageProvider == 'firebase'
+        && newData.storageProvider == 'r2'
+        && newData.mediaUrl is string
+        && newData.mediaUrl.size() > 0
+        && newData.mediaUrl.size() <= 2048
+        && newData.mediaUrl.matches('https://.*')
+        && isServerTimestamp(newData.updatedAt)
+        && newData.storyId == oldData.storyId
+        && newData.authorUid == oldData.authorUid
+        && newData.authorDisplayName == oldData.authorDisplayName
+        && newData.authorUsername == oldData.authorUsername
+        && newData.mediaType == oldData.mediaType
+        && newData.storagePath == oldData.storagePath
+        && newData.storageContentType == oldData.storageContentType
+        && newData.fileSizeBytes == oldData.fileSizeBytes
+        && newData.durationMs == oldData.durationMs
+        && newData.width == oldData.width
+        && newData.height == oldData.height
+        && newData.sourceNormalized == oldData.sourceNormalized
+        && newData.publishedAt == oldData.publishedAt
+        && newData.expiresAt == oldData.expiresAt
         && newData.createdAt == oldData.createdAt
         && newData.keys().hasOnly(storyBaseKeys());
     }

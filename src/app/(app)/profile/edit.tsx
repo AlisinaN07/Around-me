@@ -1,9 +1,10 @@
 import { Ionicons } from '@expo/vector-icons';
+import { Image } from 'expo-image';
 import * as ImagePicker from 'expo-image-picker';
 import { LinearGradient } from 'expo-linear-gradient';
 import { router } from 'expo-router';
 import { useEffect, useState } from 'react';
-import { ActivityIndicator, Image, Pressable, StyleSheet, Text, View } from 'react-native';
+import { ActivityIndicator, Pressable, StyleSheet, Text, View } from 'react-native';
 
 import { Avatar } from '@/components/Avatar';
 import { Button } from '@/components/Button';
@@ -274,7 +275,12 @@ export default function EditProfileScreen() {
         >
           {profile.coverPhotoURL ? (
             <>
-              <Image source={{ uri: profile.coverPhotoURL }} style={styles.coverImage} />
+              {/* Perf pass — expo-image, memory+disk cached: the same
+                  URL ProfileHeader.tsx renders, so a cache warmed by
+                  viewing the profile itself makes this preview instant
+                  too. contentFit="cover" matches the plain <Image>'s own
+                  prior default resizeMode exactly. */}
+              <Image source={{ uri: profile.coverPhotoURL }} style={styles.coverImage} contentFit="cover" cachePolicy="memory-disk" />
               {/* Same bottom fade as ProfileHeader's own cover banner, so
                   this preview matches exactly. */}
               <LinearGradient colors={['transparent', Colors.background]} style={styles.coverFade} pointerEvents="none" />

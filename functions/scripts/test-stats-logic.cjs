@@ -15,7 +15,7 @@
  * genuine document create/delete).
  */
 const assert = require('node:assert/strict');
-const { bumpField, validateWatchSample, isMeaningfulView } = require('../lib/engagementStats.js');
+const { bumpField, validateWatchSample, isMeaningfulView, resolveSaveTarget } = require('../lib/engagementStats.js');
 
 const results = [];
 function check(name, fn) {
@@ -92,6 +92,34 @@ check('a view clearing only the absolute-duration bar is meaningful (long video,
 });
 check('a view clearing only the percentage bar is meaningful (short video, high percentage)', () => {
   assert.equal(isMeaningfulView({ watchDurationMs: 800, watchPercentage: 0.3 }), true);
+});
+
+// ---------------------------------------------------------------------------
+// Step 12C — resolveSaveTarget: the gap this step found and fixed. An
+// Event save must resolve to the SAME content/{id}/stats/engagement path
+// a Post save already does — scoreEventQuality's own `save` component
+// (ranking.ts) reads stats.saves regardless of which content type
+// produced it.
+// ---------------------------------------------------------------------------
+check('resolveSaveTarget: a Reel save resolves to kind "reel"', () => {
+  assert.deepEqual(resolveSaveTarget({ targetType: 'reel', targetId: 'r1' }), { kind: 'reel', id: 'r1' });
+});
+check('resolveSaveTarget: a Post save resolves to kind "content" (unchanged behavior)', () => {
+  assert.deepEqual(resolveSaveTarget({ targetType: 'post', targetId: 'p1' }), { kind: 'content', id: 'p1' });
+});
+check('resolveSaveTarget: an Event save ALSO resolves to kind "content", same path a Post save uses — the Step 12C fix', () => {
+  assert.deepEqual(resolveSaveTarget({ targetType: 'event', targetId: 'e1' }), { kind: 'content', id: 'e1' });
+});
+check('resolveSaveTarget: a sound save is still never a content/Reel save (unchanged, deliberate exclusion)', () => {
+  assert.equal(resolveSaveTarget({ targetType: 'sound', targetId: 'hash1' }), null);
+});
+check('resolveSaveTarget: an unrecognized/missing targetType is a safe null, never a throw', () => {
+  assert.equal(resolveSaveTarget({ targetType: 'bogus', targetId: 'x' }), null);
+  assert.equal(resolveSaveTarget({}), null);
+});
+check('resolveSaveTarget: an empty-string or missing targetId is a safe null even for a recognized targetType', () => {
+  assert.equal(resolveSaveTarget({ targetType: 'event', targetId: '' }), null);
+  assert.equal(resolveSaveTarget({ targetType: 'event' }), null);
 });
 
 console.log('\n=== functions/ engagement-stats logic test results ===');

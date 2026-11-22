@@ -20,13 +20,15 @@ import type { ActivityContent, EventContent } from '@/types/content';
 import type { ContentEngagementStats } from '@/types/engagementStats';
 import type { Reel } from '@/types/reel';
 import type { RankedItem, RecommendationProfile } from '@/types/recommendation';
+import { resolveEventHashtagsForScoring } from '@/utils/eventHashtagsForScoring';
 
 import { bucketAndSort, classifyBucket, type BucketableEntry } from './bucketing';
 import { deriveSourceTags } from './attribution';
 import { getCachedCollaborativeProfile } from './collaborative';
 import { applyDiversity } from './diversity';
-import { generateReelCandidates } from './candidateGenerator';
+import { generateReelCandidates, type ReelCandidateCursor } from './candidateGenerator';
 import { fetchEngagementStatsBatch } from './engagementStats';
+import { getCachedHashtagInterestMap } from './hashtagInterestCache';
 import { getCachedInterestProfile } from './profileCache';
 import { FOR_YOU_PAGE_SIZE, RANKING_CONFIG_VERSION, SECONDARY_CITY_EVENT_SECTION_LIMIT, SESSION_JITTER_WEIGHT } from './recommendationConfig';
 import { computeItemScore, hashToUnitInterval, normalizeCityAffinity, pickSecondaryCity, scoreExploration, type ScoreResult } from './ranking';
@@ -108,12 +110,26 @@ export type GetForYouReelsInput = {
   pageSize?: number;
   /** Attaches RankingBreakdown to each result — dev/debug only, see Step 18. Never true in production UI code. */
   debug?: boolean;
+  /**
+   * Perf pass — whatever `cursor` the PREVIOUS getForYouReels call for
+   * this same session returned (`undefined` on the first page). Opaque
+   * to the caller — the UI never needs to understand Firestore cursors,
+   * just hold this in state/a ref and pass it straight back on the next
+   * `loadMore`. Automatically restarted (that scope's own pool begins
+   * fresh, from page one) the moment `scope` no longer matches what the
+   * cursor was generated for — see candidateGenerator.ts's own
+   * generateReelCandidates doc comment — so the caller doesn't need its
+   * own scope-change detection either. `excludeReelIds` remains the
+   * caller's OWN safety-net dedupe on top of this cursor, not a
+   * replacement for it.
+   */
+  cursor?: ReelCandidateCursor;
 };
 
 export type ForYouReelsPage = {
   reels: RankedItem<Reel>[];
-  /** True when the candidate pool needed to widen beyond the active scope (Step 8) to have enough content. */
-  widenedScope: boolean;
+  /** Perf pass — pass this back as `cursor` on the NEXT getForYouReels call for this same session to continue paging through the active scope's own local pool via a real Firestore cursor, instead of re-fetching the same bounded top-N query from the start every page. */
+  cursor: ReelCandidateCursor;
   /** Recommendation Engine — Step 6, Step 21 — coarse phase timings for THIS call, in ms. Cheap (a handful of Date.now() calls, no extra I/O) and always populated — "we need to know if intelligence makes the feed slow" without needing a separate profiling pass. DEVELOPMENT/observability only; never affects ranking (Step 29). */
   latencyMs: { profileAndCollaborativeRead: number; candidateGeneration: number; scoringAndDiversity: number; statsRead: number; total: number };
 };
@@ -137,9 +153,16 @@ export async function getForYouReels(input: GetForYouReelsInput): Promise<ForYou
   // candidate-generation dependency (unlike the profile above), so it's
   // fetched in parallel with candidate generation rather than blocking it.
   const afterProfileAt = Date.now();
-  const [candidatePool, collaborativeProfile] = await Promise.all([
-    generateReelCandidates(input.uid, input.scope, input.homeCountryCode, input.excludeReelIds, normalizedCityAffinity),
+  // For You ranking integration — the caller's own top hashtag interests,
+  // loaded ONCE per batch (see hashtagInterestCache.ts) alongside the
+  // collaborative profile — neither has a candidate-generation dependency
+  // (unlike `profile` above), so both fetch in parallel with it. Reused
+  // as-is for every candidate scored below; never refetched per page
+  // within this cache's TTL, never refetched per candidate at all.
+  const [candidatePool, collaborativeProfile, hashtagInterests] = await Promise.all([
+    generateReelCandidates(input.uid, input.scope, input.homeCountryCode, input.excludeReelIds, normalizedCityAffinity, input.cursor),
     getCachedCollaborativeProfile(input.uid),
+    getCachedHashtagInterestMap(input.uid),
   ]);
   const afterCandidatesAt = Date.now();
 
@@ -148,7 +171,7 @@ export async function getForYouReels(input: GetForYouReelsInput): Promise<ForYou
   if (eligible.length === 0) {
     return {
       reels: [],
-      widenedScope: candidatePool.widened,
+      cursor: candidatePool.cursor,
       latencyMs: {
         profileAndCollaborativeRead: afterProfileAt - startedAt,
         candidateGeneration: afterCandidatesAt - afterProfileAt,
@@ -177,6 +200,8 @@ export async function getForYouReels(input: GetForYouReelsInput): Promise<ForYou
         commentCount: 0,
         collaborativeProfile,
         exposure: exposureContextFor(profile, reel.reelId),
+        reelHashtags: reel.hashtags,
+        hashtagInterests,
       },
       profile,
       input.scope,
@@ -221,6 +246,8 @@ export async function getForYouReels(input: GetForYouReelsInput): Promise<ForYou
         videoDurationMs: entry.item.durationMs,
         collaborativeProfile,
         exposure: exposureContextFor(profile, entry.item.reelId),
+        reelHashtags: entry.item.hashtags,
+        hashtagInterests,
       },
       profile,
       input.scope,
@@ -259,7 +286,7 @@ export async function getForYouReels(input: GetForYouReelsInput): Promise<ForYou
 
   return {
     reels: page,
-    widenedScope: candidatePool.widened,
+    cursor: candidatePool.cursor,
     latencyMs: {
       profileAndCollaborativeRead: afterProfileAt - startedAt,
       candidateGeneration: afterCandidatesAt - afterProfileAt,
@@ -469,10 +496,19 @@ export async function rankEventSections(
   sessionSeed = 'default'
 ): Promise<DiscoverySections> {
   const nowMs = Date.now();
-  const [profile, collaborativeProfile, blockedUids] = await Promise.all([
+  // Step 12D — hashtagInterests joins the same batch read as
+  // getForYouReels' own identical call (recommendationEngine.ts) — one
+  // bounded read per ranking batch, never per-event. Previously absent
+  // here entirely, which is exactly why every Event's own hashtagRelevance
+  // always scored a flat 0 regardless of its hashtags: with no
+  // hashtagInterests map supplied, computeItemScore's own
+  // `context.hashtagInterests ?? EMPTY_HASHTAG_INTEREST_MAP` fallback was
+  // the ONLY thing ever reached.
+  const [profile, collaborativeProfile, blockedUids, hashtagInterests] = await Promise.all([
     getCachedInterestProfile(uid, onboardingInterestIds),
     getCachedCollaborativeProfile(uid),
     fetchMyBlockedUserIds(uid),
+    getCachedHashtagInterestMap(uid),
   ]);
   const blocked = new Set(blockedUids);
   const excluded = new Set(profile.excludedContentIds);
@@ -525,6 +561,13 @@ export async function rankEventSections(
           // Second pass, Step 8 — deprioritize (not exclude) an event the
           // viewer already responded to, so it stops dominating discovery.
           hasRespondedToEvent: profile.respondedEventIds.includes(event.contentId),
+          // Step 12D — real hashtags, replacing the previous permanent []
+          // placeholder (see scoreHashtagRelevance's own call site in
+          // ranking.ts — "Events have no hashtags field at all" is no
+          // longer true). See resolveEventHashtagsForScoring's own doc
+          // comment for the Activity/legacy-Event fallback reasoning.
+          reelHashtags: resolveEventHashtagsForScoring(event),
+          hashtagInterests,
         },
         profile,
         scope,

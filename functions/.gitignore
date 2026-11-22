@@ -2,3 +2,13 @@ node_modules/
 lib/
 *.local
 firebase-debug.log
+
+# Step 5A — Firebase Functions v2's own deploy-time dotenv files
+# (.env, .env.<project-id>) are how R2_ACCOUNT_ID/R2_BUCKET_NAME actually
+# reach a deployed function (see functions/.env.example's own doc
+# comment) — real values belong only in these, never committed.
+# .env.example itself stays tracked (placeholder names only, already
+# committed in Step 4) — ignoring it here would only stop it being
+# re-added if deleted, never untrack the existing file.
+.env
+.env.*

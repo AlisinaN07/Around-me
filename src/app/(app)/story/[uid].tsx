@@ -1,8 +1,9 @@
 import { Ionicons } from '@expo/vector-icons';
+import { Image } from 'expo-image';
 import { router, useFocusEffect, useLocalSearchParams } from 'expo-router';
 import { useVideoPlayer, VideoView } from 'expo-video';
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { ActivityIndicator, Image, Pressable, StyleSheet, Text, View } from 'react-native';
+import { ActivityIndicator, Pressable, StyleSheet, Text, View } from 'react-native';
 
 import { Avatar } from '@/components/Avatar';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
@@ -90,14 +91,14 @@ export default function StoryViewerScreen() {
     setPlaybackUrl(null);
     setProgress(0);
     if (!currentStory) return;
-    resolveStoryPlaybackUrl(currentStory.storagePath).then((url) => {
+    resolveStoryPlaybackUrl(currentStory).then((url) => {
       if (!cancelled) setPlaybackUrl(url);
     });
     return () => {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentStory?.storagePath]);
+  }, [currentStory?.storagePath, currentStory?.storageProvider, currentStory?.mediaUrl]);
 
   useEffect(() => {
     if (isVideoStory && playbackUrl) player.play();
@@ -227,7 +228,9 @@ export default function StoryViewerScreen() {
       <SwipeBackEdge onBack={closeViewer} />
 
       {currentStory.mediaType === 'photo' ? (
-        <Image source={{ uri: playbackUrl ?? undefined }} style={StyleSheet.absoluteFill} resizeMode="cover" />
+        // Perf pass — expo-image, memory+disk cached. Video Stories
+        // (VideoView below) are untouched.
+        <Image source={{ uri: playbackUrl ?? undefined }} style={StyleSheet.absoluteFill} contentFit="cover" cachePolicy="memory-disk" />
       ) : playbackUrl ? (
         <VideoView style={StyleSheet.absoluteFill} player={player} contentFit="cover" nativeControls={false} allowsPictureInPicture={false} />
       ) : (

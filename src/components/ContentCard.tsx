@@ -1,6 +1,7 @@
 import { Ionicons } from '@expo/vector-icons';
+import { Image } from 'expo-image';
 import { router } from 'expo-router';
-import { Image, Pressable, StyleSheet, Text, View } from 'react-native';
+import { Pressable, StyleSheet, Text, View } from 'react-native';
 
 import { AuthorLink } from '@/components/AuthorLink';
 import { INTERESTS } from '@/constants/interests';
@@ -101,7 +102,12 @@ export function ContentCard({ item, currentUid, showAuthor = true, showTypeBadge
     >
       {coverPhotoURL ? (
         <>
-          <Image source={{ uri: coverPhotoURL }} style={StyleSheet.absoluteFill} resizeMode="cover" />
+          {/* Perf pass — expo-image, memory+disk cached: the same
+              Event cover renders here every time this card appears in a
+              feed/discovery list, so a real cache avoids re-downloading
+              it on every scroll-past. contentFit="cover" matches the
+              plain <Image>'s own prior resizeMode="cover" exactly. */}
+          <Image source={{ uri: coverPhotoURL }} style={StyleSheet.absoluteFill} contentFit="cover" cachePolicy="memory-disk" />
           <View style={[StyleSheet.absoluteFill, styles.coverOverlay]} pointerEvents="none" />
         </>
       ) : null}
@@ -135,11 +141,25 @@ export function ContentCard({ item, currentUid, showAuthor = true, showTypeBadge
       {showAuthor && <TypeAndCategoryBadges item={item} category={category} showType={showTypeBadge} />}
 
       {item.type === 'post' ? (
-        <Text style={styles.body}>{item.body}</Text>
+        // Clamped to one line, same reasoning as description below —
+        // this is a browsing-list card, not the full detail screen
+        // (which this card's own onPress already opens for the
+        // untruncated text), so every card in the list should read as
+        // one compact row regardless of how long its own text is.
+        <Text style={styles.body} numberOfLines={1}>
+          {item.body}
+        </Text>
       ) : (
         <>
           <Text style={styles.title}>{item.title}</Text>
-          <Text style={styles.description}>{item.description}</Text>
+          {/* Clamped to one line — an unbounded description used to blow
+              this card up to the length of its own text (visible once an
+              Event/Activity had a genuinely long one), dwarfing every
+              other card in the same list. Full text is one tap away on
+              the real detail screen (this card's own onPress). */}
+          <Text style={styles.description} numberOfLines={1}>
+            {item.description}
+          </Text>
         </>
       )}
 

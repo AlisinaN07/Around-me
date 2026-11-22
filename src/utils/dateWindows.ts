@@ -110,16 +110,26 @@ export function getTodayOrTonightWindow(now: Date = new Date(), timeZone: string
 }
 
 /**
- * [windowEnd, windowEnd + days) — deliberately starts exactly where the
- * Today/Tonight window ends (not at `now`), so Upcoming and Today/Tonight
- * never overlap by construction and need no client-side dedup between
- * themselves. Happening Now can still overlap with Today/Tonight (an
- * already-started item that hasn't ended yet) — that dedup is handled by
- * the caller filtering Today's results against Happening Now's
- * contentIds (see fetchDiscoverySections in src/services/content.ts).
+ * [windowEnd, +∞) — deliberately starts exactly where the Today/Tonight
+ * window ends (not at `now`), so Upcoming and Today/Tonight never overlap
+ * by construction and need no client-side dedup between themselves.
+ * Happening Now can still overlap with Today/Tonight (an already-started
+ * item that hasn't ended yet) — that dedup is handled by the caller
+ * filtering Today's results against Happening Now's contentIds (see
+ * fetchDiscoverySections in src/services/content.ts).
+ *
+ * Deliberately open-ended, no further cutoff — "Coming Up" is meant to
+ * show every real upcoming Event, however far out, not just the next few
+ * days. This used to cap at `afterWindowEnd + 7 days`; per explicit
+ * product feedback that a real, further-out Event was going missing,
+ * that date cutoff is gone. The read cost stays bounded exactly the same
+ * way it already was — fetchByStartsAtWindowByType's own `limitCount`
+ * (SECTION_LIMIT on the Events tab), ordered soonest-first — this only
+ * removes a SECOND, redundant cap that was cutting things off before
+ * that limit ever came into play.
  */
-export function getUpcomingWindow(afterWindowEnd: Date, days = 7): DateWindow {
-  return { start: afterWindowEnd, end: new Date(afterWindowEnd.getTime() + days * 24 * 60 * 60 * 1000) };
+export function getUpcomingWindow(afterWindowEnd: Date): { start: Date } {
+  return { start: afterWindowEnd };
 }
 
 /**

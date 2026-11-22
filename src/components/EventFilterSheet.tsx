@@ -1,5 +1,5 @@
 import { Ionicons } from '@expo/vector-icons';
-import { Modal, Pressable, ScrollView, StyleSheet, Text } from 'react-native';
+import { Modal, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 
 import { KARLSTAD_LAUNCH_CATEGORIES } from '@/constants/launchCategories';
 import { Colors, Radius, Spacing, Typography } from '@/constants/theme';
@@ -18,12 +18,22 @@ type EventFilterSheetProps = {
  * Events from the now-retired legacy Activity content type; with Events
  * discovery Event-only, that distinction no longer means anything, so it
  * was removed rather than kept as a filter with a single meaningful value.
+ *
+ * Backdrop is a SIBLING of the sheet (not a wrapping Pressable around it)
+ * — same structure as OptionsMenu — rather than a Pressable-wraps-Pressable
+ * backdrop, which used to render a `<button>` nested inside a `<button>`
+ * on web (a real hydration-error warning, confirmed live via the Browser
+ * pane console) since the sheet itself, and every CategoryRow inside it,
+ * are Pressables too. The sheet's old `onPress={stopPropagation}` trick
+ * is gone along with it — with the backdrop no longer an ancestor, taps on
+ * the sheet never reach it in the first place.
  */
 export function EventFilterSheet({ visible, categoryFilter, onChangeCategoryFilter, onClose }: EventFilterSheetProps) {
   return (
     <Modal visible={visible} animationType="slide" transparent onRequestClose={onClose}>
-      <Pressable style={styles.backdrop} onPress={onClose} accessibilityRole="button" accessibilityLabel="Close">
-        <Pressable style={styles.sheet} onPress={(event) => event.stopPropagation()}>
+      <View style={styles.backdrop}>
+        <Pressable style={StyleSheet.absoluteFill} onPress={onClose} accessibilityRole="button" accessibilityLabel="Close" />
+        <View style={styles.sheet}>
           <Text style={styles.title}>Filter</Text>
 
           <Text style={styles.subtitle}>Category</Text>
@@ -38,8 +48,8 @@ export function EventFilterSheet({ visible, categoryFilter, onChangeCategoryFilt
               />
             ))}
           </ScrollView>
-        </Pressable>
-      </Pressable>
+        </View>
+      </View>
     </Modal>
   );
 }

@@ -242,7 +242,7 @@ export const LOCATION_SECONDARY_CITY_BONUS_MAX = 0.35;
 export const LOCATION_WORLD_AFFINITY_BONUS_MAX = 0.15;
 /** Step 7 — Events weight location more heavily than Reels/Posts (an event's whole value proposition is "can I actually get there"), applied as a multiplier on RANKING_WEIGHTS.location inside ranking.ts's weightedSum rather than a second, duplicated set of ranking weights (Step 7's own "do not duplicate ranking logic unnecessarily — use feed-specific configuration"). The Following feed needs no equivalent entry here at all: it is not ranked by this engine (see index.tsx's own separate fetchFollowingReels path) — a feed of accounts the viewer explicitly chose to follow has nothing for scoreLocation to weigh in the first place. */
 export const EVENT_LOCATION_WEIGHT_MULTIPLIER = 1.6;
-/** Step 17 — bounded supplementary candidate pool for the single qualifying learned secondary city, under 'city' scope only. Deliberately much smaller than CANDIDATE_POOL.localPoolLimit — this is a small exploration injection, never a second full-size pool. */
+/** Step 17 — bounded supplementary candidate pool for the single qualifying learned secondary city, under 'city' scope only. Deliberately much smaller than CANDIDATE_POOL.localPoolLimit — this is a small exploration injection, never a second full-size pool. No longer used by Reel candidate generation (candidateGenerator.ts) — strict geography now means a City-scope Reel feed only ever pulls from the viewer's OWN city, never a learned secondary one; kept defined in case a future, more deliberate (e.g. clearly-labeled "also popular in X") surface wants it. */
 export const SECONDARY_CITY_REEL_POOL_LIMIT = 24;
 /** Step 18 — same idea for Events' discovery sections (see recommendationEngine.ts's rankEventSections) — kept small since fetchDiscoverySections itself already fans out into several window queries per call (see its own doc comment in content.ts). */
 export const SECONDARY_CITY_EVENT_SECTION_LIMIT = 6;
@@ -354,10 +354,8 @@ export const DIVERSITY_LIMITS = {
 // Step 6/19 — candidate pool sizing and pagination.
 // ---------------------------------------------------------------------------
 export const CANDIDATE_POOL = {
-  /** Bounded read of the most recent published Reels/content in the active scope — the primary candidate source (covers exploitation, related, discovery, freshness, and local-popularity scoring all from ONE query pool, since a per-category query per candidate source isn't worth it at this app's current per-city content volume — see candidateGenerator.ts's own doc comment). */
+  /** Bounded read of the most recent published Reels/content in the active scope — the primary candidate source (covers exploitation, related, discovery, freshness, and local-popularity scoring all from ONE query pool, since a per-category query per candidate source isn't worth it at this app's current per-city content volume — see candidateGenerator.ts's own doc comment). Strict geography: never widened into a broader scope, no matter how few candidates it returns — see candidateGenerator.ts's own doc comment. */
   localPoolLimit: 180,
-  /** Below this many local candidates, widen scope city -> country -> world (Step 8's graceful widening) rather than serving a starved feed. */
-  minLocalPoolBeforeWidening: 30,
   /** A smaller supplementary pool from followed creators, for creator-affinity/exploitation candidates that a pure recency-ordered local pool might miss. */
   followingPoolLimit: 60,
 };

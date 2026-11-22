@@ -117,6 +117,18 @@ export function ReelCommentsSheet({ visible, reelId, onClose, onCommentCountChan
   // error — see the render below's `reactions[comment.commentId] ?? ...`.
   const [reactions, setReactions] = useState<Record<string, CommentReactionState>>({});
   const [reactingCommentId, setReactingCommentId] = useState<string | null>(null);
+  // Phase 4 perf pass — which commentIds have had their reactions fetched
+  // (attempted) THIS sheet-open session — see load()'s own doc comment
+  // below for why replies are deliberately excluded from that eager
+  // fetch, and handleToggleThread's own doc comment for how a reply's
+  // reactions are fetched on demand the first time its thread is actually
+  // expanded. Persists across close/reopen of this same mounted sheet
+  // (this component is never unmounted while its Reel is, only hidden via
+  // `visible` — see this file's own doc comment) so re-expanding an
+  // already-expanded-this-session thread never re-fetches; reset to just
+  // the fresh top-level set at the start of every REAL (non-silent) load,
+  // since that's a genuinely new snapshot of this Reel's comments.
+  const loadedReactionCommentIdsRef = useRef<Set<string>>(new Set());
 
   const cacheKey = commentsCacheKey(reelId, user?.uid);
 
@@ -124,6 +136,34 @@ export function ReelCommentsSheet({ visible, reelId, onClose, onCommentCountChan
   // already proven on Home/Events/Profile/Inbox: a silent revalidate skips
   // entirely rather than overlap one already running.
   const isLoadInFlightRef = useRef(false);
+
+  /**
+   * Fetches reaction counts + the viewer's own reaction for exactly the
+   * given comments — never more. Each comment's fetch is caught
+   * INDIVIDUALLY (a slow or failed reaction fetch for one comment must
+   * never affect any other, or the comment list's own already-'loaded'
+   * status — same reasoning `load` below already followed before this was
+   * split out as its own function).
+   */
+  const fetchReactionsFor = useCallback(
+    async (targets: ReelComment[]): Promise<Record<string, CommentReactionState>> => {
+      const entries = await Promise.all(
+        targets.map(async (comment) => {
+          try {
+            const [counts, myReaction] = await Promise.all([
+              fetchReelCommentReactionCounts(reelId, comment.commentId),
+              user ? fetchMyReelCommentReaction(reelId, comment.commentId, user.uid) : Promise.resolve(null),
+            ]);
+            return [comment.commentId, { ...counts, myReaction }] as const;
+          } catch {
+            return [comment.commentId, { likeCount: 0, dislikeCount: 0, myReaction: null }] as const;
+          }
+        })
+      );
+      return Object.fromEntries(entries);
+    },
+    [reelId, user]
+  );
 
   /**
    * `silent` (default false) is this sheet's stale-while-revalidate
@@ -144,7 +184,15 @@ export function ReelCommentsSheet({ visible, reelId, onClose, onCommentCountChan
       const silent = options?.silent ?? false;
       if (silent && isLoadInFlightRef.current) return;
       isLoadInFlightRef.current = true;
-      if (!silent) setStatus('loading');
+      if (!silent) {
+        setStatus('loading');
+        // Phase 4 perf pass — a REAL load is a genuinely new snapshot of
+        // this Reel's comments; a silent revalidate is not (see
+        // loadedReactionCommentIdsRef's own doc comment above for why
+        // that path deliberately keeps whatever was already tracked, so
+        // an already-expanded thread's replies stay refreshed too).
+        loadedReactionCommentIdsRef.current = new Set();
+      }
       let list: ReelComment[];
       let total: number;
       try {
@@ -167,30 +215,35 @@ export function ReelCommentsSheet({ visible, reelId, onClose, onCommentCountChan
       // deliberately OUTSIDE the try/catch above: the comment list itself
       // is already showing (status is 'loaded') by this point, so a slow or
       // failed reaction fetch for one comment must never flip the whole
-      // sheet to an error state — it just leaves that one comment's
-      // reactions at their default (0/0/none), caught individually per
-      // comment rather than letting one failure reject the whole Promise.all.
-      const entries = await Promise.all(
-        list.map(async (comment) => {
-          try {
-            const [counts, myReaction] = await Promise.all([
-              fetchReelCommentReactionCounts(reelId, comment.commentId),
-              user ? fetchMyReelCommentReaction(reelId, comment.commentId, user.uid) : Promise.resolve(null),
-            ]);
-            return [comment.commentId, { ...counts, myReaction }] as const;
-          } catch {
-            return [comment.commentId, { likeCount: 0, dislikeCount: 0, myReaction: null }] as const;
-          }
-        })
-      );
-      const reactionsByCommentId = Object.fromEntries(entries);
+      // sheet to an error state — see fetchReactionsFor's own doc comment
+      // for how each comment's own fetch is caught individually.
+      //
+      // Phase 4 perf pass — eager reactions are fetched for TOP-LEVEL
+      // comments only, plus any reply already tracked in
+      // loadedReactionCommentIdsRef (a thread expanded earlier this
+      // session — see handleToggleThread below), never every reply
+      // unconditionally. Replies stay collapsed behind "Show N answers"
+      // until tapped (see expandedThreads' own doc comment) — the vast
+      // majority of threads on a busy Reel are never expanded at all, so
+      // eagerly reacting-fetching every reply on every open was pure N+1
+      // waste. This substantially cuts the per-open reaction-read volume
+      // for any Reel with replies, with zero schema/index change — a
+      // bigger reduction (e.g. a single batched query, or pre-aggregated
+      // counts on the comment doc itself) would need a real backend
+      // change; see this phase's own audit report for the two designs
+      // considered and why neither was applied without an explicit
+      // go-ahead.
+      const alreadyLoadedIds = loadedReactionCommentIdsRef.current;
+      const targets = list.filter((comment) => !comment.parentCommentId || alreadyLoadedIds.has(comment.commentId));
+      const reactionsByCommentId = await fetchReactionsFor(targets);
+      loadedReactionCommentIdsRef.current = new Set(targets.map((comment) => comment.commentId));
       setReactions(reactionsByCommentId);
       // Phase 1 perf pass — a successful load (real or silent) is exactly
       // what keeps the cache fresh; see commentsCache's own doc comment.
       commentsCache.set(cacheKey, { comments: list, commentCount: total, reactions: reactionsByCommentId, fetchedAt: Date.now() });
       isLoadInFlightRef.current = false;
     },
-    [reelId, onCommentCountChange, user, cacheKey]
+    [reelId, onCommentCountChange, cacheKey, fetchReactionsFor]
   );
 
   // Stale-while-revalidate, keyed by cacheKey (reelId + viewer uid — see
@@ -257,8 +310,34 @@ export function ReelCommentsSheet({ visible, reelId, onClose, onCommentCountChan
   const handleToggleThread = (commentId: string) => {
     setExpandedThreads((prev) => {
       const next = new Set(prev);
-      if (next.has(commentId)) next.delete(commentId);
-      else next.add(commentId);
+      if (next.has(commentId)) {
+        next.delete(commentId);
+      } else {
+        next.add(commentId);
+        // Phase 4 perf pass — the FIRST time this thread is expanded this
+        // sheet-open session, fetch reactions for exactly its own replies
+        // (never fetched eagerly by load() — see its own doc comment) —
+        // most threads are never expanded at all, so this only ever pays
+        // for the ones a person actually opens. Skipped for a reply
+        // already covered by loadedReactionCommentIdsRef (collapsing then
+        // re-expanding the same thread, or one a prior silent revalidate
+        // already refreshed).
+        const replies = repliesByParent.get(commentId) ?? [];
+        const unfetched = replies.filter((reply) => !loadedReactionCommentIdsRef.current.has(reply.commentId));
+        if (unfetched.length > 0) {
+          fetchReactionsFor(unfetched).then((fetched) => {
+            unfetched.forEach((reply) => loadedReactionCommentIdsRef.current.add(reply.commentId));
+            setReactions((prevReactions) => {
+              const merged = { ...prevReactions, ...fetched };
+              // Keep the cache entry (if any) in step, same reasoning as
+              // handleToggleReaction's own cache write below.
+              const cached = commentsCache.get(cacheKey);
+              if (cached) commentsCache.set(cacheKey, { ...cached, reactions: merged });
+              return merged;
+            });
+          });
+        }
+      }
       return next;
     });
   };

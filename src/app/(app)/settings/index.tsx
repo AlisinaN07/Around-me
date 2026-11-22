@@ -12,19 +12,19 @@ import { useAuth } from '@/hooks/useAuth';
 import { useProfile } from '@/hooks/useProfile';
 import { fetchMyBlockedUserIds } from '@/services/blocks';
 import { fetchMyNewMessagesFrom } from '@/services/privacySettings';
+import { removeCurrentDevicePushToken } from '@/services/pushTokens';
 import { NEW_MESSAGES_FROM_OPTIONS } from '@/types/privacy';
 import { isBusinessAccount } from '@/utils/accountCapabilities';
 
 type LoadStatus = 'loading' | 'loaded' | 'error';
 
 /**
- * Settings home (Step 27; Account section added Step 33) — real rows only.
- * Edit profile now has a real route/backend (src/app/(app)/profile/edit.tsx),
- * so it's a real row, not a dead one (see README "Settings — real rows
- * only"). No Notifications section (no preference backend or push system
- * exists) and no Content & Reels section (no real per-account content
- * preferences exist) — both intentionally omitted rather than rendered as
- * inert toggles.
+ * Settings home (Step 27; Account section added Step 33; Notifications
+ * row added Step 3E, now that a real push-token foundation exists —
+ * src/app/(app)/settings/notifications.tsx). No Content & Reels section
+ * (no real per-account content preferences exist) — still intentionally
+ * omitted rather than rendered as an inert toggle, same "real rows only"
+ * rule (see README) the Notifications row now satisfies too.
  */
 export default function SettingsScreen() {
   const { user, signOut } = useAuth();
@@ -56,6 +56,18 @@ export default function SettingsScreen() {
     if (isSigningOut) return;
     setIsSigningOut(true);
     try {
+      // Step 3B/3C — this device's own push-token registration (if any) is
+      // explicitly a per-ACCOUNT-SESSION thing, not a per-install thing: a
+      // different user signing in on this same device afterward must
+      // never inherit it. Must run BEFORE signOut() below, while
+      // request.auth.uid still resolves to this user (the Firestore rule
+      // this relies on is owner-only). Retries internally and marks a
+      // durable local marker on failure for a later retry — see
+      // src/services/pushTokens.ts's own doc comment — but never throws,
+      // so a failure here still never blocks signing out.
+      if (user) {
+        await removeCurrentDevicePushToken(user.uid);
+      }
       await signOut();
     } catch {
       setIsSigningOut(false);
@@ -104,6 +116,10 @@ export default function SettingsScreen() {
               value={blockedCount > 0 ? String(blockedCount) : undefined}
               onPress={() => router.push('/settings/privacy')}
             />
+          </SettingsSection>
+
+          <SettingsSection title="Notifications">
+            <SettingsRow icon="notifications-outline" label="Notifications" onPress={() => router.push('/settings/notifications')} />
           </SettingsSection>
 
           <SettingsSection title="Session">
