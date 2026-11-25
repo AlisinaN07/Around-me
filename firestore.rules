@@ -311,10 +311,10 @@ service cloud.firestore {
     // Step 41.2E — target validation for a new Saved relationship. Rejects:
     // a missing target (exists() short-circuits before either get() below
     // ever runs against a nonexistent document), an unpublished/draft Reel,
-    // a non-'post' legacy content document (Event, Activity — this is the
-    // enforcement point that keeps Saved video-Post/text-Post-only), an
-    // unpublished legacy Post, saving your own Post either way, and a
-    // malformed/mismatched targetType or savedId. Firestore Rules cache
+    // a non-'post'/'event' legacy content document (Activity — this is the
+    // enforcement point that keeps Saved video-Post/text-Post/Event-only), an
+    // unpublished legacy Post or Event, saving your own Post/Event either
+    // way, and a malformed/mismatched targetType or savedId. Firestore Rules cache
     // repeated get() calls to the same path within one evaluation, so
     // calling savedReelTarget/savedContentTarget more than once below costs
     // only one real read each.
@@ -341,6 +341,16 @@ service cloud.firestore {
           || (data.targetType == 'post'
             && exists(/databases/$(database)/documents/content/$(data.targetId))
             && savedContentTarget(data.targetId).type == 'post'
+            && savedContentTarget(data.targetId).status == 'published'
+            && savedContentTarget(data.targetId).authorUid != uid)
+          // Step 12C — a saved Event (content/{contentId}, type=='event'),
+          // same shape of check as 'post' above, just against 'event'
+          // instead — see SavedTargetType's own doc comment in
+          // src/types/saved.ts for why this is a separate targetType from
+          // 'post' despite both living in the same content/ collection.
+          || (data.targetType == 'event'
+            && exists(/databases/$(database)/documents/content/$(data.targetId))
+            && savedContentTarget(data.targetId).type == 'event'
             && savedContentTarget(data.targetId).status == 'published'
             && savedContentTarget(data.targetId).authorUid != uid)
           // A saved SOUND (see Reel.musicHash's own doc comment in
